@@ -1,17 +1,25 @@
-## My Project
+# NeuronxDistributed
 
-TODO: Fill this README out!
+Source code for `neuronx-distributed`. This package is used for releasing neuron-friendly implementations 
+of certain 3rd party tools.
 
-Be sure to:
+## Development resources
 
-* Change the title in this README
-* Edit your repository description on GitHub
+VersionSet: KaenaPyTorchXLATest/development: https://code.amazon.com/version-sets/KaenaPyTorchXLATest/development
 
-## Security
+Pipeline: KaenaPyTorchXLATest: https://pipelines.amazon.com/pipelines/KaenaPyTorchXLATest
 
-See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for more information.
+Auto Test Pipeline: https://pipelines.amazon.com/pipelines/KaenaPyTorchXLATest-development-autotest
 
-## License
+## Building NeuronxDistributed
 
-This library is licensed under the MIT-0 License. See the LICENSE file.
+```
+brazil ws create --name NeuronxDistributed --versionSet KaenaPyTorchXLATest/development
+cd NeuronxDistributed
+brazil ws use NeuronxDistributed
 
+# Build NeuronxDistributed to get neuronx-distributed
+cd src/NeuronxDistributed
+git checkout mainline
+bb clean && bb
+```
