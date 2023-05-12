@@ -12,30 +12,26 @@ _DATA_PARALLEL_GROUP_SPMD = None
 _MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE = None
 _MPU_TENSOR_MODEL_PARALLEL_RANK = None
 
-def initialize_model_parallel(tensor_model_parallel_size_: int = 1) -> None:
+def initialize_model_parallel(tensor_model_parallel_size: int = 1) -> None:
     """
     Initialize model data parallel groups.
 
     Arguments:
         tensor_model_parallel_size: number of Neuron devices used to parallelize model tensor.
 
-    Let's say we have a total of 16 Neuron devices denoted by g0 ... g15 and we
+    Let's say we have a total of 16 Neuron devices denoted by n0 ... n15 and we
     use 2 Neuron devices to parallelize the data. The present function will
     create 8 data-parallel groups, and 2 tensor model-parallel groups as:
         8 data_parallel groups:
-            [g0, g1], [g2, g3], [g4, g5], [g6, g7], [g8, g9], [g10, g11], [g12, g13], [g14, g15]
+            [n0, n1], [n2, n3], [n4, n5], [n6, n7], [n8, n9], [n10, n11], [n12, n13], [n14, n15]
         4 tensor model-parallel groups:
-            [g0, g2, g4, g6], [g1, g3, g5, g7]
-    Note that for efficiency, the caller should make sure adjacent ranks
-    are on the same DGX box. For example if we are using 2 DGX-1 boxes
-    with a total of 16 Neuron devices, rank 0 to 7 belong to the first box and
-    ranks 8 to 15 belong to the second box.
+            [n0, n2, n4, n6], [n1, n3, n5, n7]
     """
     # Get world size and rank. Ensure some consistencies.
     assert torch.distributed.is_initialized()
     
     world_size: int = torch.distributed.get_world_size()
-    tensor_model_parallel_size: int = min(tensor_model_parallel_size_, world_size)
+    tensor_model_parallel_size: int = min(tensor_model_parallel_size, world_size)
     data_parallel_size: int = world_size // tensor_model_parallel_size
     if torch.distributed.get_rank() == 0:
         print(
@@ -106,14 +102,14 @@ def get_data_parallel_group():
     assert _DATA_PARALLEL_GROUP is not None, "data parallel group is not initialized"
     return _DATA_PARALLEL_GROUP
 
-def get_tensor_model_parallel_world_size():
+def get_tensor_model_parallel_size():
     """Return world size for the tensor model parallel group."""
     global _MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE
     if _MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE is not None:
         return _MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE
     return torch.distributed.get_world_size(group=get_tensor_model_parallel_group())
 
-def set_tensor_model_parallel_world_size(world_size):
+def set_tensor_model_parallel_size(world_size):
     """Set the tensor model parallel size"""
     global _MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE
     _MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE = world_size
@@ -134,17 +130,17 @@ def get_tensor_model_parallel_src_rank():
     """Calculate the global rank corresponding to the first local rank
     in the tensor model parallel group."""
     global_rank = torch.distributed.get_rank()
-    local_world_size = get_tensor_model_parallel_world_size()
+    local_world_size = get_tensor_model_parallel_size()
     return (global_rank // local_world_size) * local_world_size
 
 def get_data_parallel_src_rank():
     """Calculate the global rank corresponding to the first local rank in the data parallel group."""
     global_rank = torch.distributed.get_rank()
-    data_parallel_size: int = get_data_parallel_world_size()
+    data_parallel_size: int = get_data_parallel_size()
     num_data_parallel_groups = torch.distributed.get_world_size() // data_parallel_size
     return global_rank % num_data_parallel_groups
 
-def get_data_parallel_world_size():
+def get_data_parallel_size():
     """Return world size for the data parallel group."""
     return torch.distributed.get_world_size(group=get_data_parallel_group())
 

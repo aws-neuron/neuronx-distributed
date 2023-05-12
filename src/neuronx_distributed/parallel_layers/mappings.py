@@ -2,7 +2,7 @@ import torch
 
 from .parallel_state import (get_tensor_model_parallel_group,
                              get_tensor_model_parallel_rank,
-                             get_tensor_model_parallel_world_size)
+                             get_tensor_model_parallel_size)
 from .utils import split_tensor_along_last_dim
 
 if "all_gather_into_tensor" not in dir(torch.distributed):
@@ -13,8 +13,8 @@ if "reduce_scatter_tensor" not in dir(torch.distributed):
 def _reduce(input_: torch.Tensor) -> torch.Tensor:
     """All-reduce the input tensor across model parallel group."""
 
-    # Bypass the function if we are using only 1 GPU.
-    if get_tensor_model_parallel_world_size() == 1:
+    # Bypass the function if we are using only 1 device.
+    if get_tensor_model_parallel_size() == 1:
         return input_
 
     # All-reduce.
@@ -27,8 +27,8 @@ def _split_along_last_dim(input_: torch.Tensor) -> torch.Tensor:
     """Split the tensor along its last dimension and keep the
     corresponding slice."""
 
-    world_size = get_tensor_model_parallel_world_size()
-    # Bypass the function if we are using only 1 GPU.
+    world_size = get_tensor_model_parallel_size()
+    # Bypass the function if we are using only 1 device.
     if world_size == 1:
         return input_
 
@@ -45,8 +45,8 @@ def _split_along_last_dim(input_: torch.Tensor) -> torch.Tensor:
 def _gather_along_last_dim(input_: torch.Tensor) -> torch.Tensor:
     """Gather tensors and concatenate along the last dimension."""
 
-    world_size = get_tensor_model_parallel_world_size()
-    # Bypass the function if we are using only 1 GPU.
+    world_size = get_tensor_model_parallel_size()
+    # Bypass the function if we are using only 1 device.
     if world_size == 1:
         return input_
 

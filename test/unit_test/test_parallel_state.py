@@ -51,7 +51,7 @@ def test_initialize_model_parallel(tensor_model_parallel_size):
         # Model parallel.
         world_size = tensor_model_parallel_size_
         rank = torch.distributed.get_rank() % tensor_model_parallel_size_
-        assert world_size == parallel_state.get_tensor_model_parallel_world_size()
+        assert world_size == parallel_state.get_tensor_model_parallel_size()
         assert rank == parallel_state.get_tensor_model_parallel_rank()
         check(parallel_state.get_tensor_model_parallel_group(), world_size, rank)
 
@@ -59,7 +59,7 @@ def test_initialize_model_parallel(tensor_model_parallel_size):
         world_size = torch.distributed.get_world_size(
         ) // tensor_model_parallel_size_
         rank = torch.distributed.get_rank() // tensor_model_parallel_size
-        assert world_size == parallel_state.get_data_parallel_world_size()
+        assert world_size == parallel_state.get_data_parallel_size()
         assert rank == parallel_state.get_data_parallel_rank()
         check(parallel_state.get_data_parallel_group(), world_size, rank)
 

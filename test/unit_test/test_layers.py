@@ -41,7 +41,7 @@ def test_parallel_embedding(tensor_model_parallel_size):
         device = xm.xla_device()
         tensor_model_parallel_size_ = tensor_model_parallel_size
         parallel_state.initialize_model_parallel(tensor_model_parallel_size_)
-        tensor_model_parallel_size_ = parallel_state.get_tensor_model_parallel_world_size()
+        tensor_model_parallel_size_ = parallel_state.get_tensor_model_parallel_size()
 
         batch_size = 17
         seq_length = 23
@@ -109,7 +109,7 @@ def test_initialize_affine_weight_cpu(tensor_model_parallel_size):
 
         tensor_model_parallel_size_ = tensor_model_parallel_size
         parallel_state.initialize_model_parallel(tensor_model_parallel_size_)
-        tensor_model_parallel_size_ = parallel_state.get_tensor_model_parallel_world_size()
+        tensor_model_parallel_size_ = parallel_state.get_tensor_model_parallel_size()
 
         seed = 12345
         input_size_coeff = 13
@@ -188,7 +188,7 @@ def parallel_self_attention_wrapper(device, tensor_model_parallel_size,
     
     tensor_model_parallel_size_ = tensor_model_parallel_size
     parallel_state.initialize_model_parallel(tensor_model_parallel_size_)
-    tensor_model_parallel_size_ = parallel_state.get_tensor_model_parallel_world_size()
+    tensor_model_parallel_size_ = parallel_state.get_tensor_model_parallel_size()
 
     seed = 12345
     set_random_seed(seed)

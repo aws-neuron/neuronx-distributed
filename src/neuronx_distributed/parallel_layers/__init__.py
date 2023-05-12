@@ -1,5 +1,6 @@
 """Model parallel utility interface."""
 
+from .checkpointing import save, load
 from .grads import clip_grad_norm
 from .layers import (ColumnParallelLinear, ParallelAttention,
                      ParallelEmbedding, RowParallelLinear,

@@ -274,7 +274,7 @@ def create_pretraining_dataset(
     )
     train_sampler = DistributedSampler(
         train_data,
-        num_replicas=parallel_state.get_data_parallel_world_size(),
+        num_replicas=parallel_state.get_data_parallel_size(),
         rank=parallel_state.get_data_parallel_rank(),
     )
     train_dataloader = DataLoader(
@@ -360,9 +360,36 @@ def get_model(flags):
         my_config.num_attention_heads = 2
         my_config.hidden_size = 16
     my_model = BertForPreTraining(my_config)
-    
+    def init_weights(weights):
+        torch.nn.init.normal_(weights, mean=0.0, std=my_config.initializer_range)
+    my_model.bert.embeddings.word_embeddings = layers.ParallelEmbedding(
+        my_config.vocab_size,
+        my_config.hidden_size,
+        init_method=init_weights,
+    )
+
+    my_model.cls.predictions.decoder = layers.ColumnParallelLinear(
+        my_config.hidden_size, my_config.vocab_size, bias=False)
+
+    init_weights(my_model.cls.predictions.decoder.weight)
+
+    class ParallelAttentionWithNormalInit(layers.ParallelAttention):
+        def __init__(self, config):
+            super().__init__(config)
+            init_weights(self.query.weight)
+            init_weights(self.key.weight)
+            init_weights(self.value.weight)
+            init_weights(self.dense.weight)
+            with torch.no_grad():
+                self.query.bias.zero_()
+                self.key.bias.zero_()
+                self.value.bias.zero_()
+                self.dense.bias.zero_()
+
     for layer in my_model.bert.encoder.layer:
         layer.attention = layers.ParallelAttention(my_config)
+
+
     return my_model
 
 
@@ -381,9 +408,9 @@ def get_dtype(model) -> str:
     return str(model.dtype)    
     
 def train_bert_hdf5(flags):
-    parallel_state.initialize_model_parallel(tensor_model_parallel_size_=2)
+    parallel_state.initialize_model_parallel(tensor_model_parallel_size=2)
     rank = xm.get_ordinal()
-    world_size = parallel_state.get_data_parallel_world_size()
+    world_size = parallel_state.get_data_parallel_size()
     is_root = xm.is_master_ordinal(local=False)
     extract_graphs_only = os.environ.get("NEURON_EXTRACT_GRAPHS_ONLY", None)
     set_seed(flags.seed)
@@ -563,8 +590,11 @@ def train_bert_hdf5(flags):
 
     if flags.resume_ckpt:
         step = flags.resume_step
-        global_step, epoch, scheduler_state_dict = checkpointing.load_checkpoint(
-            model, optimizer, step, flags.output_dir)
+        state_dict = checkpointing.load(flags.output_dir, model)
+        optimizer.load_state_dict(state_dict["optimizer"])
+        global_step = state_dict["global_step"]
+        epoch = state_dict["epoch"]
+        scheduler_state_dict = state_dict["scheduler"]
     else:
         global_step = 0
         epoch = 0
@@ -714,8 +744,14 @@ def train_bert_hdf5(flags):
                         ),
                     ]
                     metric_writer.store_metrics(metric_data)
-                checkpointing.save_checkpoint(global_step, epoch, model,
-                                              optimizer, scheduler, flags.output_dir)
+                state_dict = {
+                    "model": model.state_dict(),
+                    "global_step": global_step,
+                    "epoch": epoch,
+                    "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict()
+                }
+                checkpointing.save(state_dict, flags.output_dir)
                 return
             del train_device_loader
             del train_dataloader
