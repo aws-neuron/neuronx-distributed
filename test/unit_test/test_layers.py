@@ -65,8 +65,7 @@ def test_parallel_embedding(tensor_model_parallel_size):
         embedding_parallel = layers.ParallelEmbedding(
             vocab_size,
             hidden_size,
-            init_method=init.normal_,
-            use_cpu_initialization=True).to(device)
+            init_method=init.normal_).to(device)
         output = embedding_parallel(input_data)
         loss_parallel = torch.mul(output, loss_weight).sum()
         loss_parallel.backward()
