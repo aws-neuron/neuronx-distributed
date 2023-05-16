@@ -90,18 +90,18 @@ def model_parallel_is_initialized():
     return True
 
 
-def get_tensor_model_parallel_group():
+def get_tensor_model_parallel_group(as_list=False):
     """Get the tensor model parallel group the caller rank belongs to."""
     assert (
         _TENSOR_MODEL_PARALLEL_GROUP is not None
     ), "intra_layer_model parallel group is not initialized"
-    return _TENSOR_MODEL_PARALLEL_GROUP
+    return _TENSOR_MODEL_PARALLEL_GROUP._mesh if as_list else _TENSOR_MODEL_PARALLEL_GROUP
 
 
-def get_data_parallel_group():
+def get_data_parallel_group(as_list=False):
     """Get the data parallel group the caller rank belongs to."""
     assert _DATA_PARALLEL_GROUP is not None, "data parallel group is not initialized"
-    return _DATA_PARALLEL_GROUP
+    return _DATA_PARALLEL_GROUP._mesh if as_list else _DATA_PARALLEL_GROUP
 
 
 def get_tensor_model_parallel_size():

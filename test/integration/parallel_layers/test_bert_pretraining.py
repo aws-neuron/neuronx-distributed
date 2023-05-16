@@ -545,13 +545,13 @@ def train_bert_hdf5(flags):
                 running_loss_reduced = xm.all_reduce(
                     xm.REDUCE_SUM,
                     running_loss_div,
-                    groups=parallel_state.get_data_parallel_group()._mesh,
+                    groups=parallel_state.get_data_parallel_group(as_list=True),
                 )
                 running_loss_reduced_detached = running_loss_reduced.detach()
                 running_loss.zero_()
                 # all-reduce and then clip. Order matters.
                 xm.reduce_gradients(
-                    optimizer, groups=parallel_state.get_data_parallel_group()._mesh
+                    optimizer, groups=parallel_state.get_data_parallel_group(as_list=True)
                 )
                 grads.clip_grad_norm(
                     model.parameters(), max_grad_norm
