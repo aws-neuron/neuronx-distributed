@@ -6,7 +6,7 @@ from .parallel_state import get_tensor_model_parallel_group
 
 
 def param_is_not_shared(param):
-    return not hasattr(param, 'shared') or not param.shared
+    return not hasattr(param, "shared") or not param.shared
 
 
 def clip_grad_norm(parameters, max_norm, norm_type=2):
@@ -53,9 +53,11 @@ def clip_grad_norm(parameters, max_norm, norm_type=2):
     if norm_type == inf:
         total_norm = max(grad.abs().max() for grad in grads_for_norm)
         total_norm = torch.FloatTensor([float(total_norm)]).to(device)
-        torch.distributed.all_reduce(total_norm,
-                                     op=torch.distributed.ReduceOp.MAX,
-                                     group=get_tensor_model_parallel_group())
+        torch.distributed.all_reduce(
+            total_norm,
+            op=torch.distributed.ReduceOp.MAX,
+            group=get_tensor_model_parallel_group(),
+        )
         total_norm = total_norm[0].item()
 
     else:
@@ -63,9 +65,11 @@ def clip_grad_norm(parameters, max_norm, norm_type=2):
             grad_norm = torch.norm(grad, norm_type)
             total_norm += grad_norm**norm_type
 
-        torch.distributed.all_reduce(total_norm,
-                                     op=torch.distributed.ReduceOp.SUM,
-                                     group=get_tensor_model_parallel_group())
+        torch.distributed.all_reduce(
+            total_norm,
+            op=torch.distributed.ReduceOp.SUM,
+            group=get_tensor_model_parallel_group(),
+        )
         total_norm = torch.pow(total_norm, 1.0 / norm_type)
 
     # Scale.
@@ -73,6 +77,6 @@ def clip_grad_norm(parameters, max_norm, norm_type=2):
 
     for g in grads:
         g.data.mul_(
-            torch.where(clip_coeff < 1, clip_coeff,
-                        torch.tensor(1., device=device)))
+            torch.where(clip_coeff < 1, clip_coeff, torch.tensor(1.0, device=device))
+        )
     return total_norm

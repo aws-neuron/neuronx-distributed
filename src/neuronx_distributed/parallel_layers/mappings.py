@@ -1,15 +1,18 @@
 import torch
 
-from .parallel_state import (get_tensor_model_parallel_group,
-                             get_tensor_model_parallel_rank,
-                             get_tensor_model_parallel_size)
+from .parallel_state import (
+    get_tensor_model_parallel_group,
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_size,
+)
 from .utils import split_tensor_along_last_dim
 
 if "all_gather_into_tensor" not in dir(torch.distributed):
     torch.distributed.all_gather_into_tensor = torch.distributed._all_gather_base
 if "reduce_scatter_tensor" not in dir(torch.distributed):
     torch.distributed.reduce_scatter_tensor = torch.distributed._reduce_scatter_base
-    
+
+
 def _reduce(input_: torch.Tensor) -> torch.Tensor:
     """All-reduce the input tensor across model parallel group."""
 
@@ -83,7 +86,7 @@ class _CopyToModelParallelRegion(torch.autograd.Function):
     def backward(ctx, grad_output):
         return _reduce(grad_output)
 
-    
+
 class _ReduceFromModelParallelRegion(torch.autograd.Function):
     """All-reduce the input from the tensor model parallel region."""
 
@@ -101,7 +104,7 @@ class _ReduceFromModelParallelRegion(torch.autograd.Function):
     def backward(ctx, grad_output):
         return grad_output
 
-    
+
 class _ScatterToModelParallelRegion(torch.autograd.Function):
     """Split the input and keep only the corresponding chuck to the rank."""
 
@@ -142,14 +145,18 @@ class _GatherFromModelParallelRegion(torch.autograd.Function):
 # Helper functions.
 # -----------------
 
+
 def copy_to_tensor_model_parallel_region(input_):
     return _CopyToModelParallelRegion.apply(input_)
+
 
 def reduce_from_tensor_model_parallel_region(input_):
     return _ReduceFromModelParallelRegion.apply(input_)
 
+
 def scatter_to_tensor_model_parallel_region(input_):
     return _ScatterToModelParallelRegion.apply(input_)
+
 
 def gather_from_tensor_model_parallel_region(input_):
     return _GatherFromModelParallelRegion.apply(input_)

@@ -9,8 +9,14 @@ import torch.distributed as dist
 from transformers.utils import ModelOutput, logging, is_torch_tpu_available
 from transformers.generation.logits_process import LogitsProcessorList
 
-from transformers.generation.beam_constraints import DisjunctiveConstraint, PhrasalConstraint
-from transformers.generation.beam_search import BeamSearchScorer, ConstrainedBeamSearchScorer
+from transformers.generation.beam_constraints import (
+    DisjunctiveConstraint,
+    PhrasalConstraint,
+)
+from transformers.generation.beam_search import (
+    BeamSearchScorer,
+    ConstrainedBeamSearchScorer,
+)
 from transformers.generation.configuration_utils import GenerationConfig
 
 from transformers.generation.stopping_criteria import (
@@ -29,7 +35,6 @@ from transformers.generation.utils import GreedySearchOutput
 from transformers.generation.utils import GenerateOutput
 
 logger = logging.get_logger(__name__)
-    
 
 
 def _patch(fn, newfn, matching_signatures=True):
@@ -38,24 +43,25 @@ def _patch(fn, newfn, matching_signatures=True):
 
     if matching_signatures and xfingerprint != fingerprint:
         raise RuntimeError(
-            'Unable to patch {}, signature mismatch: {} vs {}'.format(
-                fn, xfingerprint, fingerprint))
+            "Unable to patch {}, signature mismatch: {} vs {}".format(
+                fn, xfingerprint, fingerprint
+            )
+        )
     newfn._orig = fn
     return newfn
 
 
 def _update_model_kwargs_for_xla_generation(
-        self,
-        outputs: ModelOutput,
-        model_kwargs: Dict[str, Any],
-        batch_size: int,
-        is_encoder_decoder: bool = False,
-        standardize_cache_format: bool = False,
-        max_length: int = None,
-        seq_length: int = None,
-        use_cache=True,
+    self,
+    outputs: ModelOutput,
+    model_kwargs: Dict[str, Any],
+    batch_size: int,
+    is_encoder_decoder: bool = False,
+    standardize_cache_format: bool = False,
+    max_length: int = None,
+    seq_length: int = None,
+    use_cache=True,
 ) -> Dict[str, Any]:
-
     def _initialize_attention(model_kwargs, num_padding_values, is_encoder_decoder):
         """initializes the appropriate attention mask -- encoder-decoder models use `decoder_attention_mask`"""
         if is_encoder_decoder:
@@ -74,10 +80,17 @@ def _update_model_kwargs_for_xla_generation(
             # 0s for the currently-unfilled locations in the past_key_values tensor, 1s for the actual input_ids
             attention_mask = torch.cat(
                 [
-                    torch.zeros((batch_size, num_padding_values), dtype=attention_mask.dtype,
-                                device=attention_mask.device),
+                    torch.zeros(
+                        (batch_size, num_padding_values),
+                        dtype=attention_mask.dtype,
+                        device=attention_mask.device,
+                    ),
                     attention_mask,
-                    torch.ones((batch_size, 1), dtype=attention_mask.dtype, device=attention_mask.device),
+                    torch.ones(
+                        (batch_size, 1),
+                        dtype=attention_mask.dtype,
+                        device=attention_mask.device,
+                    ),
                 ],
                 axis=1,
             )
@@ -89,16 +102,26 @@ def _update_model_kwargs_for_xla_generation(
         """updates the appropriate attention mask -- encoder-decoder models use `decoder_attention_mask`"""
         if is_encoder_decoder:
             decoder_attention_mask = model_kwargs.pop("decoder_attention_mask")
-            decoder_attention_mask_update_slice = torch.ones((batch_size, 1), dtype=decoder_attention_mask.dtype,
-                                                             device=decoder_attention_mask.device)
-            decoder_attention_mask = torch.cat([decoder_attention_mask[:, 1:],
-                                                decoder_attention_mask_update_slice], dim=-1)
+            decoder_attention_mask_update_slice = torch.ones(
+                (batch_size, 1),
+                dtype=decoder_attention_mask.dtype,
+                device=decoder_attention_mask.device,
+            )
+            decoder_attention_mask = torch.cat(
+                [decoder_attention_mask[:, 1:], decoder_attention_mask_update_slice],
+                dim=-1,
+            )
             mask = {"decoder_attention_mask": decoder_attention_mask}
         else:
             attention_mask = model_kwargs.pop("attention_mask")
-            attention_mask_update_slice = torch.ones((batch_size, 1), dtype=attention_mask.dtype,
-                                                     device=attention_mask.device)
-            attention_mask = torch.cat([attention_mask[:, 1:], attention_mask_update_slice], dim=-1)
+            attention_mask_update_slice = torch.ones(
+                (batch_size, 1),
+                dtype=attention_mask.dtype,
+                device=attention_mask.device,
+            )
+            attention_mask = torch.cat(
+                [attention_mask[:, 1:], attention_mask_update_slice], dim=-1
+            )
             mask = {"attention_mask": attention_mask}
         return mask
 
@@ -112,10 +135,16 @@ def _update_model_kwargs_for_xla_generation(
             for i in range(len(new_past_layer[:2])):
                 b, n_heads, _, head_dim = past_layer[i].shape
                 new_past_layer[i] = torch.cat(
-                    [torch.zeros((b, n_heads, num_padding_values, head_dim),
-                                 dtype=past_layer[i].dtype,
-                                 device=past_layer[i].device),
-                     past_layer[i]], dim=2)
+                    [
+                        torch.zeros(
+                            (b, n_heads, num_padding_values, head_dim),
+                            dtype=past_layer[i].dtype,
+                            device=past_layer[i].device,
+                        ),
+                        past_layer[i],
+                    ],
+                    dim=2,
+                )
             new_past += (tuple(new_past_layer),)
 
         return new_past
@@ -144,7 +173,9 @@ def _update_model_kwargs_for_xla_generation(
             # previous autoregressive generation steps (step 0 has no past_key_values, step 1 has 1 past_key_values value, ..., the last step
             # has `max_length - 1` past_key_values values).
             num_padding_values = max_length - seq_length
-            mask = _initialize_attention(model_kwargs, num_padding_values, is_encoder_decoder)
+            mask = _initialize_attention(
+                model_kwargs, num_padding_values, is_encoder_decoder
+            )
             new_past = _initialize_past(past_key_values, num_padding_values)
         else:
             mask = _update_attention(model_kwargs, is_encoder_decoder)
@@ -156,22 +187,32 @@ def _update_model_kwargs_for_xla_generation(
     else:
         if "token_type_ids" in model_kwargs:
             token_type_ids = model_kwargs["token_type_ids"]
-            model_kwargs["token_type_ids"] = torch.cat([token_type_ids, token_type_ids[:, -1].unsqueeze(-1)],
-                                                       dim=-1)
+            model_kwargs["token_type_ids"] = torch.cat(
+                [token_type_ids, token_type_ids[:, -1].unsqueeze(-1)], dim=-1
+            )
 
         if not is_encoder_decoder:
             # update attention mask
             if "attention_mask" in model_kwargs:
                 attention_mask = model_kwargs["attention_mask"]
                 model_kwargs["attention_mask"] = torch.cat(
-                    [attention_mask, attention_mask.new_ones((attention_mask.shape[0], 1))], dim=-1
+                    [
+                        attention_mask,
+                        attention_mask.new_ones((attention_mask.shape[0], 1)),
+                    ],
+                    dim=-1,
                 )
         else:
             # update decoder attention mask
             if "decoder_attention_mask" in model_kwargs:
                 decoder_attention_mask = model_kwargs["decoder_attention_mask"]
                 model_kwargs["decoder_attention_mask"] = torch.cat(
-                    [decoder_attention_mask, decoder_attention_mask.new_ones((decoder_attention_mask.shape[0], 1))],
+                    [
+                        decoder_attention_mask,
+                        decoder_attention_mask.new_ones(
+                            (decoder_attention_mask.shape[0], 1)
+                        ),
+                    ],
                     dim=-1,
                 )
 
@@ -180,14 +221,14 @@ def _update_model_kwargs_for_xla_generation(
 
 @torch.no_grad()
 def generate(
-        self,
-        inputs: Optional[torch.Tensor] = None,
-        generation_config: Optional[GenerationConfig] = None,
-        logits_processor: Optional[LogitsProcessorList] = None,
-        stopping_criteria: Optional[StoppingCriteriaList] = None,
-        prefix_allowed_tokens_fn: Optional[Callable[[int, torch.Tensor], List[int]]] = None,
-        synced_gpus: Optional[bool] = False,
-        **kwargs,
+    self,
+    inputs: Optional[torch.Tensor] = None,
+    generation_config: Optional[GenerationConfig] = None,
+    logits_processor: Optional[LogitsProcessorList] = None,
+    stopping_criteria: Optional[StoppingCriteriaList] = None,
+    prefix_allowed_tokens_fn: Optional[Callable[[int, torch.Tensor], List[int]]] = None,
+    synced_gpus: Optional[bool] = False,
+    **kwargs,
 ) -> Union[GenerateOutput, torch.LongTensor]:
     r"""
 
@@ -279,14 +320,23 @@ def generate(
         generation_config = self.generation_config
 
     generation_config = copy.deepcopy(generation_config)
-    model_kwargs = generation_config.update(**kwargs)  # All unused kwargs must be model kwargs
+    model_kwargs = generation_config.update(
+        **kwargs
+    )  # All unused kwargs must be model kwargs
     self._validate_model_kwargs(model_kwargs.copy())
 
     # 2. Set generation parameters if not already defined
-    logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList()
-    stopping_criteria = stopping_criteria if stopping_criteria is not None else StoppingCriteriaList()
+    logits_processor = (
+        logits_processor if logits_processor is not None else LogitsProcessorList()
+    )
+    stopping_criteria = (
+        stopping_criteria if stopping_criteria is not None else StoppingCriteriaList()
+    )
 
-    if generation_config.pad_token_id is None and generation_config.eos_token_id is not None:
+    if (
+        generation_config.pad_token_id is None
+        and generation_config.eos_token_id is not None
+    ):
         if model_kwargs.get("attention_mask", None) is None:
             logger.warning(
                 "The attention mask and the pad token id were not set. As a consequence, you may observe "
@@ -295,7 +345,9 @@ def generate(
         eos_token_id = generation_config.eos_token_id
         if isinstance(eos_token_id, list):
             eos_token_id = eos_token_id[0]
-        logger.warning(f"Setting `pad_token_id` to `eos_token_id`:{eos_token_id} for open-end generation.")
+        logger.warning(
+            f"Setting `pad_token_id` to `eos_token_id`:{eos_token_id} for open-end generation."
+        )
         generation_config.pad_token_id = eos_token_id
 
     # 3. Define model inputs
@@ -313,19 +365,27 @@ def generate(
     model_kwargs["output_hidden_states"] = generation_config.output_hidden_states
     model_kwargs["use_cache"] = generation_config.use_cache
 
-    accepts_attention_mask = "attention_mask" in set(inspect.signature(self.forward).parameters.keys())
+    accepts_attention_mask = "attention_mask" in set(
+        inspect.signature(self.forward).parameters.keys()
+    )
     requires_attention_mask = "encoder_outputs" not in model_kwargs
 
-    if model_kwargs.get("attention_mask", None) is None and requires_attention_mask and accepts_attention_mask:
+    if (
+        model_kwargs.get("attention_mask", None) is None
+        and requires_attention_mask
+        and accepts_attention_mask
+    ):
         model_kwargs["attention_mask"] = self._prepare_attention_mask_for_generation(
-            inputs_tensor, generation_config.pad_token_id, generation_config.eos_token_id
+            inputs_tensor,
+            generation_config.pad_token_id,
+            generation_config.eos_token_id,
         )  # For encoder alone
 
     # decoder-only models should use left-padding for generation
     if not self.config.is_encoder_decoder:
         if (
-                generation_config.pad_token_id is not None
-                and torch.sum(inputs_tensor[:, -1] == generation_config.pad_token_id) > 0
+            generation_config.pad_token_id is not None
+            and torch.sum(inputs_tensor[:, -1] == generation_config.pad_token_id) > 0
         ):
             logger.warning(
                 "A decoder-only architecture is being used, but right-padding was detected! For correct "
@@ -355,7 +415,9 @@ def generate(
     # 6. Prepare `max_length` depending on other stopping criteria.
     input_ids_seq_length = input_ids.shape[-1]
 
-    has_default_max_length = kwargs.get("max_length") is None and generation_config.max_length is not None
+    has_default_max_length = (
+        kwargs.get("max_length") is None and generation_config.max_length is not None
+    )
     if has_default_max_length and generation_config.max_new_tokens is None:
         warnings.warn(
             "Neither `max_length` nor `max_new_tokens` has been set, `max_length` will default to"
@@ -365,7 +427,9 @@ def generate(
             UserWarning,
         )
     elif has_default_max_length and generation_config.max_new_tokens is not None:
-        generation_config.max_length = generation_config.max_new_tokens + input_ids_seq_length
+        generation_config.max_length = (
+            generation_config.max_new_tokens + input_ids_seq_length
+        )
     elif not has_default_max_length and generation_config.max_new_tokens is not None:
         raise ValueError(
             "Both `max_new_tokens` and `max_length` have been set but they serve the same purpose -- setting a"
@@ -374,13 +438,18 @@ def generate(
             "(https://huggingface.co/docs/transformers/main/en/main_classes/text_generation)"
         )
 
-    if generation_config.min_length is not None and generation_config.min_length > generation_config.max_length:
+    if (
+        generation_config.min_length is not None
+        and generation_config.min_length > generation_config.max_length
+    ):
         raise ValueError(
             f"Unfeasible length constraints: the minimum length ({generation_config.min_length}) is larger than"
             f" the maximum length ({generation_config.max_length})"
         )
     if input_ids_seq_length >= generation_config.max_length:
-        input_ids_string = "decoder_input_ids" if self.config.is_encoder_decoder else "input_ids"
+        input_ids_string = (
+            "decoder_input_ids" if self.config.is_encoder_decoder else "input_ids"
+        )
         logger.warning(
             f"Input length of {input_ids_string} is {input_ids_seq_length}, but `max_length` is set to"
             f" {generation_config.max_length}. This can lead to unexpected behavior. You should consider"
@@ -390,13 +459,22 @@ def generate(
     # Pad to max_length
     if is_torch_tpu_available():
         input_ids = torch.cat(
-            [input_ids, torch.ones((batch_size, (generation_config.max_length - input_ids_seq_length)),
-                                   dtype=torch.long, device=input_ids.device) *
-             generation_config.pad_token_id], 1)
+            [
+                input_ids,
+                torch.ones(
+                    (batch_size, (generation_config.max_length - input_ids_seq_length)),
+                    dtype=torch.long,
+                    device=input_ids.device,
+                )
+                * generation_config.pad_token_id,
+            ],
+            1,
+        )
 
     # 7. determine generation mode
     is_constraint_gen_mode = (
-        generation_config.constraints is not None or generation_config.force_words_ids is not None
+        generation_config.constraints is not None
+        or generation_config.force_words_ids is not None
     )
 
     is_contrastive_search_gen_mode = (
@@ -544,7 +622,9 @@ def generate(
 
     elif is_beam_gen_mode:
         if generation_config.num_return_sequences > generation_config.num_beams:
-            raise ValueError("`num_return_sequences` has to be smaller or equal to `num_beams`.")
+            raise ValueError(
+                "`num_return_sequences` has to be smaller or equal to `num_beams`."
+            )
 
         if stopping_criteria.max_length is None:
             raise ValueError("`max_length` needs to be a stopping_criteria for now.")
@@ -597,7 +677,8 @@ def generate(
         # 13. interleave input_ids with `num_beams` additional sequences per batch
         input_ids, model_kwargs = self._expand_inputs_for_generation(
             input_ids=input_ids,
-            expand_size=generation_config.num_beams * generation_config.num_return_sequences,
+            expand_size=generation_config.num_beams
+            * generation_config.num_return_sequences,
             is_encoder_decoder=self.config.is_encoder_decoder,
             **model_kwargs,
         )
@@ -619,17 +700,25 @@ def generate(
 
     elif is_group_beam_gen_mode:
         if generation_config.num_return_sequences > generation_config.num_beams:
-            raise ValueError("`num_return_sequences` has to be smaller or equal to `num_beams`.")
+            raise ValueError(
+                "`num_return_sequences` has to be smaller or equal to `num_beams`."
+            )
 
         if generation_config.num_beams % generation_config.num_beam_groups != 0:
-            raise ValueError("`num_beams` should be divisible by `num_beam_groups` for group beam search.")
+            raise ValueError(
+                "`num_beams` should be divisible by `num_beam_groups` for group beam search."
+            )
 
         if stopping_criteria.max_length is None:
             raise ValueError("`max_length` needs to be a stopping_criteria for now.")
 
-        has_default_typical_p = kwargs.get("typical_p") is None and generation_config.typical_p == 1.0
+        has_default_typical_p = (
+            kwargs.get("typical_p") is None and generation_config.typical_p == 1.0
+        )
         if not has_default_typical_p:
-            raise ValueError("Decoder argument `typical_p` is not supported with beam groups.")
+            raise ValueError(
+                "Decoder argument `typical_p` is not supported with beam groups."
+            )
 
         # 11. prepare beam search scorer
         beam_scorer = BeamSearchScorer(
@@ -665,19 +754,30 @@ def generate(
 
     elif is_constraint_gen_mode:
         if generation_config.num_return_sequences > generation_config.num_beams:
-            raise ValueError("`num_return_sequences` has to be smaller or equal to `num_beams`.")
+            raise ValueError(
+                "`num_return_sequences` has to be smaller or equal to `num_beams`."
+            )
 
         if stopping_criteria.max_length is None:
             raise ValueError("`max_length` needs to be a stopping_criteria for now.")
 
         if generation_config.num_beams <= 1:
-            raise ValueError("`num_beams` needs to be greater than 1 for constrained generation.")
+            raise ValueError(
+                "`num_beams` needs to be greater than 1 for constrained generation."
+            )
 
         if generation_config.do_sample:
-            raise ValueError("`do_sample` needs to be false for constrained generation.")
+            raise ValueError(
+                "`do_sample` needs to be false for constrained generation."
+            )
 
-        if generation_config.num_beam_groups is not None and generation_config.num_beam_groups > 1:
-            raise ValueError("`num_beam_groups` not supported yet for constrained generation.")
+        if (
+            generation_config.num_beam_groups is not None
+            and generation_config.num_beam_groups > 1
+        ):
+            raise ValueError(
+                "`num_beam_groups` not supported yet for constrained generation."
+            )
 
         final_constraints = []
         if generation_config.constraints is not None:
@@ -692,8 +792,8 @@ def generate(
                 )
 
             if (
-                    not isinstance(generation_config.force_words_ids, list)
-                    or len(generation_config.force_words_ids) == 0
+                not isinstance(generation_config.force_words_ids, list)
+                or len(generation_config.force_words_ids) == 0
             ):
                 typeerror()
 
@@ -704,8 +804,11 @@ def generate(
                     if any(not isinstance(token_ids, list) for token_ids in word_ids):
                         typeerror()
                     if any(
-                            any((not isinstance(token_id, int) or token_id < 0) for token_id in token_ids)
-                            for token_ids in word_ids
+                        any(
+                            (not isinstance(token_id, int) or token_id < 0)
+                            for token_id in token_ids
+                        )
+                        for token_ids in word_ids
                     ):
                         typeerror()
 
@@ -713,7 +816,10 @@ def generate(
                 else:
                     if not isinstance(word_ids, list) or len(word_ids) == 0:
                         typeerror()
-                    if any((not isinstance(token_id, int) or token_id < 0) for token_id in word_ids):
+                    if any(
+                        (not isinstance(token_id, int) or token_id < 0)
+                        for token_id in word_ids
+                    ):
                         typeerror()
 
                     constraint = PhrasalConstraint(word_ids)
@@ -752,20 +858,20 @@ def generate(
 
 
 def greedy_search(
-        self,
-        input_ids: torch.LongTensor,
-        logits_processor: Optional[LogitsProcessorList] = None,
-        stopping_criteria: Optional[StoppingCriteriaList] = None,
-        max_length: Optional[int] = None,
-        pad_token_id: Optional[int] = None,
-        eos_token_id: Optional[Union[int, List[int]]] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        output_scores: Optional[bool] = None,
-        return_dict_in_generate: Optional[bool] = None,
-        synced_gpus: Optional[bool] = False,
-        seq_length: Optional[int] = int,
-        **model_kwargs,
+    self,
+    input_ids: torch.LongTensor,
+    logits_processor: Optional[LogitsProcessorList] = None,
+    stopping_criteria: Optional[StoppingCriteriaList] = None,
+    max_length: Optional[int] = None,
+    pad_token_id: Optional[int] = None,
+    eos_token_id: Optional[Union[int, List[int]]] = None,
+    output_attentions: Optional[bool] = None,
+    output_hidden_states: Optional[bool] = None,
+    output_scores: Optional[bool] = None,
+    return_dict_in_generate: Optional[bool] = None,
+    synced_gpus: Optional[bool] = False,
+    seq_length: Optional[int] = int,
+    **model_kwargs,
 ) -> Union[GreedySearchOutput, torch.LongTensor]:
     r"""
     Generates sequences of token ids for models with a language modeling head using **greedy decoding** and can be
@@ -859,8 +965,12 @@ def greedy_search(
     ["It might be possible to get a better understanding of the nature of the problem, but it's not"]
     ```"""
     # init values
-    logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList()
-    stopping_criteria = stopping_criteria if stopping_criteria is not None else StoppingCriteriaList()
+    logits_processor = (
+        logits_processor if logits_processor is not None else LogitsProcessorList()
+    )
+    stopping_criteria = (
+        stopping_criteria if stopping_criteria is not None else StoppingCriteriaList()
+    )
     if max_length is not None:
         warnings.warn(
             "`max_length` is deprecated in this function, use"
@@ -868,16 +978,32 @@ def greedy_search(
             UserWarning,
         )
         stopping_criteria = validate_stopping_criteria(stopping_criteria, max_length)
-    pad_token_id = pad_token_id if pad_token_id is not None else self.generation_config.pad_token_id
-    eos_token_id = eos_token_id if eos_token_id is not None else self.generation_config.eos_token_id
+    pad_token_id = (
+        pad_token_id
+        if pad_token_id is not None
+        else self.generation_config.pad_token_id
+    )
+    eos_token_id = (
+        eos_token_id
+        if eos_token_id is not None
+        else self.generation_config.eos_token_id
+    )
     if isinstance(eos_token_id, int):
         eos_token_id = [eos_token_id]
-    output_scores = output_scores if output_scores is not None else self.generation_config.output_scores
+    output_scores = (
+        output_scores
+        if output_scores is not None
+        else self.generation_config.output_scores
+    )
     output_attentions = (
-        output_attentions if output_attentions is not None else self.generation_config.output_attentions
+        output_attentions
+        if output_attentions is not None
+        else self.generation_config.output_attentions
     )
     output_hidden_states = (
-        output_hidden_states if output_hidden_states is not None else self.generation_config.output_hidden_states
+        output_hidden_states
+        if output_hidden_states is not None
+        else self.generation_config.output_hidden_states
     )
     return_dict_in_generate = (
         return_dict_in_generate
@@ -889,13 +1015,21 @@ def greedy_search(
     scores = () if (return_dict_in_generate and output_scores) else None
     decoder_attentions = () if (return_dict_in_generate and output_attentions) else None
     cross_attentions = () if (return_dict_in_generate and output_attentions) else None
-    decoder_hidden_states = () if (return_dict_in_generate and output_hidden_states) else None
+    decoder_hidden_states = (
+        () if (return_dict_in_generate and output_hidden_states) else None
+    )
 
     # if model is an encoder-decoder, retrieve encoder attention weights and hidden states
     if return_dict_in_generate and self.config.is_encoder_decoder:
-        encoder_attentions = model_kwargs["encoder_outputs"].get("attentions") if output_attentions else None
+        encoder_attentions = (
+            model_kwargs["encoder_outputs"].get("attentions")
+            if output_attentions
+            else None
+        )
         encoder_hidden_states = (
-            model_kwargs["encoder_outputs"].get("hidden_states") if output_hidden_states else None
+            model_kwargs["encoder_outputs"].get("hidden_states")
+            if output_hidden_states
+            else None
         )
 
     # keep track of which sequences are already finished
@@ -906,7 +1040,9 @@ def greedy_search(
         if synced_gpus:
             # Under synced_gpus the `forward` call must continue until all gpus complete their sequence.
             # The following logic allows an early break if all peers finished generating their sequence
-            this_peer_finished_flag = torch.tensor(0.0 if this_peer_finished else 1.0).to(input_ids.device)
+            this_peer_finished_flag = torch.tensor(
+                0.0 if this_peer_finished else 1.0
+            ).to(input_ids.device)
             # send 0.0 if we finished, 1.0 otherwise
             dist.all_reduce(this_peer_finished_flag, op=dist.ReduceOp.SUM)
             # did all peers finish? the reduced sum will be 0.0 then
@@ -914,13 +1050,20 @@ def greedy_search(
                 break
 
         # prepare model inputs
-        if model_kwargs['use_cache'] and is_torch_tpu_available():
-            # From max_length-sized input_ids, select first 
+        if model_kwargs["use_cache"] and is_torch_tpu_available():
+            # From max_length-sized input_ids, select first
             # seq_length - 1 values.
             update_indices = torch.stack(
-                [torch.arange(input_ids.size(0)), torch.tensor(seq_length - 1).repeat(input_ids.size(0))], dim=-1)
+                [
+                    torch.arange(input_ids.size(0)),
+                    torch.tensor(seq_length - 1).repeat(input_ids.size(0)),
+                ],
+                dim=-1,
+            )
             input_ids_ = input_ids[update_indices[:, 0], update_indices[:, 1], None]
-            model_inputs = self.prepare_inputs_for_generation(input_ids_, **model_kwargs)
+            model_inputs = self.prepare_inputs_for_generation(
+                input_ids_, **model_kwargs
+            )
         else:
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
 
@@ -929,17 +1072,25 @@ def greedy_search(
             **model_inputs,
             return_dict=True,
             output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states
+            output_hidden_states=output_hidden_states,
         )
 
         if synced_gpus and this_peer_finished:
             continue  # don't waste resources running the code we don't need
 
-        if not model_kwargs['use_cache'] and is_torch_tpu_available():
-            one_hot = torch.cat([torch.tensor([0]).repeat(1, seq_length - 1),
-                                 torch.tensor([1]).repeat(1, 1),
-                                 torch.tensor([0]).repeat(1, input_ids.size(1) - seq_length)], dim=1) \
-                .to(device=outputs.logits.device).float()
+        if not model_kwargs["use_cache"] and is_torch_tpu_available():
+            one_hot = (
+                torch.cat(
+                    [
+                        torch.tensor([0]).repeat(1, seq_length - 1),
+                        torch.tensor([1]).repeat(1, 1),
+                        torch.tensor([0]).repeat(1, input_ids.size(1) - seq_length),
+                    ],
+                    dim=1,
+                )
+                .to(device=outputs.logits.device)
+                .float()
+            )
             next_token_logits = torch.matmul(one_hot, outputs.logits)
             next_token_logits = next_token_logits.squeeze(1)
         else:
@@ -954,7 +1105,9 @@ def greedy_search(
                 scores += (next_tokens_scores,)
             if output_attentions:
                 decoder_attentions += (
-                    (outputs.decoder_attentions,) if self.config.is_encoder_decoder else (outputs.attentions,)
+                    (outputs.decoder_attentions,)
+                    if self.config.is_encoder_decoder
+                    else (outputs.attentions,)
                 )
                 if self.config.is_encoder_decoder:
                     cross_attentions += (outputs.cross_attentions,)
@@ -972,19 +1125,29 @@ def greedy_search(
         # finished sentences should have their next token be a padding token
         if eos_token_id is not None:
             if pad_token_id is None:
-                raise ValueError("If `eos_token_id` is defined, make sure that `pad_token_id` is defined.")
-            next_tokens = next_tokens * unfinished_sequences + pad_token_id * (1 - unfinished_sequences)
+                raise ValueError(
+                    "If `eos_token_id` is defined, make sure that `pad_token_id` is defined."
+                )
+            next_tokens = next_tokens * unfinished_sequences + pad_token_id * (
+                1 - unfinished_sequences
+            )
 
         # update generated ids, model inputs, and length for next step
         if is_torch_tpu_available():
             batch_size, _ = input_ids.shape
-            update_indices = torch.stack([torch.arange(batch_size),
-                                         torch.tensor(seq_length).repeat(batch_size)],
-                                         dim=-1)
+            update_indices = torch.stack(
+                [torch.arange(batch_size), torch.tensor(seq_length).repeat(batch_size)],
+                dim=-1,
+            )
             input_ids[update_indices[:, 0], update_indices[:, 1]] = next_tokens[:]
             model_kwargs = self._update_model_kwargs_for_xla_generation(
-                outputs, model_kwargs, batch_size=batch_size, is_encoder_decoder=self.config.is_encoder_decoder,
-                max_length=stopping_criteria.max_length, seq_length=seq_length, use_cache=model_kwargs['use_cache'],
+                outputs,
+                model_kwargs,
+                batch_size=batch_size,
+                is_encoder_decoder=self.config.is_encoder_decoder,
+                max_length=stopping_criteria.max_length,
+                seq_length=seq_length,
+                use_cache=model_kwargs["use_cache"],
             )
 
             seq_length += 1
@@ -996,12 +1159,15 @@ def greedy_search(
 
         # if eos_token was found in one sentence, set sentence to finished
         if eos_token_id is not None:
-            unfinished_sequences = unfinished_sequences.mul((sum(next_tokens != i for i in eos_token_id)).long())
+            unfinished_sequences = unfinished_sequences.mul(
+                (sum(next_tokens != i for i in eos_token_id)).long()
+            )
 
         # stop when each sentence is finished, or if we exceed the maximum length
         stop_criterion_1 = unfinished_sequences.max() == 0
         if is_torch_tpu_available():
             import torch_xla.core.xla_model as xm
+
             xm.mark_step()
             if isinstance(stopping_criteria, list):
                 if len(stopping_criteria) == 1:
@@ -1016,10 +1182,19 @@ def greedy_search(
             else:
                 # Other cases will be handled on CPU
                 batch_size, _ = input_ids.shape
-                mask = torch.cat([torch.ones(batch_size, seq_length),
-                                  torch.zeros(batch_size, input_ids.shape[1] - seq_length)], dim=1).bool()
-                input_ids_cpu = torch.masked_select(input_ids, mask).reshape((batch_size, seq_length)).to('cpu')
-                scores_cpu = scores.to('cpu') if torch.is_tensor(scores) else scores
+                mask = torch.cat(
+                    [
+                        torch.ones(batch_size, seq_length),
+                        torch.zeros(batch_size, input_ids.shape[1] - seq_length),
+                    ],
+                    dim=1,
+                ).bool()
+                input_ids_cpu = (
+                    torch.masked_select(input_ids, mask)
+                    .reshape((batch_size, seq_length))
+                    .to("cpu")
+                )
+                scores_cpu = scores.to("cpu") if torch.is_tensor(scores) else scores
                 stop_criterion_2 = stopping_criteria(input_ids_cpu, scores_cpu)
         else:
             stop_criterion_2 = stopping_criteria(input_ids, scores)
@@ -1063,9 +1238,8 @@ def prepare_inputs_for_generation(
     decoder_attention_mask=None,
     use_cache=None,
     encoder_outputs=None,
-    **kwargs
+    **kwargs,
 ):
-
     # cut decoder_input_ids if past is used
     if past_key_values is not None:
         input_ids = input_ids[:, -1:]
@@ -1084,13 +1258,16 @@ def prepare_inputs_for_generation(
 
 
 def _apply_patches():
-    GenerationMixin._update_model_kwargs_for_xla_generation = \
+    GenerationMixin._update_model_kwargs_for_xla_generation = (
         _update_model_kwargs_for_xla_generation
-    GenerationMixin.greedy_search = _patch(GenerationMixin.greedy_search,
-                                           greedy_search, False)
-    GenerationMixin.generate = _patch(GenerationMixin.generate,
-                                      generate, True)
+    )
+    GenerationMixin.greedy_search = _patch(
+        GenerationMixin.greedy_search, greedy_search, False
+    )
+    GenerationMixin.generate = _patch(GenerationMixin.generate, generate, True)
 
-    T5ForConditionalGeneration.prepare_inputs_for_generation = \
-        _patch(T5ForConditionalGeneration.prepare_inputs_for_generation,
-               prepare_inputs_for_generation, False)
+    T5ForConditionalGeneration.prepare_inputs_for_generation = _patch(
+        T5ForConditionalGeneration.prepare_inputs_for_generation,
+        prepare_inputs_for_generation,
+        False,
+    )

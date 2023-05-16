@@ -54,6 +54,7 @@ import torch_xla.distributed.xla_multiprocessing as xmp
 import torch_xla.distributed.xla_backend
 import numpy as np
 from transformers import BertForPreTraining
+from transformers.models.bert.modeling_bert import BertSelfAttention, BertSelfOutput
 from transformers import (
     AdamW,
     set_seed,
@@ -72,7 +73,7 @@ from concurrent.futures import ThreadPoolExecutor
 import inspect
 import requests
 import gc
-from neuronx_distributed.parallel_layers import parallel_state, layers, grads, checkpointing
+from neuronx_distributed.parallel_layers import parallel_state, layers, grads, checkpointing, move_model_to_device
 
 os.environ["NEURON_CC_FLAGS"] = (
     os.environ.get("NEURON_CC_FLAGS", "") + " --model-type=transformer"
@@ -373,22 +374,35 @@ def get_model(flags):
 
     init_weights(my_model.cls.predictions.decoder.weight)
 
-    class ParallelAttentionWithNormalInit(layers.ParallelAttention):
-        def __init__(self, config):
-            super().__init__(config)
+    class ParallelSelfAttention(BertSelfAttention):
+        def __init__(self, config, position_embedding_type=None):
+            super().__init__(config, position_embedding_type)
+            self.query = layers.ColumnParallelLinear(config.hidden_size, self.all_head_size, gather_output=False)
+            self.key = layers.ColumnParallelLinear(config.hidden_size, self.all_head_size, gather_output=False)
+            self.value = layers.ColumnParallelLinear(config.hidden_size, self.all_head_size, gather_output=False)
             init_weights(self.query.weight)
             init_weights(self.key.weight)
             init_weights(self.value.weight)
-            init_weights(self.dense.weight)
             with torch.no_grad():
                 self.query.bias.zero_()
                 self.key.bias.zero_()
                 self.value.bias.zero_()
+            self.num_attention_heads = self.num_attention_heads // parallel_state.get_tensor_model_parallel_size()
+            self.all_head_size = self.all_head_size // parallel_state.get_tensor_model_parallel_size()
+
+    class ParallelSelfOutput(BertSelfOutput):
+        def __init__(self, config):
+            super().__init__(config)
+            self.dense = layers.RowParallelLinear(config.hidden_size,
+                                       config.hidden_size,
+                                       input_is_parallel=True)
+            init_weights(self.dense.weight)
+            with torch.no_grad():
                 self.dense.bias.zero_()
-
+    
     for layer in my_model.bert.encoder.layer:
-        layer.attention = layers.ParallelAttention(my_config)
-
+        layer.attention.self = ParallelSelfAttention(my_config)
+        layer.attention.output = ParallelSelfOutput(my_config)
 
     return my_model
 
@@ -417,7 +431,7 @@ def train_bert_hdf5(flags):
     worker_init = WorkerInitObj(flags.seed)
     device = xm.xla_device()
     model = get_model(flags)
-    model.to(device)
+    move_model_to_device(model, device)
     model.train()
     model.tie_weights()
     # Additional tie needed

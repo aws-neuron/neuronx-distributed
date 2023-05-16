@@ -23,19 +23,26 @@ class TensorParallelNeuronModel(ParallelModel):
         self.models = models
         self.load = False
         self.tp_degree = len(models)
-    
+
     def _load(self):
         with concurrent.futures.ThreadPoolExecutor() as executor:
             futures = [
                 executor.submit(
-                    torch.ops.neuron._load_collectives_neuron, model.model, i, 1, i, self.tp_degree)
-                for i, model in enumerate(self.models)]
+                    torch.ops.neuron._load_collectives_neuron,
+                    model.model,
+                    i,
+                    1,
+                    i,
+                    self.tp_degree,
+                )
+                for i, model in enumerate(self.models)
+            ]
             for future in concurrent.futures.as_completed(futures):
                 # Here we wait for result to make sure all the processes have finished loading
                 # models
                 future.result()
         self.load = True
-    
+
     def forward(self, *tensors):
         if not self.load:
             self._load()
@@ -46,7 +53,7 @@ class TensorParallelNeuronModel(ParallelModel):
                 results.append(future.result())
         # Here we are making the assumption that we are operating in SPMD mode.
         # We can extend this to return all results.
-        return results[0]   
+        return results[0]
 
 
 def _trace(
@@ -57,13 +64,20 @@ def _trace(
     states=None,
     compiler_workdir: Optional[Union[str, pathlib.Path]] = None,
     compiler_args: Optional[Union[List[str], str]] = None,
-    options: Union[Iterable[Options], Options] = None) -> None:
-    os.environ['RANK'] = str(rank)
-    torch.distributed.init_process_group('xla')
-    parallel_state.initialize_model_parallel(tensor_model_parallel_size_=2)
+    options: Union[Iterable[Options], Options] = None,
+) -> None:
+    os.environ["RANK"] = str(rank)
+    torch.distributed.init_process_group("xla")
+    parallel_state.initialize_model_parallel(tensor_model_parallel_size=2)
     model = func()
     neff_filename, metaneff, flattener, packer = torch_neuronx.xla_impl.trace._trace(
-        model, example_inputs, states, f"{compiler_workdir}_{rank}", compiler_args, options)
+        model,
+        example_inputs,
+        states,
+        f"{compiler_workdir}_{rank}",
+        compiler_args,
+        options,
+    )
     mp_q.put((neff_filename, metaneff, flattener, packer))
 
 
@@ -100,18 +114,28 @@ def parallel_model_trace(
     """
 
     mp_q = multiprocessing.Queue()
-    
+
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "2022"
     os.environ["TPU_NUM_DEVICES"] = str(tp_degree)
-    os.environ['WORLD_SIZE'] = str(tp_degree)
-    compiler_workdir = "/tmp/compiler_workdir" if compiler_workdir is None else compiler_workdir
+    os.environ["WORLD_SIZE"] = str(tp_degree)
     xmp.spawn(
         _trace,
-        args=(func, example_inputs, mp_q, states, compiler_workdir, compiler_args, options),
-        start_method="fork"
+        args=(
+            func,
+            example_inputs,
+            mp_q,
+            states,
+            compiler_workdir,
+            compiler_args,
+            options,
+        ),
+        start_method="fork",
     )
-    models = [torch_neuronx.xla_impl.trace.create_neuron_model(*mp_q.get(), example_inputs) for _ in range(tp_degree)]
+    models = [
+        torch_neuronx.xla_impl.trace.create_neuron_model(*mp_q.get(), example_inputs)
+        for _ in range(tp_degree)
+    ]
     return TensorParallelNeuronModel(models)
 
 

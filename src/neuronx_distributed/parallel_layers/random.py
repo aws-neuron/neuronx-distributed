@@ -2,8 +2,8 @@ import torch
 import contextlib
 from .parallel_state import get_tensor_model_parallel_rank
 
-    
-_MODEL_PARALLEL_RNG_TRACKER_NAME = 'model-parallel-rng'
+
+_MODEL_PARALLEL_RNG_TRACKER_NAME = "model-parallel-rng"
 
 
 def _set_xla_rng_state(new_state, device=-1):
@@ -11,7 +11,7 @@ def _set_xla_rng_state(new_state, device=-1):
 
     Args:
         new_state (torch.ByteTensor): The desired state
-    
+
     """
     torch.set_rng_state(new_state)
 

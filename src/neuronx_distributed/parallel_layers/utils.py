@@ -1,11 +1,14 @@
 import torch
 from typing import List, Sequence
 
+import neuronx_distributed.parallel_layers.layers as layers
+
 
 def ensure_divisibility(numerator, denominator):
     """Ensure that numerator is divisible by the denominator."""
-    assert numerator % denominator == 0, '{} is not divisible by {}'.format(
-        numerator, denominator)
+    assert numerator % denominator == 0, "{} is not divisible by {}".format(
+        numerator, denominator
+    )
 
 
 def divide(numerator, denominator):
@@ -45,16 +48,34 @@ class EmbeddingUtility:
     partition: Note that indices in [fist, last)"""
 
     @staticmethod
-    def range_from_per_partition_vocab_size(per_partition_vocab_size: int,
-                                            rank,
-                                            world_size: int) -> Sequence[int]:
+    def range_from_per_partition_vocab_size(
+        per_partition_vocab_size: int, rank, world_size: int
+    ) -> Sequence[int]:
         index_f = rank * per_partition_vocab_size
         index_l = index_f + per_partition_vocab_size
         return index_f, index_l
 
     @staticmethod
-    def range_from_global_vocab_size(global_vocab_size: int, rank: int,
-                                     world_size: int) -> Sequence[int]:
+    def range_from_global_vocab_size(
+        global_vocab_size: int, rank: int, world_size: int
+    ) -> Sequence[int]:
         per_partition_vocab_size = divide(global_vocab_size, world_size)
         return EmbeddingUtility.range_from_per_partition_vocab_size(
-            per_partition_vocab_size, rank, world_size)
+            per_partition_vocab_size, rank, world_size
+        )
+
+
+def move_model_to_device(model: torch.nn.Module, device: torch.device) -> None:
+    tp_params = {}
+    for name, param in model.named_parameters():
+        if hasattr(param, "tensor_model_parallel"):
+            tp_params[name] = {
+                "is_parallel": param.tensor_model_parallel,
+                "partition_dim": param.partition_dim,
+            }
+    model.to(device)
+    for name, param in model.named_parameters():
+        if name in tp_params and not hasattr(param, "tensor_model_parallel"):
+            layers.set_tensor_model_parallel_attributes(
+                param, tp_params[name]["is_parallel"], tp_params[name]["partition_dim"]
+            )
