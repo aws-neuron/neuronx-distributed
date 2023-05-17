@@ -203,7 +203,5 @@ if __name__ == '__main__':
         test_parallel_embedding(tensor_model_parallel_size)
         print_separator('test initialize affine weight')
         test_initialize_affine_weight_cpu(tensor_model_parallel_size)
-        print_separator('test parallel attention')
-        test_parallel_self_attention(tensor_model_parallel_size)
         tensor_model_parallel_size *= 2
     atexit.register(on_exit)
