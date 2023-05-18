@@ -3,7 +3,7 @@ import torch
 from .parallel_state import get_tensor_model_parallel_group, get_tensor_model_parallel_rank, get_tensor_model_parallel_size
 from .utils import EmbeddingUtility
 
-class _VocabParallelCrossEntropy(torch.autograd.Function):
+class _ParallelCrossEntropy(torch.autograd.Function):
     @staticmethod
     def forward(ctx, vocab_parallel_logits, target, label_smoothing=0.0):
         import torch_xla.core.xla_model as xm
@@ -13,7 +13,6 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
             logits_max, op=torch.distributed.ReduceOp.MAX, group=get_tensor_model_parallel_group()
         )
         # Subtract the maximum value.
-        # vocab_parallel_logits = vocab_parallel_logits - logits_max.unsqueeze(dim=-1)
         vocab_parallel_logits.sub_(logits_max.unsqueeze(dim=-1))
 
         # Get the partition's vocab indecies
@@ -24,7 +23,6 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
         vocab_start_index, vocab_end_index = get_vocab_range(partition_vocab_size, rank, world_size)
 
         # Create a mask of valid vocab ids (1 means it needs to be masked).
-        #target_mask = (target < vocab_start_index) | (target >= vocab_end_index)
         #masked_target = target.clone() - vocab_start_index
         #masked_target[target_mask] = 0
         #new xla friendly
@@ -124,7 +122,7 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
         return grad_input, None, None
 
 
-def vocab_parallel_cross_entropy(vocab_parallel_logits, target, label_smoothing=0.0):
+def parallel_cross_entropy(vocab_parallel_logits, target, label_smoothing=0.0):
     """Helper function for the cross entropy."""
-    return _VocabParallelCrossEntropy.apply(vocab_parallel_logits, target, label_smoothing)
+    return _ParallelCrossEntropy.apply(vocab_parallel_logits, target, label_smoothing)
 
