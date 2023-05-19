@@ -72,10 +72,11 @@ def move_model_to_device(model: torch.nn.Module, device: torch.device) -> None:
             tp_params[name] = {
                 "is_parallel": param.tensor_model_parallel,
                 "partition_dim": param.partition_dim,
+                "stride": param.partition_stride,
             }
     model.to(device)
     for name, param in model.named_parameters():
         if name in tp_params and not hasattr(param, "tensor_model_parallel"):
             layers.set_tensor_model_parallel_attributes(
-                param, tp_params[name]["is_parallel"], tp_params[name]["partition_dim"]
+                param, *tp_params[name].values()
             )

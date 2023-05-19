@@ -41,7 +41,7 @@ def param_is_not_tensor_parallel_duplicate(param: torch.Tensor) -> bool:
 
 
 def set_tensor_model_parallel_attributes(
-    tensor: torch.Tensor, is_parallel: bool, dim: int
+    tensor: torch.Tensor, is_parallel: bool, dim: int, stride: int = 1
 ) -> None:
     # Make sure the attributes are not set.
     for attribute in _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS:
@@ -49,6 +49,7 @@ def set_tensor_model_parallel_attributes(
     # Set the attributes.
     setattr(tensor, "tensor_model_parallel", is_parallel)
     setattr(tensor, "partition_dim", dim)
+    setattr(tensor, "partition_stride", stride)
 
 
 def set_defaults_if_not_set_tensor_model_parallel_attributes(
@@ -73,7 +74,7 @@ def copy_tensor_model_parallel_attributes(
         maybe_copy(attribute)
 
 
-def _initialize_affine_weight_neuron(weight, init_method, partition_dim):
+def _initialize_affine_weight_neuron(weight, init_method, partition_dim, stride=1):
     """Initialize affine weight for model parallel on Neuron device.
 
     Args:
@@ -83,7 +84,7 @@ def _initialize_affine_weight_neuron(weight, init_method, partition_dim):
     """
 
     set_tensor_model_parallel_attributes(
-        tensor=weight, is_parallel=True, dim=partition_dim
+        tensor=weight, is_parallel=True, dim=partition_dim, stride=stride
     )
 
     with get_xla_rng_tracker().fork():
@@ -100,6 +101,7 @@ def _initialize_affine_weight_cpu(
     return_master_weight=False,
     *,
     params_dtype=torch.float32,
+    stride=1,
 ):
     """Initialize affine weight for model parallel.
 
@@ -107,7 +109,7 @@ def _initialize_affine_weight_cpu(
     the relevant chunk."""
 
     set_tensor_model_parallel_attributes(
-        tensor=weight, is_parallel=True, dim=partition_dim
+        tensor=weight, is_parallel=True, dim=partition_dim, stride=stride
     )
 
     # Initialize master weight
@@ -118,8 +120,11 @@ def _initialize_affine_weight_cpu(
     init_method(master_weight)
 
     master_weight = master_weight.to(dtype=params_dtype)
-
-    weight_list = torch.split(master_weight, per_partition_size, dim=partition_dim)
+    
+    per_partition_per_stride_size = divide(per_partition_size, stride)
+    weight_list = torch.split(
+        master_weight, per_partition_per_stride_size, dim=partition_dim
+    )
     rank = get_tensor_model_parallel_rank()
     world_size = get_tensor_model_parallel_size()
     my_weight_list = weight_list[rank::world_size]
@@ -324,7 +329,23 @@ def linear_with_async_allreduce(
         return LinearWithAsyncCommunication.apply(*args)
 
 
-class ColumnParallelLinear(torch.nn.Module):
+class BaseParallelLinear(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+    
+    def _init_weight(self, weight):
+        if self.arg_init_method is None:
+            torch.nn.init.kaiming_uniform_(weight, a=math.sqrt(5))
+        else:
+            self.arg_init_method(weight)
+
+    def _init_bias(self):
+        fan_in, _ = torch.nn.init._calculate_fan_in_and_fan_out(self.weight)
+        bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+        torch.nn.init.uniform_(self.bias, -bound, bound)
+
+
+class ColumnParallelLinear(BaseParallelLinear):
     """Linear layer with column parallelism.
 
     The linear layer is defined as Y = XA + b. A is parallelized along
@@ -353,6 +374,8 @@ class ColumnParallelLinear(torch.nn.Module):
         gather_output: bool = True,
         dtype: torch.dtype = torch.float32,
         device: torch.device = None,
+        stride: int = 1,
+        init_method: torch.nn.init = None
     ):
         super().__init__()
 
@@ -360,6 +383,7 @@ class ColumnParallelLinear(torch.nn.Module):
         self.input_size = input_size
         self.output_size = output_size
         self.gather_output = gather_output
+        self.arg_init_method = init_method
         # Divide the weight matrix along the last dimension.
         world_size = get_tensor_model_parallel_size()
         self.output_size_per_partition = divide(output_size, world_size)
@@ -382,6 +406,7 @@ class ColumnParallelLinear(torch.nn.Module):
                 0,
                 self._init_weight,
                 params_dtype=dtype,
+                stride=stride,
             )
         else:
             assert device.type == "xla", "Currently only xla device type is supported"
@@ -393,7 +418,7 @@ class ColumnParallelLinear(torch.nn.Module):
                     dtype=dtype,
                 )
             )
-            _initialize_affine_weight_neuron(self.weight, init_method, partition_dim=0)
+            _initialize_affine_weight_neuron(self.weight, init_method, partition_dim=0, stride=stride)
 
         if bias:
             self.bias_size = (
@@ -414,21 +439,13 @@ class ColumnParallelLinear(torch.nn.Module):
             self._init_bias()
 
             if not self.gather_output:
-                set_tensor_model_parallel_attributes(self.bias, True, 0)
+                set_tensor_model_parallel_attributes(self.bias, True, 0, stride=stride)
         else:
             self.register_parameter("bias", None)
 
         self.async_tensor_model_parallel_allreduce = world_size > 1
 
         self._forward_impl = linear_with_async_allreduce
-
-    def _init_weight(self, weight):
-        return torch.nn.init.kaiming_uniform_(weight, a=math.sqrt(5))
-
-    def _init_bias(self):
-        fan_in, _ = torch.nn.init._calculate_fan_in_and_fan_out(self.weight)
-        bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
-        torch.nn.init.uniform_(self.bias, -bound, bound)
 
     def forward(
         self, input: torch.Tensor
@@ -463,7 +480,7 @@ class ColumnParallelLinear(torch.nn.Module):
         return output
 
 
-class RowParallelLinear(torch.nn.Module):
+class RowParallelLinear(BaseParallelLinear):
     """Linear layer with row parallelism.
 
     The linear layer is defined as Y = XA + b. A is parallelized along
@@ -499,6 +516,8 @@ class RowParallelLinear(torch.nn.Module):
         input_is_parallel: bool = False,
         dtype: torch.dtype = torch.float32,
         device: torch.device = None,
+        stride: int = 1,
+        init_method: torch.nn.init = None
     ):
         super().__init__()
 
@@ -509,6 +528,7 @@ class RowParallelLinear(torch.nn.Module):
         # Divide the weight matrix along the last dimension.
         world_size = get_tensor_model_parallel_size()
         self.input_size_per_partition = divide(input_size, world_size)
+        self.arg_init_method = init_method
 
         # Note: torch.nn.functional.linear performs XA^T + b and as a result
         # we allocate the transpose.
@@ -527,6 +547,7 @@ class RowParallelLinear(torch.nn.Module):
                 1,
                 self._init_weight,
                 params_dtype=dtype,
+                stride=stride,
             )
         else:
             assert device.type == "xla", "Currently only xla device type is supported"
@@ -539,7 +560,7 @@ class RowParallelLinear(torch.nn.Module):
                 )
             )
             _initialize_affine_weight_neuron(
-                self.weight, self._init_weight, partition_dim=1
+                self.weight, self._init_weight, partition_dim=1, stride=stride
             )
         if bias:
             if device is None or device.type == "cpu":
@@ -557,14 +578,6 @@ class RowParallelLinear(torch.nn.Module):
             self.register_parameter("bias", None)
 
         self._forward_impl = linear_with_async_allreduce
-
-    def _init_weight(self, weight: torch.nn.Parameter) -> torch.nn.Parameter:
-        return torch.nn.init.kaiming_uniform_(weight, a=math.sqrt(5))
-
-    def _init_bias(self):
-        fan_in, _ = torch.nn.init._calculate_fan_in_and_fan_out(self.weight)
-        bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
-        torch.nn.init.uniform_(self.bias, -bound, bound)
 
     def forward(
         self, input_: torch.Tensor
