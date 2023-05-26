@@ -12,6 +12,8 @@ if "all_gather_into_tensor" not in dir(torch.distributed):
 if "reduce_scatter_tensor" not in dir(torch.distributed):
     torch.distributed.reduce_scatter_tensor = torch.distributed._reduce_scatter_base
 
+import torch_xla.core.xla_model as xm
+
 
 def _reduce(input_: torch.Tensor) -> torch.Tensor:
     """All-reduce the input tensor across model parallel group."""
@@ -45,6 +47,22 @@ def _split_along_last_dim(input_: torch.Tensor) -> torch.Tensor:
     return output
 
 
+def _split_along_first_dim(input_: torch.Tensor) -> torch.Tensor:
+    """Split the tensor along its first dimension and keep the corresponding slice."""
+    world_size = get_tensor_model_parallel_size()
+    # Bypass the function if we are using only 1 GPU for tensor model parallel.
+    if world_size == 1:
+        return input_
+
+    # Split along first dimension.
+    dim_size = input_.size(0)
+    assert dim_size % world_size == 0
+    local_dim_size = dim_size // world_size
+    dim_offset = get_tensor_model_parallel_rank() * local_dim_size
+    output = input_[dim_offset:dim_offset + local_dim_size].contiguous()
+    return output
+
+
 def _gather_along_last_dim(input_: torch.Tensor) -> torch.Tensor:
     """Gather tensors and concatenate along the last dimension."""
 
@@ -65,6 +83,45 @@ def _gather_along_last_dim(input_: torch.Tensor) -> torch.Tensor:
 
     # Note: torch.cat already creates a contiguous tensor.
     output = torch.cat(tensor_list, dim=last_dim).contiguous()
+
+    return output
+
+
+def _gather_along_first_dim(input_: torch.Tensor) -> torch.Tensor:
+    """Gather tensors and concatenate along the first dimension."""
+    world_size = get_tensor_model_parallel_size()
+    # Bypass the function if we are using only 1 GPU.
+    if world_size == 1:
+        return input_
+
+    output = xm.all_gather(input_, groups=get_tensor_model_parallel_group()._mesh, pin_layout=False)
+
+    return output
+
+
+def _reduce_scatter_along_first_dim(input_: torch.Tensor) -> torch.Tensor:
+    """Reduce-scatter the input tensor across model parallel group."""
+    world_size = get_tensor_model_parallel_size()
+    # Bypass the function if we are using only 1 GPU.
+    if world_size == 1:
+        return input_
+
+    shape = list(input_.shape)
+    assert shape[0] % world_size == 0
+    shape[0] //= world_size
+    output = torch.empty(shape, dtype=input_.dtype, device=torch.cuda.current_device())
+    groups = get_tensor_model_parallel_group()._mesh
+
+    xm.reduce_scatter(
+        xm.REDUCE_SUM,
+        input_.contiguous(),
+        scatter_dim=0,
+        shard_count = len(groups[0]),
+        scale=1,
+        output=output,
+        groups=groups,
+        pin_layout=False
+        )
 
     return output
 
@@ -141,6 +198,46 @@ class _GatherFromModelParallelRegion(torch.autograd.Function):
         return _split_along_last_dim(grad_output)
 
 
+class _GatherFromSequenceParallelRegion(torch.autograd.Function):
+    """Gather the input from sequence parallel region and concatenate."""
+
+    # FIXME(mkozuki): Definition of static symbolic methods don't look correct according to
+    # https://pytorch.org/docs/stable/onnx.html#static-symbolic-method
+    @staticmethod
+    def symbolic(graph, input_, to_model_parallel: bool = True):
+        return _gather_along_first_dim(input_)
+
+    @staticmethod
+    def forward(ctx, input_, to_model_parallel: bool = True):
+        ctx.to_model_parallel = to_model_parallel
+        return _gather_along_first_dim(input_)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        if ctx.to_model_parallel:
+            return _reduce_scatter_along_first_dim(grad_output), None
+        else:
+            return _split_along_first_dim(grad_output), None
+
+
+class _ReduceScatterToSequenceParallelRegion(torch.autograd.Function):
+    """Reduce scatter the input from the sequence parallel region and concatenate."""
+
+    # FIXME(mkozuki): Definition of static symbolic methods don't look correct according to
+    # https://pytorch.org/docs/stable/onnx.html#static-symbolic-method
+    @staticmethod
+    def symbolic(graph, input_):
+        return _reduce_scatter_along_first_dim(input_)
+
+    @staticmethod
+    def forward(ctx, input_):
+        return _reduce_scatter_along_first_dim(input_)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return _gather_along_first_dim(grad_output)
+
+
 # -----------------
 # Helper functions.
 # -----------------
@@ -160,3 +257,11 @@ def scatter_to_tensor_model_parallel_region(input_):
 
 def gather_from_tensor_model_parallel_region(input_):
     return _GatherFromModelParallelRegion.apply(input_)
+
+
+def gather_from_sequence_parallel_region(input_, to_model_parallel=True):
+    return _GatherFromSequenceParallelRegion.apply(input_, to_model_parallel)
+
+
+def reduce_scatter_to_sequence_parallel_region(input_):
+    return _ReduceScatterToSequenceParallelRegion.apply(input_)
