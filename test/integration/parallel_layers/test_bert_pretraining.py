@@ -422,7 +422,7 @@ def get_dtype(model) -> str:
     return str(model.dtype)    
     
 def train_bert_hdf5(flags):
-    parallel_state.initialize_model_parallel(tensor_model_parallel_size=2)
+    parallel_state.initialize_model_parallel(tensor_model_parallel_size=flags.tensor_parallel_size)
     rank = xm.get_ordinal()
     world_size = parallel_state.get_data_parallel_size()
     is_root = xm.is_master_ordinal(local=False)
@@ -897,6 +897,12 @@ if __name__ == "__main__":
         default=-1,
         type=int,
         help="Step to resume training from."
+    )
+    parser.add_argument(
+        "--tensor_parallel_size",
+        default=2,
+        type=int,
+        help="Tensor parallel size"
     )
     
     args = parser.parse_args(sys.argv[1:])

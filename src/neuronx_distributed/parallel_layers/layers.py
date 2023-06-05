@@ -418,7 +418,7 @@ class ColumnParallelLinear(BaseParallelLinear):
                     dtype=dtype,
                 )
             )
-            _initialize_affine_weight_neuron(self.weight, init_method, partition_dim=0, stride=stride)
+            _initialize_affine_weight_neuron(self.weight, self._init_weight, partition_dim=0, stride=stride)
 
         if bias:
             self.bias_size = (
@@ -578,6 +578,12 @@ class RowParallelLinear(BaseParallelLinear):
             self.register_parameter("bias", None)
 
         self._forward_impl = linear_with_async_allreduce
+    
+
+    def _init_bias(self):
+        bound = 1 / math.sqrt(self.input_size_per_partition) if self.input_size_per_partition > 0 else 0
+        torch.nn.init.uniform_(self.bias, -bound, bound)
+
 
     def forward(
         self, input_: torch.Tensor
