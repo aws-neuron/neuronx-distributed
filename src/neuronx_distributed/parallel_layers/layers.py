@@ -266,7 +266,7 @@ class LinearWithAsyncCommunication(torch.autograd.Function):
 
         if ctx.sequence_parallel_enabled:
             # `input` is supposed to be 3D and its order of dimension is [sequence, batch, hidden]
-            total_input = xm.all_gather(input, groups=get_tensor_model_parallel_group()._mesh, pin_layout=False)
+            total_input = xm.all_gather(input, groups=get_tensor_model_parallel_group(as_list=True), pin_layout=False)
         else:
             total_input = input
         output = torch.matmul(total_input, weight.t())
@@ -287,7 +287,7 @@ class LinearWithAsyncCommunication(torch.autograd.Function):
         handle = None
         if ctx.compute_weight_gradient:
             if ctx.sequence_parallel_enabled:
-                total_input = xm.all_gather(input, groups=get_tensor_model_parallel_group()._mesh, pin_layout=False)
+                total_input = xm.all_gather(input, groups=get_tensor_model_parallel_group(as_list=True), pin_layout=False)
             else:
                 total_input = input
 
@@ -310,7 +310,12 @@ class LinearWithAsyncCommunication(torch.autograd.Function):
                 shape = list(grad_input.shape)
                 shape[0] //= world_size
 
-                sub_grad_input = torch.empty(torch.Size(shape), dtype=grad_input.dtype, device=grad_input.device, requires_grad=False)
+                sub_grad_input = torch.empty(
+                    torch.Size(shape),
+                    dtype=grad_input.dtype,
+                    device=grad_input.device,
+                    requires_grad=False
+                )
                 groups = get_tensor_model_parallel_group()._mesh
 
                 xm.reduce_scatter(

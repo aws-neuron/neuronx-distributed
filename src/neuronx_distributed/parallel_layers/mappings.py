@@ -94,7 +94,7 @@ def _gather_along_first_dim(input_: torch.Tensor) -> torch.Tensor:
     if world_size == 1:
         return input_
 
-    output = xm.all_gather(input_, groups=get_tensor_model_parallel_group()._mesh, pin_layout=False)
+    output = xm.all_gather(input_, groups=get_tensor_model_parallel_group(as_list=True), pin_layout=False)
 
     return output
 
@@ -110,7 +110,7 @@ def _reduce_scatter_along_first_dim(input_: torch.Tensor) -> torch.Tensor:
     assert shape[0] % world_size == 0
     shape[0] //= world_size
     output = torch.empty(shape, dtype=input_.dtype, device=input_.device)
-    groups = get_tensor_model_parallel_group()._mesh
+    groups = get_tensor_model_parallel_group(as_list=True)
 
     xm.reduce_scatter(
         xm.REDUCE_SUM,

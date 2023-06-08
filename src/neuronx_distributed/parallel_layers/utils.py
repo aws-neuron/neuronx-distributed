@@ -67,6 +67,7 @@ class EmbeddingUtility:
 
 def move_model_to_device(model: torch.nn.Module, device: torch.device) -> None:
     tp_params = {}
+    seq_parallel_params = {}
     for name, param in model.named_parameters():
         if hasattr(param, "tensor_model_parallel"):
             tp_params[name] = {
@@ -74,9 +75,13 @@ def move_model_to_device(model: torch.nn.Module, device: torch.device) -> None:
                 "partition_dim": param.partition_dim,
                 "stride": param.partition_stride,
             }
+        if hasattr(param, "sequence_parallel_enabled"):
+            seq_parallel_params[name] = param.sequence_parallel_enabled
     model.to(device)
     for name, param in model.named_parameters():
         if name in tp_params and not hasattr(param, "tensor_model_parallel"):
             layers.set_tensor_model_parallel_attributes(
                 param, *tp_params[name].values()
             )
+        if name in seq_parallel_params and not hasattr(param, "sequence_parallel_enabled"):
+            setattr(param, "sequence_parallel_enabled", seq_parallel_params[name])
