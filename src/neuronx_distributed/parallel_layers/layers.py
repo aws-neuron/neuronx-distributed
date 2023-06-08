@@ -310,7 +310,7 @@ class LinearWithAsyncCommunication(torch.autograd.Function):
                 shape = list(grad_input.shape)
                 shape[0] //= world_size
 
-                sub_grad_input = torch.empty(torch.Size(shape), dtype=grad_input.dtype, device=torch.cuda.current_device(), requires_grad=False)
+                sub_grad_input = torch.empty(torch.Size(shape), dtype=grad_input.dtype, device=grad_input.device, requires_grad=False)
                 groups = get_tensor_model_parallel_group()._mesh
 
                 xm.reduce_scatter(
@@ -340,7 +340,7 @@ class LinearWithAsyncCommunication(torch.autograd.Function):
 
         if ctx.sequence_parallel_enabled:
             assert not ctx.async_grad_allreduce
-            sub_grad_input = torch.empty(input.shape, dtype=input.dtype, device=torch.cuda.current_device(), requires_grad=False)
+            sub_grad_input = torch.empty(input.shape, dtype=input.dtype, device=input.device, requires_grad=False)
             groups = get_tensor_model_parallel_group()._mesh
             xm.reduce_scatter(
                 xm.REDUCE_SUM,
@@ -461,6 +461,7 @@ class ColumnParallelLinear(BaseParallelLinear):
                 self._init_weight,
                 params_dtype=dtype,
                 stride=stride,
+                return_master_weight=True,
             )
         else:
             assert device.type == "xla", "Currently only xla device type is supported"
@@ -619,6 +620,7 @@ class RowParallelLinear(BaseParallelLinear):
                 self._init_weight,
                 params_dtype=dtype,
                 stride=stride,
+                return_master_weight=True,
             )
         else:
             assert device.type == "xla", "Currently only xla device type is supported"

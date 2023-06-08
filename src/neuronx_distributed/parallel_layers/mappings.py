@@ -109,7 +109,7 @@ def _reduce_scatter_along_first_dim(input_: torch.Tensor) -> torch.Tensor:
     shape = list(input_.shape)
     assert shape[0] % world_size == 0
     shape[0] //= world_size
-    output = torch.empty(shape, dtype=input_.dtype, device=torch.cuda.current_device())
+    output = torch.empty(shape, dtype=input_.dtype, device=input_.device)
     groups = get_tensor_model_parallel_group()._mesh
 
     xm.reduce_scatter(

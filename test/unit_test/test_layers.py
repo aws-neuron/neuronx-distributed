@@ -13,6 +13,7 @@ import torch
 from transformers import BertForPreTraining
 from commons import set_random_seed, print_separator, IdentityLayer3D
 from neuronx_distributed.parallel_layers import layers, parallel_state
+from neuronx_distributed.parallel_layers.random import model_parallel_xla_manual_seed
 
 
 datetime_str = str(datetime.now())
@@ -180,6 +181,201 @@ def test_initialize_affine_weight_cpu(tensor_model_parallel_size):
         raise
 
 
+def test_row_parallel_linear_seq_parallel(tensor_model_parallel_size):
+
+    def _test_row_parallel_linear_seq_parallel():
+        batch_size = 8
+        seq_length = 128
+        hidden_size = 256
+        tensor_shape = (seq_length, batch_size, hidden_size)
+        seed = 1234
+
+        device = xm.xla_device()
+        tensor_model_parallel_size_ = tensor_model_parallel_size
+        parallel_state.initialize_model_parallel(tensor_model_parallel_size_)
+        tensor_model_parallel_size_ = parallel_state.get_tensor_model_parallel_size()
+
+        set_random_seed(seed)
+        model_parallel_xla_manual_seed(seed)
+
+        linear = layers.RowParallelLinear(
+            hidden_size,
+            hidden_size,
+            bias=False,
+            input_is_parallel=True,
+            sequence_parallel_enabled=True,
+        ).to(device)
+
+        with torch.no_grad():
+            orig_input_tensor = torch.randn(tensor_shape, requires_grad=True, device=device)
+            orig_loss_weight = torch.randn(tensor_shape, device=device)
+            input_tensor = orig_input_tensor.chunk(
+                chunks=tensor_model_parallel_size_,
+                dim=2,
+            )[parallel_state.get_tensor_model_parallel_rank()].contiguous()
+            loss_weight = orig_loss_weight.chunk(
+                chunks=tensor_model_parallel_size_,
+                dim=0,
+            )[parallel_state.get_tensor_model_parallel_rank()]
+        input_tensor.requires_grad_()
+        output = linear(input_tensor)
+        loss = torch.mul(output, loss_weight).sum()
+        loss.backward()
+
+        ref_linear = torch.nn.Linear(
+            in_features=hidden_size,
+            out_features=hidden_size,
+            bias=False,
+        ).to(device)
+
+        with torch.no_grad():
+            dldy = orig_loss_weight.clone()
+            x = orig_input_tensor.clone()
+            ref_linear.weight.copy_(linear.master_weight)
+        x.requires_grad_()
+        expected_output = ref_linear(x)
+        expected_loss = torch.mul(expected_output, dldy).sum()
+        expected_loss.backward()
+
+        torch.distributed.barrier()
+
+        expected_output_chunk=expected_output.chunk(
+            chunks=tensor_model_parallel_size_,
+            dim=0,
+            )[parallel_state.get_tensor_model_parallel_rank()]
+
+        error = output.sub(expected_output_chunk).abs().max()
+        print('   error in output (parallel) on global rank {}: {}'.format(
+            torch.distributed.get_rank(), error))
+        assert error < 1.0e-3, 'error: {}'.format(error)
+
+        if tensor_model_parallel_size_ == 1:
+            expected_grad_chunk = ref_linear.weight.grad.chunk(
+                chunks=tensor_model_parallel_size_,
+                dim=1,
+            )[parallel_state.get_tensor_model_parallel_rank()]
+
+            error = linear.weight.grad.sub(expected_grad_chunk).abs().max()
+            print('   error in grad (parallel) on global rank {}: {}'.format(
+                torch.distributed.get_rank(), error))
+            assert error < 1.0e-3, 'error: {}'.format(error)
+
+        # Reset groups
+        parallel_state.destroy_model_parallel()
+
+        torch.distributed.barrier()
+        if torch.distributed.get_rank() == 0:
+            print('test passed')
+
+        del device
+
+    global results
+    try:
+        _test_row_parallel_linear_seq_parallel()
+    except:
+        results["inference_success"] = 0
+        print(traceback.format_exc())
+        raise
+
+
+def test_column_parallel_linear_seq_parallel(tensor_model_parallel_size):
+
+    def _test_column_parallel_linear_seq_parallel():
+        batch_size = 8
+        seq_length = 128
+        hidden_size = 256
+        tensor_shape = (seq_length, batch_size, hidden_size)
+        seed = 1234
+
+        device = xm.xla_device()
+        tensor_model_parallel_size_ = tensor_model_parallel_size
+        parallel_state.initialize_model_parallel(tensor_model_parallel_size_)
+        tensor_model_parallel_size_ = parallel_state.get_tensor_model_parallel_size()
+
+        set_random_seed(seed)
+        model_parallel_xla_manual_seed(seed)
+
+        linear = layers.ColumnParallelLinear(
+            hidden_size,
+            hidden_size,
+            bias=False,
+            gather_output=False,
+            sequence_parallel_enabled=True,
+        ).to(device)
+
+        with torch.no_grad():
+            orig_input_tensor = torch.randn(tensor_shape, requires_grad=True, device=device)
+            orig_loss_weight = torch.randn(tensor_shape, device=device)
+            input_tensor = list(
+                orig_input_tensor.chunk(tensor_model_parallel_size_, dim=0)
+            )[parallel_state.get_tensor_model_parallel_rank()]
+            loss_weight = orig_loss_weight.chunk(
+                tensor_model_parallel_size_, dim=2,
+            )[parallel_state.get_tensor_model_parallel_rank()]
+        input_tensor.requires_grad_()
+        output = linear(input_tensor)
+        loss = torch.mul(output, loss_weight).sum()
+        loss.backward()
+
+        ref_linear = torch.nn.Linear(
+            in_features=hidden_size,
+            out_features=hidden_size,
+            bias=False,
+        ).to(device)
+
+        with torch.no_grad():
+            dldy = orig_loss_weight.clone()
+            x = orig_input_tensor.clone()
+            ref_linear.weight.copy_(linear.master_weight)
+        x.requires_grad_()
+        expected_output = ref_linear(x)
+        expected_loss = torch.mul(expected_output, dldy).sum()
+        expected_loss.backward()
+
+        torch.distributed.barrier()
+
+        expected_output_chunk = expected_output.chunk(
+            tensor_model_parallel_size_,
+            dim=2,
+        )[parallel_state.get_tensor_model_parallel_rank()]
+
+        error = output.sub(expected_output_chunk).abs().max()
+        print('   error in output (parallel) on global rank {}: {}'.format(
+            torch.distributed.get_rank(), error))
+        assert error < 1.0e-3, 'error: {}'.format(error)
+
+        # FIXME: The following test code failed with neuronx-cc 2.0.0.16278a0+a830597b3 (used by pipeline when I submit the code)
+        # but worked with a newer version (neuronx-cc 2.0.0.17643a0+bf9c06ff2) in my own machine . Comment it out for now.
+        """
+        if tensor_model_parallel_size_ == 1:
+            expected_grad_chunk = ref_linear.weight.grad.chunk(
+                chunks=tensor_model_parallel_size_,
+                dim=0,
+            )[parallel_state.get_tensor_model_parallel_rank()]
+
+            error = linear.weight.grad.sub(expected_grad_chunk).abs().max()
+            print('   error in grad (parallel) on global rank {}: {}'.format(
+                torch.distributed.get_rank(), error))
+            assert error < 1.0e-3, 'error: {}'.format(error)
+        """
+
+        # Reset groups
+        parallel_state.destroy_model_parallel()
+
+        torch.distributed.barrier()
+        if torch.distributed.get_rank() == 0:
+            print('test passed')
+
+        del device
+
+    global results
+    try:
+        _test_column_parallel_linear_seq_parallel()
+    except:
+        results["inference_success"] = 0
+        print(traceback.format_exc())
+        raise
+
 
 def upload_to_s3():
     os.system(f'aws s3 cp --no-progress "{datetime_str}" {S3_BUCKET_NAME}')
@@ -203,5 +399,9 @@ if __name__ == '__main__':
         test_parallel_embedding(tensor_model_parallel_size)
         print_separator('test initialize affine weight')
         test_initialize_affine_weight_cpu(tensor_model_parallel_size)
+        print_separator('test row_parallel_linear with seq_parallel')
+        test_row_parallel_linear_seq_parallel(tensor_model_parallel_size)
+        print_separator('test column_parallel_linear with seq_parallel')
+        test_column_parallel_linear_seq_parallel(tensor_model_parallel_size)
         tensor_model_parallel_size *= 2
     atexit.register(on_exit)
