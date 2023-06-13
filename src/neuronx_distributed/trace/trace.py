@@ -65,10 +65,11 @@ def _trace(
     compiler_workdir: Optional[Union[str, pathlib.Path]] = None,
     compiler_args: Optional[Union[List[str], str]] = None,
     options: Union[Iterable[Options], Options] = None,
+    tp_degree: int = 1,
 ) -> None:
     os.environ["RANK"] = str(rank)
     torch.distributed.init_process_group("xla")
-    parallel_state.initialize_model_parallel(tensor_model_parallel_size=2)
+    parallel_state.initialize_model_parallel(tensor_model_parallel_size=tp_degree)
     model = func()
     neff_filename, metaneff, flattener, packer = torch_neuronx.xla_impl.trace._trace(
         model,
@@ -129,6 +130,7 @@ def parallel_model_trace(
             compiler_workdir,
             compiler_args,
             options,
+            tp_degree,
         ),
         start_method="fork",
     )
