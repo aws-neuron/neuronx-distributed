@@ -3,11 +3,6 @@ from setuptools import setup, PEP420PackageFinder
 from setuptools.dist import Distribution
 from wheel.bdist_wheel import bdist_wheel
 
-def get_torch_xla_version():
-    return os.environ['TORCH_XLA_VERSION']
-
-def get_torch_version():
-    return os.environ['PYTORCH_VERSION'] + '.*'
 
 class BinaryDistribution(Distribution):
 
@@ -51,8 +46,8 @@ setup(
         'LICENSE.txt',
     ]},
     install_requires=[
-        f'torch-neuronx=={get_torch_version()}',
-        f'torch-xla=={get_torch_xla_version()}',
+        'torch-neuronx',
+        'torch-xla',
     ],
     distclass=BinaryDistribution,
     cmdclass={

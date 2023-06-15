@@ -15,11 +15,6 @@ SRC_PATH=$(brazil-path package-src-root)
 RUNTIMEFARM_PATH=$(brazil-path tooldirect.runtimefarm)
 LICENSE_TXT_PATH=$(brazil-path [NeuronLicense]pkg.src)/LICENSE.txt
 
-FIRST_TORCH_XLA=$(ls ${RUNTIMEFARM_PATH}/pip/public/torch-xla/ | head -n 1)
-TORCH_XLA_VERSION=${FIRST_TORCH_XLA#*-}
-export TORCH_XLA_VERSION=${TORCH_XLA_VERSION%%-*}
-export PYTORCH_VERSION=$(echo ${TORCH_XLA_VERSION} | cut -d "." -f 1,2 )
-
 # Create NeuronxDistributed build folder
 BUILD_PATH_NEURONX_DISTRIBUTED=${BUILD_PATH}/public/NeuronxDistributed
 mkdir -p ${BUILD_PATH_NEURONX_DISTRIBUTED}

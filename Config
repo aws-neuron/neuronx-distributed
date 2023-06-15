@@ -8,7 +8,6 @@ package.NeuronxDistributed = {
             Python-setuptools = default;
             Python-wheel = 0.x;
             NeuronLicense = 1.0;
-            KaenaTorchXlaWheels = 1.0;
         };
     };
 

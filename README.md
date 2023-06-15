@@ -1,25 +1,21 @@
 # NeuronxDistributed
 
-Source code for `neuronx-distributed`. This package is used for releasing neuron-friendly implementations 
-of certain 3rd party tools.
+Neuron Distributed is a package for supporting different distributed training/inference mechanism for Neuron devices. It would provide xla friendly implementations of some of the more popular distributed training/inference techniques. As the size of the model scales, fitting these models on a single device becomes impossible and hence we have to make use of model sharding techniques to partition the model across multiple devices. As part of this library, we enable support for Tensor Parallel sharding technique with other distributed library supported to be added in future.
 
-## Development resources
+## Building/Installing NeuronxDistributed
 
-VersionSet: KaenaPyTorchXLATest/development: https://code.amazon.com/version-sets/KaenaPyTorchXLATest/development
+To install the library, please follow the instructions mentioned here: https://awsdocs-neuron.readthedocs-hosted.com/en/latest//libraries/neuronx-distributed/index.html
 
-Pipeline: KaenaPyTorchXLATest: https://pipelines.amazon.com/pipelines/KaenaPyTorchXLATest
-
-Auto Test Pipeline: https://pipelines.amazon.com/pipelines/KaenaPyTorchXLATest-development-autotest
-
-## Building NeuronxDistributed
+To build from source, run the following command:
 
 ```
-brazil ws create --name NeuronxDistributed --versionSet KaenaPyTorchXLATest/development
-cd NeuronxDistributed
-brazil ws use NeuronxDistributed
-
-# Build NeuronxDistributed to get neuronx-distributed
-cd src/NeuronxDistributed
-git checkout mainline
-bb clean && bb
+python3 setup.py bdist_wheel
 ```
+
+It should place the wheel at `dist/`
+
+## API Reference Guide
+
+For a detailed API reference guide, please refer to: https://awsdocs-neuron.readthedocs-hosted.com/en/latest/libraries/neuronx-distributed/tp_api_guide.html#tp-api-guide
+
+
