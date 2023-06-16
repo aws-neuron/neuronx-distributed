@@ -1,0 +1,14 @@
+package.NeuronxDistributed = {
+    interfaces = (1.0);
+
+    build-system = custom-build;
+    build-tools = {
+        1.0 = {
+            Python3PBuildTool = 2.0;
+            Python-setuptools = default;
+            Python-wheel = 0.x;
+            NeuronLicense = 1.0;
+        };
+    };
+
+};

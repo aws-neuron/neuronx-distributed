@@ -1,17 +1,21 @@
-## My Project
+# NeuronxDistributed
 
-TODO: Fill this README out!
+Neuron Distributed is a package for supporting different distributed training/inference mechanism for Neuron devices. It would provide xla friendly implementations of some of the more popular distributed training/inference techniques. As the size of the model scales, fitting these models on a single device becomes impossible and hence we have to make use of model sharding techniques to partition the model across multiple devices. As part of this library, we enable support for Tensor Parallel sharding technique with other distributed library supported to be added in future.
 
-Be sure to:
+## Building/Installing NeuronxDistributed
 
-* Change the title in this README
-* Edit your repository description on GitHub
+To install the library, please follow the instructions mentioned here: https://awsdocs-neuron.readthedocs-hosted.com/en/latest//libraries/neuronx-distributed/index.html
 
-## Security
+To build from source, run the following command:
 
-See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for more information.
+```
+python3 setup.py bdist_wheel
+```
 
-## License
+It should place the wheel at `dist/`
 
-This library is licensed under the MIT-0 License. See the LICENSE file.
+## API Reference Guide
+
+For a detailed API reference guide, please refer to: https://awsdocs-neuron.readthedocs-hosted.com/en/latest/libraries/neuronx-distributed/tp_api_guide.html#tp-api-guide
+
 
