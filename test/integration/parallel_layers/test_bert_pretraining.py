@@ -363,14 +363,18 @@ def get_model(flags):
     my_model = BertForPreTraining(my_config)
     def init_weights(weights):
         torch.nn.init.normal_(weights, mean=0.0, std=my_config.initializer_range)
+    padded_vocab_size = my_config.vocab_size + (parallel_state.get_tensor_model_parallel_size() - my_config.vocab_size % parallel_state.get_tensor_model_parallel_size())
     my_model.bert.embeddings.word_embeddings = layers.ParallelEmbedding(
-        my_config.vocab_size,
+        padded_vocab_size,
         my_config.hidden_size,
         init_method=init_weights,
     )
 
+    my_model.cls.predictions.bias = torch.nn.Parameter(torch.zeros(padded_vocab_size))
     my_model.cls.predictions.decoder = layers.ColumnParallelLinear(
-        my_config.hidden_size, my_config.vocab_size, bias=False)
+        my_config.hidden_size, padded_vocab_size, bias=False)
+    
+    my_model.config.vocab_size = padded_vocab_size
 
     init_weights(my_model.cls.predictions.decoder.weight)
 

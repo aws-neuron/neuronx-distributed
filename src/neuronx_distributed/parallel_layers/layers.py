@@ -1,4 +1,5 @@
 from typing import Optional, Tuple
+import warnings
 import math
 
 import torch
@@ -13,6 +14,7 @@ from .mappings import (
     gather_from_tensor_model_parallel_region,
     reduce_from_tensor_model_parallel_region,
     scatter_to_tensor_model_parallel_region,
+    reduce_scatter_to_sequence_parallel_region,
 )
 from .parallel_state import (
     get_tensor_model_parallel_group,
@@ -250,9 +252,11 @@ class LinearWithAsyncCommunication(torch.autograd.Function):
         weight: torch.Tensor,
         bias: Optional[torch.Tensor],
         async_grad_allreduce: bool,
+        sequence_parallel_enabled: bool,
     ):
         ctx.use_bias = bias is not None and weight.requires_grad
         ctx.async_grad_allreduce = async_grad_allreduce
+        ctx.sequence_parallel_enabled = sequence_parallel_enabled
         ctx.compute_weight_gradient = weight.requires_grad
 
         if ctx.compute_weight_gradient:
@@ -260,7 +264,11 @@ class LinearWithAsyncCommunication(torch.autograd.Function):
         else:
             ctx.save_for_backward(weight)
 
-        total_input = input
+        if ctx.sequence_parallel_enabled:
+            # `input` is supposed to be 3D and its order of dimension is [sequence, batch, hidden]
+            total_input = xm.all_gather(input, groups=get_tensor_model_parallel_group(as_list=True), pin_layout=False)
+        else:
+            total_input = input
         output = torch.matmul(total_input, weight.t())
         if bias is not None:
             output = output + bias
@@ -278,7 +286,10 @@ class LinearWithAsyncCommunication(torch.autograd.Function):
 
         handle = None
         if ctx.compute_weight_gradient:
-            total_input = input
+            if ctx.sequence_parallel_enabled:
+                total_input = xm.all_gather(input, groups=get_tensor_model_parallel_group(as_list=True), pin_layout=False)
+            else:
+                total_input = input
 
         grad_input = grad_output.matmul(weight)
 
@@ -293,6 +304,33 @@ class LinearWithAsyncCommunication(torch.autograd.Function):
 
         # if no weight gradient, immediately return
         if not ctx.compute_weight_gradient:
+            if ctx.sequence_parallel_enabled:
+                assert not ctx.async_grad_allreduce
+                world_size = get_tensor_model_parallel_size()
+                shape = list(grad_input.shape)
+                shape[0] //= world_size
+
+                sub_grad_input = torch.empty(
+                    torch.Size(shape),
+                    dtype=grad_input.dtype,
+                    device=grad_input.device,
+                    requires_grad=False
+                )
+                groups = get_tensor_model_parallel_group()._mesh
+
+                xm.reduce_scatter(
+                    xm.REDUCE_SUM,
+                    grad_input,
+                    output=sub_grad_input,
+                    groups=groups,
+                    shard_count = len(groups[0]),
+                    scatter_dim=0,
+                    scale=1,
+                    pin_layout=False
+                )
+
+                return sub_grad_input, None, None, None, None, None, None
+
             if ctx.async_grad_allreduce:
                 handle.wait()
             return grad_input, None, None, None, None, None, None
@@ -305,8 +343,26 @@ class LinearWithAsyncCommunication(torch.autograd.Function):
             total_input.shape[0] * total_input.shape[1], total_input.shape[2]
         )
 
+        if ctx.sequence_parallel_enabled:
+            assert not ctx.async_grad_allreduce
+            sub_grad_input = torch.empty(input.shape, dtype=input.dtype, device=input.device, requires_grad=False)
+            groups = get_tensor_model_parallel_group()._mesh
+            xm.reduce_scatter(
+                xm.REDUCE_SUM,
+                grad_input,
+                output=sub_grad_input,
+                groups=groups,
+                shard_count = len(groups[0]),
+                scatter_dim=0,
+                scale=1,
+                pin_layout=False
+            )
+
         grad_weight = grad_output.t().matmul(total_input)
         grad_bias = grad_output.sum(dim=0) if use_bias else None
+
+        if ctx.sequence_parallel_enabled:
+            return sub_grad_input, grad_weight, grad_bias, None, None, None, None
 
         if ctx.async_grad_allreduce:
             handle.wait()
@@ -318,12 +374,14 @@ def linear_with_async_allreduce(
     weight: torch.Tensor,
     bias: Optional[torch.Tensor],
     async_grad_allreduce: bool,
+    sequence_parallel_enabled: bool,
 ) -> torch.Tensor:
     args = (
         input,
         weight,
         bias,
         async_grad_allreduce,
+        sequence_parallel_enabled,
     )
     with torch.cuda.amp.autocast(enabled=False):
         return LinearWithAsyncCommunication.apply(*args)
@@ -375,7 +433,8 @@ class ColumnParallelLinear(BaseParallelLinear):
         dtype: torch.dtype = torch.float32,
         device: torch.device = None,
         stride: int = 1,
-        init_method: torch.nn.init = None
+        init_method: torch.nn.init = None,
+        sequence_parallel_enabled: bool = False,
     ):
         super().__init__()
 
@@ -407,6 +466,7 @@ class ColumnParallelLinear(BaseParallelLinear):
                 self._init_weight,
                 params_dtype=dtype,
                 stride=stride,
+                return_master_weight=True,
             )
         else:
             assert device.type == "xla", "Currently only xla device type is supported"
@@ -443,7 +503,18 @@ class ColumnParallelLinear(BaseParallelLinear):
         else:
             self.register_parameter("bias", None)
 
-        self.async_tensor_model_parallel_allreduce = world_size > 1
+        self.async_tensor_model_parallel_allreduce = (
+            not sequence_parallel_enabled and world_size > 1
+        )
+        if sequence_parallel_enabled:
+            if world_size <= 1:
+                warnings.warn(
+                    f"`sequence_parallel_enabled` is set to `True`, but got world_size of {world_size}"
+                )
+        self.sequence_parallel_enabled = sequence_parallel_enabled
+
+        if self.async_tensor_model_parallel_allreduce and self.sequence_parallel_enabled:
+            raise RuntimeError("`async_tensor_model_parallel_allreduce` and `sequence_parallel_enabled` cannot be enabled at the same time.")
 
         self._forward_impl = linear_with_async_allreduce
 
@@ -459,7 +530,7 @@ class ColumnParallelLinear(BaseParallelLinear):
             - output
         """
 
-        if self.async_tensor_model_parallel_allreduce:
+        if self.async_tensor_model_parallel_allreduce or self.sequence_parallel_enabled:
             input_parallel = input
         else:
             input_parallel = copy_to_tensor_model_parallel_region(input)
@@ -470,9 +541,11 @@ class ColumnParallelLinear(BaseParallelLinear):
             weight=self.weight,
             bias=None,
             async_grad_allreduce=self.async_tensor_model_parallel_allreduce,
+            sequence_parallel_enabled=self.sequence_parallel_enabled,
         )
         if self.gather_output:
             # All-gather across the partitions.
+            assert not self.sequence_parallel_enabled
             output = gather_from_tensor_model_parallel_region(output_parallel)
         else:
             output = output_parallel
@@ -517,7 +590,8 @@ class RowParallelLinear(BaseParallelLinear):
         dtype: torch.dtype = torch.float32,
         device: torch.device = None,
         stride: int = 1,
-        init_method: torch.nn.init = None
+        init_method: torch.nn.init = None,
+        sequence_parallel_enabled: bool = False,
     ):
         super().__init__()
 
@@ -529,6 +603,9 @@ class RowParallelLinear(BaseParallelLinear):
         world_size = get_tensor_model_parallel_size()
         self.input_size_per_partition = divide(input_size, world_size)
         self.arg_init_method = init_method
+        self.sequence_parallel_enabled = sequence_parallel_enabled
+        if self.sequence_parallel_enabled and not self.input_is_parallel:
+            raise RuntimeError("To enable `sequence_parallel_enabled`, `input_is_parallel` must be `True`")
 
         # Note: torch.nn.functional.linear performs XA^T + b and as a result
         # we allocate the transpose.
@@ -548,6 +625,7 @@ class RowParallelLinear(BaseParallelLinear):
                 self._init_weight,
                 params_dtype=dtype,
                 stride=stride,
+                return_master_weight=True,
             )
         else:
             assert device.type == "xla", "Currently only xla device type is supported"
@@ -574,6 +652,7 @@ class RowParallelLinear(BaseParallelLinear):
                     )
                 )
             self._init_bias()
+            setattr(self.bias, "sequence_parallel_enabled", sequence_parallel_enabled)
         else:
             self.register_parameter("bias", None)
 
@@ -600,6 +679,7 @@ class RowParallelLinear(BaseParallelLinear):
         if self.input_is_parallel:
             input_parallel = input_
         else:
+            assert not self.sequence_parallel_enabled
             input_parallel = scatter_to_tensor_model_parallel_region(input_)
         # Matrix multiply.
         output_parallel = self._forward_impl(
@@ -607,8 +687,12 @@ class RowParallelLinear(BaseParallelLinear):
             weight=self.weight,
             bias=None,
             async_grad_allreduce=False,
+            sequence_parallel_enabled=False,
         )
         # All-reduce across all the partitions.
-        output_ = reduce_from_tensor_model_parallel_region(output_parallel)
+        if self.sequence_parallel_enabled:
+            output_ = reduce_scatter_to_sequence_parallel_region(output_parallel)
+        else:
+            output_ = reduce_from_tensor_model_parallel_region(output_parallel)
         output = (output_ + self.bias) if self.bias is not None else output_
         return output
