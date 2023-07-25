@@ -919,7 +919,12 @@ if __name__ == "__main__":
 
     # WORLD_SIZE is set by torchrun
     if os.environ.get("WORLD_SIZE"):
-        dist.init_process_group("xla")
+        if is_pjrt_device():
+            import torch_xla.experimental.pjrt_backend
+            torch.distributed.init_process_group("xla", init_method="pjrt://")
+            set_gloo_group_for_barrier()
+        else:
+            torch.distributed.init_process_group("xla")
         _mp_fn(0, args)
     else:
         xmp.spawn(_mp_fn, args=(args,))

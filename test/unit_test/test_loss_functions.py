@@ -123,8 +123,13 @@ def on_exit():
         with open(args.test_json, "w") as f:
             json.dump({k: results}, f)
 
-if __name__ == '__main__':
-    torch.distributed.init_process_group("xla")
+
+if __name__ == "__main__":
+    if is_pjrt_device():
+        import torch_xla.experimental.pjrt_backend
+        torch.distributed.init_process_group("xla", init_method="pjrt://")
+    else:
+        torch.distributed.init_process_group("xla")
     world_size = xm.xrt_world_size()
     tensor_model_parallel_size = 1
     while tensor_model_parallel_size <= world_size:

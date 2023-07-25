@@ -68,7 +68,11 @@ def _trace(
     tp_degree: int = 1,
 ) -> None:
     os.environ["RANK"] = str(rank)
-    torch.distributed.init_process_group("xla")
+    if is_pjrt_device():
+        import torch_xla.experimental.pjrt_backend
+        torch.distributed.init_process_group("xla", init_method="pjrt://")
+    else:
+        torch.distributed.init_process_group("xla")
     parallel_state.initialize_model_parallel(tensor_model_parallel_size=tp_degree)
     model = func()
     neff_filename, metaneff, flattener, packer = torch_neuronx.xla_impl.trace._trace(
