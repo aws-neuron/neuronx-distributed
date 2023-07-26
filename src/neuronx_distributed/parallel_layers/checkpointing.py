@@ -61,8 +61,20 @@ def save(state_dict: dict, output_dir: str) -> None:
         chkpt_path, "tp_rank_{:02d}".format(get_tensor_model_parallel_rank())
     )
 
+    if down_cast_bf16:
+        state_dict = cast_all(state_dict, from_dtype=torch.float32, to_dtype=torch.bfloat16)
     if get_data_parallel_rank() == 0:
         ensure_directory_exists(chkpt_path)
+    if save_serially:
+        cpu_data = xm._maybe_convert_to_cpu(state_dict, convert=(get_data_parallel_rank() == 0))
+        for tp_rank in range(0, get_tensor_model_parallel_size()):
+            # Staggering save checkpoints
+            if get_data_parallel_rank() == 0 and get_tensor_model_parallel_rank() == tp_rank:
+                torch.save(cpu_data, chkpt_path)
+            add_barrier(f"ckpt-save-{tp_rank}")
+    else:
+        cpu_data = xm._maybe_convert_to_cpu(state_dict, convert=(get_data_parallel_rank() == 0))
+        torch.save(cpu_data, chkpt_path)
 
     should_chkpt = get_data_parallel_rank() == 0
     cpu_data = xm._maybe_convert_to_cpu(state_dict, convert=should_chkpt)

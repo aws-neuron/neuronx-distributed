@@ -363,20 +363,24 @@ def get_model(flags):
     my_model = BertForPreTraining(my_config)
     def init_weights(weights):
         torch.nn.init.normal_(weights, mean=0.0, std=my_config.initializer_range)
-    padded_vocab_size = my_config.vocab_size + (parallel_state.get_tensor_model_parallel_size() - my_config.vocab_size % parallel_state.get_tensor_model_parallel_size())
-    my_model.bert.embeddings.word_embeddings = layers.ParallelEmbedding(
-        padded_vocab_size,
-        my_config.hidden_size,
-        init_method=init_weights,
-    )
 
-    my_model.cls.predictions.bias = torch.nn.Parameter(torch.zeros(padded_vocab_size))
-    my_model.cls.predictions.decoder = layers.ColumnParallelLinear(
-        my_config.hidden_size, padded_vocab_size, bias=False)
-    
-    my_model.config.vocab_size = padded_vocab_size
+    if flags.use_parallel_embedding:
+        padded_vocab_size = my_config.vocab_size + (
+            parallel_state.get_tensor_model_parallel_size()
+            - my_config.vocab_size % parallel_state.get_tensor_model_parallel_size()
+        )
+        my_model.bert.embeddings.word_embeddings = layers.ParallelEmbedding(
+            padded_vocab_size,
+            my_config.hidden_size,
+            init_method=init_weights,
+        )
 
-    init_weights(my_model.cls.predictions.decoder.weight)
+        my_model.cls.predictions.bias = torch.nn.Parameter(torch.zeros(padded_vocab_size))
+        my_model.cls.predictions.decoder = layers.ColumnParallelLinear(my_config.hidden_size, padded_vocab_size, bias=False)
+
+        my_model.config.vocab_size = padded_vocab_size
+
+        init_weights(my_model.cls.predictions.decoder.weight)
 
     class ParallelSelfAttention(BertSelfAttention):
         def __init__(self, config, position_embedding_type=None):
@@ -903,12 +907,12 @@ if __name__ == "__main__":
         help="Step to resume training from."
     )
     parser.add_argument(
-        "--tensor_parallel_size",
-        default=2,
-        type=int,
-        help="Tensor parallel size"
+        "--use_parallel_embedding",
+        default=False,
+        action="store_true",
+        help="Whether to use parallel embedding",
     )
-    
+
     args = parser.parse_args(sys.argv[1:])
 
     if args.steps_this_run < 0:
