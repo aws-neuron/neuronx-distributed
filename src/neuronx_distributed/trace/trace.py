@@ -76,11 +76,7 @@ def _trace(
     else:
         torch.distributed.init_process_group("xla")
     parallel_state.initialize_model_parallel(tensor_model_parallel_size=tp_degree)
-    func_outputs = func()
-    if len(func_outputs) > 1:
-        model, input_output_alias = func_outputs
-    else:
-        model, input_output_alias = func_outputs, {}
+    model, input_output_alias = func()
     if compiler_workdir is None:
         compiler_workdir = f"/tmp/trace_compiler_workdir_{rank}"
     else:
@@ -157,10 +153,7 @@ def parallel_model_trace(
         start_method="spawn",
         nprocs=tp_degree,
     )
-    models = [
-        torch_neuronx.xla_impl.trace.create_neuron_model(*mp_q.get(), example_inputs)
-        for _ in range(tp_degree)
-    ]
+    models = [torch_neuronx.xla_impl.trace.create_neuron_model(*mp_q.get()) for _ in range(tp_degree)]
     return TensorParallelNeuronModel(models)
 
 
