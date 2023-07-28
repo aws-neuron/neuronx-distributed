@@ -1,7 +1,7 @@
-import torch
 from torch import nn
 from torch.nn import functional as F
 from neuronx_distributed.parallel_layers.layers import ColumnParallelLinear, RowParallelLinear
+
 
 def get_number_of_extra_heads(n_head, tp_degree):
     """
@@ -25,18 +25,18 @@ def pad_model(model, tp_degree, num_heads_field="num_attention_heads"):
     """
     Pads a generic model to function to a desired tensor parallelism degree by padding the number of attention heads.
     Returns the original model modified with padding.
- 
-    Uses 1-axis padding strategy: pads the sharded dim of the ParallelLinear layers to the size it would have been 
-    for the padded number of heads.
+
+    Uses 1-axis padding strategy: pads the sharded dim of the ParallelLinear layers to the size it would have been
+     for the padded number of heads.
 
     Usage:
         When modifying the Attention layer, typically you must divide by TP degree like so:
-        > self.num_heads = neuronx_dist_utils.divide(self.num_heads, get_tensor_model_parallel_size()) 
+        > self.num_heads = neuronx_dist_utils.divide(self.num_heads, get_tensor_model_parallel_size())
 
         This line must be modified like so:
         > self.num_heads = neuronx_dist_utils.divide(
             self.num_heads + get_number_of_extra_heads(self.num_heads, get_tensor_model_parallel_size()),
-            get_tensor_model_parallel_size()) 
+            get_tensor_model_parallel_size())
 
         Then, after initializing the model, you must call this wrapper:
         > model = get_model(config=desired_config)
@@ -45,8 +45,9 @@ def pad_model(model, tp_degree, num_heads_field="num_attention_heads"):
     Args:
         model (torch.nn.Module): model to be padded
         tp_degree (int): tensor parallel degree
-        num_heads_field (String, *optional*, defaults to 'num_attention_heads'): the name of the field for the number of attention heads in the model config
-    
+        num_heads_field (String, *optional*, defaults to 'num_attention_heads'): the name of the field for the number
+             of attention heads in the model config
+
     Returns:
         torch.nn.Module: padded model
     """
@@ -65,7 +66,7 @@ def pad_model(model, tp_degree, num_heads_field="num_attention_heads"):
             model.weight = nn.Parameter(F.pad(model.weight.data.to("cpu"), (0, 0, 0, size_to_pad)))
             if model.bias is not None:  # bias may not always exist
                 model.bias = nn.Parameter(F.pad(model.bias.data.to("cpu"), (0, size_to_pad)))
-                
+
         elif isinstance(model, RowParallelLinear):
             # pad input dim (dim=1)
             size_to_pad = int(model.weight.shape[1] * tgt_src_ratio - model.weight.shape[1])
@@ -74,10 +75,10 @@ def pad_model(model, tp_degree, num_heads_field="num_attention_heads"):
 
         return model
 
-    # We use tgt_src_ratio to figure out how much we have to pad by, but we could also just use n_heads_padded / n_heads?
+    # We use tgt_src_ratio to figure out how much we have to pad by, but we could also just use n_heads_padded/n_heads?
     n_heads = getattr(model.config, num_heads_field)
     n_heads_padded = n_heads + get_number_of_extra_heads(n_heads, tp_degree)
-    
+
     tgt_src_ratio = n_heads_padded / n_heads
 
     return pad_helper(model, tgt_src_ratio)
