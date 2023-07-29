@@ -81,4 +81,6 @@ def pad_model(model, tp_degree, num_heads_field="num_attention_heads"):
 
     tgt_src_ratio = n_heads_padded / n_heads
 
+    setattr(model, num_heads_field, n_heads_padded)  # So calling the wrapper again won't erroneously pad the model
+
     return pad_helper(model, tgt_src_ratio)
