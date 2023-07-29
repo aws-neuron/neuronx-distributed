@@ -85,3 +85,42 @@ def move_model_to_device(model: torch.nn.Module, device: torch.device) -> None:
             )
         if name in seq_parallel_params and not hasattr(param, "sequence_parallel_enabled"):
             setattr(param, "sequence_parallel_enabled", seq_parallel_params[name])
+
+
+def is_torch_version_greater_than_2():
+    return torch.__version__.startswith("2")
+
+
+def is_pjrt_device():
+    return os.environ.get("PJRT_DEVICE", None) == "NEURON"
+
+
+def add_barrier(name=None):
+    if is_torch_version_greater_than_2():
+        torch.distributed.monitored_barrier(group=get_gloo_group_for_barrier())
+    else:
+        xm.rendezvous(name)
+
+
+def cast_tensor(tensor, from_dtype=torch.float32, to_dtype=torch.bfloat16):
+    return tensor.to(dtype=to_dtype) if tensor.dtype == from_dtype else tensor
+
+
+def cast_all(state, from_dtype=torch.float32, to_dtype=torch.bfloat16):
+    if isinstance(state, torch.Tensor):
+        return cast_tensor(state, from_dtype=from_dtype, to_dtype=to_dtype)
+    else:
+        if isinstance(state, dict):
+            new_dict = {}
+            for k in state.keys():
+                new_dict[k] = cast_all(state[k], from_dtype=from_dtype, to_dtype=to_dtype)
+            return new_dict
+        elif isinstance(state, (list, tuple)):
+            return type(state)(cast_all(x, from_dtype=from_dtype, to_dtype=to_dtype) for x in state)
+        else:
+            # We only cast Tensor, list, tuple or dict of tensors.
+            return state
+
+
+def get_local_world_size():
+    return int(os.environ["NEURON_NUM_DEVICES"])
