@@ -75,9 +75,19 @@ import requests
 import gc
 from neuronx_distributed.parallel_layers import parallel_state, layers, grads, checkpointing, move_model_to_device
 
-os.environ["NEURON_CC_FLAGS"] = (
-    os.environ.get("NEURON_CC_FLAGS", "") + " --model-type=transformer"
+from neuronx_distributed.optimizer import NeuronZero1Optimizer
+from neuronx_distributed.parallel_layers import (
+    checkpointing,
+    grads,
+    layers,
+    move_model_to_device,
+    parallel_state,
 )
+from neuronx_distributed.parallel_layers.utils import add_barrier, is_pjrt_device
+
+os.environ["NEURON_CC_FLAGS"] = os.environ.get("NEURON_CC_FLAGS", "") + " --model-type=transformer"
+
+from neuronx_distributed.parallel_layers.parallel_state import set_gloo_group
 
 # For PT autocast.
 torch.cuda.is_bf16_supported = lambda: True
@@ -376,7 +386,9 @@ def get_model(flags):
         )
 
         my_model.cls.predictions.bias = torch.nn.Parameter(torch.zeros(padded_vocab_size))
-        my_model.cls.predictions.decoder = layers.ColumnParallelLinear(my_config.hidden_size, padded_vocab_size, bias=False)
+        my_model.cls.predictions.decoder = layers.ColumnParallelLinear(
+            my_config.hidden_size, padded_vocab_size, bias=False
+        )
 
         my_model.config.vocab_size = padded_vocab_size
 
@@ -924,9 +936,8 @@ if __name__ == "__main__":
     # WORLD_SIZE is set by torchrun
     if os.environ.get("WORLD_SIZE"):
         if is_pjrt_device():
-            import torch_xla.experimental.pjrt_backend
             torch.distributed.init_process_group("xla", init_method="pjrt://")
-            set_gloo_group_for_barrier()
+            set_gloo_group()
         else:
             torch.distributed.init_process_group("xla")
         _mp_fn(0, args)

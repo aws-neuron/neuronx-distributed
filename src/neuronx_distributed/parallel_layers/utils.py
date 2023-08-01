@@ -1,7 +1,72 @@
 import torch
 from typing import List, Sequence
 
-import neuronx_distributed.parallel_layers.layers as layers
+import torch
+import torch_xla.core.xla_model as xm
+
+from neuronx_distributed.parallel_layers.parallel_state import (
+    get_gloo_group,
+    get_tensor_model_parallel_rank,
+)
+
+_MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {
+    "tensor_model_parallel": False,
+    "partition_dim": -1,
+    "partition_stride": 1,
+}
+
+
+class EmbeddingUtility:
+    """Split the vocabulary into `world_size` chunks and return the
+    first and last index of the vocabulary belonging to the `rank`
+    partition: Note that indices in [fist, last)"""
+
+    @staticmethod
+    def range_from_per_partition_vocab_size(per_partition_vocab_size: int, rank, world_size: int) -> Sequence[int]:
+        index_f = rank * per_partition_vocab_size
+        index_l = index_f + per_partition_vocab_size
+        return index_f, index_l
+
+    @staticmethod
+    def range_from_global_vocab_size(global_vocab_size: int, rank: int, world_size: int) -> Sequence[int]:
+        per_partition_vocab_size = divide(global_vocab_size, world_size)
+        return EmbeddingUtility.range_from_per_partition_vocab_size(per_partition_vocab_size, rank, world_size)
+
+
+def param_is_not_tensor_parallel_duplicate(param: torch.Tensor) -> bool:
+    return (hasattr(param, "tensor_model_parallel") and param.tensor_model_parallel) or (
+        get_tensor_model_parallel_rank() == 0
+    )
+
+
+def set_tensor_model_parallel_attributes(tensor: torch.Tensor, is_parallel: bool, dim: int, stride: int = 1) -> None:
+    # Make sure the attributes are not set.
+    for attribute in _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS:
+        assert not hasattr(tensor, attribute)
+    # Set the attributes.
+    setattr(tensor, "tensor_model_parallel", is_parallel)
+    setattr(tensor, "partition_dim", dim)
+    setattr(tensor, "partition_stride", stride)
+
+
+def set_defaults_if_not_set_tensor_model_parallel_attributes(
+    tensor: torch.Tensor,
+) -> None:
+    def maybe_set(attribute, value):
+        if not hasattr(tensor, attribute):
+            setattr(tensor, attribute, value)
+
+    for attribute in _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS:
+        maybe_set(attribute, _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS[attribute])
+
+
+def copy_tensor_model_parallel_attributes(destination_tensor: torch.Tensor, source_tensor: torch.Tensor) -> None:
+    def maybe_copy(attribute):
+        if hasattr(source_tensor, attribute):
+            setattr(destination_tensor, attribute, getattr(source_tensor, attribute))
+
+    for attribute in _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS:
+        maybe_copy(attribute)
 
 
 def ensure_divisibility(numerator, denominator):
@@ -97,7 +162,7 @@ def is_pjrt_device():
 
 def add_barrier(name=None):
     if is_torch_version_greater_than_2():
-        torch.distributed.monitored_barrier(group=get_gloo_group_for_barrier())
+        torch.distributed.monitored_barrier(group=get_gloo_group())
     else:
         xm.rendezvous(name)
 

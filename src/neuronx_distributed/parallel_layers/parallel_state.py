@@ -1,5 +1,9 @@
 import torch
 
+from ..utils.logger import get_logger
+
+logger = get_logger()
+
 # Intra-layer model parallel group that the current rank belongs to.
 _TENSOR_MODEL_PARALLEL_GROUP = None
 _TENSOR_MODEL_PARALLEL_GROUP_SPMD = None
@@ -164,3 +168,81 @@ def destroy_model_parallel():
     _TENSOR_MODEL_PARALLEL_GROUP = None
     global _DATA_PARALLEL_GROUP
     _DATA_PARALLEL_GROUP = None
+    global _PIPELINE_MODEL_PARALLEL_GROUP
+    _PIPELINE_MODEL_PARALLEL_GROUP = None
+    global _PIPELINE_GLOBAL_RANKS
+    _PIPELINE_GLOBAL_RANKS = None
+    global _PIPELINE_MODEL_PARALLEL_GROUP_SPMD
+    _PIPELINE_MODEL_PARALLEL_GROUP_SPMD = None
+    global _NEXT_RANK_GROUP
+    _NEXT_RANK_GROUP = None
+    global _PREV_RANK_GROUP
+    _PREV_RANK_GROUP = None
+    global _NEXT_RANK_GROUP_SPMD
+    _NEXT_RANK_GROUP_SPMD = None
+    global _PREV_RANK_GROUP_SPMD
+    _PREV_RANK_GROUP_SPMD = None
+
+
+def set_gloo_group():
+    global _GLOBAL_GLOO_GROUP
+    if _GLOBAL_GLOO_GROUP is None:
+        _GLOBAL_GLOO_GROUP = torch.distributed.new_group(backend="gloo")
+    else:
+        logger.warning("gloo group is already created, skipping...")
+
+
+def get_gloo_group():
+    if _GLOBAL_GLOO_GROUP is None:
+        raise RuntimeError("Trying to get gloo group when not initialized")
+    return _GLOBAL_GLOO_GROUP
+
+
+def create_pg_with_ranks(ranks):
+    """
+    Create a SPMD process group based on input pp ranks.
+    This can be used to create process group to average grads for shared weights betweenn PP ranks
+    Input:
+    - ranks: a list of ranks that will be used to create the process group
+    """
+    world_size = torch.distributed.get_world_size()
+    world_rank = torch.distributed.get_rank()
+    pipeline_model_parallel_size = get_pipeline_model_parallel_size()
+    num_pipeline_model_parallel_groups = world_size // pipeline_model_parallel_size
+    all_shared_ranks_spmd = []
+
+    # Collect the share ranks for each PP group
+    for i in range(num_pipeline_model_parallel_groups):
+        pp_group_ranks = range(i, world_size, num_pipeline_model_parallel_groups)
+        shared_global_ranks = [pp_group_ranks[k] for k in ranks]
+        all_shared_ranks_spmd.append(shared_global_ranks)
+
+    # For each PP groups, create the same pg for every PP rank.
+    # The pg will only contain the shared ranks
+    # This is because that torch.distributed.new_group requires all processes in main group to enter
+    pp_model_parallel_group_spmd = get_pipeline_model_parallel_group(as_list=True)
+    for ranks, current_shared_ranks in zip(pp_model_parallel_group_spmd, all_shared_ranks_spmd):
+        pg_options = {"xla_pg_options": {"mesh": all_shared_ranks_spmd}}
+        if world_rank in ranks:
+            logger.debug(
+                rmsg(
+                    f"creating pg based on ranks {ranks}, all_shared_ranks_spmd {all_shared_ranks_spmd}, current_shared_ranks {current_shared_ranks}"  # noqa: E501
+                )
+            )
+            group = torch.distributed.new_group(current_shared_ranks, pg_options=pg_options)
+    return group
+
+
+def rmsg(msg):
+    """
+    Return a message with parallel ranking information
+    """
+    try:
+        pp_rank = get_pipeline_model_parallel_rank()
+        tp_rank = get_tensor_model_parallel_rank()
+        dp_rank = get_data_parallel_rank()
+    except AssertionError:
+        # Parallel state is not initialized
+        pp_rank, tp_rank, dp_rank = -1, -1, -1
+    global_rank = torch.distributed.get_rank()
+    return f"[rank_{global_rank}_pp{pp_rank}_tp{tp_rank}_dp{dp_rank}] {msg}"
