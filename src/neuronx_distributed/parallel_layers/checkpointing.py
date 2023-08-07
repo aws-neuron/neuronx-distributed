@@ -1,18 +1,18 @@
 import os
 import gc
-import logging
+
 import torch
 import torch_xla
 import torch_xla.core.xla_model as xm
-import torch_xla.distributed.xla_backend
+
+from ..utils.logger import get_logger
 from .parallel_state import (
     get_data_parallel_rank,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_size,
 )
 
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+logger = get_logger()
 
 
 def ensure_directory_exists(filename: str) -> None:

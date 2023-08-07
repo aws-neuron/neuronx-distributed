@@ -1,5 +1,4 @@
 import gc
-import logging
 import math
 import os
 from typing import Union
@@ -16,9 +15,9 @@ from ..parallel_layers.parallel_state import (
     get_tensor_model_parallel_size,
 )
 from ..parallel_layers.utils import add_barrier, get_local_world_size
+from ..utils.logger import get_logger
 
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+logger = get_logger()
 
 
 class NeuronZero1Optimizer(ZeroRedundancyOptimizer):
