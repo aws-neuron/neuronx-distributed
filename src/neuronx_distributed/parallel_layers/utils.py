@@ -2,6 +2,7 @@ import torch
 from typing import List, Sequence
 
 import torch
+import torch_xla.core.xla_env_vars as xenv
 import torch_xla.core.xla_model as xm
 
 from neuronx_distributed.parallel_layers.parallel_state import (
@@ -188,4 +189,4 @@ def cast_all(state, from_dtype=torch.float32, to_dtype=torch.bfloat16):
 
 
 def get_local_world_size():
-    return int(os.environ["NEURON_NUM_DEVICES"])
+    return xm.xrt_world_size() // int(os.environ[xenv.HOST_WORLD_SIZE])
