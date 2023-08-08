@@ -517,14 +517,14 @@ if __name__ == "__main__":
     world_size = xm.xrt_world_size()
     tensor_model_parallel_size = 1
     while tensor_model_parallel_size <= world_size:
-        # print_separator("test parallel embedding")
-        # test_parallel_embedding(tensor_model_parallel_size)
-        # print_separator("test initialize affine weight")
-        # test_initialize_affine_weight_cpu(tensor_model_parallel_size)
-        # print_separator("test row_parallel_linear with seq_parallel")
-        # test_row_parallel_linear_seq_parallel(tensor_model_parallel_size)
-        # print_separator("test column_parallel_linear with seq_parallel")
-        # test_column_parallel_linear_seq_parallel(tensor_model_parallel_size)
+        print_separator("test parallel embedding")
+        test_parallel_embedding(tensor_model_parallel_size)
+        print_separator("test initialize affine weight")
+        test_initialize_affine_weight_cpu(tensor_model_parallel_size)
+        print_separator("test row_parallel_linear with seq_parallel")
+        test_row_parallel_linear_seq_parallel(tensor_model_parallel_size)
+        print_separator("test column_parallel_linear with seq_parallel")
+        test_column_parallel_linear_seq_parallel(tensor_model_parallel_size)
         print_separator("test padding attention heads")
         test_padding_attention_heads(tensor_model_parallel_size)
         tensor_model_parallel_size *= 2
