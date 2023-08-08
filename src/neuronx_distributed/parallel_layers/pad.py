@@ -21,7 +21,7 @@ def get_number_of_extra_heads(n_head, tp_degree):
     return extra_heads
 
 
-def pad_model(model, tp_degree, num_heads_field="num_attention_heads"):
+def pad_model(model, tp_degree, n_heads):
     """
     Pads a generic model to function to a desired tensor parallelism degree by padding the number of attention heads.
     Returns the original model modified with padding.
@@ -40,13 +40,12 @@ def pad_model(model, tp_degree, num_heads_field="num_attention_heads"):
 
         Then, after initializing the model, you must call this wrapper:
         > model = get_model(config=desired_config)
-        > model = pad_model(model, tp_degree=32)  # Use the model as desired after this point
+        > model = pad_model(model, tp_degree=32, desired_config.num_heads)  # Use the model as desired after this point
 
     Args:
         model (torch.nn.Module): model to be padded
         tp_degree (int): tensor parallel degree
-        num_heads_field (String, *optional*, defaults to 'num_attention_heads'): the name of the field for the number
-             of attention heads in the model config
+        n_heads (int): the number of heads the given model to be padded has. This can typically be found in the config
 
     Returns:
         torch.nn.Module: padded model
@@ -63,24 +62,21 @@ def pad_model(model, tp_degree, num_heads_field="num_attention_heads"):
         if isinstance(model, ColumnParallelLinear):
             # pad output dim (dim=0)
             size_to_pad = int(model.weight.shape[0] * tgt_src_ratio - model.weight.shape[0])
-            model.weight = nn.Parameter(F.pad(model.weight.data.to("cpu"), (0, 0, 0, size_to_pad)))
+            model.weight = nn.Parameter(F.pad(model.weight.data, (0, 0, 0, size_to_pad)))
             if model.bias is not None:  # bias may not always exist
-                model.bias = nn.Parameter(F.pad(model.bias.data.to("cpu"), (0, size_to_pad)))
+                model.bias = nn.Parameter(F.pad(model.bias.data, (0, size_to_pad)))
 
         elif isinstance(model, RowParallelLinear):
             # pad input dim (dim=1)
             size_to_pad = int(model.weight.shape[1] * tgt_src_ratio - model.weight.shape[1])
-            model.weight = nn.Parameter(F.pad(model.weight.data.to("cpu"), (0, size_to_pad)))  # along dim = 1
+            model.weight = nn.Parameter(F.pad(model.weight.data, (0, size_to_pad)))  # along dim = 1
             # ignore bias b/c bias not sharded
 
         return model
 
     # We use tgt_src_ratio to figure out how much we have to pad by, but we could also just use n_heads_padded/n_heads?
-    n_heads = getattr(model.config, num_heads_field)
     n_heads_padded = n_heads + get_number_of_extra_heads(n_heads, tp_degree)
 
     tgt_src_ratio = n_heads_padded / n_heads
-
-    setattr(model, num_heads_field, n_heads_padded)  # So calling the wrapper again won't erroneously pad the model
 
     return pad_helper(model, tgt_src_ratio)

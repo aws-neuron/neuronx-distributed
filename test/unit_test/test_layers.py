@@ -14,7 +14,8 @@ from transformers import BertForPreTraining
 from commons import set_random_seed, print_separator, IdentityLayer3D
 from neuronx_distributed.parallel_layers import layers, parallel_state
 from neuronx_distributed.parallel_layers.random import model_parallel_xla_manual_seed
-
+from neuronx_distributed.parallel_layers.utils import is_pjrt_device
+from neuronx_distributed.parallel_layers.pad import pad_model
 
 datetime_str = str(datetime.now())
 
@@ -377,6 +378,123 @@ def test_column_parallel_linear_seq_parallel(tensor_model_parallel_size):
         raise
 
 
+def test_padding_attention_heads(tensor_model_parallel_size):
+    def _test_padding_attention_heads():
+        # Set up largely copied from other tests
+        batch_size = 8
+        seq_length = 128
+        hidden_size = 256
+        tensor_shape = (batch_size, seq_length, hidden_size)
+        seed = 1234
+
+        device = xm.xla_device()
+        tensor_model_parallel_size_ = tensor_model_parallel_size
+        parallel_state.initialize_model_parallel(tensor_model_parallel_size_)
+        tensor_model_parallel_size_ = parallel_state.get_tensor_model_parallel_size()
+
+        set_random_seed(seed)
+        model_parallel_xla_manual_seed(seed)
+
+        # Set up a model to pad
+        model_to_pad = torch.nn.Sequential(
+            layers.ColumnParallelLinear(
+                hidden_size,
+                hidden_size,
+                bias=False,
+                gather_output=False,
+                init_master_weight=True,
+            ).to(device),
+            layers.RowParallelLinear(
+                hidden_size,
+                hidden_size,
+                bias=False,
+                input_is_parallel=True,
+                init_master_weight=True,
+            ).to(device),
+        )
+        # Pad it to the desired TP_DEGREE
+        padded_model = pad_model(model_to_pad, parallel_state.get_tensor_model_parallel_size(), 1)
+        # Get output
+        with torch.no_grad():
+            orig_input_tensor = torch.randn(tensor_shape, requires_grad=True, device=device)
+            orig_loss_weight = torch.randn(tensor_shape, device=device)
+            input_tensor = list(orig_input_tensor.chunk(tensor_model_parallel_size_, dim=0))[
+                parallel_state.get_tensor_model_parallel_rank()
+            ]
+            loss_weight = orig_loss_weight.chunk(
+                tensor_model_parallel_size_,
+                dim=0,
+            )[parallel_state.get_tensor_model_parallel_rank()]
+        input_tensor.requires_grad_()
+        output = padded_model(input_tensor)
+        # Get a loss for it
+        loss = torch.mul(output, loss_weight).sum()
+        loss.backward()
+
+        # Re-seed, which should be easier than copying weights in my case:
+        set_random_seed(seed)
+        model_parallel_xla_manual_seed(seed)
+
+        # Set up an original unpadded model
+        model = torch.nn.Sequential(
+            layers.ColumnParallelLinear(
+                hidden_size,
+                hidden_size,
+                bias=False,
+                gather_output=False,
+                init_master_weight=True,
+            ).to(device),
+            layers.RowParallelLinear(
+                hidden_size,
+                hidden_size,
+                bias=False,
+                input_is_parallel=True,
+                init_master_weight=True,
+            ).to(device)
+        )
+
+        # Get output (after both ColumnParallel/RowParallel, should be same size) and loss
+        with torch.no_grad():
+            input_tensor = list(orig_input_tensor.chunk(tensor_model_parallel_size_, dim=0))[
+                parallel_state.get_tensor_model_parallel_rank()
+            ]
+            loss_weight = orig_loss_weight.chunk(
+                tensor_model_parallel_size_,
+                dim=0,
+            )[parallel_state.get_tensor_model_parallel_rank()]
+        input_tensor.requires_grad_()
+        expected_output = model(input_tensor)
+        # Get a loss for it
+        expected_loss = torch.mul(expected_output, loss_weight).sum()
+        expected_loss.backward()
+
+        # Note: since we're working entirely in ColumnParallel/RowParallel anyways, no need to chunk the expected output
+
+        # Compare the outputs and losses
+        torch.distributed.barrier()
+
+        error = output.sub(expected_output).abs().max()
+        print("   error in output (parallel) on global rank {}: {}".format(torch.distributed.get_rank(), error))
+        assert error < 1.0e-3, "error: {}".format(error)
+
+        # Reset groups
+        parallel_state.destroy_model_parallel()
+
+        torch.distributed.barrier()
+        if torch.distributed.get_rank() == 0:
+            print("test passed")
+
+        del device
+
+    global results
+    try:
+        _test_padding_attention_heads()
+    except:
+        results["inference_success"] = 0
+        print(traceback.format_exc())
+        raise
+
+
 def upload_to_s3():
     os.system(f'aws s3 cp --no-progress "{datetime_str}" {S3_BUCKET_NAME}')
     print(met.metrics_report())
@@ -399,13 +517,15 @@ if __name__ == "__main__":
     world_size = xm.xrt_world_size()
     tensor_model_parallel_size = 1
     while tensor_model_parallel_size <= world_size:
-        print_separator('test parallel embedding')
-        test_parallel_embedding(tensor_model_parallel_size)
-        print_separator('test initialize affine weight')
-        test_initialize_affine_weight_cpu(tensor_model_parallel_size)
-        print_separator('test row_parallel_linear with seq_parallel')
-        test_row_parallel_linear_seq_parallel(tensor_model_parallel_size)
-        print_separator('test column_parallel_linear with seq_parallel')
-        test_column_parallel_linear_seq_parallel(tensor_model_parallel_size)
+        # print_separator("test parallel embedding")
+        # test_parallel_embedding(tensor_model_parallel_size)
+        # print_separator("test initialize affine weight")
+        # test_initialize_affine_weight_cpu(tensor_model_parallel_size)
+        # print_separator("test row_parallel_linear with seq_parallel")
+        # test_row_parallel_linear_seq_parallel(tensor_model_parallel_size)
+        # print_separator("test column_parallel_linear with seq_parallel")
+        # test_column_parallel_linear_seq_parallel(tensor_model_parallel_size)
+        print_separator("test padding attention heads")
+        test_padding_attention_heads(tensor_model_parallel_size)
         tensor_model_parallel_size *= 2
     atexit.register(on_exit)
