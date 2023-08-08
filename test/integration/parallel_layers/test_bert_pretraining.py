@@ -80,10 +80,10 @@ from neuronx_distributed.parallel_layers import (
     checkpointing,
     grads,
     layers,
-    move_model_to_device,
     parallel_state,
 )
 from neuronx_distributed.parallel_layers.utils import add_barrier, is_pjrt_device
+from neuronx_distributed.utils.model_utils import move_model_to_device
 
 os.environ["NEURON_CC_FLAGS"] = os.environ.get("NEURON_CC_FLAGS", "") + " --model-type=transformer"
 

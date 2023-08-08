@@ -9,7 +9,10 @@ from .layers import param_is_not_tensor_parallel_duplicate
 from .parallel_state import (
     get_data_parallel_group,
     get_data_parallel_size,
+    get_pipeline_model_parallel_group,
+    get_pipeline_model_parallel_size,
     get_tensor_model_parallel_group,
+    get_tensor_model_parallel_size,
     rmsg,
 )
 
@@ -41,6 +44,20 @@ def clip_grad_norm(parameters, max_norm, norm_type=2):
         Total norm of the parameters (viewed as a single vector).
     """
 
+    def _allreduce_norm_across_model_parallel_groups(total_norm, reduce_op):
+        if get_tensor_model_parallel_size() > 1:
+            torch.distributed.all_reduce(
+                total_norm,
+                op=reduce_op,
+                group=get_tensor_model_parallel_group(),
+            )
+        if get_pipeline_model_parallel_size() > 1:
+            torch.distributed.all_reduce(
+                total_norm,
+                op=reduce_op,
+                group=get_pipeline_model_parallel_group(),
+            )
+
     device = xm.xla_device()
 
     if isinstance(parameters, torch.Tensor):
@@ -67,11 +84,7 @@ def clip_grad_norm(parameters, max_norm, norm_type=2):
     if norm_type == inf:
         total_norm = max(grad.abs().max() for grad in grads_for_norm)
         total_norm = torch.FloatTensor([float(total_norm)]).to(device)
-        torch.distributed.all_reduce(
-            total_norm,
-            op=torch.distributed.ReduceOp.MAX,
-            group=get_tensor_model_parallel_group(),
-        )
+        _allreduce_norm_across_model_parallel_groups(total_norm, torch.distributed.ReduceOp.MAX)
         total_norm = total_norm[0].item()
 
     else:
@@ -79,11 +92,7 @@ def clip_grad_norm(parameters, max_norm, norm_type=2):
             grad_norm = torch.norm(grad, norm_type)
             total_norm += grad_norm**norm_type
 
-        torch.distributed.all_reduce(
-            total_norm,
-            op=torch.distributed.ReduceOp.SUM,
-            group=get_tensor_model_parallel_group(),
-        )
+        _allreduce_norm_across_model_parallel_groups(total_norm, torch.distributed.ReduceOp.SUM)
         total_norm = torch.pow(total_norm, 1.0 / norm_type)
 
     # Scale.

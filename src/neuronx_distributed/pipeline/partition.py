@@ -4,7 +4,10 @@ from typing import Any, List, Optional
 import torch
 from torch.fx.passes.split_module import split_module
 
-from neuronx_distributed.parallel_layers.parallel_state import rmsg
+from neuronx_distributed.parallel_layers.parallel_state import (
+    get_pipeline_model_parallel_rank,
+    rmsg,
+)
 from neuronx_distributed.utils.logger import get_logger
 from neuronx_distributed.utils.serialization import TensorMeta
 
@@ -64,7 +67,7 @@ class PipelineIO:
 
 
 def adding_live_obj_for_previous_stages(
-    stage_id_to_IO_input_names, stage_id_2_IO_output_names, obj_name, current_stage
+    stage_id_to_IO_input_names, stage_id_to_IO_output_names, obj_name, current_stage
 ):
     """
     If the object is not from the model input, it must from one of the outputs of previous stages.
@@ -73,26 +76,26 @@ def adding_live_obj_for_previous_stages(
     """
     if current_stage < 0:
         raise RuntimeError(
-            f"{obj_name} is missing from all previous stages, stage_id_2_IO_output_names {stage_id_2_IO_output_names}"  # noqa: E501
+            f"{obj_name} is missing from all previous stages, stage_id_to_IO_output_names {stage_id_to_IO_output_names}"  # noqa: E501
         )
     if (
         obj_name not in stage_id_to_IO_input_names[current_stage]
-        and obj_name not in stage_id_2_IO_output_names[current_stage]
+        and obj_name not in stage_id_to_IO_output_names[current_stage]
     ):
         # This object is from previous stage
         adding_live_obj_for_previous_stages(
-            stage_id_to_IO_input_names, stage_id_2_IO_output_names, obj_name, current_stage - 1
+            stage_id_to_IO_input_names, stage_id_to_IO_output_names, obj_name, current_stage - 1
         )
         # Add the obj as both input and output for current stage
         stage_id_to_IO_input_names[current_stage][obj_name] = PipelineIO(obj_name)
-        stage_id_2_IO_output_names[current_stage][obj_name] = PipelineIO(obj_name)
+        stage_id_to_IO_output_names[current_stage][obj_name] = PipelineIO(obj_name)
     else:
-        if obj_name in stage_id_2_IO_output_names[current_stage]:
+        if obj_name in stage_id_to_IO_output_names[current_stage]:
             # Do nothing, this tensor will be passed to next stage
             return
         else:
             # Object is consumed in this stage, pass it to next stage as well
-            stage_id_2_IO_output_names[current_stage][obj_name] = PipelineIO(obj_name)
+            stage_id_to_IO_output_names[current_stage][obj_name] = PipelineIO(obj_name)
 
 
 def iterate_graph_model_outputs(output_node_args):
@@ -122,7 +125,7 @@ def iterate_graph_model_outputs(output_node_args):
 def analyze_pipeline_module(top_mod):
     """
     Analyze the stage inputs/outputs. Anything with IO in the name requires communication between stages
-    Ouputs:
+    Outputs:
         stage_id_to_IO_input_names(dict): Stage id to a dict mapping IO input names to PipelineIOs.
                                          Inputs sequence is guarantee across PP ranks, so that send/recv will be in same order # noqa: E501
         stage_id_to_model_input_names(dict): Stage id to a dict mapping model input name to the index of current stage input
@@ -139,7 +142,7 @@ def analyze_pipeline_module(top_mod):
 
     curr_stage_id = 0
     stage_id_to_IO_input_names = {}
-    stage_id_2_IO_output_names = {}
+    stage_id_to_IO_output_names = {}
     stage_id_to_model_input_names = {}
     stage_id_to_input_count = {}
     stage_id_to_output_count = {}
@@ -154,7 +157,7 @@ def analyze_pipeline_module(top_mod):
         # Use ordered dict to enforce order when iterating through model inputs/outputs
         # This is required to make the send/recvs between stages
         stage_id_to_IO_input_names[curr_stage_id] = OrderedDict()
-        stage_id_2_IO_output_names[curr_stage_id] = OrderedDict()
+        stage_id_to_IO_output_names[curr_stage_id] = OrderedDict()
         stage_id_to_model_input_names[curr_stage_id] = {}
         stage_id_to_input_count[curr_stage_id] = 0
         stage_id_to_output_count[curr_stage_id] = 0
@@ -165,7 +168,7 @@ def analyze_pipeline_module(top_mod):
                     # From previous stage
                     adding_live_obj_for_previous_stages(
                         stage_id_to_IO_input_names,
-                        stage_id_2_IO_output_names,
+                        stage_id_to_IO_output_names,
                         get_name(node),
                         curr_stage_id - 1,
                     )
@@ -181,24 +184,26 @@ def analyze_pipeline_module(top_mod):
             # Stage output
             elif node.op == "output":
                 for idx, arg in enumerate(iterate_graph_model_outputs(node.args)):
-                    stage_id_2_IO_output_names[curr_stage_id][get_name(arg)] = PipelineIO(get_name(arg), output_idx=idx)
+                    stage_id_to_IO_output_names[curr_stage_id][get_name(arg)] = PipelineIO(
+                        get_name(arg), output_idx=idx
+                    )
                     stage_id_to_output_count[curr_stage_id] += 1
         curr_stage_id += 1
 
     logger.debug(rmsg(f"stage_id_to_IO_input_names {stage_id_to_IO_input_names}"))
-    logger.debug(rmsg(f"stage_id_2_IO_output_names {stage_id_2_IO_output_names}"))
+    logger.debug(rmsg(f"stage_id_to_IO_output_names {stage_id_to_IO_output_names}"))
 
     # Current stage output should align with next stage input
     # We just need to keep one copy, since we do not need last stage output info
     # we keep the stage_id_to_IO_input_names
     for i in range(1, curr_stage_id):
-        if set(stage_id_to_IO_input_names[i].keys()) != set(stage_id_2_IO_output_names[i - 1].keys()):
+        if set(stage_id_to_IO_input_names[i].keys()) != set(stage_id_to_IO_output_names[i - 1].keys()):
             raise RuntimeError(
-                f"Stage {i}'s IO inputs {set(stage_id_to_IO_input_names[i].keys())} does not match stage {i-1}'s output {set(stage_id_2_IO_output_names[i-1].keys())}"  # noqa: E501
+                f"Stage {i}'s IO inputs {set(stage_id_to_IO_input_names[i].keys())} does not match stage {i-1}'s output {set(stage_id_to_IO_output_names[i-1].keys())}"  # noqa: E501
             )
         # Update the output index as the source of the current input io
         for name, io in stage_id_to_IO_input_names[i].items():
-            io.output_idx = stage_id_2_IO_output_names[i - 1][name].output_idx
+            io.output_idx = stage_id_to_IO_output_names[i - 1][name].output_idx
 
     logger.debug(rmsg(f"stage_id_to_model_input_names {stage_id_to_model_input_names}"))
     logger.debug(rmsg(f"stage_id_to_input_count {stage_id_to_input_count}"))
@@ -221,13 +226,16 @@ def analyze_shared_weights_across_stages(top_module, partitions):
     param_to_partition = {p: [] for p in top_module.parameters()}
     for stage, partition in enumerate(partitions):
         for name, p in partition.named_parameters():
-            if p not in param_to_partition:
-                # not shared parameter or shared parameter on first occurance stage
-                # this attr will be use to calculate global grad norm
-                setattr(p, "shared", False)
-            else:
-                # shared parameter on rest stages
-                setattr(p, "shared", True)
+            if stage == get_pipeline_model_parallel_rank():
+                # For the parameters that belong to current pipeline stage
+                # mark if it is shared parameter
+                if len(param_to_partition[p]) == 0:
+                    # not shared parameter or shared parameter on first occurance stage
+                    # this attr will be use to calculate global grad norm
+                    setattr(p, "shared", False)
+                else:
+                    # shared parameter on rest stages
+                    setattr(p, "shared", True)
             param_to_partition[p].append((name, stage))
     shared_weights = []
     for weights in param_to_partition.values():

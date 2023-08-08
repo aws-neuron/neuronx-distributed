@@ -1,18 +1,22 @@
+import inspect
 import math
 from abc import ABC
 from types import ModuleType
 from typing import Any, Callable, List, Optional, Union
 
 import torch
+import torch_xla.core.xla_model as xm
 from torch import nn
-from transformers import PreTrainedModel
-from transformers.utils.fx import HFTracer, get_concrete_args
 
 import neuronx_distributed
 from neuronx_distributed import parallel_layers
 from neuronx_distributed.parallel_layers import PARALLEL_FUNCTIONS, PARALLEL_MODULES
 from neuronx_distributed.parallel_layers.parallel_state import rmsg
 from neuronx_distributed.utils.logger import get_logger
+from neuronx_distributed.utils.model_utils import (
+    is_hf_pretrained_model,
+    is_hf_transformers_available,
+)
 
 logger = get_logger()
 
@@ -29,14 +33,17 @@ class NxDTracer(ABC):
         return is_leaf
 
 
-class HFTracerWrapper(NxDTracer, HFTracer):
-    def __init__(self, **config) -> None:
-        super().__init__(
-            autowrap_modules=config["autowrap_modules"],
-            autowrap_functions=config["autowrap_functions"],
-        )
-        self.leaf_modules = config.get("leaf_modules", ())
-        self.name = "HF"
+if is_hf_transformers_available():
+    from transformers.utils.fx import HFTracer
+
+    class HFTracerWrapper(NxDTracer, HFTracer):
+        def __init__(self, **config) -> None:
+            super().__init__(
+                autowrap_modules=config["autowrap_modules"],
+                autowrap_functions=config["autowrap_functions"],
+            )
+            self.leaf_modules = config.get("leaf_modules", ())
+            self.name = "HF"
 
 
 class TorchTracerWrapper(NxDTracer, torch.fx.Tracer):
@@ -59,10 +66,24 @@ class TorchTracerWrapper(NxDTracer, torch.fx.Tracer):
         self.name = "pytorch"
 
 
+def get_concrete_args(model: nn.Module, input_names: List[str]):
+    sig = inspect.signature(model.forward)
+
+    if not (set(input_names) <= set(sig.parameters.keys())):
+        formatted_input_names = input_names[0] if len(input_names) == 1 else ", ".join(input_names)
+        formatted_allowed_input_names = ", ".join(sig.parameters.keys())
+        raise ValueError(
+            f"The model does not have input(s) named: {formatted_input_names}, expected a subset of the following:"
+            f" {formatted_allowed_input_names}"
+        )
+
+    return {p.name: p.default for p in sig.parameters.values() if p.name not in input_names}
+
+
 def get_tracer_class(model, tracer_cls=None):
     # Get the right tracer
     if tracer_cls is None:
-        if isinstance(model, PreTrainedModel):
+        if is_hf_pretrained_model(model):
             tracer_cls = HFTracerWrapper
         else:
             tracer_cls = TorchTracerWrapper
@@ -70,18 +91,17 @@ def get_tracer_class(model, tracer_cls=None):
         if isinstance(tracer_cls, str):
             if tracer_cls == "torch":
                 tracer_cls = TorchTracerWrapper
-            elif tracer_cls == "hf":
+            elif tracer_cls == "hf" and is_hf_transformers_available():
                 tracer_cls = HFTracerWrapper
             else:
                 raise ValueError(f"Unsupported tracer_cls {tracer_cls}")
-        else:
-            return tracer_cls
+    return tracer_cls
 
 
 def trace_model(
     model: nn.Module,
     input_names: Optional[List[str]] = None,
-    tracer_cls: Union[torch.fx.Tracer, str] = None,
+    tracer_cls: Union[Any, str] = None,
     leaf_modules: Optional[List[Any]] = None,
     autowrap_functions: Optional[List[Callable]] = None,
     autowrap_modules: Optional[List[ModuleType]] = None,
@@ -90,7 +110,7 @@ def trace_model(
 
     if input_names is None:
         logger.warning(f"Getting input_names None. It is recommending to set up input names for tracing.")
-        if isinstance(model, PreTrainedModel):
+        if is_hf_pretrained_model(model):
             input_names = model.dummy_inputs.keys()
         else:
             input_names = []
@@ -111,7 +131,7 @@ def trace_model(
     # Everything from these modules will be skipped for tracing
     if autowrap_modules is None:
         autowrap_modules = []
-    autowrap_modules.extend([math, neuronx_distributed, parallel_layers])
+    autowrap_modules.extend([math, neuronx_distributed, parallel_layers, xm])
     autowrap_modules = tuple(set(autowrap_modules))
 
     logger.debug(rmsg(f"leaf_modules {leaf_modules}"))
@@ -126,7 +146,7 @@ def trace_model(
     traced_graph = tracer.trace(model, concrete_args=concrete_args)
     traced_model = torch.fx.GraphModule(model, traced_graph)
 
-    if isinstance(model, PreTrainedModel):
+    if is_hf_pretrained_model(model):
         traced_model.config = model.config
         # The model class must be stored as an attribute to allow model deserialization, which uses trace, and thus
         # _generate_dummy_input, where the model class is needed.
@@ -140,7 +160,7 @@ def trace_model(
     traced_model.recompile()
 
     # Remove the meta tensors created by HF tracer
-    for name in dict(traced_model.named_buffers()):
-        if "tensor_constant" in name and hasattr(traced_model, name):
+    for name, buffer in dict(traced_model.named_buffers()).items():
+        if "_tensor_constant" in name and hasattr(traced_model, name) and buffer.device == torch.device("meta"):
             traced_model.__delattr__(name)  # pylint: disable=unnecessary-dunder-call
     return traced_model

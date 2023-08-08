@@ -139,10 +139,25 @@ class InferenceSchedule(PipeSchedule):
 
 
 class TrainSchedule(PipeSchedule):
-    """A schedule for training a batch using pipeline parallelism."""
+    """
+    1F1B schedule for training a batch using pipeline parallelism.
+    Schedule is created by first assuming that even stage is doing 1F1B and odd stage is doing 1B1F
+    without any idle time. Each step will be assigned with either fwd or bwd task. For the steps where
+    a certain stage is supposed to be idle, we feed a invalid microbatch id to it. An example of
+    pipeline exection with PP4 MB6 will be like
+    Steps 0   1   2   3   4   5   6   7   8   9   10   11   12   13   14   15   16   17
+    PP0   F0  IB  F1  IB  F2  IB  F3  B0  F4  B1  F5   B2   IF   B3   IF   B4   IF   B5
+    PP1   IB  F0  IB  F1  IB  F2  B0  F3  B1  F4  B2   F5   B3   IF   B4   IF   B5   IF
+    PP2   IF  IB  F0  IB  F1  B0  F2  B1  F3  B2  F4   B3   F5   B4   IF   B5   IF   IB
+    PP3   IB  IF  IB  F0  B0  F1  B1  F2  B2  F3  B3   F4   B4   F5   B5   IF   IB   IF
+    Where IB/IF means fake bwd/fwd with invalid microbatch ids, i.e. bubbles
+    Referred from https://github.com/microsoft/DeepSpeed/blob/master/deepspeed/runtime/pipe/schedule.py#L189
+    """
 
     def steps(self):
         prev_micro_batch_id = -1
+        # 2 * self.micro_batches for fwd+bwd steps
+        # 2 * (self.stages - 1) for bubbles
         total_steps = 2 * (self.micro_batches + self.stages - 1)
         for step_id in range(total_steps):
             # Map the step of the pipeline to the micro-batch id and also whether it is a
@@ -157,6 +172,8 @@ class TrainSchedule(PipeSchedule):
                 if self._valid_micro_batch(micro_batch_id):
                     cmds.append(ForwardPreprocessTask(micro_batch_id))
             else:
+                # Once enter the 1F1B steady states
+                # Need to recv bwd before sending fwd to avoid hanging
                 if self._valid_micro_batch(micro_batch_id) and self._valid_stage(self.next_stage):
                     cmds.append(BackwardPreprocessTask(micro_batch_id))
                 if self._valid_micro_batch(prev_micro_batch_id) and self._valid_stage(self.next_stage):
@@ -178,6 +195,42 @@ class TrainSchedule(PipeSchedule):
             yield cmds
 
     def _step_to_micro_batch(self, step_id):
+        """
+        This function calculate the microbatch id for each step based on the 1F1B schedule.
+        The microbatch id is calculated from step_id, stage_id and total # stages
+        For even stages, scheduler will assume it is doing 1F1B, so even step will be fwd otherwise bwd
+        For odd stages, scheduler assumes 1B1F so even step will be bwd and odd step will be fwd
+        The equation to calculate microbatch id:
+            microbatch_id = base_microbatch_id - offset
+            base_microbatch_id: microbatch id with the assumption that there is no invalid microbatches
+            offset: the # invalid microbatches until the first valid microbatch
+        Now we discuss how to calculate each for both forward and backward steps
+        - forward steps
+          - base = step_id // 2 as the nature of pipeline execution, base = (step_id-1) // 2 for
+            odd stages to make it divisible
+          - offset = stage_id // 2 which equals to the # extra mbs first stage need to run
+            until current stage can start first valid mb
+        - backward steps
+          - base = step_id // 2 as the nature of pipeline execution, base = (step_id-1) // 2 for
+            odd stages to make it divisible
+          - offset = #invalid_forward_mbs + #warmup_mbs(i.e. # mbs need to run before 1F1B steady state)
+            #warmup_mbs = #stage - stage_id - 1 (from #stage-1 to 0 starting from 0th stage)
+            #invalid_forward_mbs = stage_id // 2 from fwd steps calculation
+            But be careful, odd stages has an extra offset since it is starting with an invalid bwd step
+        As a result
+        - even step, even stage_id, fwd
+            micro_batch_id = step_id // 2 - stage_id // 2
+        - even step, odd stage_id, bwd
+            micro_batch_id = step_id // 2 - (#stage - stage_id - 1) - stage_id // 2 - 1
+              = step_id // 2 - #stage + stage_id + 1 - stage_id // 2 - 1
+              = step_id // 2 - #stage + (stage_id + 1) // 2
+        - odd step, even stage_id, bwd
+            micro_batch_id = (step_id-1) // 2 - (#stage - stage_id - 1) - stage_id // 2
+              = (step_id-1) // 2 - #stage + stage_id + 1 - stage_id // 2
+              = (step_id-1) // 2 - #stage + stage_id // 2 + 1
+        - odd step, odd stage_id, fwd
+            micro_batch_id = (step_id-1) // 2 - stage_id // 2
+        """
         if _is_even(step_id) and _is_even(self.stage_id):
             micro_batch_id = self._even_step_forward_id(step_id)
             is_forward = True
@@ -215,8 +268,8 @@ class TrainSchedule(PipeSchedule):
         return micro_batch_id
 
     def _odd_step_backward_id(self, step_id):
-        base = ((step_id - 1) // 2) - self.stages + 1
-        micro_batch_id = int(base + self.stage_id // 2)
+        base = (step_id - 1) // 2
+        micro_batch_id = int(base - self.stages + 1 + self.stage_id // 2)
         return micro_batch_id
 
 

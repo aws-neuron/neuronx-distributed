@@ -1,2 +1,1 @@
-from . import parallel_layers
-from . import trace
+from . import parallel_layers, pipeline, trace, utils

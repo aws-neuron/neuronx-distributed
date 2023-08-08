@@ -108,51 +108,6 @@ def split_tensor_along_last_dim(
     return tensor_list
 
 
-class EmbeddingUtility:
-    """Split the vocabulary into `world_size` chunks and return the
-    first and last index of the vocabulary belonging to the `rank`
-    partition: Note that indices in [fist, last)"""
-
-    @staticmethod
-    def range_from_per_partition_vocab_size(
-        per_partition_vocab_size: int, rank, world_size: int
-    ) -> Sequence[int]:
-        index_f = rank * per_partition_vocab_size
-        index_l = index_f + per_partition_vocab_size
-        return index_f, index_l
-
-    @staticmethod
-    def range_from_global_vocab_size(
-        global_vocab_size: int, rank: int, world_size: int
-    ) -> Sequence[int]:
-        per_partition_vocab_size = divide(global_vocab_size, world_size)
-        return EmbeddingUtility.range_from_per_partition_vocab_size(
-            per_partition_vocab_size, rank, world_size
-        )
-
-
-def move_model_to_device(model: torch.nn.Module, device: torch.device) -> None:
-    tp_params = {}
-    seq_parallel_params = {}
-    for name, param in model.named_parameters():
-        if hasattr(param, "tensor_model_parallel"):
-            tp_params[name] = {
-                "is_parallel": param.tensor_model_parallel,
-                "partition_dim": param.partition_dim,
-                "stride": param.partition_stride,
-            }
-        if hasattr(param, "sequence_parallel_enabled"):
-            seq_parallel_params[name] = param.sequence_parallel_enabled
-    model.to(device)
-    for name, param in model.named_parameters():
-        if name in tp_params and not hasattr(param, "tensor_model_parallel"):
-            layers.set_tensor_model_parallel_attributes(
-                param, *tp_params[name].values()
-            )
-        if name in seq_parallel_params and not hasattr(param, "sequence_parallel_enabled"):
-            setattr(param, "sequence_parallel_enabled", seq_parallel_params[name])
-
-
 def is_torch_version_greater_than_2():
     return torch.__version__.startswith("2")
 
