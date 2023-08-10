@@ -936,6 +936,7 @@ if __name__ == "__main__":
     # WORLD_SIZE is set by torchrun
     if os.environ.get("WORLD_SIZE"):
         if is_pjrt_device():
+            import torch_xla.experimental.pjrt_backend # noqa
             torch.distributed.init_process_group("xla", init_method="pjrt://")
             set_gloo_group()
         else:
