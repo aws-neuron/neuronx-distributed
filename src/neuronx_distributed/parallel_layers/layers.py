@@ -166,8 +166,6 @@ class ParallelEmbedding(torch.nn.Module):
         # Keep the input dimensions.
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
-        # Set the detauls for compatibility.
-        self.padding_idx = padding_idx
         self.max_norm = max_norm
         self.norm_type = norm_type
         self.scale_grad_by_freq = scale_grad_by_freq
@@ -183,6 +181,11 @@ class ParallelEmbedding(torch.nn.Module):
             self.tensor_model_parallel_size,
         )
         self.num_embeddings_per_partition = self.end_index - self.start_index
+        # only pad idx when it is in range
+        if padding_idx and padding_idx >= self.start_index and padding_idx < self.end_index:
+            self.padding_idx = padding_idx - self.start_index
+        else:
+            self.padding_idx = None
 
         # Allocate weights and initialize.
         if device is None or device.type == "cpu":
