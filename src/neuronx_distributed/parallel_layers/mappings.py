@@ -198,6 +198,24 @@ class _GatherFromModelParallelRegion(torch.autograd.Function):
         return _split_along_last_dim(grad_output)
 
 
+class _ScatterToSequenceParallelRegion(torch.autograd.Function):
+    """Split the input and keep only the corresponding chunk to the rank."""
+
+    # FIXME(mkozuki): Definition of static symbolic methods don't look correct according to
+    # https://pytorch.org/docs/stable/onnx.html#static-symbolic-method
+    @staticmethod
+    def symbolic(graph, input_):
+        return _split_along_first_dim(input_)
+
+    @staticmethod
+    def forward(ctx, input_):
+        return _split_along_first_dim(input_)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return _gather_along_first_dim(grad_output)
+
+
 class _GatherFromSequenceParallelRegion(torch.autograd.Function):
     """Gather the input from sequence parallel region and concatenate."""
 
@@ -257,6 +275,10 @@ def scatter_to_tensor_model_parallel_region(input_):
 
 def gather_from_tensor_model_parallel_region(input_):
     return _GatherFromModelParallelRegion.apply(input_)
+
+
+def scatter_to_sequence_parallel_region(input_: torch.Tensor) -> torch.Tensor:
+    return _ScatterToSequenceParallelRegion.apply(input_)
 
 
 def gather_from_sequence_parallel_region(input_, to_model_parallel=True):
