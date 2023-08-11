@@ -1,6 +1,7 @@
 from torch import nn
 from torch.nn import functional as F
 from neuronx_distributed.parallel_layers.layers import ColumnParallelLinear, RowParallelLinear
+from neuronx_distributed.utils.model_utils import is_hf_pretrained_model
 
 
 def get_number_of_extra_heads(n_head, tp_degree):
@@ -56,7 +57,7 @@ def pad_model(model, tp_degree, n_heads):
             pad_helper(module, tgt_src_ratio)
 
         # Note: many models don't use split_size to split the heads after fusing, but they still keep the field
-        if hasattr(model, "split_size"):
+        if is_hf_model and hasattr(model, "split_size"):
             model.split_size = int(model.split_size * tgt_src_ratio)
 
         if isinstance(model, ColumnParallelLinear):
@@ -73,6 +74,9 @@ def pad_model(model, tp_degree, n_heads):
             # ignore bias b/c bias not sharded
 
         return model
+
+    # must do here b/c attn layer (which contains split size) does not inherit from PreTrainedModel
+    is_hf_model = is_hf_pretrained_model(model)
 
     # We use tgt_src_ratio to figure out how much we have to pad by, but we could also just use n_heads_padded/n_heads?
     n_heads_padded = n_heads + get_number_of_extra_heads(n_heads, tp_degree)
