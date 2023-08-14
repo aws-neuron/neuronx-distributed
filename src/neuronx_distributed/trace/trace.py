@@ -2,7 +2,7 @@ import os
 import concurrent.futures
 import multiprocessing
 import pathlib
-from typing import Any, Callable, Dict, Iterable, List, Optional, Union
+from typing import Any, Callable, Iterable, List, Optional, Union
 import torch
 import torch_neuronx
 import torch_xla.core.xla_model as xm
@@ -93,7 +93,7 @@ def _trace(
                 compiler_args,
                 options,
             )
-            mp_q.put((neff_filename, metaneff, flattener, packer, example_inputs, input_output_alias))
+            mp_q.put((neff_filename, metaneff, flattener, packer, example_inputs, input_output_alias, rank))
     xm.rendezvous("compilation-done")
 
 
@@ -153,7 +153,12 @@ def parallel_model_trace(
         start_method="spawn",
         nprocs=tp_degree,
     )
-    models = [torch_neuronx.xla_impl.trace.create_neuron_model(*mp_q.get()) for _ in range(tp_degree)]
+    models = [None] * tp_degree
+    while not mp_q.empty():
+        neff_filename, metaneff, flattener, packer, example_inputs, input_output_alias, rank = mp_q.get()
+        models[rank] = torch_neuronx.xla_impl.trace.create_neuron_model(
+            neff_filename, metaneff, flattener, packer, example_inputs, input_output_alias
+        )
     return TensorParallelNeuronModel(models)
 
 
