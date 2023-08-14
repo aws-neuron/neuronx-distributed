@@ -200,9 +200,6 @@ class _GatherFromModelParallelRegion(torch.autograd.Function):
 
 class _ScatterToSequenceParallelRegion(torch.autograd.Function):
     """Split the input and keep only the corresponding chunk to the rank."""
-
-    # FIXME(mkozuki): Definition of static symbolic methods don't look correct according to
-    # https://pytorch.org/docs/stable/onnx.html#static-symbolic-method
     @staticmethod
     def symbolic(graph, input_):
         return _split_along_first_dim(input_)
