@@ -1,2 +1,4 @@
 build
 .vscode/
+.attach_pid*
+src/neuronx_distributed.egg-info/
