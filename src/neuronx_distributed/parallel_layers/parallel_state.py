@@ -86,6 +86,45 @@ def initialize_model_parallel(tensor_model_parallel_size: int = 1) -> None:
         if rank in ranks:
             _TENSOR_MODEL_PARALLEL_GROUP = group
 
+    # Build the pipeline model-parallel groups.
+    global _PIPELINE_MODEL_PARALLEL_GROUP
+    global _PIPELINE_GLOBAL_RANKS
+    global _PIPELINE_MODEL_PARALLEL_GROUP_SPMD
+    assert _PIPELINE_MODEL_PARALLEL_GROUP is None, "pipeline model parallel group is already initialized"
+    all_pipeline_parallel_group_ranks = []
+    for i in range(num_pipeline_model_parallel_groups):
+        ranks = range(i, world_size, num_pipeline_model_parallel_groups)
+        all_pipeline_parallel_group_ranks.append(list(ranks))
+    _PIPELINE_MODEL_PARALLEL_GROUP_SPMD = all_pipeline_parallel_group_ranks
+    for ranks in _PIPELINE_MODEL_PARALLEL_GROUP_SPMD:
+        pg_options = {"xla_pg_options": {"mesh": _PIPELINE_MODEL_PARALLEL_GROUP_SPMD}}
+        if rank in ranks:
+            group = torch.distributed.new_group(ranks, pg_options=pg_options)
+            _PIPELINE_MODEL_PARALLEL_GROUP = group
+            _PIPELINE_GLOBAL_RANKS = ranks
+
+    global _NEXT_RANK_GROUP_SPMD
+    global _PREV_RANK_GROUP_SPMD
+    global _NEXT_RANK_GROUP
+    global _PREV_RANK_GROUP
+    parity = bool(get_pipeline_model_parallel_rank() % 2)
+    _NEXT_RANK_GROUP_SPMD = get_pipeline_model_parallel_sr_group(parity)
+    _PREV_RANK_GROUP_SPMD = get_pipeline_model_parallel_sr_group(not parity)
+    for ranks in _NEXT_RANK_GROUP_SPMD:
+        pg_options = {"xla_pg_options": {"mesh": _NEXT_RANK_GROUP_SPMD}}
+        if rank in ranks:
+            group = torch.distributed.new_group(ranks, pg_options=pg_options)
+            _NEXT_RANK_GROUP = group
+    for ranks in _PREV_RANK_GROUP_SPMD:
+        pg_options = {"xla_pg_options": {"mesh": _PREV_RANK_GROUP_SPMD}}
+        if rank in ranks:
+            group = torch.distributed.new_group(ranks, pg_options=pg_options)
+            _PREV_RANK_GROUP = group
+    if torch.distributed.get_rank() == 0:
+        logger.debug(rmsg(f"_PIPELINE_MODEL_PARALLEL_GROUP_SPMD {_PIPELINE_MODEL_PARALLEL_GROUP_SPMD}"))
+        logger.debug(rmsg(f"_TENSOR_MODEL_PARALLEL_GROUP_SPMD {_TENSOR_MODEL_PARALLEL_GROUP_SPMD}"))
+        logger.debug(rmsg(f"_DATA_PARALLEL_GROUP_SPMD {_DATA_PARALLEL_GROUP_SPMD}"))
+
 
 def model_parallel_is_initialized():
     """Check if model and data parallel groups are initialized."""
@@ -231,6 +270,18 @@ def create_pg_with_ranks(ranks):
             )
             group = torch.distributed.new_group(current_shared_ranks, pg_options=pg_options)
     return group
+
+
+def gather_python_object(obj, group):
+    """
+    Eagerly gather python object for a group
+    Usually used to collect timeline events
+    """
+    object_gather_list = None
+    if torch.distributed.get_rank(group=group) == 0:
+        object_gather_list = [None] * torch.distributed.get_world_size(group=group)
+    torch.distributed.gather_object(obj, object_gather_list=object_gather_list, group=group)
+    return object_gather_list
 
 
 def rmsg(msg):

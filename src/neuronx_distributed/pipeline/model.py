@@ -24,6 +24,7 @@ from neuronx_distributed.pipeline.partition import (
     partition_traced_model,
 )
 from neuronx_distributed.pipeline.scheduler import InferenceSchedule, TrainSchedule
+from neuronx_distributed.pipeline.timeline import PPTimeline
 from neuronx_distributed.pipeline.trace import trace_model
 from neuronx_distributed.utils.logger import get_logger
 from neuronx_distributed.utils.model_utils import (
@@ -53,6 +54,7 @@ class NxDPPModel(nn.Module):
         autowrap_functions: Optional[Tuple[ModuleType]] = None,
         autowrap_modules: Optional[Tuple[Callable, ...]] = None,
         tracer_cls: Optional[Union[str, Any]] = None,
+        trace_file_path: Optional[str] = None,
     ):
         """
         Model wrapper to run pipeline parallelism
@@ -138,6 +140,7 @@ class NxDPPModel(nn.Module):
         self.pipeline_parallel_size = parallel_state.get_pipeline_model_parallel_size()
         self.pipeline_parallel_rank = parallel_state.get_pipeline_model_parallel_rank()
         self.serialization_manager = SerializationManager()
+        self.timeline = PPTimeline(trace_file_path, self.pipeline_parallel_rank)
         self.input_names = None
 
         # Outputs from analyze_pipeline_module
@@ -422,6 +425,7 @@ class NxDPPModel(nn.Module):
         self._exec_schedule(self.train_scheduler)
         loss = self._process_loss()
         self.clear_minibatch_state()
+        self.timeline.mark_step_end()
         return loss
 
     def run_eval(self, **kwargs):
@@ -433,6 +437,7 @@ class NxDPPModel(nn.Module):
             self._exec_schedule(self.eval_scheduler)
             loss = self._process_loss()
             self.clear_minibatch_state()
+            self.timeline.mark_step_end()
             return loss
 
     def get_batch_iterator(self, batch: List[torch.Tensor]):
@@ -500,6 +505,7 @@ class NxDPPModel(nn.Module):
         - Collect loss for the last pipeline stage
         - Collect the outputs that require grad for bwd
         """
+        self.timeline.mark_event_start(f"mb_{self.current_mb}_ForwardStepTask")
         if not self.tracing:
             if self.current_mb_stage_input is None:
                 raise RuntimeError(rmsg("Running ForwardStepTask but current_mb_stage_input is None"))
@@ -519,10 +525,12 @@ class NxDPPModel(nn.Module):
         self.current_mb_stage_input = None
 
         # Run local pipeline stage
+        self.timeline.mark_event_start(f"mb_{self.current_mb}_ForwardStep")
         outputs = self.local_module(*inputs)
 
         if not self.tracing:
             self._mark_step()
+        self.timeline.mark_event_end(f"mb_{self.current_mb}_ForwardStep")
 
         if self.pipeline_parallel_rank == self.pipeline_parallel_size - 1:
             # [TODO] Add inference support
@@ -562,17 +570,22 @@ class NxDPPModel(nn.Module):
                         # Current stage output and next stage input should match exactly
                         if self.training and t.requires_grad:
                             self.mb_to_outputs_for_grads[self.current_mb].append(t)
+        self.timeline.mark_event_end(f"mb_{self.current_mb}_ForwardStepTask")
 
     def _bwd_step_task(self):
         """
         Major duties of for this task:
         - Run current stage forward step for current mb
         """
+        self.timeline.mark_event_start(f"mb_{self.current_mb}_BackwardStepTask")
         # Last pipeline stage will directly do backprop from loss
         if self.pipeline_parallel_rank == self.pipeline_parallel_size - 1:
+            self.timeline.mark_event_start(f"mb_{self.current_mb}_BackwardStep")
             scaled_loss = self.losses[self.current_mb] / self.num_microbatches
             scaled_loss.backward()
             self._mark_step()
+            self.timeline.mark_event_end(f"mb_{self.current_mb}_BackwardStep")
+            self.timeline.mark_event_end(f"mb_{self.current_mb}_BackwardStepTask")
             return
 
         if self.current_mb_grads is None:
@@ -589,9 +602,12 @@ class NxDPPModel(nn.Module):
         self.current_mb_grads = None
         outputs = self.mb_to_outputs_for_grads.pop(self.current_mb)
 
+        self.timeline.mark_event_start(f"mb_{self.current_mb}_BackwardStep")
         # Run local pipeline stage
         torch.autograd.backward(outputs, grad_tensors=grads)
         self._mark_step()
+        self.timeline.mark_event_end(f"mb_{self.current_mb}_BackwardStep")
+        self.timeline.mark_event_end(f"mb_{self.current_mb}_BackwardStepTask")
 
     def _fwd_preprocess_task(self):
         """
@@ -603,6 +619,7 @@ class NxDPPModel(nn.Module):
         - Collect the inputs that require grad for bwd
         - Collect the inputs that will pass along this stage
         """
+        self.timeline.mark_event_start(f"mb_{self.current_mb}_ForwardPreprocessTask")
         if not self.tracing:
             if self.current_mb_stage_input is not None:
                 raise RuntimeError(rmsg("Running ForwardPreprocessTask but current_mb_stage_input is not None"))
@@ -617,11 +634,14 @@ class NxDPPModel(nn.Module):
 
         # Get the model inputs from model_inputs_iter
         if self.model_inputs_iter is not None:
+            self.timeline.mark_event_start(f"mb_{self.current_mb}_ForwardFetchInput")
             model_inputs = next(self.model_inputs_iter)
             for name, idx in self.stage_id_to_model_input_names[self.pipeline_parallel_rank].items():
                 inputs[idx] = model_inputs[self.input_name_to_iter_idx[name]]
+            self.timeline.mark_event_end(f"mb_{self.current_mb}_ForwardFetchInput")
 
         for name, inp in self.stage_id_to_IO_input_names[self.pipeline_parallel_rank].items():
+            self.timeline.mark_event_start(f"mb_{self.current_mb}_ForwardRecv_{name}")
             if not self.shape_traced:
                 # Suppose to receive List(TensorMeta), python obj
                 tensor_meta, py_obj = recv_python_object()
@@ -648,7 +668,9 @@ class NxDPPModel(nn.Module):
             ):
                 # Pass along
                 self.current_mb_pass_along_io[name] = inp_reconstructed
+            self.timeline.mark_event_end(f"mb_{self.current_mb}_ForwardRecv_{name}")
         self.current_mb_stage_input = (tuple(inputs), self.current_mb)
+        self.timeline.mark_event_end(f"mb_{self.current_mb}_ForwardPreprocessTask")
 
     def _fwd_postprocess_task(self):
         """
@@ -659,6 +681,7 @@ class NxDPPModel(nn.Module):
         # Last stage do not need to send
         if self.pipeline_parallel_rank == self.pipeline_parallel_size - 1:
             return
+        self.timeline.mark_event_start(f"mb_{self.current_mb}_ForwardPostprocessTask")
 
         if not self.tracing:
             if self.current_mb_stage_output is None:
@@ -683,6 +706,7 @@ class NxDPPModel(nn.Module):
 
         current_stage_output_IO = self.stage_id_to_IO_input_names[self.pipeline_parallel_rank + 1]
         for name, out in current_stage_output_IO.items():
+            self.timeline.mark_event_start(f"mb_{self.current_mb}_ForwardSend_{name}")
             if out.output_idx is not None:
                 # Current stage outputs
                 current_output = outputs[out.output_idx]
@@ -700,14 +724,17 @@ class NxDPPModel(nn.Module):
             for idx, t in enumerate(tx_list):
                 logger.debug(rmsg(f"fwd mb {self.current_mb} send {name}'s {idx}th tensor meta {tensor_meta[idx]}"))
                 self.send_op(t, tracing=self.tracing)
+            self.timeline.mark_event_end(f"mb_{self.current_mb}_ForwardSend_{name}")
         if len(self.current_mb_pass_along_io) != 0:
             raise RuntimeError(f"Unprocessed passing along io: {self.current_mb_pass_along_io.keys()}")
+        self.timeline.mark_event_end(f"mb_{self.current_mb}_ForwardPostprocessTask")
 
     def _bwd_preprocess_task(self):
         """
         Major duties of for this task:
         - Receive the grads for current mb backprop
         """
+        self.timeline.mark_event_start(f"mb_{self.current_mb}_BackwardPreprocessTask")
         # Last stage do not need to recv
         if self.pipeline_parallel_rank == self.pipeline_parallel_size - 1:
             return None, None
@@ -722,17 +749,21 @@ class NxDPPModel(nn.Module):
         grads = []
         current_mb_outputs = self.mb_to_outputs_for_grads[self.current_mb]
         logger.debug(rmsg(f"bwd mb {self.current_mb} recv grads count {len(current_mb_outputs)}"))
-        for t in current_mb_outputs:
+        for idx, t in enumerate(current_mb_outputs):
+            self.timeline.mark_event_start(f"mb_{self.current_mb}_BackwardRecv_{idx}")
             meta = TensorMeta(tensor_index=-1, dtype=t.dtype, shape=t.size(), requires_grad=False, device=t.device)
             logger.debug(rmsg(f"bwd mb {self.current_mb} recv grad meta {meta}"))
             grads.append(self.recv_op(meta, recv_prev=False))
+            self.timeline.mark_event_end(f"mb_{self.current_mb}_BackwardRecv_{idx}")
         self.current_mb_grads = (grads, self.current_mb)
+        self.timeline.mark_event_end(f"mb_{self.current_mb}_BackwardPreprocessTask")
 
     def _bwd_postprocess_task(self):
         """
         Major duties of for this task:
         - Send grads for previous rank for backprop
         """
+        self.timeline.mark_event_start(f"mb_{self.current_mb}_BackwardPostprocessTask")
         if len(self.mb_to_inputs_for_grads[self.current_mb]) == 0:
             raise RuntimeError(
                 "Running BackwardPostprocessTask but mb_to_inputs_for_grads does not contain inputs for current mb"
@@ -740,11 +771,14 @@ class NxDPPModel(nn.Module):
 
         current_mb_inputs = self.mb_to_inputs_for_grads.pop(self.current_mb)
         logger.debug(rmsg(f"bwd mb {self.current_mb} send grads count {len(current_mb_inputs)}"))
-        for t in current_mb_inputs:
+        for idx, t in enumerate(current_mb_inputs):
+            self.timeline.mark_event_start(f"mb_{self.current_mb}_BackwardSend_{idx}")
             if not t.requires_grad or t.grad is None:
                 raise RuntimeError(rmsg("Backward sending grads, but get None"))
             logger.debug(rmsg(f"bwd mb {self.current_mb} send grad shape {t.grad.size()}"))
             self.send_op(t.grad, send_next=False)
+            self.timeline.mark_event_end(f"mb_{self.current_mb}_BackwardSend_{idx}")
+        self.timeline.mark_event_end(f"mb_{self.current_mb}_BackwardPostprocessTask")
 
     def _reduce_grads_task(self):
         """
@@ -752,6 +786,7 @@ class NxDPPModel(nn.Module):
         - Average the grads acorss data parallel ranks
         - Add the grads for shared weights
         """
+        self.timeline.mark_event_start(f"mb_{self.current_mb}_ReduceGradsTask")
         # Group for different dtypes and all-reduce
         dtype_groups = {}
         for param in self.local_parameters():
@@ -772,6 +807,7 @@ class NxDPPModel(nn.Module):
 
         self._reduce_shared_weights()
         self._mark_step()
+        self.timeline.mark_event_end(f"mb_{self.current_mb}_ReduceGradsTask")
 
     # A map of PipeInstruction types to methods. Each method will be executed with the
     # kwargs provided to the PipeInstruction from the scheduler.
