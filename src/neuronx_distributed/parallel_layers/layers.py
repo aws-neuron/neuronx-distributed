@@ -186,6 +186,8 @@ class ParallelEmbedding(torch.nn.Module):
             self.padding_idx = padding_idx - self.start_index
         else:
             self.padding_idx = None
+        self.init_method = init_method
+        self.dtype = dtype
 
         # Allocate weights and initialize.
         if device is None or device.type == "cpu":
@@ -196,15 +198,8 @@ class ParallelEmbedding(torch.nn.Module):
                     dtype=dtype,
                 )
             )
-            _initialize_affine_weight_cpu(
-                self.weight,
-                self.num_embeddings,
-                self.embedding_dim,
-                self.num_embeddings_per_partition,
-                0,
-                init_method,
-                params_dtype=dtype,
-            )
+            if self.weight.device != torch.device("meta"):
+                self.init_weight_cpu()
         else:
             assert device.type == "xla", "Currently only xla device type is supported"
             self.weight = Parameter(
@@ -216,6 +211,17 @@ class ParallelEmbedding(torch.nn.Module):
                 )
             )
             _initialize_affine_weight_neuron(self.weight, init_method, partition_dim=0)
+
+    def init_weight_cpu(self):
+        _initialize_affine_weight_cpu(
+            self.weight,
+            self.num_embeddings,
+            self.embedding_dim,
+            self.num_embeddings_per_partition,
+            0,
+            self.init_method,
+            params_dtype=self.dtype,
+        )
 
     def forward(self, input_):
         if self.tensor_model_parallel_size > 1:
@@ -449,28 +455,18 @@ class ColumnParallelLinear(BaseParallelLinear):
         # Divide the weight matrix along the last dimension.
         world_size = get_tensor_model_parallel_size()
         self.output_size_per_partition = divide(output_size, world_size)
+        self.dtype = dtype
+        self.stride = stride
+        self.init_master_weight = init_master_weight
 
         # Parameters.
         # Note: torch.nn.functional.linear performs XA^T + b and as a result
         # we allocate the transpose.
         # Initialize weight.
         if device is None or device.type == "cpu":
-            self.weight = Parameter(
-                torch.empty(
-                    self.output_size_per_partition, self.input_size, dtype=dtype
-                )
-            )
-            self.master_weight = _initialize_affine_weight_cpu(
-                self.weight,
-                self.output_size,
-                self.input_size,
-                self.output_size_per_partition,
-                0,
-                self._init_weight,
-                params_dtype=dtype,
-                stride=stride,
-                return_master_weight=True,
-            )
+            self.weight = Parameter(torch.empty(self.output_size_per_partition, self.input_size, dtype=dtype))
+            if self.weight.device != torch.device("meta"):
+                self.init_weight_cpu()
         else:
             assert device.type == "xla", "Currently only xla device type is supported"
             self.weight = Parameter(
@@ -499,7 +495,8 @@ class ColumnParallelLinear(BaseParallelLinear):
                         dtype=dtype,
                     )
                 )
-            self._init_bias()
+            if self.bias.device != torch.device("meta"):
+                self._init_bias()
 
             if not self.gather_output:
                 set_tensor_model_parallel_attributes(self.bias, True, 0, stride=stride)
@@ -521,9 +518,20 @@ class ColumnParallelLinear(BaseParallelLinear):
 
         self._forward_impl = linear_with_async_allreduce
 
-    def forward(
-        self, input: torch.Tensor
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def init_weight_cpu(self):
+        self.master_weight = _initialize_affine_weight_cpu(
+            self.weight,
+            self.output_size,
+            self.input_size,
+            self.output_size_per_partition,
+            0,
+            self._init_weight,
+            params_dtype=self.dtype,
+            stride=self.stride,
+            return_master_weight=self.init_master_weight,
+        )
+
+    def forward(self, input: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Forward of ColumnParallelLinear
 
         Args:
@@ -609,27 +617,17 @@ class RowParallelLinear(BaseParallelLinear):
         self.sequence_parallel_enabled = sequence_parallel_enabled
         if self.sequence_parallel_enabled and not self.input_is_parallel:
             raise RuntimeError("To enable `sequence_parallel_enabled`, `input_is_parallel` must be `True`")
+        self.dtype = dtype
+        self.stride = stride
+        self.init_master_weight = init_master_weight
 
         # Note: torch.nn.functional.linear performs XA^T + b and as a result
         # we allocate the transpose.
         # Initialize weight.
         if device is None or device.type == "cpu":
-            self.weight = Parameter(
-                torch.empty(
-                    self.output_size, self.input_size_per_partition, dtype=dtype
-                )
-            )
-            self.master_weight = _initialize_affine_weight_cpu(
-                self.weight,
-                self.output_size,
-                self.input_size,
-                self.input_size_per_partition,
-                1,
-                self._init_weight,
-                params_dtype=dtype,
-                stride=stride,
-                return_master_weight=True,
-            )
+            self.weight = Parameter(torch.empty(self.output_size, self.input_size_per_partition, dtype=dtype))
+            if self.weight.device != torch.device("meta"):
+                self.init_weight_cpu()
         else:
             assert device.type == "xla", "Currently only xla device type is supported"
             self.weight = Parameter(
@@ -654,13 +652,27 @@ class RowParallelLinear(BaseParallelLinear):
                         dtype=dtype,
                     )
                 )
-            self._init_bias()
+            if self.bias.device != torch.device("meta"):
+                self._init_bias()
             setattr(self.bias, "sequence_parallel_enabled", sequence_parallel_enabled)
         else:
             self.register_parameter("bias", None)
 
         self._forward_impl = linear_with_async_allreduce
     
+
+    def init_weight_cpu(self):
+        self.master_weight = _initialize_affine_weight_cpu(
+            self.weight,
+            self.output_size,
+            self.input_size,
+            self.input_size_per_partition,
+            1,
+            self._init_weight,
+            params_dtype=self.dtype,
+            stride=self.stride,
+            return_master_weight=self.init_master_weight,
+        )
 
     def _init_bias(self):
         bound = 1 / math.sqrt(self.input_size_per_partition) if self.input_size_per_partition > 0 else 0

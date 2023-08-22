@@ -37,11 +37,12 @@ def initialize_model_parallel(tensor_model_parallel_size: int = 1) -> None:
 
     world_size: int = torch.distributed.get_world_size()
     tensor_model_parallel_size: int = min(tensor_model_parallel_size, world_size)
-    data_parallel_size: int = world_size // tensor_model_parallel_size
-    if torch.distributed.get_rank() == 0:
-        print(
-            "> initializing tensor model parallel with size {}".format(
-                tensor_model_parallel_size
+    pipeline_model_parallel_size: int = min(pipeline_model_parallel_size, world_size)
+    if world_size % (tensor_model_parallel_size * pipeline_model_parallel_size) != 0:
+        raise RuntimeError(
+            (
+                f"`world_size` ({world_size}) is not divisible by tensor_model_parallel_size"
+                f" ({tensor_model_parallel_size}) x pipeline_model_parallel_size ({pipeline_model_parallel_size})"
             )
         )
         print("> initializing data parallel with size {}".format(data_parallel_size))

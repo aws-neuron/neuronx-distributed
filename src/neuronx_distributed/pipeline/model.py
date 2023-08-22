@@ -30,6 +30,7 @@ from neuronx_distributed.utils.logger import get_logger
 from neuronx_distributed.utils.model_utils import (
     maybe_materalize_model,
     move_model_to_device,
+    reinit_model,
 )
 from neuronx_distributed.utils.serialization import (
     SerializationManager,
@@ -54,6 +55,7 @@ class NxDPPModel(nn.Module):
         autowrap_functions: Optional[Tuple[ModuleType]] = None,
         autowrap_modules: Optional[Tuple[Callable, ...]] = None,
         tracer_cls: Optional[Union[str, Any]] = None,
+        param_init_fn: Optional[Any] = None,
         trace_file_path: Optional[str] = None,
     ):
         """
@@ -105,6 +107,14 @@ class NxDPPModel(nn.Module):
                 User provided tracer class for symbolic tracing. It can be "hf", "torch" or any tracer class
                 user created.
 
+            param_init_fn:
+                Function used to initialize parameters. This is useful if user wants to use meta device to do
+                delayed parameter initialization. param_init_fn should take a module as input and initialize the
+                parameters that belongs to this module only (not for submodules).
+
+            trace_file_path:
+                The file location to save the timeline file. Setting to None will not create timeline
+
 
         Usage:
             User can feed the partition config into the NxDPPModel, then tracing and partition will
@@ -141,6 +151,7 @@ class NxDPPModel(nn.Module):
         self.pipeline_parallel_rank = parallel_state.get_pipeline_model_parallel_rank()
         self.serialization_manager = SerializationManager()
         self.timeline = PPTimeline(trace_file_path, self.pipeline_parallel_rank)
+        self.param_init_fn = param_init_fn
         self.input_names = None
 
         # Outputs from analyze_pipeline_module
@@ -355,15 +366,6 @@ class NxDPPModel(nn.Module):
             if p not in local_p:
                 p.requires_grad = False
                 p.grad = None
-
-    def _maybe_materialize_local_module(self):
-        """
-        Check whether there's fake tensor in local module, if so materialize it to cpu
-        """
-        maybe_materalize_model(self.local_module)
-        # Casting local module to xla device
-        move_model_to_device(self.local_module, xm.xla_device())
-        self._mark_step()
 
     def _prepare_run(self, kwargs, train=True):
         self._validate_partitioned()
@@ -910,3 +912,14 @@ class NxDPPModel(nn.Module):
 
     def _get_microbatch_dataloader(self, all_batches):
         return MpDeviceLoader(all_batches, xm.xla_device(), batches_per_execution=self.num_microbatches)
+
+    def _maybe_materialize_local_module(self):
+        """
+        Check whether there's fake tensor in local module, if so materialize it to cpu
+        """
+        maybe_materalize_model(self.local_module)
+        if self.param_init_fn is not None:
+            reinit_model(self.local_module, torch.device("cpu"), self.param_init_fn)
+        # Casting local module to xla device
+        move_model_to_device(self.local_module, xm.xla_device())
+        self._mark_step()

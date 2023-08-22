@@ -2,9 +2,13 @@ from contextlib import contextmanager
 from typing import Optional, Set
 
 import torch
+from torch import nn
 
 from ..parallel_layers.parallel_state import rmsg
-from ..parallel_layers.utils import set_tensor_model_parallel_attributes
+from ..parallel_layers.utils import (
+    is_torch_version_greater_than_2,
+    set_tensor_model_parallel_attributes,
+)
 from ..utils.logger import get_logger
 
 logger = get_logger()
@@ -14,6 +18,12 @@ try:
     from transformers import PreTrainedModel
 except ImportError:
     _TRANSFORMERS_AVAIL = False
+
+_Accelerate_AVAIL = True
+try:
+    from accelerate import init_on_device as hf_init_on_device
+except ImportError:
+    _Accelerate_AVAIL = False
 
 _TORCHDISTX_AVAIL = True
 try:
@@ -77,6 +87,10 @@ def is_hf_transformers_available():
     return _TRANSFORMERS_AVAIL
 
 
+def is_hf_accelerate_available():
+    return _Accelerate_AVAIL
+
+
 @contextmanager
 def preserve_shared_weights(model: torch.nn.Module, ignore_hf=False) -> None:
     """
@@ -128,6 +142,33 @@ def preserve_parallel_attributes(model: torch.nn.Module) -> None:
                 setattr(param, "shared", shared_parameters[name])
 
 
+def _set_module_param_to_empty(module: torch.nn.Module, device: torch.device, recurse: bool = False):
+    """
+    Set all parameters for input module to empty like tensors on provided device
+    """
+    for key, param in module._parameters.items():
+        if param is None:
+            continue
+        with torch.no_grad():
+            assert isinstance(param, torch.nn.parameter.Parameter)
+            assert param.is_leaf
+            t = torch.empty_like(param, device=device)
+            out_param = torch.nn.parameter.Parameter(t, param.requires_grad)
+            module._parameters[key] = out_param
+
+
+def reinit_model(model: torch.nn.Module, device: torch.device, param_init_fn):
+    """
+    Re-initialize model with the param_init_fn on provided device
+    """
+    with preserve_parallel_attributes(model):
+        with preserve_shared_weights(model):
+            with torch.no_grad():
+                for module in model.modules():
+                    _set_module_param_to_empty(module, device)
+                    param_init_fn(module)
+
+
 def move_model_to_device(model: torch.nn.Module, device: torch.device) -> None:
     with preserve_parallel_attributes(model):
         with preserve_shared_weights(model):
@@ -149,3 +190,67 @@ def has_fake_tensors(
     for param in model.parameters():
         if param not in ignored_params and fake.is_fake(param):
             return True
+
+
+@contextmanager
+def init_on_device(device: torch.device, include_buffers: bool = False):
+    """
+    A context manager under which models are initialized with all parameters on the specified device.
+    Referred from: https://github.com/huggingface/accelerate/blob/main/src/accelerate/big_modeling.py#L82
+    """
+    # Directly use accelerate implementation if available
+    if is_hf_accelerate_available():
+        with hf_init_on_device(device, include_buffers=include_buffers):
+            yield
+        return
+
+    if is_torch_version_greater_than_2() and include_buffers:
+        with device:
+            yield
+        return
+
+    old_register_parameter = nn.Module.register_parameter
+    if include_buffers:
+        old_register_buffer = nn.Module.register_buffer
+
+    def register_empty_parameter(module, name, param):
+        old_register_parameter(module, name, param)
+        if param is not None:
+            param_cls = type(module._parameters[name])
+            kwargs = module._parameters[name].__dict__
+            module._parameters[name] = param_cls(module._parameters[name].to(device), **kwargs)
+
+    def register_empty_buffer(module, name, buffer, persistent=True):
+        old_register_buffer(module, name, buffer, persistent=persistent)
+        if buffer is not None:
+            module._buffers[name] = module._buffers[name].to(device)
+
+    # Patch tensor creation
+    if include_buffers:
+        tensor_constructors_to_patch = {
+            torch_function_name: getattr(torch, torch_function_name)
+            for torch_function_name in ["empty", "zeros", "ones", "full"]
+        }
+    else:
+        tensor_constructors_to_patch = {}
+
+    def patch_tensor_constructor(fn):
+        def wrapper(*args, **kwargs):
+            kwargs["device"] = device
+            return fn(*args, **kwargs)
+
+        return wrapper
+
+    try:
+        nn.Module.register_parameter = register_empty_parameter
+        if include_buffers:
+            nn.Module.register_buffer = register_empty_buffer
+        for torch_function_name in tensor_constructors_to_patch.keys():
+            setattr(torch, torch_function_name, patch_tensor_constructor(getattr(torch, torch_function_name)))
+        yield
+    finally:
+        nn.Module.register_parameter = old_register_parameter
+        if include_buffers:
+            nn.Module.register_buffer = old_register_buffer
+        for torch_function_name, old_torch_function in tensor_constructors_to_patch.items():
+            setattr(torch, torch_function_name, old_torch_function)
