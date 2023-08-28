@@ -20,6 +20,7 @@ from .parallel_state import initialize_model_parallel
 from .random import get_xla_rng_tracker, model_parallel_xla_manual_seed
 from .utils import (
     copy_tensor_model_parallel_attributes,
+    move_model_to_device,
     set_defaults_if_not_set_tensor_model_parallel_attributes,
     set_tensor_model_parallel_attributes,
     split_tensor_along_last_dim,

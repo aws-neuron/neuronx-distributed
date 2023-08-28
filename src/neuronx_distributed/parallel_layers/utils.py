@@ -9,6 +9,7 @@ from neuronx_distributed.parallel_layers.parallel_state import (
     get_gloo_group,
     get_tensor_model_parallel_rank,
 )
+from neuronx_distributed.utils.logger import get_logger
 
 _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {
     "tensor_model_parallel": False,
@@ -16,6 +17,7 @@ _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {
     "partition_stride": 1,
 }
 
+logger = get_logger()
 
 class EmbeddingUtility:
     """Split the vocabulary into `world_size` chunks and return the
@@ -145,3 +147,10 @@ def cast_all(state, from_dtype=torch.float32, to_dtype=torch.bfloat16):
 
 def get_local_world_size():
     return xm.xrt_world_size() // int(os.environ[xenv.HOST_WORLD_SIZE])
+
+def move_model_to_device(model: torch.nn.Module, device: torch.device) -> None:
+    logger.warn("parallel_layers.move_model_to_device method is deprecated, \
+        please use neuronx_distributed.utils.model_utils.move_model_to_device")
+    from neuronx_distributed.utils import model_utils
+    model_utils.move_model_to_device(model, device)
+
