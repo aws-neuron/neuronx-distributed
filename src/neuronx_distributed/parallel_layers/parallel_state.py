@@ -104,23 +104,25 @@ def initialize_model_parallel(tensor_model_parallel_size: int = 1) -> None:
             _PIPELINE_MODEL_PARALLEL_GROUP = group
             _PIPELINE_GLOBAL_RANKS = ranks
 
-    global _NEXT_RANK_GROUP_SPMD
-    global _PREV_RANK_GROUP_SPMD
-    global _NEXT_RANK_GROUP
-    global _PREV_RANK_GROUP
-    parity = bool(get_pipeline_model_parallel_rank() % 2)
-    _NEXT_RANK_GROUP_SPMD = get_pipeline_model_parallel_sr_group(parity)
-    _PREV_RANK_GROUP_SPMD = get_pipeline_model_parallel_sr_group(not parity)
-    for ranks in _NEXT_RANK_GROUP_SPMD:
-        pg_options = {"xla_pg_options": {"mesh": _NEXT_RANK_GROUP_SPMD}}
-        if rank in ranks:
-            group = torch.distributed.new_group(ranks, pg_options=pg_options)
-            _NEXT_RANK_GROUP = group
-    for ranks in _PREV_RANK_GROUP_SPMD:
-        pg_options = {"xla_pg_options": {"mesh": _PREV_RANK_GROUP_SPMD}}
-        if rank in ranks:
-            group = torch.distributed.new_group(ranks, pg_options=pg_options)
-            _PREV_RANK_GROUP = group
+    # Only create pre/next groups if PP is enabled
+    if pipeline_model_parallel_size > 1:
+        global _NEXT_RANK_GROUP_SPMD
+        global _PREV_RANK_GROUP_SPMD
+        global _NEXT_RANK_GROUP
+        global _PREV_RANK_GROUP
+        parity = bool(get_pipeline_model_parallel_rank() % 2)
+        _NEXT_RANK_GROUP_SPMD = get_pipeline_model_parallel_sr_group(parity)
+        _PREV_RANK_GROUP_SPMD = get_pipeline_model_parallel_sr_group(not parity)
+        for ranks in _NEXT_RANK_GROUP_SPMD:
+            pg_options = {"xla_pg_options": {"mesh": _NEXT_RANK_GROUP_SPMD}}
+            if rank in ranks:
+                group = torch.distributed.new_group(ranks, pg_options=pg_options)
+                _NEXT_RANK_GROUP = group
+        for ranks in _PREV_RANK_GROUP_SPMD:
+            pg_options = {"xla_pg_options": {"mesh": _PREV_RANK_GROUP_SPMD}}
+            if rank in ranks:
+                group = torch.distributed.new_group(ranks, pg_options=pg_options)
+                _PREV_RANK_GROUP = group
     if torch.distributed.get_rank() == 0:
         logger.debug(rmsg(f"_PIPELINE_MODEL_PARALLEL_GROUP_SPMD {_PIPELINE_MODEL_PARALLEL_GROUP_SPMD}"))
         logger.debug(rmsg(f"_TENSOR_MODEL_PARALLEL_GROUP_SPMD {_TENSOR_MODEL_PARALLEL_GROUP_SPMD}"))

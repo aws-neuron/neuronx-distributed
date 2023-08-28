@@ -1,16 +1,20 @@
 import os
-import gc
+from typing import Optional
 
 import torch
 import torch_xla
 import torch_xla.core.xla_model as xm
 
 from ..utils.logger import get_logger
+from .layers import create_local_weight_cpu
 from .parallel_state import (
     get_data_parallel_rank,
+    get_pipeline_model_parallel_rank,
+    get_pipeline_model_parallel_size,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_size,
 )
+from .utils import add_barrier, cast_all, get_local_world_size
 
 logger = get_logger()
 
@@ -23,58 +27,75 @@ def ensure_directory_exists(filename: str) -> None:
 
 
 def get_sharded_model_dict(model: torch.nn.Module, model_state_dict: dict) -> dict:
-    tp_rank = get_tensor_model_parallel_rank()
+    from ..pipeline.model import NxDPPModel
+
     tp_size = get_tensor_model_parallel_size()
-    for name, param in model.named_parameters():
+    if isinstance(model, NxDPPModel):
+        model = model.original_torch_module
+    # Use state_dict to keep the shared parameters
+    for name, param in model.state_dict(keep_vars=True).items():
         if hasattr(param, "tensor_model_parallel") and param.tensor_model_parallel:
-            per_partition_size = (
-                model_state_dict[name].shape[param.partition_dim] // tp_size
+            if param.partition_dim not in [0, 1]:
+                raise Exception(f"Partiton value of 0,1 are supported, found {param.partition_dim}.")
+            per_partition_size = model_state_dict[name].shape[param.partition_dim] // tp_size
+            full_weight = model_state_dict[name]
+            model_state_dict[name] = create_local_weight_cpu(
+                full_weight, param.partition_dim, per_partition_size, param.partition_stride
             )
-            if param.partition_dim == 0:
-                model_state_dict[name] = model_state_dict[name][
-                    per_partition_size * tp_rank : per_partition_size * (tp_rank + 1)
-                ]
-            elif param.partition_dim == 1:
-                model_state_dict[name] = model_state_dict[name][
-                    :, per_partition_size * tp_rank : per_partition_size * (tp_rank + 1)
-                ]
-            else:
-                raise Exception(
-                    f"Partiton value of 0,1 are supported, found {param.partition_dim}."
-                )
     return model_state_dict
 
 
-def save(state_dict: dict, output_dir: str) -> None:
+def save(
+    state_dict: dict,
+    output_dir: str,
+    save_serially: bool = True,
+    down_cast_bf16: bool = False,
+    model_key: str = "model",
+) -> None:
     """Save a model checkpoint."""
 
     if torch.distributed.is_initialized():
-        if torch.distributed.get_rank() == 0:
-            logger.debug("saving checkpoint to {}".format(output_dir))
+        rank = torch.distributed.get_rank()
+        if rank == 0:
+            logger.info("saving checkpoint to {}".format(output_dir))
     else:
-        logger.debug("saving checkpoint to {}".format(output_dir))
+        logger.info("saving checkpoint to {}".format(output_dir))
+        rank = 0
 
-    state_dict["tp_rank"] = get_tensor_model_parallel_rank()
+    checkpoint = {}
+    checkpoint[model_key] = state_dict
+    checkpoint["tp_rank"] = get_tensor_model_parallel_rank()
+    checkpoint["pp_rank"] = get_pipeline_model_parallel_rank()
 
     chkpt_path = output_dir
     chkpt_path = os.path.join(
-        chkpt_path, "tp_rank_{:02d}".format(get_tensor_model_parallel_rank())
+        chkpt_path,
+        "tp_rank_{:02d}_pp_rank{:02d}.pt".format(get_tensor_model_parallel_rank(), get_pipeline_model_parallel_rank()),
     )
 
     if down_cast_bf16:
-        state_dict = cast_all(state_dict, from_dtype=torch.float32, to_dtype=torch.bfloat16)
-    if get_data_parallel_rank() == 0:
+        checkpoint = cast_all(checkpoint, from_dtype=torch.float32, to_dtype=torch.bfloat16)
+    if rank % get_local_world_size() == 0:
         ensure_directory_exists(chkpt_path)
+    add_barrier("Ensure directory exists Done")
+
     if save_serially:
-        cpu_data = xm._maybe_convert_to_cpu(state_dict, convert=(get_data_parallel_rank() == 0))
+        # TODO: optmization to save multiple ranks together
         for tp_rank in range(0, get_tensor_model_parallel_size()):
-            # Staggering save checkpoints
-            if get_data_parallel_rank() == 0 and get_tensor_model_parallel_rank() == tp_rank:
-                torch.save(cpu_data, chkpt_path)
-            add_barrier(f"ckpt-save-{tp_rank}")
+            for pp_rank in range(0, get_pipeline_model_parallel_size()):
+                # Staggering save checkpoints
+                if (
+                    get_data_parallel_rank() == 0
+                    and get_tensor_model_parallel_rank() == tp_rank
+                    and get_pipeline_model_parallel_rank() == pp_rank
+                ):
+                    cpu_data = xm._maybe_convert_to_cpu(checkpoint)
+                    torch.save(cpu_data, chkpt_path)
+                add_barrier(f"ckpt-save-{tp_rank}")
     else:
-        cpu_data = xm._maybe_convert_to_cpu(state_dict, convert=(get_data_parallel_rank() == 0))
-        torch.save(cpu_data, chkpt_path)
+        cpu_data = xm._maybe_convert_to_cpu(checkpoint, convert=(get_data_parallel_rank() == 0))
+        if get_data_parallel_rank() == 0:
+            torch.save(cpu_data, chkpt_path)
 
     should_chkpt = get_data_parallel_rank() == 0
     cpu_data = xm._maybe_convert_to_cpu(state_dict, convert=should_chkpt)
@@ -86,9 +107,9 @@ def save(state_dict: dict, output_dir: str) -> None:
 
 
 def load(
-    output_dir: str,
+    chkpt_path: str,
     model: torch.nn.Module = None,
-    model_key: str = "model",
+    model_key: Optional[str] = "model",
     sharded: bool = True,
 ) -> dict:
     """Load a checkpoint and return. In case the model object is
@@ -101,15 +122,31 @@ def load(
             model is not None
         ), "When checkpoint is not shareded, model object needs to be passed"
 
+    if model is not None:
+        from ..pipeline.model import NxDPPModel
+
+        if (isinstance(model, NxDPPModel) and model.model_moved_to_device) or list(model.parameters())[
+            0
+        ].device == xm.xla_device():
+            logger.warning(
+                f"[Warning] It is recommended to call load \
+                           before moving model to device to reduce redundant graphs."
+            )
+
     # Checkpoint.
-    chkpt_path = output_dir
-    checkpoint_name = (
-        os.path.join(
-            chkpt_path, "tp_rank_{:02d}".format(get_tensor_model_parallel_rank())
+    if sharded:
+        checkpoint_name = (
+            os.path.join(
+                chkpt_path,
+                "tp_rank_{:02d}_pp_rank{:02d}.pt".format(
+                    get_tensor_model_parallel_rank(), get_pipeline_model_parallel_rank()
+                ),
+            )
+            if sharded
+            else chkpt_path
         )
-        if sharded
-        else chkpt_path
-    )
+    else:
+        checkpoint_name = chkpt_path
 
     if torch.distributed.is_initialized():
         if torch.distributed.get_rank() == 0:
@@ -124,11 +161,17 @@ def load(
             logger.debug(f"Worker {rank} resuming from checkpoint {checkpoint_name}")
             check_point = torch.load(checkpoint_name, map_location="cpu")
             if model:
-                model_state_dict = check_point[model_key]
+                if model_key is not None:
+                    model_state_dict = check_point[model_key]
+                else:
+                    model_state_dict = check_point
                 if not sharded:
                     model_state_dict = get_sharded_model_dict(model, model_state_dict)
                 model.load_state_dict(model_state_dict, strict=True)
-                del check_point[model_key]
+                if model_key is not None:
+                    del check_point[model_key]
+                else:
+                    check_point = None
             gc.collect()
         xm.rendezvous("neuron.load_checkpoint" + str(worker_start))
 

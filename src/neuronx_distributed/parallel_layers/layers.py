@@ -93,6 +93,17 @@ def _initialize_affine_weight_neuron(weight, init_method, partition_dim, stride=
         init_method(weight)
 
 
+def create_local_weight_cpu(full_weight, partition_dim, per_partition_size, stride, out_weight=None):
+    per_partition_per_stride_size = divide(per_partition_size, stride)
+    weight_list = torch.split(full_weight, per_partition_per_stride_size, dim=partition_dim)
+    rank = get_tensor_model_parallel_rank()
+    world_size = get_tensor_model_parallel_size()
+    my_weight_list = weight_list[rank::world_size]
+
+    with torch.no_grad():
+        return torch.cat(my_weight_list, dim=partition_dim, out=out_weight)
+
+
 def _initialize_affine_weight_cpu(
     weight,
     output_size,
@@ -122,17 +133,8 @@ def _initialize_affine_weight_cpu(
     init_method(master_weight)
 
     master_weight = master_weight.to(dtype=params_dtype)
-    
-    per_partition_per_stride_size = divide(per_partition_size, stride)
-    weight_list = torch.split(
-        master_weight, per_partition_per_stride_size, dim=partition_dim
-    )
-    rank = get_tensor_model_parallel_rank()
-    world_size = get_tensor_model_parallel_size()
-    my_weight_list = weight_list[rank::world_size]
 
-    with torch.no_grad():
-        torch.cat(my_weight_list, dim=partition_dim, out=weight)
+    create_local_weight_cpu(master_weight, partition_dim, per_partition_size, stride, out_weight=weight)
     if return_master_weight:
         return master_weight
     return None
