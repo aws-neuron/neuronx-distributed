@@ -2,12 +2,14 @@ import os
 import concurrent.futures
 import multiprocessing
 import pathlib
+from typing import Any, Callable, Dict, Iterable, List, Optional, Union
 import torch
 import torch_neuronx
-from torch_neuronx.xla_impl.options import Options
-import torch_xla.distributed.xla_multiprocessing as xmp
+import torch_xla.core.xla_model as xm
 import torch_xla.distributed.xla_backend
-from typing import List, Any, Union, Callable, Optional, Dict, Iterable
+import torch_xla.distributed.xla_multiprocessing as xmp
+from torch_neuronx.xla_impl.options import Options
+from torch_xla.utils.utils import get_free_tcp_ports
 
 from neuronx_distributed.parallel_layers import layers, parallel_state
 
@@ -68,18 +70,31 @@ def _trace(
     tp_degree: int = 1,
 ) -> None:
     os.environ["RANK"] = str(rank)
-    torch.distributed.init_process_group("xla")
+    if is_pjrt_device():
+        import torch_xla.experimental.pjrt_backend
+        torch.distributed.init_process_group("xla", init_method="pjrt://")
+    else:
+        torch.distributed.init_process_group("xla")
     parallel_state.initialize_model_parallel(tensor_model_parallel_size=tp_degree)
-    model = func()
-    neff_filename, metaneff, flattener, packer = torch_neuronx.xla_impl.trace._trace(
-        model,
-        example_inputs,
-        states,
-        f"{compiler_workdir}_{rank}",
-        compiler_args,
-        options,
-    )
-    mp_q.put((neff_filename, metaneff, flattener, packer))
+    model, input_output_alias = func()
+    if compiler_workdir is None:
+        compiler_workdir = f"/tmp/trace_compiler_workdir_{rank}"
+    else:
+        compiler_workdir = f"{compiler_workdir}_{rank}"
+
+    for tp_rank in range(tp_degree):
+        if rank == tp_rank:
+            neff_filename, metaneff, flattener, packer = torch_neuronx.xla_impl.trace._trace(
+                model,
+                example_inputs,
+                states,
+                input_output_alias,
+                compiler_workdir,
+                compiler_args,
+                options,
+            )
+            mp_q.put((neff_filename, metaneff, flattener, packer, example_inputs, input_output_alias))
+    xm.rendezvous("compilation-done")
 
 
 def parallel_model_trace(
@@ -114,11 +129,14 @@ def parallel_model_trace(
         fused neuron::foward operation.
     """
 
-    mp_q = multiprocessing.Queue()
+    ctx = multiprocessing.get_context("spawn")
+    manager = ctx.Manager()
+    mp_q = manager.Queue()
 
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "2022"
     os.environ["TPU_NUM_DEVICES"] = str(tp_degree)
+    os.environ["XRT_TPU_CONFIG"] = "localservice;0;localhost:{}".format(get_free_tcp_ports()[0])
     os.environ["WORLD_SIZE"] = str(tp_degree)
     xmp.spawn(
         _trace,
@@ -132,12 +150,10 @@ def parallel_model_trace(
             options,
             tp_degree,
         ),
-        start_method="fork",
+        start_method="spawn",
+        nprocs=tp_degree,
     )
-    models = [
-        torch_neuronx.xla_impl.trace.create_neuron_model(*mp_q.get(), example_inputs)
-        for _ in range(tp_degree)
-    ]
+    models = [torch_neuronx.xla_impl.trace.create_neuron_model(*mp_q.get()) for _ in range(tp_degree)]
     return TensorParallelNeuronModel(models)
 
 

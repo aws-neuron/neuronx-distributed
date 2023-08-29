@@ -1,4 +1,12 @@
 import os
+
+import torch
+import torch_neuronx
+import transformers
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
+from transformers.models.bert.modeling_bert import (BertSelfAttention,
+                                                    BertSelfOutput)
+
 import neuronx_distributed
 from neuronx_distributed.parallel_layers import layers, parallel_state
 import torch
@@ -38,6 +46,9 @@ not_paraphrase = encode(tokenizer, sequence_1, sequence_1)
 
 def get_model():
     model = AutoModelForSequenceClassification.from_pretrained(name, torchscript=True)
+    # Here we build a model with tensor-parallel layers.
+    # Note: If you already have a Model class that does this, we can use that directly
+    # and load the checkpoint in it.
     class ParallelSelfAttention(BertSelfAttention):
         def __init__(self, config, position_embedding_type=None):
             super().__init__(config, position_embedding_type)
@@ -51,22 +62,38 @@ def get_model():
         def __init__(self, config):
             super().__init__(config)
             self.dense = layers.RowParallelLinear(config.hidden_size,
-                                       config.hidden_size,
-                                       input_is_parallel=True)
+                                    config.hidden_size,
+                                    input_is_parallel=True)
 
     for layer in model.bert.encoder.layer:
         layer.attention.self = ParallelSelfAttention(model.config)
         layer.attention.output = ParallelSelfOutput(model.config)
-    
-    neuronx_distributed.parallel_layers.load("bert/bert.pt", model, sharded=False)
-    
-    return model
 
-model = neuronx_distributed.trace.parallel_model_trace(get_model, paraphrase, tp_degree=2)
+    # Here we created a checkpoint as mentioned above. We pass sharded=False, since the checkpoint
+    # we obtained is unsharded. In case you are using the checkpoint from the tensor-parallel training,
+    # you can set the sharded=True, as that checkpoint will contain shards from each tp rank.
+    neuronx_distributed.parallel_layers.load("bert.pt", model, sharded=False)
 
-neuronx_distributed.trace.parallel_model_save(model, "tp_models")
-model = neuronx_distributed.trace.parallel_model_load("tp_models")
+    model.eval()
 
-model_cpu = AutoModelForSequenceClassification.from_pretrained(name, torchscript=True)
-model_neuron = torch_neuronx.trace(model_cpu, paraphrase)
-print(model(*paraphrase), model_cpu(*paraphrase), model_neuron(*paraphrase))
+    return model, {}
+
+def infer():
+
+    # Note how we are passing a function that returns a model object, which needs to be traced.
+    # This is mainly done, since the model initialization needs to happen within the processes
+    # that get launched internally withing the parallel_model_trace.
+    model = neuronx_distributed.trace.parallel_model_trace(get_model, paraphrase, tp_degree=2, compiler_args=" --model-type=transformer-inference")
+
+    # Once traced, we now save the trace model for future inference. This API takes care
+    # of saving the checkpoint from each tensor parallel worker
+    neuronx_distributed.trace.parallel_model_save(model, "tp_models")
+
+    # We now load the saved model and will run inference against it
+    model = neuronx_distributed.trace.parallel_model_load("tp_models")
+    cpu_model = AutoModelForSequenceClassification.from_pretrained(name, torchscript=True)
+    assert torch.argmax(model(*paraphrase)[0]) == torch.argmax(cpu_model(*paraphrase)[0])
+
+
+if __name__ == "__main__":
+    infer()
