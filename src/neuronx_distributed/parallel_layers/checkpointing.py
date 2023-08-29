@@ -46,11 +46,10 @@ def get_sharded_model_dict(model: torch.nn.Module, model_state_dict: dict) -> di
 
 
 def save(
-    state_dict: dict,
+    checkpoint: dict,
     output_dir: str,
     save_serially: bool = True,
     down_cast_bf16: bool = False,
-    model_key: str = "model",
 ) -> None:
     """Save a model checkpoint."""
 
@@ -61,11 +60,6 @@ def save(
     else:
         logger.info("saving checkpoint to {}".format(output_dir))
         rank = 0
-
-    checkpoint = {}
-    checkpoint[model_key] = state_dict
-    checkpoint["tp_rank"] = get_tensor_model_parallel_rank()
-    checkpoint["pp_rank"] = get_pipeline_model_parallel_rank()
 
     chkpt_path = output_dir
     chkpt_path = os.path.join(
