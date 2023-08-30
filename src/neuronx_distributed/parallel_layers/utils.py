@@ -146,7 +146,12 @@ def cast_all(state, from_dtype=torch.float32, to_dtype=torch.bfloat16):
 
 
 def get_local_world_size():
-    return xm.xrt_world_size() // int(os.environ[xenv.HOST_WORLD_SIZE])
+    if is_torch_version_greater_than_2():
+        # With pjrt this only works after init_process_group()
+        import torch_xla.experimental.pjrt as pjrt
+        return pjrt.local_process_count()
+    else:    
+        return xm.xrt_world_size() // int(os.environ[xenv.HOST_WORLD_SIZE])
 
 def move_model_to_device(model: torch.nn.Module, device: torch.device) -> None:
     logger.warn("parallel_layers.move_model_to_device method is deprecated, \
