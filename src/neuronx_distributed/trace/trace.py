@@ -62,7 +62,8 @@ class TensorParallelNeuronModel(ParallelModel):
         return results[0]
     
     def __del__(self):
-        self.executor.shutdown()
+        if self.executor:
+            self.executor.shutdown()
 
 
 def _trace(

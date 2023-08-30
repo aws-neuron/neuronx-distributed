@@ -516,7 +516,10 @@ class ColumnParallelLinear(BaseParallelLinear):
         self.sequence_parallel_enabled = sequence_parallel_enabled
 
         if self.async_tensor_model_parallel_allreduce and self.sequence_parallel_enabled:
-            raise RuntimeError("`async_tensor_model_parallel_allreduce` and `sequence_parallel_enabled` cannot be enabled at the same time.")
+            raise RuntimeError(
+                "`async_tensor_model_parallel_allreduce` and `sequence_parallel_enabled` cannot be enabled at the same time."
+
+            )
 
         self._forward_impl = linear_with_async_allreduce
 
