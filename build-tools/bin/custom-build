@@ -1,39 +1,50 @@
 #!/bin/bash -xe
 
 # Obtain build path from brazil
-BUILD_PATH=$(brazil-path package-build-root)
-
-# `bb clean` logic
-if [ "$1" == "clean" ]; then
-    rm -rf ${BUILD_PATH}/bdist.* ${BUILD_PATH}/pip ${BUILD_PATH}/python3.*
-    env TOOL_VERBOSE=true python-3p-tool "$@"
-    exit
-fi
-
-# Obtain src/runtimefarm paths from brazil
-SRC_PATH=$(brazil-path package-src-root)
-RUNTIMEFARM_PATH=$(brazil-path tooldirect.runtimefarm)
-LICENSE_TXT_PATH=$(brazil-path [NeuronLicense]pkg.src)/LICENSE.txt
+BUILD_PATH=build/
+LICENSE_TXT_PATH=${BUILD_PATH}/private/LICENSE.txt
 
 # Create NeuronxDistributed build folder
 BUILD_PATH_NEURONX_DISTRIBUTED=${BUILD_PATH}/public/NeuronxDistributed
 mkdir -p ${BUILD_PATH_NEURONX_DISTRIBUTED}
 
-# Copy Python source files
-cp ${SRC_PATH}/setup.py ${BUILD_PATH_NEURONX_DISTRIBUTED}/
-cp -r ${SRC_PATH}/src ${BUILD_PATH_NEURONX_DISTRIBUTED}/
+# check against flake8 linter
+# Options used:
+#   --max-line-length=120 is used since a lot of docstrings
+#   contain lines longer than 120 that wouldn't make sense
+#   to split (ex. code snippets)
+#
+#   Warnings that are ignored
+#   F401: unused import
+#     - Reason to ignore: Side effects might occur on import.
+#       Also, neuronx-cc check would trip this.
+#   W503/504: newline before/after binary operator.
+#     - Reason to Ignore: conditionals are often split into
+#       multiple lines for readability).
+#
+#   More info in the following links:
+#   1) https://flake8.pycqa.org/en/latest/user/error-codes.html
+#   2) https://pycodestyle.pycqa.org/en/latest/intro.html#error-codes
 
-# Run Python3PBuildTool build
-env TOOL_VERBOSE=true python-3p-tool "$@"
+FLAKE8_MSG=$(flake8 --max-line-length=120 --ignore=F401,W503,W504,E203 ${SRC_PATH}/src/neuronx_distributed || true)
 
-# Copy neuronx-distributed build folder to site-packages
-PYVER=$(python -c 'from sys import version_info as vi; print(f"{vi.major}.{vi.minor}")')
-SITE_PACKAGES_SUFFIX="lib/python${PYVER}/site-packages"
-cp -r ${BUILD_PATH_NEURONX_DISTRIBUTED}/src/ ${BUILD_PATH}/${SITE_PACKAGES_SUFFIX}/
+python3.8 -m pip install flake8==3.7
+if [[ ! -z $FLAKE8_MSG ]]
+then
+  echo "FLAKE8 LINTING HAS DETECTED FORMATTING AND POTENTIALLY SOME SYNTAX ERRORS, PLEASE CHECK ABOVE OUTPUT!"
+  exit 1
+fi
 
-# Build wheel
-cd ${BUILD_PATH_NEURONX_DISTRIBUTED}
-cp ${LICENSE_TXT_PATH} ${BUILD_PATH_NEURONX_DISTRIBUTED}/src/
-export PYTHONPATH=${RUNTIMEFARM_PATH}/${SITE_PACKAGES_SUFFIX}
+if [[ "$1" == "flake8" ]]
+then
+  exit 0
+fi
+
+# # Copy Python source files
+cp setup.py ${BUILD_PATH_NEURONX_DISTRIBUTED}/
+cp -r src ${BUILD_PATH_NEURONX_DISTRIBUTED}/
+cp $LICENSE_TXT_PATH ${BUILD_PATH_NEURONX_DISTRIBUTED}/
+
+## Build wheel
 DIST_DIR=${BUILD_PATH}/pip/public/neuronx-distributed
-python setup.py bdist_wheel --dist-dir ${DIST_DIR}
+python3.8 setup.py bdist_wheel --dist-dir ${DIST_DIR}

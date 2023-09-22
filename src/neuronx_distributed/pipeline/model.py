@@ -24,11 +24,13 @@ from neuronx_distributed.pipeline.partition import (
     partition_traced_model,
 )
 from neuronx_distributed.pipeline.scheduler import InferenceSchedule, TrainSchedule
+from neuronx_distributed.pipeline.timeline import PPTimeline
 from neuronx_distributed.pipeline.trace import trace_model
 from neuronx_distributed.utils.logger import get_logger
 from neuronx_distributed.utils.model_utils import (
     maybe_materalize_model,
     move_model_to_device,
+    reinit_model,
 )
 from neuronx_distributed.utils.serialization import (
     SerializationManager,
@@ -47,12 +49,15 @@ class NxDPPModel(nn.Module):
         num_microbatches: int = 1,
         output_loss_value_spec: Optional[Union[Dict, Tuple]] = None,
         return_mb_loss: bool = False,
+        broadcast_and_average_loss: bool = False,
         pipeline_cuts: Optional[List[str]] = None,
         input_names: Optional[List[str]] = None,
         leaf_module_cls: Optional[List[Any]] = None,
         autowrap_functions: Optional[Tuple[ModuleType]] = None,
         autowrap_modules: Optional[Tuple[Callable, ...]] = None,
         tracer_cls: Optional[Union[str, Any]] = None,
+        param_init_fn: Optional[Any] = None,
+        trace_file_path: Optional[str] = None,
     ):
         """
         Model wrapper to run pipeline parallelism
@@ -78,6 +83,10 @@ class NxDPPModel(nn.Module):
             return_mb_loss:
                 Whether return a list of loss for all microbatchs
 
+            broadcast_and_average_loss:
+                Whether to broadcast loss to all PP ranks and average across dp ranks, when set to True
+                return_mb_loss must be False
+
             pipeline_cuts:
                 A list of layer names that will be used to annotate pipeline stage boundaries
 
@@ -102,6 +111,14 @@ class NxDPPModel(nn.Module):
             tracer_cls:
                 User provided tracer class for symbolic tracing. It can be "hf", "torch" or any tracer class
                 user created.
+
+            param_init_fn:
+                Function used to initialize parameters. This is useful if user wants to use meta device to do
+                delayed parameter initialization. param_init_fn should take a module as input and initialize the
+                parameters that belongs to this module only (not for submodules).
+
+            trace_file_path:
+                The file location to save the timeline file. Setting to None will not create timeline
 
 
         Usage:
@@ -130,14 +147,20 @@ class NxDPPModel(nn.Module):
         self.paritioned_model = None
         self.pipeline_cuts = []
         self.partitioned = False
+        self.model_moved_to_device = False
         self.shape_traced = False
         self.return_mb_loss = return_mb_loss
+        self.broadcast_and_average_loss = broadcast_and_average_loss
+        if self.broadcast_and_average_loss:
+            assert not self.return_mb_loss, "When broadcast_and_average_loss is True return_mb_loss must be False"
         self.output_loss_value_spec = output_loss_value_spec
         self.transformer_layer_cls = transformer_layer_cls
         self.num_microbatches = num_microbatches
         self.pipeline_parallel_size = parallel_state.get_pipeline_model_parallel_size()
         self.pipeline_parallel_rank = parallel_state.get_pipeline_model_parallel_rank()
         self.serialization_manager = SerializationManager()
+        self.timeline = PPTimeline(trace_file_path, self.pipeline_parallel_rank)
+        self.param_init_fn = param_init_fn
         self.input_names = None
 
         # Outputs from analyze_pipeline_module
@@ -147,6 +170,8 @@ class NxDPPModel(nn.Module):
         self.stage_id_to_output_count = None
 
         self.shared_weights_name_to_pg = {}
+        self.local_name_to_original_name = {}
+        self.original_name_to_local_name = {}
         self.clear_minibatch_state()
         self._set_distributed()
         # If user set up the pipeline cuts in config, directly run tracing and partition
@@ -242,28 +267,49 @@ class NxDPPModel(nn.Module):
         ), "NxDPPModel.trace() should be called before calling NxDPPModel.partition()"
 
         # Partition
-        self.paritioned_model = partition_traced_model(self.traced_model)
+        qualname_map = {}
+        self.paritioned_model = partition_traced_model(self.traced_model, qualname_map)
         (
             self.stage_id_to_IO_input_names,
             self.stage_id_to_model_input_names,
             self.stage_id_to_input_count,
             self.stage_id_to_output_count,
         ) = analyze_pipeline_module(self.paritioned_model)
-        self.partitioned = True
 
         # Extract the local module
         self.partitions = []
         for _, module in self.paritioned_model.named_children():
             self.partitions.append(module)
-        self.register_shared_weights()
         assert self.pipeline_parallel_size == len(
             self.partitions
         ), f"pipeline_parallel_size {self.pipeline_parallel_size} != number submodules {len(self.paritioned_model)}"
+
         self.local_module = self.partitions[self.pipeline_parallel_rank]
         if parallel_state.get_tensor_model_parallel_rank() == 0 and parallel_state.get_data_parallel_rank() == 0:
             logger.debug(
                 rmsg(f"pipeline_parallel_rank {self.pipeline_parallel_rank} local_module {self.local_module }")
             )
+
+        self._post_partition(qualname_map)
+
+    def _post_partition(self, qualname_map):
+        # Create name mapping between original parameter to partitioned parameter
+        self._build_parameter_buffer_name_mapping(qualname_map)
+        self.partitioned = True
+
+        # Locate shared weights between stages
+        self.register_shared_weights()
+
+        # Create pipeline schedule
+        self.create_schedule()
+
+        # Materialize local module to CPU then move to XLA device
+        self._maybe_materialize_local_module()
+
+        # grad is only enabled for local parameters
+        self._disable_grad_for_nonlocal()
+
+    def create_schedule(self):
         self.eval_scheduler = InferenceSchedule(
             self.num_microbatches, self.pipeline_parallel_size, self.pipeline_parallel_rank
         )
@@ -273,10 +319,39 @@ class NxDPPModel(nn.Module):
         logger.debug(rmsg(f"eval_schedule {[task for task in self.eval_scheduler.steps()]}"))
         logger.debug(rmsg(f"train_schedule {[task for task in self.train_scheduler.steps()]}"))
 
-        # Materialize local module to CPU then move to XLA device
-        self._maybe_materialize_local_module()
-
-        self._disable_grad_for_nonlocal()
+    def _build_parameter_buffer_name_mapping(self, qualname_map):
+        """
+        After partition, FX will change the parameter name. Here we build a mapping between local parameter name
+        and the original parameter name. The general rule is:
+        - `split_module` call for FX will create each partition as a child module
+        - Each child module will be named with submod_ prefix
+        - `split_module` call will return qualname_map as the mapping of original name to changed name
+        For example:
+            Original name: transformer.h.2.attn.c_proj.bias
+            Changed name from split call: submod_0.transformer_h_2.attn.c_proj.bias
+            We create transformer.h.2.attn.c_proj.bias : transformer_h_2.attn.c_proj.bias mapping to translate names
+        """
+        local_state_dict = self.local_module.state_dict(keep_vars=True)
+        orginal_state_dict = self.original_torch_module.state_dict(keep_vars=True)
+        qualname_map_local = {}
+        for local_name, origin_name in qualname_map.items():
+            assert local_name.startswith("submod_"), f"Found local module name with out submod_ prefix {local_name}"
+            if local_name.startswith(f"submod_{self.pipeline_parallel_rank}"):
+                # remove the submod_ prefix
+                local_name = ".".join(local_name.split(".")[1:])
+                qualname_map_local[local_name] = origin_name
+        for local_name, _ in local_state_dict.items():
+            origin_name = local_name
+            for local, orgin in qualname_map_local.items():
+                if local_name.startswith(local):
+                    origin_name = local_name.replace(local, orgin)
+            assert (
+                origin_name in orginal_state_dict
+            ), f"parameter/buffer name {origin_name} is missing from original torch model"
+            self.local_name_to_original_name[local_name] = origin_name
+            self.original_name_to_local_name[origin_name] = local_name
+        logger.debug(rmsg(f"local_name_to_original_name {self.local_name_to_original_name}"))
+        logger.debug(rmsg(f"original_name_to_local_name {self.original_name_to_local_name}"))
 
     def register_shared_weights(self):
         """
@@ -305,11 +380,23 @@ class NxDPPModel(nn.Module):
 
     def _reduce_shared_weights(self):
         for shared_name, pg in self.shared_weights_name_to_pg.items():
-            for n, p in self.local_named_parameters():
+            for n, p in self.local_module.named_parameters():
                 if shared_name == n and p.requires_grad:
                     assert p.grad is not None, f"Found shared weight {n} has None grad"
                     logger.debug(rmsg(f"Reduce shared weight {shared_name}"))
                     torch.distributed.all_reduce(p.grad, group=pg)
+                    break
+
+    def _sync_shared_weights(self):
+        for shared_name, pg in self.shared_weights_name_to_pg.items():
+            for n, p in self.local_module.named_parameters():
+                if shared_name == n:
+                    logger.info(rmsg(f"Sync shared weight {shared_name}"))
+                    with torch.no_grad():
+                        # Set parameter data to zeros except for the first rank in the shared group
+                        if torch.distributed.get_rank(group=pg) != 0:
+                            p.data.zero_()
+                        torch.distributed.all_reduce(p.data, group=pg)
                     break
 
     def _mark_pipeline_cuts(self, cut_point):
@@ -348,22 +435,14 @@ class NxDPPModel(nn.Module):
     def _disable_grad_for_nonlocal(self):
         # disable grads for non-local parameters
         local_p = set([p for p in self.local_parameters()])
-        for p in self.parameters():
+        for n, p in self.named_parameters():
             if p not in local_p:
                 p.requires_grad = False
                 p.grad = None
 
-    def _maybe_materialize_local_module(self):
-        """
-        Check whether there's fake tensor in local module, if so materialize it to cpu
-        """
-        maybe_materalize_model(self.local_module)
-        # Casting local module to xla device
-        move_model_to_device(self.local_module, xm.xla_device())
-        self._mark_step()
-
     def _prepare_run(self, kwargs, train=True):
         self._validate_partitioned()
+        self.move_model_to_device()
         self._prepare_inputs_and_infer_shape(kwargs, train=train)
 
     def _prepare_inputs_and_infer_shape(self, kwargs, train=True):
@@ -409,9 +488,19 @@ class NxDPPModel(nn.Module):
                 loss_all.append(loss.detach().cpu())
             if not self.return_mb_loss:
                 loss = torch.sum(torch.stack(loss_all), dim=0) / len(loss_all)
+                if self.broadcast_and_average_loss:
+                    loss = loss * self.pipeline_parallel_size
+                    world_cpu_group = parallel_state.get_gloo_group()
+                    torch.distributed.all_reduce(loss, group=parallel_state.get_gloo_group())
+                    return loss / torch.distributed.get_world_size(group=world_cpu_group)
                 return loss
             else:
                 return loss_all
+        elif self.broadcast_and_average_loss:
+            loss = torch.tensor(0.0)
+            world_cpu_group = parallel_state.get_gloo_group()
+            torch.distributed.all_reduce(loss, group=world_cpu_group)
+            return loss / torch.distributed.get_world_size(group=world_cpu_group)
         return None
 
     def run_train(self, **kwargs):
@@ -422,6 +511,7 @@ class NxDPPModel(nn.Module):
         self._exec_schedule(self.train_scheduler)
         loss = self._process_loss()
         self.clear_minibatch_state()
+        self.timeline.mark_step_end()
         return loss
 
     def run_eval(self, **kwargs):
@@ -433,6 +523,7 @@ class NxDPPModel(nn.Module):
             self._exec_schedule(self.eval_scheduler)
             loss = self._process_loss()
             self.clear_minibatch_state()
+            self.timeline.mark_step_end()
             return loss
 
     def get_batch_iterator(self, batch: List[torch.Tensor]):
@@ -500,6 +591,7 @@ class NxDPPModel(nn.Module):
         - Collect loss for the last pipeline stage
         - Collect the outputs that require grad for bwd
         """
+        self.timeline.mark_event_start(f"mb_{self.current_mb}_ForwardStepTask")
         if not self.tracing:
             if self.current_mb_stage_input is None:
                 raise RuntimeError(rmsg("Running ForwardStepTask but current_mb_stage_input is None"))
@@ -519,10 +611,12 @@ class NxDPPModel(nn.Module):
         self.current_mb_stage_input = None
 
         # Run local pipeline stage
+        self.timeline.mark_event_start(f"mb_{self.current_mb}_ForwardStep")
         outputs = self.local_module(*inputs)
 
         if not self.tracing:
             self._mark_step()
+        self.timeline.mark_event_end(f"mb_{self.current_mb}_ForwardStep")
 
         if self.pipeline_parallel_rank == self.pipeline_parallel_size - 1:
             # [TODO] Add inference support
@@ -562,17 +656,22 @@ class NxDPPModel(nn.Module):
                         # Current stage output and next stage input should match exactly
                         if self.training and t.requires_grad:
                             self.mb_to_outputs_for_grads[self.current_mb].append(t)
+        self.timeline.mark_event_end(f"mb_{self.current_mb}_ForwardStepTask")
 
     def _bwd_step_task(self):
         """
         Major duties of for this task:
         - Run current stage forward step for current mb
         """
+        self.timeline.mark_event_start(f"mb_{self.current_mb}_BackwardStepTask")
         # Last pipeline stage will directly do backprop from loss
         if self.pipeline_parallel_rank == self.pipeline_parallel_size - 1:
+            self.timeline.mark_event_start(f"mb_{self.current_mb}_BackwardStep")
             scaled_loss = self.losses[self.current_mb] / self.num_microbatches
             scaled_loss.backward()
             self._mark_step()
+            self.timeline.mark_event_end(f"mb_{self.current_mb}_BackwardStep")
+            self.timeline.mark_event_end(f"mb_{self.current_mb}_BackwardStepTask")
             return
 
         if self.current_mb_grads is None:
@@ -589,9 +688,12 @@ class NxDPPModel(nn.Module):
         self.current_mb_grads = None
         outputs = self.mb_to_outputs_for_grads.pop(self.current_mb)
 
+        self.timeline.mark_event_start(f"mb_{self.current_mb}_BackwardStep")
         # Run local pipeline stage
         torch.autograd.backward(outputs, grad_tensors=grads)
         self._mark_step()
+        self.timeline.mark_event_end(f"mb_{self.current_mb}_BackwardStep")
+        self.timeline.mark_event_end(f"mb_{self.current_mb}_BackwardStepTask")
 
     def _fwd_preprocess_task(self):
         """
@@ -603,6 +705,7 @@ class NxDPPModel(nn.Module):
         - Collect the inputs that require grad for bwd
         - Collect the inputs that will pass along this stage
         """
+        self.timeline.mark_event_start(f"mb_{self.current_mb}_ForwardPreprocessTask")
         if not self.tracing:
             if self.current_mb_stage_input is not None:
                 raise RuntimeError(rmsg("Running ForwardPreprocessTask but current_mb_stage_input is not None"))
@@ -617,11 +720,14 @@ class NxDPPModel(nn.Module):
 
         # Get the model inputs from model_inputs_iter
         if self.model_inputs_iter is not None:
+            self.timeline.mark_event_start(f"mb_{self.current_mb}_ForwardFetchInput")
             model_inputs = next(self.model_inputs_iter)
             for name, idx in self.stage_id_to_model_input_names[self.pipeline_parallel_rank].items():
                 inputs[idx] = model_inputs[self.input_name_to_iter_idx[name]]
+            self.timeline.mark_event_end(f"mb_{self.current_mb}_ForwardFetchInput")
 
         for name, inp in self.stage_id_to_IO_input_names[self.pipeline_parallel_rank].items():
+            self.timeline.mark_event_start(f"mb_{self.current_mb}_ForwardRecv_{name}")
             if not self.shape_traced:
                 # Suppose to receive List(TensorMeta), python obj
                 tensor_meta, py_obj = recv_python_object()
@@ -648,7 +754,9 @@ class NxDPPModel(nn.Module):
             ):
                 # Pass along
                 self.current_mb_pass_along_io[name] = inp_reconstructed
+            self.timeline.mark_event_end(f"mb_{self.current_mb}_ForwardRecv_{name}")
         self.current_mb_stage_input = (tuple(inputs), self.current_mb)
+        self.timeline.mark_event_end(f"mb_{self.current_mb}_ForwardPreprocessTask")
 
     def _fwd_postprocess_task(self):
         """
@@ -659,6 +767,7 @@ class NxDPPModel(nn.Module):
         # Last stage do not need to send
         if self.pipeline_parallel_rank == self.pipeline_parallel_size - 1:
             return
+        self.timeline.mark_event_start(f"mb_{self.current_mb}_ForwardPostprocessTask")
 
         if not self.tracing:
             if self.current_mb_stage_output is None:
@@ -683,6 +792,7 @@ class NxDPPModel(nn.Module):
 
         current_stage_output_IO = self.stage_id_to_IO_input_names[self.pipeline_parallel_rank + 1]
         for name, out in current_stage_output_IO.items():
+            self.timeline.mark_event_start(f"mb_{self.current_mb}_ForwardSend_{name}")
             if out.output_idx is not None:
                 # Current stage outputs
                 current_output = outputs[out.output_idx]
@@ -700,14 +810,17 @@ class NxDPPModel(nn.Module):
             for idx, t in enumerate(tx_list):
                 logger.debug(rmsg(f"fwd mb {self.current_mb} send {name}'s {idx}th tensor meta {tensor_meta[idx]}"))
                 self.send_op(t, tracing=self.tracing)
+            self.timeline.mark_event_end(f"mb_{self.current_mb}_ForwardSend_{name}")
         if len(self.current_mb_pass_along_io) != 0:
             raise RuntimeError(f"Unprocessed passing along io: {self.current_mb_pass_along_io.keys()}")
+        self.timeline.mark_event_end(f"mb_{self.current_mb}_ForwardPostprocessTask")
 
     def _bwd_preprocess_task(self):
         """
         Major duties of for this task:
         - Receive the grads for current mb backprop
         """
+        self.timeline.mark_event_start(f"mb_{self.current_mb}_BackwardPreprocessTask")
         # Last stage do not need to recv
         if self.pipeline_parallel_rank == self.pipeline_parallel_size - 1:
             return None, None
@@ -722,17 +835,21 @@ class NxDPPModel(nn.Module):
         grads = []
         current_mb_outputs = self.mb_to_outputs_for_grads[self.current_mb]
         logger.debug(rmsg(f"bwd mb {self.current_mb} recv grads count {len(current_mb_outputs)}"))
-        for t in current_mb_outputs:
+        for idx, t in enumerate(current_mb_outputs):
+            self.timeline.mark_event_start(f"mb_{self.current_mb}_BackwardRecv_{idx}")
             meta = TensorMeta(tensor_index=-1, dtype=t.dtype, shape=t.size(), requires_grad=False, device=t.device)
             logger.debug(rmsg(f"bwd mb {self.current_mb} recv grad meta {meta}"))
             grads.append(self.recv_op(meta, recv_prev=False))
+            self.timeline.mark_event_end(f"mb_{self.current_mb}_BackwardRecv_{idx}")
         self.current_mb_grads = (grads, self.current_mb)
+        self.timeline.mark_event_end(f"mb_{self.current_mb}_BackwardPreprocessTask")
 
     def _bwd_postprocess_task(self):
         """
         Major duties of for this task:
         - Send grads for previous rank for backprop
         """
+        self.timeline.mark_event_start(f"mb_{self.current_mb}_BackwardPostprocessTask")
         if len(self.mb_to_inputs_for_grads[self.current_mb]) == 0:
             raise RuntimeError(
                 "Running BackwardPostprocessTask but mb_to_inputs_for_grads does not contain inputs for current mb"
@@ -740,11 +857,14 @@ class NxDPPModel(nn.Module):
 
         current_mb_inputs = self.mb_to_inputs_for_grads.pop(self.current_mb)
         logger.debug(rmsg(f"bwd mb {self.current_mb} send grads count {len(current_mb_inputs)}"))
-        for t in current_mb_inputs:
+        for idx, t in enumerate(current_mb_inputs):
+            self.timeline.mark_event_start(f"mb_{self.current_mb}_BackwardSend_{idx}")
             if not t.requires_grad or t.grad is None:
                 raise RuntimeError(rmsg("Backward sending grads, but get None"))
             logger.debug(rmsg(f"bwd mb {self.current_mb} send grad shape {t.grad.size()}"))
             self.send_op(t.grad, send_next=False)
+            self.timeline.mark_event_end(f"mb_{self.current_mb}_BackwardSend_{idx}")
+        self.timeline.mark_event_end(f"mb_{self.current_mb}_BackwardPostprocessTask")
 
     def _reduce_grads_task(self):
         """
@@ -752,6 +872,7 @@ class NxDPPModel(nn.Module):
         - Average the grads acorss data parallel ranks
         - Add the grads for shared weights
         """
+        self.timeline.mark_event_start(f"mb_{self.current_mb}_ReduceGradsTask")
         # Group for different dtypes and all-reduce
         dtype_groups = {}
         for param in self.local_parameters():
@@ -772,6 +893,7 @@ class NxDPPModel(nn.Module):
 
         self._reduce_shared_weights()
         self._mark_step()
+        self.timeline.mark_event_end(f"mb_{self.current_mb}_ReduceGradsTask")
 
     # A map of PipeInstruction types to methods. Each method will be executed with the
     # kwargs provided to the PipeInstruction from the scheduler.
@@ -802,12 +924,24 @@ class NxDPPModel(nn.Module):
 
     def forward(self, *args, **kwargs):
         """Disabled for pipeline parallel training."""
-        raise RuntimeError("Only run_train() and run_eval() are accessible when pipeline parallelism is enabled.")
+        raise RuntimeError(
+            "model.forward() is not supported in pipeline model. \
+                           Use model.run_train() and model.run_eval() instead."
+        )
 
-    def load_state_dict(self, state_dict):
-        self._validate_partitioned()
-        print("loading state dict")
-        self.local_module.load_state_dict(state_dict)
+    def train(self, *args, **kwargs):
+        """Disabled for pipeline parallel training."""
+        raise RuntimeError(
+            "model.train() is not supported in pipeline mode. \
+                           Use model.run_train() and model.run_eval() instead."
+        )
+
+    def state_dict(self, *args, **kwargs):
+        """Disabled for pipeline parallel training."""
+        raise RuntimeError(
+            "model.state_dict() is not supported in pipeline mode. \
+                           Use model.local_state_dict() instead."
+        )
 
     def named_parameters(self, *args, **kwargs):
         return self.original_torch_module.named_parameters(*args, **kwargs)
@@ -823,7 +957,6 @@ class NxDPPModel(nn.Module):
 
     """
     Below methods requires partition
-    [TODO] translate the module/parameter names
     """
 
     def local_modules(self):
@@ -844,17 +977,50 @@ class NxDPPModel(nn.Module):
     def local_named_parameters(self, recurse: bool = True):
         self._validate_partitioned()
         for n, p in self.local_module.named_parameters(recurse=recurse):
-            yield n, p
+            original_name = self.local_name_to_original_name[n]
+            yield original_name, p
 
     def local_named_buffers(self, prefix: str = "", recurse: bool = True):
         self._validate_partitioned()
         for name, buf in self.local_module.named_buffers(prefix=prefix, recurse=recurse):
-            yield name, buf
+            original_name = self.local_name_to_original_name[name]
+            yield original_name, buf
 
     def local_buffers(self, recurse=True):
         self._validate_partitioned()
         for n, b in self.local_named_buffers(recurse=recurse):
             yield b
+
+    def load_state_dict(self, state_dict, strict=True):
+        self._validate_partitioned()
+        local_state_dict = self.translate_origin_state_dict_to_local_state_dict(state_dict)
+        self.local_module.load_state_dict(local_state_dict, strict=strict)
+
+    def local_state_dict(self, *args, **kwargs):
+        self._validate_partitioned()
+        local_state_dict = self.local_module.state_dict(*args, **kwargs)
+        local_state_dict = self.translate_local_state_dict_to_origin_state_dict(local_state_dict)
+        return local_state_dict
+
+    def translate_origin_state_dict_to_local_state_dict(self, origin_state_dict):
+        self._validate_partitioned()
+        local_dict = {}
+        for n, p in origin_state_dict.items():
+            if n in self.original_name_to_local_name:
+                local_name = self.original_name_to_local_name[n]
+                local_dict[local_name] = p
+        return local_dict
+
+    def translate_local_state_dict_to_origin_state_dict(self, local_state_dict):
+        self._validate_partitioned()
+        origin_state_dict = {}
+        for n, p in local_state_dict.items():
+            if n in self.local_name_to_original_name:
+                origin_name = self.local_name_to_original_name[n]
+                origin_state_dict[origin_name] = p
+            else:
+                raise ValueError(f"parameter {n} in local_state_dict does not exist in local module")
+        return origin_state_dict
 
     """
     Below methods can be overwritten to support non-XLA devices
@@ -874,3 +1040,19 @@ class NxDPPModel(nn.Module):
 
     def _get_microbatch_dataloader(self, all_batches):
         return MpDeviceLoader(all_batches, xm.xla_device(), batches_per_execution=self.num_microbatches)
+
+    def _maybe_materialize_local_module(self):
+        """
+        Check whether there's fake tensor in local module, if so materialize it to cpu
+        """
+        maybe_materalize_model(self.local_module)
+        if self.param_init_fn is not None:
+            reinit_model(self.local_module, torch.device("cpu"), self.param_init_fn)
+
+    def move_model_to_device(self):
+        if not self.model_moved_to_device:
+            # Casting local module to xla device
+            move_model_to_device(self.local_module, xm.xla_device())
+            self._sync_shared_weights()
+            self._mark_step()
+            self.model_moved_to_device = True

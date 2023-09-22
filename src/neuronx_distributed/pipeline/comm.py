@@ -5,13 +5,31 @@ import torch
 import torch_xla.core.xla_model as xm
 
 from ..parallel_layers import parallel_state
-from ..parallel_layers.parallel_state import get_gloo_group, rmsg
+from ..parallel_layers.parallel_state import (
+    get_gloo_group,
+    get_pipeline_model_parallel_group,
+    rmsg,
+)
 from ..utils.logger import get_logger
 
 logger = get_logger()
 
 # max size of python object buffer to send between stages
 MAX_LENGTH = 2**20  # 1M
+
+# a CPU group that contains ranks from first PP group
+# usually used to collect timeline events
+FIRST_PP_GROUP_PG_GLOO = None
+
+
+def get_gloo_pg_for_first_pp_group():
+    global FIRST_PP_GROUP_PG_GLOO
+    if FIRST_PP_GROUP_PG_GLOO is None:
+        first_pp_group = get_pipeline_model_parallel_group(as_list=True)[0]
+        if torch.distributed.get_rank() == 0:
+            logger.debug(f"Create FIRST_PP_GROUP_PG_GLOO for ranks {first_pp_group}")
+        FIRST_PP_GROUP_PG_GLOO = torch.distributed.new_group(ranks=first_pp_group, backend="gloo")
+    return FIRST_PP_GROUP_PG_GLOO
 
 
 """

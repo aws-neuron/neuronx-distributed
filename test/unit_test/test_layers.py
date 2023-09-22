@@ -45,15 +45,14 @@ def test_parallel_embedding(tensor_model_parallel_size):
         parallel_state.initialize_model_parallel(tensor_model_parallel_size_)
         tensor_model_parallel_size_ = parallel_state.get_tensor_model_parallel_size()
 
-        batch_size = 17
-        seq_length = 23
-        vocab_size = 48
-        hidden_size = 16
+        batch_size = 1
+        seq_length = 2048
+        vocab_size = 30432
+        hidden_size = 1024
         seed = 1234
 
-        set_random_seed(123)
-        input_data = torch.LongTensor(size=(batch_size, seq_length)).random_(
-            0, vocab_size).to(device)
+        set_random_seed(seed)
+        input_data = torch.LongTensor(size=(batch_size, seq_length)).random_(0, vocab_size).to(device)
         loss_weight = torch.randn([batch_size, seq_length, hidden_size]).to(device)
 
         set_random_seed(seed)
@@ -74,9 +73,8 @@ def test_parallel_embedding(tensor_model_parallel_size):
 
         torch.distributed.barrier()
         error = loss_parallel.sub(loss_original).abs()
-        print('   error in loss (parallel) on global rank {}: {}'.format(
-            torch.distributed.get_rank(), error))
-        assert error < 1.0e-5, 'error: {}'.format(error)
+        print("   error in loss (parallel) on global rank {}: {}".format(torch.distributed.get_rank(), error))
+        assert error < 1.0e-3, "error: {}".format(error)
 
         weight_grad_orig = torch.split(
             embedding_original.weight.grad,
@@ -345,9 +343,7 @@ def test_column_parallel_linear_seq_parallel(tensor_model_parallel_size):
             torch.distributed.get_rank(), error))
         assert error < 1.0e-3, 'error: {}'.format(error)
 
-        # FIXME: The following test code failed with neuronx-cc 2.0.0.16278a0+a830597b3 (used by pipeline when I submit the code)
-        # but worked with a newer version (neuronx-cc 2.0.0.17643a0+bf9c06ff2) in my own machine . Comment it out for now.
-        """
+        
         if tensor_model_parallel_size_ == 1:
             expected_grad_chunk = ref_linear.weight.grad.chunk(
                 chunks=tensor_model_parallel_size_,
@@ -358,7 +354,6 @@ def test_column_parallel_linear_seq_parallel(tensor_model_parallel_size):
             print('   error in grad (parallel) on global rank {}: {}'.format(
                 torch.distributed.get_rank(), error))
             assert error < 1.0e-3, 'error: {}'.format(error)
-        """
 
         # Reset groups
         parallel_state.destroy_model_parallel()

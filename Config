@@ -1,12 +1,19 @@
 package.NeuronxDistributed = {
     interfaces = (1.0);
 
-    build-system = custom-build;
+    build-environment = {
+        chroot = basic;
+        network-access = internal;
+    };
+
+    build-system = container-build;
     build-tools = {
         1.0 = {
+            ContainerBuild = 1.2;
+            KaenaAuxiliaryBuildFarmKey = 1.0;
+            KaenaTorchXlaBaseDockerImage = 1.0;
             Python3PBuildTool = 2.0;
             Python-setuptools = default;
-            Python-wheel = 0.x;
             NeuronLicense = 1.0;
         };
     };

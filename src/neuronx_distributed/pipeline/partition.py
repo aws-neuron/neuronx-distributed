@@ -14,9 +14,14 @@ from neuronx_distributed.utils.serialization import TensorMeta
 logger = get_logger()
 
 
-def partition_traced_model(traced_model):
+def partition_traced_model(traced_model, qualname_map=None):
     """
     Partition a traced model based on annotations
+    Inputs:
+    traced_model: GraphModule: The graph module to be partitioned
+    qualname_map: Optional[Dict[str, str]]: optional output parameter that returns a
+            mapping from new target names in the module after split to old target
+            names in the original module.
     """
     curr_stage_id = 0
     # "partition" will mark the cut stage
@@ -31,6 +36,7 @@ def partition_traced_model(traced_model):
         traced_model,
         None,
         lambda node: node.meta["partition"],
+        qualname_map=qualname_map,
         keep_original_order=True,
     )
     return mod_after_split

@@ -2,7 +2,7 @@ import os
 import concurrent.futures
 import multiprocessing
 import pathlib
-from typing import Any, Callable, Dict, Iterable, List, Optional, Union
+from typing import Any, Callable, Iterable, List, Optional, Union
 import torch
 import torch_neuronx
 import torch_xla.core.xla_model as xm
@@ -25,37 +25,45 @@ class TensorParallelNeuronModel(ParallelModel):
         self.models = models
         self.load = False
         self.tp_degree = len(models)
+        self.executor = None # Initialized with the first forward call
 
     def _load(self):
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            futures = [
-                executor.submit(
-                    torch.ops.neuron._load_collectives_neuron,
-                    model.model,
-                    i,
-                    1,
-                    i,
-                    self.tp_degree,
-                )
-                for i, model in enumerate(self.models)
-            ]
-            for future in concurrent.futures.as_completed(futures):
-                # Here we wait for result to make sure all the processes have finished loading
-                # models
-                future.result()
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=self.tp_degree)        
+        futures = [
+            self.executor.submit(
+                torch.ops.neuron._load_collectives_neuron,
+                model.model,
+                i,
+                1,
+                i,
+                self.tp_degree,
+            )
+            for i, model in enumerate(self.models)
+        ]
+        for future in concurrent.futures.as_completed(futures):
+            # Here we wait for result to make sure all the processes have finished loading
+            # models
+            future.result()
+
+        # We now move the state params to device
+        for i, model in enumerate(self.models):
+            torch_neuronx.move_trace_to_device(model, i)
         self.load = True
 
     def forward(self, *tensors):
         if not self.load:
             self._load()
         results = []
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            futures = [executor.submit(model, *tensors) for model in self.models]
-            for future in concurrent.futures.as_completed(futures):
-                results.append(future.result())
+        futures = [self.executor.submit(model, *tensors) for model in self.models]
+        for future in concurrent.futures.as_completed(futures):
+            results.append(future.result())
         # Here we are making the assumption that we are operating in SPMD mode.
         # We can extend this to return all results.
         return results[0]
+    
+    def __del__(self):
+        if self.executor:
+            self.executor.shutdown()
 
 
 def _trace(
@@ -93,7 +101,7 @@ def _trace(
                 compiler_args,
                 options,
             )
-            mp_q.put((neff_filename, metaneff, flattener, packer, example_inputs, input_output_alias))
+            mp_q.put((neff_filename, metaneff, flattener, packer, example_inputs, input_output_alias, rank))
     xm.rendezvous("compilation-done")
 
 
@@ -153,7 +161,12 @@ def parallel_model_trace(
         start_method="spawn",
         nprocs=tp_degree,
     )
-    models = [torch_neuronx.xla_impl.trace.create_neuron_model(*mp_q.get()) for _ in range(tp_degree)]
+    models = [None] * tp_degree
+    while not mp_q.empty():
+        neff_filename, metaneff, flattener, packer, example_inputs, input_output_alias, rank = mp_q.get()
+        models[rank] = torch_neuronx.xla_impl.trace.create_neuron_model(
+            neff_filename, metaneff, flattener, packer, example_inputs, input_output_alias
+        )
     return TensorParallelNeuronModel(models)
 
 
