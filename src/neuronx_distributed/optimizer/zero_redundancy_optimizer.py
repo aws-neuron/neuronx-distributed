@@ -8,13 +8,17 @@ import torch_xla.core.xla_model as xm
 from torch_xla.distributed.zero_redundancy_optimizer import ZeroRedundancyOptimizer
 
 from ..parallel_layers.checkpointing import ensure_directory_exists
+from ..parallel_layers.grads import clip_grad_norm
 from ..parallel_layers.parallel_state import (
     get_data_parallel_rank,
     get_data_parallel_size,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_size,
 )
-from ..parallel_layers.utils import add_barrier, get_local_world_size
+from ..parallel_layers.utils import (
+    get_local_world_size,
+    move_all_tensor_to_cpu,
+)
 from ..utils.logger import get_logger
 
 logger = get_logger()
@@ -22,57 +26,26 @@ logger = get_logger()
 
 class NeuronZero1Optimizer(ZeroRedundancyOptimizer):
     @torch.no_grad()
-    def _calc_grad_norm(
+    def _clip_grad_norm(
         self,
+        max_norm: Union[float, int],
         norm_type: Union[float, int] = 2.0,
     ) -> torch.Tensor:
-        grads_for_norm = []
-        duplicate_grads_for_norm = []
-        # use a trick to become spmd here
+        all_parameters = []
         for param_group, sharded_param_group in zip(self.param_groups, self.base_optimizer.param_groups):
             for param, shard in zip(param_group["params"], sharded_param_group["params"]):
                 if param.grad is not None:
-                    is_not_shared = not hasattr(param, "shared") or not param.shared
-                    is_not_tp_duplicate = hasattr(param, "tensor_model_parallel") and param.tensor_model_parallel
-                    if is_not_shared:
-                        if is_not_tp_duplicate:
-                            grads_for_norm.append(shard.grad.detach())
-                        else:
-                            duplicate_grads_for_norm.append(shard.grad.detach())
-        # Norm parameters.
-        if norm_type != 2.0:
-            raise RuntimeError(f"only norm type 2 is supported, getting {norm_type}")
-        total_norm = torch.zeros([], dtype=self.optimizer_dtype, device=self.device)
-        for grad in duplicate_grads_for_norm:
-            grad_norm = (grad * grad).sum()
-            total_norm += grad_norm
-        total_norm /= get_tensor_model_parallel_size()
-        for grad in grads_for_norm:
-            grad_norm = (grad * grad).sum()
-            total_norm += grad_norm
-        # All-reduce across data parallel groups
-        xm.all_reduce(
-            xm.REDUCE_SUM,
-            [total_norm],
-            groups=self._sharding_groups,
-            pin_layout=self.pin_layout,
-        )
-        # All-reduce across other parallel groups, usually model parallel groups
-        if self._grad_norm_groups is not None:
-            xm.all_reduce(
-                xm.REDUCE_SUM,
-                [total_norm],
-                groups=self._grad_norm_groups,
-                pin_layout=self.pin_layout,
-            )
-        total_norm = torch.pow(total_norm, 1.0 / norm_type)
-        return total_norm
+                    if hasattr(param, "shared"):
+                        shard.shared = param.shared
+                    if hasattr(param, "tensor_model_parallel"):
+                        shard.tensor_model_parallel = param.tensor_model_parallel
+                    all_parameters.append(shard)
 
-    def save_sharded_state_dict(
-        self,
-        output_dir: str,
-        save_serially: bool = True,
-    ) -> None:
+        # [TODO] Find a way to expose global_norm to user
+        global_norm = clip_grad_norm(all_parameters, max_norm=max_norm, norm_type=norm_type, zero1_optimizer=True)
+
+    # [TODO] Use the save/load function from parallel_layers/checkpointing.py
+    def save_sharded_state_dict(self, output_dir: str, num_workers_per_step: int = 8) -> None:
         """Save a model checkpoint."""
 
         if torch.distributed.is_initialized():
@@ -83,28 +56,34 @@ class NeuronZero1Optimizer(ZeroRedundancyOptimizer):
 
         state_dict = self.state_dict()
         state_dict["dp_rank"] = get_data_parallel_rank()
+        state_dict["tp_rank"] = get_tensor_model_parallel_rank()
 
         chkpt_path = output_dir
-        chkpt_path = os.path.join(chkpt_path, "optim.dp_rank_{:02d}".format(get_data_parallel_rank()))
+        chkpt_path = os.path.join(
+            chkpt_path,
+            "optim.dp_rank_{:02d}.tp_rank_{:02d}".format(get_data_parallel_rank(), get_tensor_model_parallel_rank()),
+        )
+        ensure_directory_exists(chkpt_path)
 
-        if get_tensor_model_parallel_rank() == 0:
-            ensure_directory_exists(chkpt_path)
-        if save_serially:
-            cpu_data = xm._maybe_convert_to_cpu(state_dict, convert=(get_tensor_model_parallel_rank() == 0))
-            for dp_rank in range(0, get_data_parallel_size()):
-                # Staggering save checkpoints
-                if get_tensor_model_parallel_rank() == 0 and get_data_parallel_rank() == dp_rank:
-                    torch.save(cpu_data, chkpt_path)
-                add_barrier(f"optimizer.ckpt-save-{dp_rank}")
-        else:
-            cpu_data = xm._maybe_convert_to_cpu(state_dict, convert=(get_tensor_model_parallel_rank() == 0))
-            torch.save(cpu_data, chkpt_path)
+        local_rank = xm.get_local_ordinal()
+        for worker in range(math.ceil(get_local_world_size() / num_workers_per_step)):
+            if local_rank // num_workers_per_step == worker:
+                logger.debug(f"optimizer.worker {local_rank} saving checkpoint {chkpt_path}")
+                cpu_data = move_all_tensor_to_cpu(state_dict)
+                torch.save(cpu_data, chkpt_path)
+                del cpu_data
+                gc.collect()
+            xm.rendezvous("optimizer.save_checkpoint" + str(worker))
 
-        add_barrier("optimizer checkpoint done")
+        xm.rendezvous("optimizer checkpoint done")
 
-    def load_sharded_state_dict(self, output_dir: str, num_workers_per_step=8) -> None:
+    # [TODO] Use the save/load function from parallel_layers/checkpointing.py
+    def load_sharded_state_dict(self, output_dir: str, num_workers_per_step: int = 8) -> None:
         chkpt_path = output_dir
-        chkpt_path = os.path.join(chkpt_path, "optim.dp_rank_{:02d}".format(get_data_parallel_rank()))
+        chkpt_path = os.path.join(
+            chkpt_path,
+            "optim.dp_rank_{:02d}.tp_rank_{:02d}".format(get_data_parallel_rank(), get_tensor_model_parallel_rank()),
+        )
 
         if torch.distributed.is_initialized():
             if torch.distributed.get_rank() == 0:
@@ -120,4 +99,5 @@ class NeuronZero1Optimizer(ZeroRedundancyOptimizer):
                 self.load_state_dict(check_point)
                 del check_point
                 gc.collect()
-            add_barrier("optimizer.load_checkpoint" + str(worker))
+            xm.rendezvous("optimizer.load_checkpoint" + str(worker))
+

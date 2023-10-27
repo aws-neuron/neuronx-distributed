@@ -9,11 +9,6 @@ from transformers.models.bert.modeling_bert import (BertSelfAttention,
 
 import neuronx_distributed
 from neuronx_distributed.parallel_layers import layers, parallel_state
-import torch
-import torch_neuronx
-import transformers
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
-from transformers.models.bert.modeling_bert import BertSelfAttention, BertSelfOutput
 
 
 def encode(tokenizer, *inputs, max_length=128, batch_size=1):

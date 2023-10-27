@@ -1,17 +1,16 @@
-import atexit
-from datetime import datetime
-import json 
 import argparse
+import atexit
+import json
 import os
 import traceback
-import copy
-import torch_xla.core.xla_model as xm
-import torch_xla
-import torch_xla.debug.metrics as met
-import torch.nn.init as init
+from datetime import datetime
+
 import torch
-from transformers import BertForPreTraining
-from commons import set_random_seed, print_separator, IdentityLayer3D
+import torch.nn.init as init
+import torch_xla.core.xla_model as xm
+import torch_xla.debug.metrics as met
+from commons import print_separator, set_random_seed
+
 from neuronx_distributed.parallel_layers import layers, parallel_state
 from neuronx_distributed.parallel_layers.random import model_parallel_xla_manual_seed
 from neuronx_distributed.parallel_layers.utils import is_pjrt_device
@@ -22,24 +21,26 @@ datetime_str = str(datetime.now())
 
 def parse_args():
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument('--test_json', required=False, help='input json listing the test spec for network to compile')
-    parser.add_argument('--s3_dir', required=False, help='location to upload all test artifacts')
-    parser.add_argument('--s3_bucket', default='s3://ktf-test-runs/neuronx_distributed_parallel_layers/layers')
+    parser.add_argument(
+        "--test_json",
+        required=False,
+        help="input json listing the test spec for network to compile",
+    )
+    parser.add_argument("--s3_dir", required=False, help="location to upload all test artifacts")
+    parser.add_argument("--s3_bucket", default="s3://ktf-test-runs/neuronx_distributed_parallel_layers/layers")
     args, leftovers = parser.parse_known_args()
     S3_BUCKET_NAME = args.s3_bucket
     with open(args.test_json, "r") as f:
         test_dict = json.load(f)
     return test_dict, S3_BUCKET_NAME, args
 
+
 test_config, S3_BUCKET_NAME, args = parse_args()
-results = {
-    "inference_success": 1
-}
+results = {"inference_success": 1}
 
 
 def test_parallel_embedding(tensor_model_parallel_size):
     def _test_parallel_embedding():
-        
         device = xm.xla_device()
         tensor_model_parallel_size_ = tensor_model_parallel_size
         parallel_state.initialize_model_parallel(tensor_model_parallel_size_)
@@ -63,10 +64,7 @@ def test_parallel_embedding(tensor_model_parallel_size):
         loss_original.backward()
 
         set_random_seed(seed)
-        embedding_parallel = layers.ParallelEmbedding(
-            vocab_size,
-            hidden_size,
-            init_method=init.normal_).to(device)
+        embedding_parallel = layers.ParallelEmbedding(vocab_size, hidden_size, init_method=init.normal_).to(device)
         output = embedding_parallel(input_data)
         loss_parallel = torch.mul(output, loss_weight).sum()
         loss_parallel.backward()
@@ -76,13 +74,11 @@ def test_parallel_embedding(tensor_model_parallel_size):
         print("   error in loss (parallel) on global rank {}: {}".format(torch.distributed.get_rank(), error))
         assert error < 1.0e-3, "error: {}".format(error)
 
-        weight_grad_orig = torch.split(
-            embedding_original.weight.grad,
-            vocab_size // tensor_model_parallel_size_,
-            0)[parallel_state.get_tensor_model_parallel_rank()]
+        weight_grad_orig = torch.split(embedding_original.weight.grad, vocab_size // tensor_model_parallel_size_, 0)[
+            parallel_state.get_tensor_model_parallel_rank()
+        ]
         error = embedding_parallel.weight.grad.sub(weight_grad_orig).abs().max()
-        print('   error in grad (parallel) on global rank {}: {}'.format(
-            torch.distributed.get_rank(), error))
+        print("   error in grad (parallel) on global rank {}: {}".format(torch.distributed.get_rank(), error))
         # assert error < 1.0e-5, 'error: {}'.format(error) #Error is 2.09
 
         # Reset groups
@@ -90,10 +86,10 @@ def test_parallel_embedding(tensor_model_parallel_size):
 
         torch.distributed.barrier()
         if torch.distributed.get_rank() == 0:
-            print('test passed')
+            print("test passed")
 
         del device
-        
+
     global results
     try:
         _test_parallel_embedding()
@@ -105,7 +101,6 @@ def test_parallel_embedding(tensor_model_parallel_size):
 
 def test_initialize_affine_weight_cpu(tensor_model_parallel_size):
     def _test_initialize_affine_weight_cpu():
-
         tensor_model_parallel_size_ = tensor_model_parallel_size
         parallel_state.initialize_model_parallel(tensor_model_parallel_size_)
         tensor_model_parallel_size_ = parallel_state.get_tensor_model_parallel_size()
@@ -121,22 +116,23 @@ def test_initialize_affine_weight_cpu(tensor_model_parallel_size):
         # ---------------
         weight = torch.empty(output_size_coeff, input_size)
         set_random_seed(seed)
-        layers._initialize_affine_weight_cpu(weight, output_size, input_size,
-                                            output_size_coeff, 0,
-                                            torch.nn.init.normal_)
+        layers._initialize_affine_weight_cpu(
+            weight, output_size, input_size, output_size_coeff, 0, torch.nn.init.normal_
+        )
         # Target.
         set_random_seed(seed)
         master_weight = torch.empty(output_size, input_size)
         torch.nn.init.normal_(master_weight)
         rank = parallel_state.get_tensor_model_parallel_rank()
-        my_weight = torch.split(master_weight, output_size_coeff,
-                                dim=0)[rank].contiguous().clone()
+        my_weight = torch.split(master_weight, output_size_coeff, dim=0)[rank].contiguous().clone()
 
         # Compare.
         error = weight.sub(my_weight).abs().max()
         torch.distributed.barrier()
-        print('   column parallel max error (should be zero) on global rank '
-            '{}: {}'.format(torch.distributed.get_rank(), error))
+        print(
+            "   column parallel max error (should be zero) on global rank "
+            "{}: {}".format(torch.distributed.get_rank(), error)
+        )
         assert error < 1.0e-6
 
         # ------------
@@ -144,22 +140,23 @@ def test_initialize_affine_weight_cpu(tensor_model_parallel_size):
         # ------------
         weight = torch.empty(output_size, input_size_coeff)
         set_random_seed(seed)
-        layers._initialize_affine_weight_cpu(weight, output_size, input_size,
-                                            input_size_coeff, 1,
-                                            torch.nn.init.normal_)
+        layers._initialize_affine_weight_cpu(
+            weight, output_size, input_size, input_size_coeff, 1, torch.nn.init.normal_
+        )
         # Target.
         set_random_seed(seed)
         master_weight = torch.empty(output_size, input_size)
         torch.nn.init.normal_(master_weight)
         rank = parallel_state.get_tensor_model_parallel_rank()
-        my_weight = torch.split(master_weight, input_size_coeff,
-                                dim=1)[rank].contiguous().clone()
+        my_weight = torch.split(master_weight, input_size_coeff, dim=1)[rank].contiguous().clone()
 
         # Compare.
         error = weight.sub(my_weight).abs().max()
         torch.distributed.barrier()
-        print('   row parallel max error (should be zero) on global rank '
-            '{}: {}'.format(torch.distributed.get_rank(), error))
+        print(
+            "   row parallel max error (should be zero) on global rank "
+            "{}: {}".format(torch.distributed.get_rank(), error)
+        )
         assert error < 1.0e-6
 
         xm.mark_step()
@@ -169,8 +166,8 @@ def test_initialize_affine_weight_cpu(tensor_model_parallel_size):
 
         torch.distributed.barrier()
         if torch.distributed.get_rank() == 0:
-            print('test passed')
-    
+            print("test passed")
+
     global results
     try:
         _test_initialize_affine_weight_cpu()
@@ -181,7 +178,6 @@ def test_initialize_affine_weight_cpu(tensor_model_parallel_size):
 
 
 def test_row_parallel_linear_seq_parallel(tensor_model_parallel_size):
-
     def _test_row_parallel_linear_seq_parallel():
         batch_size = 8
         seq_length = 128
@@ -203,6 +199,7 @@ def test_row_parallel_linear_seq_parallel(tensor_model_parallel_size):
             bias=False,
             input_is_parallel=True,
             sequence_parallel_enabled=True,
+            init_master_weight=True,
         ).to(device)
 
         with torch.no_grad():
@@ -238,15 +235,14 @@ def test_row_parallel_linear_seq_parallel(tensor_model_parallel_size):
 
         torch.distributed.barrier()
 
-        expected_output_chunk=expected_output.chunk(
+        expected_output_chunk = expected_output.chunk(
             chunks=tensor_model_parallel_size_,
             dim=0,
-            )[parallel_state.get_tensor_model_parallel_rank()]
+        )[parallel_state.get_tensor_model_parallel_rank()]
 
         error = output.sub(expected_output_chunk).abs().max()
-        print('   error in output (parallel) on global rank {}: {}'.format(
-            torch.distributed.get_rank(), error))
-        assert error < 1.0e-3, 'error: {}'.format(error)
+        print("   error in output (parallel) on global rank {}: {}".format(torch.distributed.get_rank(), error))
+        assert error < 1.0e-3, "error: {}".format(error)
 
         if tensor_model_parallel_size_ == 1:
             expected_grad_chunk = ref_linear.weight.grad.chunk(
@@ -255,16 +251,15 @@ def test_row_parallel_linear_seq_parallel(tensor_model_parallel_size):
             )[parallel_state.get_tensor_model_parallel_rank()]
 
             error = linear.weight.grad.sub(expected_grad_chunk).abs().max()
-            print('   error in grad (parallel) on global rank {}: {}'.format(
-                torch.distributed.get_rank(), error))
-            assert error < 1.0e-3, 'error: {}'.format(error)
+            print("   error in grad (parallel) on global rank {}: {}".format(torch.distributed.get_rank(), error))
+            assert error < 1.0e-3, "error: {}".format(error)
 
         # Reset groups
         parallel_state.destroy_model_parallel()
 
         torch.distributed.barrier()
         if torch.distributed.get_rank() == 0:
-            print('test passed')
+            print("test passed")
 
         del device
 
@@ -278,7 +273,6 @@ def test_row_parallel_linear_seq_parallel(tensor_model_parallel_size):
 
 
 def test_column_parallel_linear_seq_parallel(tensor_model_parallel_size):
-
     def _test_column_parallel_linear_seq_parallel():
         batch_size = 8
         seq_length = 128
@@ -300,16 +294,18 @@ def test_column_parallel_linear_seq_parallel(tensor_model_parallel_size):
             bias=False,
             gather_output=False,
             sequence_parallel_enabled=True,
+            init_master_weight=True,
         ).to(device)
 
         with torch.no_grad():
             orig_input_tensor = torch.randn(tensor_shape, requires_grad=True, device=device)
             orig_loss_weight = torch.randn(tensor_shape, device=device)
-            input_tensor = list(
-                orig_input_tensor.chunk(tensor_model_parallel_size_, dim=0)
-            )[parallel_state.get_tensor_model_parallel_rank()]
+            input_tensor = list(orig_input_tensor.chunk(tensor_model_parallel_size_, dim=0))[
+                parallel_state.get_tensor_model_parallel_rank()
+            ]
             loss_weight = orig_loss_weight.chunk(
-                tensor_model_parallel_size_, dim=2,
+                tensor_model_parallel_size_,
+                dim=2,
             )[parallel_state.get_tensor_model_parallel_rank()]
         input_tensor.requires_grad_()
         output = linear(input_tensor)
@@ -339,9 +335,8 @@ def test_column_parallel_linear_seq_parallel(tensor_model_parallel_size):
         )[parallel_state.get_tensor_model_parallel_rank()]
 
         error = output.sub(expected_output_chunk).abs().max()
-        print('   error in output (parallel) on global rank {}: {}'.format(
-            torch.distributed.get_rank(), error))
-        assert error < 1.0e-3, 'error: {}'.format(error)
+        print("   error in output (parallel) on global rank {}: {}".format(torch.distributed.get_rank(), error))
+        assert error < 1.0e-3, "error: {}".format(error)
 
         
         if tensor_model_parallel_size_ == 1:
@@ -360,7 +355,7 @@ def test_column_parallel_linear_seq_parallel(tensor_model_parallel_size):
 
         torch.distributed.barrier()
         if torch.distributed.get_rank() == 0:
-            print('test passed')
+            print("test passed")
 
         del device
 
@@ -498,7 +493,7 @@ def upload_to_s3():
 def on_exit():
     upload_to_s3()
     for k in test_config:
-        os.system(f'rm {args.test_json}')
+        os.system(f"rm {args.test_json}")
         with open(args.test_json, "w") as f:
             json.dump({k: results}, f)
 

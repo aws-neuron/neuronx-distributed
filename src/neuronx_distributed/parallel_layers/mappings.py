@@ -1,4 +1,5 @@
 import torch
+import torch_xla.core.xla_model as xm
 
 from .parallel_state import (
     get_tensor_model_parallel_group,
@@ -11,8 +12,6 @@ if "all_gather_into_tensor" not in dir(torch.distributed):
     torch.distributed.all_gather_into_tensor = torch.distributed._all_gather_base
 if "reduce_scatter_tensor" not in dir(torch.distributed):
     torch.distributed.reduce_scatter_tensor = torch.distributed._reduce_scatter_base
-
-import torch_xla.core.xla_model as xm
 
 
 def _reduce(input_: torch.Tensor) -> torch.Tensor:
@@ -59,7 +58,7 @@ def _split_along_first_dim(input_: torch.Tensor) -> torch.Tensor:
     assert dim_size % world_size == 0
     local_dim_size = dim_size // world_size
     dim_offset = get_tensor_model_parallel_rank() * local_dim_size
-    output = input_[dim_offset:dim_offset + local_dim_size].contiguous()
+    output = input_[dim_offset : dim_offset + local_dim_size].contiguous()
     return output
 
 
@@ -77,9 +76,7 @@ def _gather_along_last_dim(input_: torch.Tensor) -> torch.Tensor:
 
     tensor_list = [torch.empty_like(input_) for _ in range(world_size)]
     tensor_list[rank] = input_
-    torch.distributed.all_gather(
-        tensor_list, input_, group=get_tensor_model_parallel_group()
-    )
+    torch.distributed.all_gather(tensor_list, input_, group=get_tensor_model_parallel_group())
 
     # Note: torch.cat already creates a contiguous tensor.
     output = torch.cat(tensor_list, dim=last_dim).contiguous()
@@ -116,12 +113,12 @@ def _reduce_scatter_along_first_dim(input_: torch.Tensor) -> torch.Tensor:
         xm.REDUCE_SUM,
         input_.contiguous(),
         scatter_dim=0,
-        shard_count = len(groups[0]),
+        shard_count=len(groups[0]),
         scale=1,
         output=output,
         groups=groups,
-        pin_layout=False
-        )
+        pin_layout=False,
+    )
 
     return output
 

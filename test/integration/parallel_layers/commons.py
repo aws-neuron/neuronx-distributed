@@ -1,13 +1,14 @@
-import numpy
 import random
+
+import numpy
 import torch
 
 
 def print_separator(message):
     torch.distributed.barrier()
     filler_len = (78 - len(message)) // 2
-    filler = '-' * filler_len
-    string = '\n' + filler + ' {} '.format(message) + filler
+    filler = "-" * filler_len
+    string = "\n" + filler + " {} ".format(message) + filler
     if torch.distributed.get_rank() == 0:
         print(string, flush=True)
     torch.distributed.barrier()
@@ -23,7 +24,6 @@ class IdentityLayer(torch.nn.Module):
 
 
 class IdentityLayer3D(torch.nn.Module):
-
     def __init__(self, m, n, k):
         super(IdentityLayer3D, self).__init__()
         self.weight = torch.nn.Parameter(torch.Tensor(m, n, k))

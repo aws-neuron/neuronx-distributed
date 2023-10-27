@@ -50,6 +50,7 @@ class NxDPPModel(nn.Module):
         output_loss_value_spec: Optional[Union[Dict, Tuple]] = None,
         return_mb_loss: bool = False,
         broadcast_and_average_loss: bool = False,
+        use_zero1_optimizer: bool = False,
         pipeline_cuts: Optional[List[str]] = None,
         input_names: Optional[List[str]] = None,
         leaf_module_cls: Optional[List[Any]] = None,
@@ -86,6 +87,9 @@ class NxDPPModel(nn.Module):
             broadcast_and_average_loss:
                 Whether to broadcast loss to all PP ranks and average across dp ranks, when set to True
                 return_mb_loss must be False
+
+            use_zero1_optimizer:
+                Whether to use the zero1 optimizer. When setting to True the gradient average will be handled over.
 
             pipeline_cuts:
                 A list of layer names that will be used to annotate pipeline stage boundaries
@@ -151,6 +155,7 @@ class NxDPPModel(nn.Module):
         self.shape_traced = False
         self.return_mb_loss = return_mb_loss
         self.broadcast_and_average_loss = broadcast_and_average_loss
+        self.use_zero1_optimizer = use_zero1_optimizer
         if self.broadcast_and_average_loss:
             assert not self.return_mb_loss, "When broadcast_and_average_loss is True return_mb_loss must be False"
         self.output_loss_value_spec = output_loss_value_spec
@@ -159,9 +164,12 @@ class NxDPPModel(nn.Module):
         self.pipeline_parallel_size = parallel_state.get_pipeline_model_parallel_size()
         self.pipeline_parallel_rank = parallel_state.get_pipeline_model_parallel_rank()
         self.serialization_manager = SerializationManager()
-        self.timeline = PPTimeline(trace_file_path, self.pipeline_parallel_rank)
         self.param_init_fn = param_init_fn
         self.input_names = None
+
+        # Internal attributes for amp
+        self._autocast_enabled = False
+        self._autocast_dtype = None
 
         # Outputs from analyze_pipeline_module
         self.stage_id_to_IO_input_names = None
@@ -174,6 +182,8 @@ class NxDPPModel(nn.Module):
         self.original_name_to_local_name = {}
         self.clear_minibatch_state()
         self._set_distributed()
+        # timeline needs to be created after init dist
+        self.timeline = PPTimeline(trace_file_path, self.pipeline_parallel_rank)
         # If user set up the pipeline cuts in config, directly run tracing and partition
         if pipeline_cuts is not None and len(pipeline_cuts) > 0:
             self.trace(
@@ -186,6 +196,13 @@ class NxDPPModel(nn.Module):
             for pp_cut in pipeline_cuts:
                 self.cut_pipeline_stage(pp_cut)
             self.partition()
+
+    def __getattr__(self, name: str) -> Any:
+        """Forward missing attributes to wrapped module."""
+        try:
+            return super().__getattr__(name)  # defer to nn.Module's logic
+        except AttributeError:
+            return getattr(self.original_torch_module, name)
 
     def clear_minibatch_state(self):
         """
@@ -478,32 +495,25 @@ class NxDPPModel(nn.Module):
         # Need to create input iters again since the old one is garbage collected
         self._create_model_inputs_iter(kwargs)
 
-    def _process_loss(self):
-        """
-        Average the losses of microbatches if not self.return_mb_loss
-        """
-        if self.pipeline_parallel_rank == self.pipeline_parallel_size - 1:
-            loss_all = []
-            for loss in self.losses:
-                loss_all.append(loss.detach().cpu())
-            if not self.return_mb_loss:
-                loss = torch.sum(torch.stack(loss_all), dim=0) / len(loss_all)
-                if self.broadcast_and_average_loss:
-                    loss = loss * self.pipeline_parallel_size
-                    world_cpu_group = parallel_state.get_gloo_group()
-                    torch.distributed.all_reduce(loss, group=parallel_state.get_gloo_group())
-                    return loss / torch.distributed.get_world_size(group=world_cpu_group)
-                return loss
-            else:
-                return loss_all
-        elif self.broadcast_and_average_loss:
-            loss = torch.tensor(0.0)
-            world_cpu_group = parallel_state.get_gloo_group()
-            torch.distributed.all_reduce(loss, group=world_cpu_group)
-            return loss / torch.distributed.get_world_size(group=world_cpu_group)
-        return None
-
     def run_train(self, **kwargs):
+        self._autocast_enabled = torch.is_autocast_enabled()
+        self._autocast_dtype = torch.get_autocast_gpu_dtype()
+        with torch.cuda.amp.autocast(enabled=False):
+            loss = self._run_train(**kwargs)
+        self._autocast_enabled = False
+        self._autocast_dtype = None
+        return loss
+    
+    def run_eval(self, **kwargs):
+        self._autocast_enabled = torch.is_autocast_enabled()
+        self._autocast_dtype = torch.get_autocast_gpu_dtype()
+        with torch.cuda.amp.autocast(enabled=False):
+            loss = self._run_eval(**kwargs)
+        self._autocast_enabled = False
+        self._autocast_dtype = None
+        return loss
+
+    def _run_train(self, **kwargs):
         self._prepare_run(kwargs)
 
         self.training = True
@@ -514,7 +524,7 @@ class NxDPPModel(nn.Module):
         self.timeline.mark_step_end()
         return loss
 
-    def run_eval(self, **kwargs):
+    def _run_eval(self, **kwargs):
         self._prepare_run(kwargs, train=False)
 
         self.training = False
@@ -555,7 +565,7 @@ class NxDPPModel(nn.Module):
                 size = len(x)
                 assert size > start and size >= end, "size issue microbatch"
                 microbatch.append(x[start:end])
-            assert len(microbatch) > 0, "Microbatch lenght less than 0"
+            assert len(microbatch) > 0, "Microbatch length less than 0"
             all_batches.append(microbatch)
         return self._get_microbatch_dataloader(all_batches)
 
@@ -612,7 +622,10 @@ class NxDPPModel(nn.Module):
 
         # Run local pipeline stage
         self.timeline.mark_event_start(f"mb_{self.current_mb}_ForwardStep")
-        outputs = self.local_module(*inputs)
+
+        # [TODO]: From Torch 2.1 we can specify device_type='xla' or use torch_xla's autocast, need to revisit this once we have PT2.1 support
+        with torch.autocast(enabled=self._autocast_enabled, dtype=self._autocast_dtype, device_type='cuda'):
+            outputs = self.local_module(*inputs)
 
         if not self.tracing:
             self._mark_step()
@@ -873,23 +886,26 @@ class NxDPPModel(nn.Module):
         - Add the grads for shared weights
         """
         self.timeline.mark_event_start(f"mb_{self.current_mb}_ReduceGradsTask")
-        # Group for different dtypes and all-reduce
-        dtype_groups = {}
-        for param in self.local_parameters():
-            if param.requires_grad and param.grad is not None:
-                tp = param.dtype
-                if tp not in dtype_groups:
-                    dtype_groups[tp] = []
-                dtype_groups[tp].append(param)
+        # Grad reduction will be handled by zero1_optimizer
+        # (TODO) Maybe completely remove when the optimizer wrapper is ready
+        if not self.use_zero1_optimizer:
+            # Group for different dtypes and all-reduce
+            dtype_groups = {}
+            for param in self.local_parameters():
+                if param.requires_grad and param.grad is not None:
+                    tp = param.dtype
+                    if tp not in dtype_groups:
+                        dtype_groups[tp] = []
+                    dtype_groups[tp].append(param)
 
-        logger.debug(
-            rmsg(f"reduce grads dtype_groups counts {[(tp, len(group)) for tp, group in dtype_groups.items()]}")
-        )
-        # For each bucket, all-reduce and copy all-reduced grads.
-        for tp in dtype_groups:
-            bucket = dtype_groups[tp]
-            grads = [param.grad.data for param in bucket]
-            bucket_allreduce_gradients(grads)
+            logger.debug(
+                rmsg(f"reduce grads dtype_groups counts {[(tp, len(group)) for tp, group in dtype_groups.items()]}")
+            )
+            # For each bucket, all-reduce and copy all-reduced grads.
+            for tp in dtype_groups:
+                bucket = dtype_groups[tp]
+                grads = [param.grad.data for param in bucket]
+                bucket_allreduce_gradients(grads)
 
         self._reduce_shared_weights()
         self._mark_step()
@@ -1027,7 +1043,7 @@ class NxDPPModel(nn.Module):
     """
 
     def _set_distributed(self):
-        parallel_state.set_gloo_group()
+        parallel_state.initialize_pp_gloo_groups()
         self.send_op = send
         self.recv_op = recv_from
 
@@ -1056,3 +1072,35 @@ class NxDPPModel(nn.Module):
             self._sync_shared_weights()
             self._mark_step()
             self.model_moved_to_device = True
+
+    def _process_loss(self):
+        """
+        Average the losses of microbatches if not self.return_mb_loss
+        """
+        if self.pipeline_parallel_rank == self.pipeline_parallel_size - 1:
+            loss_all = []
+            for loss in self.losses:
+                loss_all.append(loss)
+            if not self.return_mb_loss:
+                if not self.broadcast_and_average_loss:
+                    # cast to cpu so the following operation will not create extra graph
+                    loss_all = [loss.detach().cpu() for loss in loss_all]
+                loss = torch.sum(torch.stack(loss_all), dim=0) / len(loss_all)
+                if self.broadcast_and_average_loss:
+                    loss /= parallel_state.get_data_parallel_size()
+                    torch.distributed.all_reduce(loss, group=parallel_state.get_data_parallel_group())
+                    torch.distributed.broadcast(
+                        loss, torch.distributed.get_rank(), group=parallel_state.get_pipeline_model_parallel_group()
+                    )
+                    self._mark_step()
+                return loss.detach().cpu()
+            else:
+                return loss_all
+        elif self.broadcast_and_average_loss:
+            loss = torch.tensor(0.0, device=xm.xla_device())
+            pp_group = parallel_state.get_pipeline_model_parallel_group()
+            src_rank = torch.distributed.distributed_c10d.get_global_rank(pp_group, self.pipeline_parallel_size - 1)
+            torch.distributed.broadcast(loss, src_rank, group=pp_group)
+            self._mark_step()
+            return loss.detach().cpu()
+        return None

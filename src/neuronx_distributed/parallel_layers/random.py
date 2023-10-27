@@ -1,7 +1,8 @@
-import torch
 import contextlib
-from .parallel_state import get_tensor_model_parallel_rank
 
+import torch
+
+from .parallel_state import get_tensor_model_parallel_rank
 
 _MODEL_PARALLEL_RNG_TRACKER_NAME = "model-parallel-rng"
 
@@ -123,6 +124,4 @@ def model_parallel_xla_manual_seed(seed):
     # Set the default state.
     torch.manual_seed(data_parallel_seed)
     # and model parallel state.
-    _XLA_RNG_STATE_TRACKER.add(
-        _MODEL_PARALLEL_RNG_TRACKER_NAME, tensor_model_parallel_seed
-    )
+    _XLA_RNG_STATE_TRACKER.add(_MODEL_PARALLEL_RNG_TRACKER_NAME, tensor_model_parallel_seed)

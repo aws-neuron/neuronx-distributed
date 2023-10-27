@@ -8,6 +8,15 @@ logger = get_logger()
 _TENSOR_MODEL_PARALLEL_GROUP = None
 _TENSOR_MODEL_PARALLEL_GROUP_SPMD = None
 
+# Inter-layer model parallel group that the current rank belongs to.
+_PIPELINE_MODEL_PARALLEL_GROUP = None
+_PIPELINE_GLOBAL_RANKS = None
+_PIPELINE_MODEL_PARALLEL_GROUP_SPMD = None
+_NEXT_RANK_GROUP_SPMD = None
+_PREV_RANK_GROUP_SPMD = None
+_NEXT_RANK_GROUP = None
+_PREV_RANK_GROUP = None
+
 # Data parallel group that the current rank belongs to.
 _DATA_PARALLEL_GROUP = None
 _DATA_PARALLEL_GROUP_SPMD = None
@@ -16,21 +25,33 @@ _DATA_PARALLEL_GROUP_SPMD = None
 _MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE = None
 _MPU_TENSOR_MODEL_PARALLEL_RANK = None
 
+# A CPU group that contains ranks from current rank's PP group\
+# Used for PP metadata transmission
+PP_GROUP_PG_GLOO = None
 
-def initialize_model_parallel(tensor_model_parallel_size: int = 1) -> None:
+
+def initialize_model_parallel(tensor_model_parallel_size: int = 1, pipeline_model_parallel_size: int = 1) -> None:
     """
     Initialize model data parallel groups.
 
     Arguments:
+        pipeline_model_parallel_size: number of Neuron devices used to parallelize model layer.
         tensor_model_parallel_size: number of Neuron devices used to parallelize model tensor.
 
-    Let's say we have a total of 16 Neuron devices denoted by n0 ... n15 and we
-    use 2 Neuron devices to parallelize the data. The present function will
-    create 8 data-parallel groups, and 2 tensor model-parallel groups as:
-        8 data_parallel groups:
-            [n0, n1], [n2, n3], [n4, n5], [n6, n7], [n8, n9], [n10, n11], [n12, n13], [n14, n15]
+    Let's say we have a total of 32 Neuron devices denoted by n0 ... n32 and we
+    use 8 Neuron devices to do tensor parallelism and 4 for pipeline parallelism. The present
+    function will create 32 data-parallel groups (meaning no data parallelism), 8 pipeline
+    model-parallel groups and 4 tensor model-parallel groups as:
+        32 data_parallel groups:
+            [n0], [n1], [n2], [n3], [n4], [n5], [n6], [n7], [n8], [n9], [n10], [n11],
+            [n12], [n13], [n14], [n15], [n16], [n17], [n18], [n19], [n20], [n21], [n22],
+            [n23], [n24], [n25], [n26], [n27], [n28], [n29], [n30], [n31]
         4 tensor model-parallel groups:
-            [n0, n2, n4, n6], [n1, n3, n5, n7]
+            [n0, n1, n2, n3, n4, n5, n6, n7], [n8, n9, n10, n11, n12, n13, n14, n15],
+            [n16, n17, n18, n19, n20, n21, n22, n23], [n24, n25, n26, n27, n28, n29, n30, n31]
+        8 pipeline model-parallel groups:
+            [n0, n8, n16, n24], [n1, n9, n17, n25], [n2, n10, n18, n26], [n3, n11, n19, n27],
+            [n4, n12, n20, n28], [n5, n13, n21, n29], [n6, n14, n22, n30], [n7, n15, n23, n31]
     """
     # Get world size and rank. Ensure some consistencies.
     assert torch.distributed.is_initialized()
@@ -45,10 +66,14 @@ def initialize_model_parallel(tensor_model_parallel_size: int = 1) -> None:
                 f" ({tensor_model_parallel_size}) x pipeline_model_parallel_size ({pipeline_model_parallel_size})"
             )
         )
+    data_parallel_size: int = world_size // (tensor_model_parallel_size * pipeline_model_parallel_size)
+    if torch.distributed.get_rank() == 0:
+        print("> initializing tensor model parallel with size {}".format(tensor_model_parallel_size))
+        print("> initializing pipeline model parallel with size {}".format(pipeline_model_parallel_size))
         print("> initializing data parallel with size {}".format(data_parallel_size))
 
     num_tensor_model_parallel_groups: int = world_size // tensor_model_parallel_size
-    num_data_parallel_groups: int = world_size // data_parallel_size
+    num_pipeline_model_parallel_groups: int = world_size // pipeline_model_parallel_size
 
     rank = torch.distributed.get_rank()
 
@@ -57,9 +82,12 @@ def initialize_model_parallel(tensor_model_parallel_size: int = 1) -> None:
     global _DATA_PARALLEL_GROUP_SPMD
     assert _DATA_PARALLEL_GROUP is None, "data parallel group is already initialized"
     all_data_parallel_group_ranks = []
-    for i in range(tensor_model_parallel_size):
-        ranks = range(i, world_size, tensor_model_parallel_size)
-        all_data_parallel_group_ranks.append(list(ranks))
+    for i in range(pipeline_model_parallel_size):
+        start_rank = i * num_pipeline_model_parallel_groups
+        end_rank = (i + 1) * num_pipeline_model_parallel_groups
+        for j in range(tensor_model_parallel_size):
+            ranks = range(start_rank + j, end_rank, tensor_model_parallel_size)
+            all_data_parallel_group_ranks.append(list(ranks))
 
     _DATA_PARALLEL_GROUP_SPMD = all_data_parallel_group_ranks
     for ranks in all_data_parallel_group_ranks:
@@ -72,14 +100,10 @@ def initialize_model_parallel(tensor_model_parallel_size: int = 1) -> None:
     global _TENSOR_MODEL_PARALLEL_GROUP
     global _TENSOR_MODEL_PARALLEL_GROUP_SPMD
     all_tensor_parallel_group_ranks = []
-    assert (
-        _TENSOR_MODEL_PARALLEL_GROUP is None
-    ), "tensor model parallel group is already initialized"
+    assert _TENSOR_MODEL_PARALLEL_GROUP is None, "tensor model parallel group is already initialized"
     for i in range(num_tensor_model_parallel_groups):
-        ranks = range(
-            i * tensor_model_parallel_size, (i + 1) * tensor_model_parallel_size
-        )
-        all_tensor_parallel_group_ranks.append(ranks)
+        ranks = range(i * tensor_model_parallel_size, (i + 1) * tensor_model_parallel_size)
+        all_tensor_parallel_group_ranks.append(list(ranks))
     _TENSOR_MODEL_PARALLEL_GROUP_SPMD = all_tensor_parallel_group_ranks
     for ranks in all_tensor_parallel_group_ranks:
         pg_options = {"xla_pg_options": {"mesh": _TENSOR_MODEL_PARALLEL_GROUP_SPMD}}
@@ -138,9 +162,7 @@ def model_parallel_is_initialized():
 
 def get_tensor_model_parallel_group(as_list=False):
     """Get the tensor model parallel group the caller rank belongs to."""
-    assert (
-        _TENSOR_MODEL_PARALLEL_GROUP is not None
-    ), "intra_layer_model parallel group is not initialized"
+    assert _TENSOR_MODEL_PARALLEL_GROUP is not None, "intra_layer_model parallel group is not initialized"
     return _TENSOR_MODEL_PARALLEL_GROUP._mesh if as_list else _TENSOR_MODEL_PARALLEL_GROUP
 
 
@@ -204,6 +226,62 @@ def get_data_parallel_rank():
     return torch.distributed.get_rank(group=get_data_parallel_group())
 
 
+def get_pipeline_model_parallel_group(as_list=False):
+    """Get the pipeline model parallel group the caller rank belongs to."""
+    assert _PIPELINE_MODEL_PARALLEL_GROUP is not None, "pipeline_model parallel group is not initialized"
+    return _PIPELINE_MODEL_PARALLEL_GROUP._mesh if as_list else _PIPELINE_MODEL_PARALLEL_GROUP
+
+
+def get_pipeline_model_parallel_rank():
+    """Return my rank for the pipeline model parallel group."""
+    return torch.distributed.get_rank(group=get_pipeline_model_parallel_group())
+
+
+def get_pipeline_model_parallel_sr_group(parity: bool):
+    assert _PIPELINE_GLOBAL_RANKS is not None, "Pipeline parallel group is not initialized"
+    world_size = get_pipeline_model_parallel_size()
+
+    def subgroup(r, ranks):
+        return [ranks[r], ranks[(r + 1) % world_size]]
+
+    group = list()
+    for ranks in _PIPELINE_MODEL_PARALLEL_GROUP_SPMD:
+        for i in range(parity, world_size, 2):
+            group.append(subgroup(i, ranks))
+    return group
+
+
+def get_pipeline_model_parallel_size():
+    """Return world size for the pipeline model parallel group."""
+    return torch.distributed.get_world_size(group=get_pipeline_model_parallel_group())
+
+
+def get_next_rank_group(as_list=False):
+    """Get the next tensor model parallel group the caller rank belongs to."""
+    assert _NEXT_RANK_GROUP is not None, "intra_layer_model parallel group is not initialized"
+    return _NEXT_RANK_GROUP._mesh if as_list else _NEXT_RANK_GROUP
+
+
+def get_prev_rank_group(as_list=False):
+    """Get the previous tensor model parallel group the caller rank belongs to."""
+    assert _PREV_RANK_GROUP is not None, "intra_layer_model parallel group is not initialized"
+    return _PREV_RANK_GROUP._mesh if as_list else _PREV_RANK_GROUP
+
+
+def get_pipeline_model_parallel_next_rank():
+    assert _PIPELINE_GLOBAL_RANKS is not None, "Pipeline parallel group is not initialized"
+    rank_in_pipeline = get_pipeline_model_parallel_rank()
+    world_size = get_pipeline_model_parallel_size()
+    return _PIPELINE_GLOBAL_RANKS[(rank_in_pipeline + 1) % world_size]
+
+
+def get_pipeline_model_parallel_prev_rank():
+    assert _PIPELINE_GLOBAL_RANKS is not None, "Pipeline parallel group is not initialized"
+    rank_in_pipeline = get_pipeline_model_parallel_rank()
+    world_size = get_pipeline_model_parallel_size()
+    return _PIPELINE_GLOBAL_RANKS[(rank_in_pipeline - 1) % world_size]
+
+
 def destroy_model_parallel():
     """Set the groups to none."""
     global _TENSOR_MODEL_PARALLEL_GROUP
@@ -226,18 +304,21 @@ def destroy_model_parallel():
     _PREV_RANK_GROUP_SPMD = None
 
 
-def set_gloo_group():
-    global _GLOBAL_GLOO_GROUP
-    if _GLOBAL_GLOO_GROUP is None:
-        _GLOBAL_GLOO_GROUP = torch.distributed.new_group(backend="gloo")
-    else:
-        logger.warning("gloo group is already created, skipping...")
+def initialize_pp_gloo_groups():
+    global PP_GROUP_PG_GLOO
+    assert PP_GROUP_PG_GLOO is None, "pp gloo groups are already initialized!"
+    pp_group_spmd = get_pipeline_model_parallel_group(as_list=True)
+    rank = torch.distributed.get_rank()
+    for pp_group in pp_group_spmd:
+        pg = torch.distributed.new_group(ranks=pp_group, backend="gloo")
+        if rank in pp_group:
+            PP_GROUP_PG_GLOO = pg
 
 
-def get_gloo_group():
-    if _GLOBAL_GLOO_GROUP is None:
-        raise RuntimeError("Trying to get gloo group when not initialized")
-    return _GLOBAL_GLOO_GROUP
+def get_pp_gloo_group():
+    global PP_GROUP_PG_GLOO
+    assert PP_GROUP_PG_GLOO is not None, "pp gloo groups are not initialized!"
+    return PP_GROUP_PG_GLOO
 
 
 def create_pg_with_ranks(ranks):

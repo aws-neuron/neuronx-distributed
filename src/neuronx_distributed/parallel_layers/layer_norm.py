@@ -1,6 +1,7 @@
+from typing import List, Union
+
 import torch
 from torch import Size
-from typing import Union, List
 
 
 def _set_sequence_parallel_enabled(
@@ -9,7 +10,9 @@ def _set_sequence_parallel_enabled(
 ) -> None:
     setattr(param, "sequence_parallel_enabled", sequence_parallel_enabled)
 
+
 _shape_t = Union[int, List[int], Size]
+
 
 class LayerNorm(torch.nn.LayerNorm):
     def __init__(

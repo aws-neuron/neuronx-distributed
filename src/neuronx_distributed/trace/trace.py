@@ -1,6 +1,6 @@
-import os
 import concurrent.futures
 import multiprocessing
+import os
 import pathlib
 from typing import Any, Callable, Iterable, List, Optional, Union
 import torch
@@ -11,7 +11,8 @@ import torch_xla.distributed.xla_multiprocessing as xmp
 from torch_neuronx.xla_impl.options import Options
 from torch_xla.utils.utils import get_free_tcp_ports
 
-from neuronx_distributed.parallel_layers import layers, parallel_state
+from neuronx_distributed.parallel_layers import parallel_state
+from neuronx_distributed.parallel_layers.utils import is_pjrt_device
 
 
 class ParallelModel(torch.nn.Module):
@@ -84,6 +85,8 @@ def _trace(
     else:
         torch.distributed.init_process_group("xla")
     parallel_state.initialize_model_parallel(tensor_model_parallel_size=tp_degree)
+    # refer to this github issue for context: https://github.com/pytorch/pytorch/issues/11201
+    torch.multiprocessing.set_sharing_strategy("file_system")
     model, input_output_alias = func()
     if compiler_workdir is None:
         compiler_workdir = f"/tmp/trace_compiler_workdir_{rank}"
@@ -144,8 +147,11 @@ def parallel_model_trace(
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "2022"
     os.environ["TPU_NUM_DEVICES"] = str(tp_degree)
+    os.environ["NEURONCORE_NUM_DEVICES"] = str(tp_degree) # for pjrt 
     os.environ["XRT_TPU_CONFIG"] = "localservice;0;localhost:{}".format(get_free_tcp_ports()[0])
     os.environ["WORLD_SIZE"] = str(tp_degree)
+    prev_sharing_strategy = torch.multiprocessing.get_sharing_strategy()
+    torch.multiprocessing.set_sharing_strategy("file_system")
     xmp.spawn(
         _trace,
         args=(
@@ -167,6 +173,7 @@ def parallel_model_trace(
         models[rank] = torch_neuronx.xla_impl.trace.create_neuron_model(
             neff_filename, metaneff, flattener, packer, example_inputs, input_output_alias
         )
+    torch.multiprocessing.set_sharing_strategy(prev_sharing_strategy)
     return TensorParallelNeuronModel(models)
 
 

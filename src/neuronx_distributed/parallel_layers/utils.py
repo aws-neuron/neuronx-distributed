@@ -1,15 +1,18 @@
-import torch
+import collections
+import os
 from typing import List, Sequence
 
 import torch
+import torch_xla
 import torch_xla.core.xla_env_vars as xenv
 import torch_xla.core.xla_model as xm
 
 from neuronx_distributed.parallel_layers.parallel_state import (
-    get_gloo_group,
-    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_rank
 )
 from neuronx_distributed.utils.logger import get_logger
+
+import numpy as np
 
 _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {
     "tensor_model_parallel": False,
@@ -18,6 +21,7 @@ _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {
 }
 
 logger = get_logger()
+
 
 class EmbeddingUtility:
     """Split the vocabulary into `world_size` chunks and return the
@@ -74,9 +78,7 @@ def copy_tensor_model_parallel_attributes(destination_tensor: torch.Tensor, sour
 
 def ensure_divisibility(numerator, denominator):
     """Ensure that numerator is divisible by the denominator."""
-    assert numerator % denominator == 0, "{} is not divisible by {}".format(
-        numerator, denominator
-    )
+    assert numerator % denominator == 0, "{} is not divisible by {}".format(numerator, denominator)
 
 
 def divide(numerator, denominator):
@@ -118,13 +120,6 @@ def is_pjrt_device():
     return os.environ.get("PJRT_DEVICE", None) == "NEURON"
 
 
-def add_barrier(name=None):
-    if is_torch_version_greater_than_2():
-        torch.distributed.monitored_barrier(group=get_gloo_group())
-    else:
-        xm.rendezvous(name)
-
-
 def cast_tensor(tensor, from_dtype=torch.float32, to_dtype=torch.bfloat16):
     return tensor.to(dtype=to_dtype) if tensor.dtype == from_dtype else tensor
 
@@ -144,18 +139,84 @@ def cast_all(state, from_dtype=torch.float32, to_dtype=torch.bfloat16):
             # We only cast Tensor, list, tuple or dict of tensors.
             return state
 
+# Refering to https://github.com/NVIDIA/apex/blob/master/apex/_autocast_utils.py#L22
+def cast_if_autocast_enabled(*args):
+    if not torch.is_autocast_enabled():
+        return args
+    else:
+        return _cast(args, torch.get_autocast_gpu_dtype())
+
+# Modifying from https://github.com/pytorch/pytorch/blob/main/torch/cuda/amp/autocast_mode.py#L57, removed check for cuda device
+def _cast(value, dtype):
+    if isinstance(value, torch.Tensor):
+        is_eligible = (
+            value.is_floating_point()
+            and (value.dtype is not torch.float64)
+        )
+        return value.to(dtype) if is_eligible else value
+    elif isinstance(value, (str, bytes)):
+        return value
+    elif isinstance(value, np.ndarray):
+        return value
+    elif isinstance(value, collections.abc.Mapping):
+        return {_cast(k, dtype): _cast(v, dtype) for k, v in value.items()}
+    elif isinstance(value, collections.abc.Iterable):
+        iterable = (_cast(v, dtype) for v in value)
+        if isinstance(value, (list, tuple)):
+            return type(value)(iterable)
+        else:
+            return iterable
+    else:
+        return value
+
+def move_all_tensor_to_cpu(data, convert=True):
+    def is_xla_tensor(tensor):
+        return tensor.device.type == "xla"
+
+    def convert_fn(tensors):
+        torch_xla._XLAC._xla_sync_multi(tensors, devices=[], wait=True, sync_xla_data=True)
+        if not convert:
+            return tensors
+        return [tensor.to("cpu") for tensor in tensors]
+
+    def select_fn(v):
+        return type(v) == torch.Tensor and is_xla_tensor(v)
+
+    return xm.ToXlaTensorArena(convert_fn, select_fn).transform(data)
+
 
 def get_local_world_size():
     if is_torch_version_greater_than_2():
         # With pjrt this only works after init_process_group()
         import torch_xla.experimental.pjrt as pjrt
+
         return pjrt.local_process_count()
-    else:    
+    else:
         return xm.xrt_world_size() // int(os.environ[xenv.HOST_WORLD_SIZE])
 
+
 def move_model_to_device(model: torch.nn.Module, device: torch.device) -> None:
-    logger.warn("parallel_layers.move_model_to_device method is deprecated, \
-        please use neuronx_distributed.utils.model_utils.move_model_to_device")
+    logger.warn(
+        "parallel_layers.move_model_to_device method is deprecated, \
+        please use neuronx_distributed.utils.model_utils.move_model_to_device"
+    )
     from neuronx_distributed.utils import model_utils
+
     model_utils.move_model_to_device(model, device)
 
+def verify_casted_dtype(value):
+    """Veryfy whether the input values have been casted correctly"""
+    if not torch.is_autocast_enabled():
+        return
+    else:
+        if isinstance(value, torch.Tensor):
+            assert value.dtype == torch.get_autocast_gpu_dtype(), f"Datatype of tensor is expected to be {torch.get_autocast_gpu_dtype()}, got {value.dtype} instead"
+        elif isinstance(value, collections.abc.Mapping):
+            for k, v in value.items():
+                verify_casted_dtype(k)
+                verify_casted_dtype(v)
+        elif isinstance(value, collections.abc.Iterable):
+            for v in value:
+                verify_casted_dtype(v)
+        else:
+            return

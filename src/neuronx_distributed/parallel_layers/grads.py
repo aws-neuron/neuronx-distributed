@@ -1,7 +1,6 @@
 import os
 
 import torch
-from torch._six import inf
 import torch_xla.core.xla_model as xm
 
 from ..utils.logger import get_logger
@@ -26,7 +25,7 @@ def param_is_not_shared(param):
     return not hasattr(param, "shared") or not param.shared
 
 
-def clip_grad_norm(parameters, max_norm, norm_type=2):
+def clip_grad_norm(parameters, max_norm, norm_type=2, zero1_optimizer=False, force_spmd=True):
     """Clips gradient norm of an iterable of parameters.
 
     This is adapted from torch.nn.utils.clip_grad.clip_grad_norm_ and
@@ -39,10 +38,20 @@ def clip_grad_norm(parameters, max_norm, norm_type=2):
         max_norm (float or int): max norm of the gradients
         norm_type (float or int): type of the used p-norm. Can be ``'inf'`` for
             infinity norm.
+        zero1_optimizer(bool): Whether zero1 optimizer is used, if so we will collect
+            grad norm from the world group
+        force_spmd(bool): Whether to force spmd when calculating global norm. If set to
+            True we will sum the tp duplicated paramter grads on all ranks and divide them
+            by tp size. Warning: If the grads are too small the division might result in
+            incorrect results.
 
     Returns:
         Total norm of the parameters (viewed as a single vector).
     """
+
+    if torch.isinf(torch.tensor(norm_type)):
+        # Always use spmd for inf norm since it is using MAX operation
+        force_spmd = True
 
     def _allreduce_norm_across_model_parallel_groups(total_norm, reduce_op):
         if get_tensor_model_parallel_size() > 1:
@@ -58,6 +67,9 @@ def clip_grad_norm(parameters, max_norm, norm_type=2):
                 group=get_pipeline_model_parallel_group(),
             )
 
+    def _allreduce_norm_across_world_group(total_norm, reduce_op):
+        torch.distributed.all_reduce(total_norm, op=reduce_op)
+
     device = xm.xla_device()
 
     if isinstance(parameters, torch.Tensor):
@@ -65,15 +77,23 @@ def clip_grad_norm(parameters, max_norm, norm_type=2):
 
     grads = []
     grads_for_norm = []
+    grads_for_norm_tp_duplicated = []
     for param in parameters:
         grad_not_none = param.grad is not None
         is_not_shared = param_is_not_shared(param)
         is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(param)
+        is_tp_param = hasattr(param, "tensor_model_parallel") and param.tensor_model_parallel
         if grad_not_none:
             grad = param.grad.detach()
             grads.append(grad)
-        if grad_not_none and is_not_shared and is_not_tp_duplicate:
-            grads_for_norm.append(grad)
+        if grad_not_none and is_not_shared:
+            if is_tp_param or (is_not_tp_duplicate and not force_spmd):
+                # TP parallelized parameters
+                # (not force_spmd) only tp rank 0 will add non-tp paramaters
+                grads_for_norm.append(grad)
+            elif force_spmd:
+                # non-tp paramaters
+                grads_for_norm_tp_duplicated.append(grad)
 
     # Norm parameters.
     max_norm = float(max_norm)
@@ -81,27 +101,40 @@ def clip_grad_norm(parameters, max_norm, norm_type=2):
     total_norm = torch.FloatTensor([float(0.0)]).to(device)
 
     # Calculate norm.
-    if norm_type == inf:
+    if torch.isinf(torch.tensor(norm_type)):
+        total_norm_tp_duplicated = max(grad.abs().max() for grad in grads_for_norm_tp_duplicated)
         total_norm = max(grad.abs().max() for grad in grads_for_norm)
+        total_norm = max(total_norm_tp_duplicated, total_norm)
         total_norm = torch.FloatTensor([float(total_norm)]).to(device)
-        _allreduce_norm_across_model_parallel_groups(total_norm, torch.distributed.ReduceOp.MAX)
+        if not zero1_optimizer:
+            _allreduce_norm_across_model_parallel_groups(total_norm, torch.distributed.ReduceOp.MAX)
+        else:
+            _allreduce_norm_across_world_group(total_norm, torch.distributed.ReduceOp.MAX)
         total_norm = total_norm[0].item()
 
     else:
+        if force_spmd:
+            # sum the non-tp grad norm and scale by the tp_size
+            for grad in grads_for_norm_tp_duplicated:
+                grad_norm = torch.norm(grad, norm_type)
+                total_norm += grad_norm**norm_type
+            total_norm /= get_tensor_model_parallel_size()
+
         for grad in grads_for_norm:
             grad_norm = torch.norm(grad, norm_type)
             total_norm += grad_norm**norm_type
 
-        _allreduce_norm_across_model_parallel_groups(total_norm, torch.distributed.ReduceOp.SUM)
+        if not zero1_optimizer:
+            _allreduce_norm_across_model_parallel_groups(total_norm, torch.distributed.ReduceOp.SUM)
+        else:
+            _allreduce_norm_across_world_group(total_norm, torch.distributed.ReduceOp.SUM)
         total_norm = torch.pow(total_norm, 1.0 / norm_type)
 
     # Scale.
     clip_coeff = max_norm / (total_norm + 1.0e-6)
 
     for g in grads:
-        g.data.mul_(
-            torch.where(clip_coeff < 1, clip_coeff, torch.tensor(1.0, device=device))
-        )
+        g.data.mul_(torch.where(clip_coeff < 1, clip_coeff, torch.tensor(1.0, device=device)))
     return total_norm
 
 

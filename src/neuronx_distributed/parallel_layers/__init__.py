@@ -1,15 +1,10 @@
 """Model parallel utility interface."""
 
-from .checkpointing import save, load
+from . import parallel_state
+from .checkpointing import load, save
 from .grads import clip_grad_norm
-from .layers import (
-    ColumnParallelLinear,
-    ParallelEmbedding,
-    RowParallelLinear,
-    copy_tensor_model_parallel_attributes,
-    set_defaults_if_not_set_tensor_model_parallel_attributes,
-    set_tensor_model_parallel_attributes,
-)
+from .layers import ColumnParallelLinear, ParallelEmbedding, RowParallelLinear
+from .loss_functions import parallel_cross_entropy
 from .mappings import (
     copy_to_tensor_model_parallel_region,
     gather_from_tensor_model_parallel_region,
