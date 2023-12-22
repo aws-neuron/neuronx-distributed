@@ -1,5 +1,6 @@
 """ NxD GPTNeoX model """
 
+from packaging import version
 from typing import Optional, Tuple, Union
 
 import torch
@@ -31,6 +32,12 @@ from transformers.models.gpt_neox.modeling_gpt_neox import (
 from functools import partial
 def _init_normal(std, w):
     return nn.init.normal_(w, mean=0.0, std=std)
+
+if version.parse(torch.__version__) >= version.parse("2.1"):
+    from torch_xla.utils.checkpoint import checkpoint
+    checkpoint_method = checkpoint
+else:
+    checkpoint_method = torch.utils.checkpoint.checkpoint
 
 logger = logging.get_logger(__name__)
 
@@ -140,7 +147,7 @@ class GPTNeoXAttentionNxD(GPTNeoXAttention):
         # Mason: selective checkpoint
         if self.config.selective_checkpoint_enabled:
             attn_output, attn_weights = \
-                torch.utils.checkpoint.checkpoint(self._attn, query, key, value, attention_mask, head_mask)
+                checkpoint_method(self._attn, query, key, value, attention_mask, head_mask)
         else:
             # Compute attention
             attn_output, attn_weights = self._attn(query, key, value, attention_mask, head_mask)
@@ -377,7 +384,7 @@ class GPTNeoXModelNxD(GPTNeoXModel):
 
                     return custom_forward
 
-                outputs = torch.utils.checkpoint.checkpoint(
+                outputs = checkpoint_method(
                     create_custom_forward(layer),
                     hidden_states,
                     attention_mask,

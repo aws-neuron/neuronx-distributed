@@ -61,7 +61,7 @@ from concurrent.futures import ThreadPoolExecutor
 import requests
 from torch.utils.tensorboard import SummaryWriter
 
-from neuronx_distributed.optimizer import NeuronZero1Optimizer
+import neuronx_distributed as nxd
 from neuronx_distributed.parallel_layers import (
     checkpointing,
     grads,
@@ -413,12 +413,17 @@ def get_dtype(model) -> str:
 
 
 def train_bert_hdf5(flags):
-    parallel_state.initialize_model_parallel(tensor_model_parallel_size=flags.tensor_parallel_size)
+    set_seed(flags.seed)
+
+    nxd_config = nxd.neuronx_distributed_config(
+        tensor_parallel_size=flags.tensor_parallel_size,
+        optimizer_config={"zero_one_enabled": flags.use_zero1, "grad_clipping": True, "max_grad_norm": 1.0},
+    )
+
     rank = xm.get_ordinal()
     world_size = parallel_state.get_data_parallel_size()
     is_root = xm.is_master_ordinal(local=False)
     extract_graphs_only = os.environ.get("NEURON_EXTRACT_GRAPHS_ONLY", None)
-    set_seed(flags.seed)
     worker_init = WorkerInitObj(flags.seed)
     device = xm.xla_device()
     model = get_model(flags)
@@ -453,22 +458,14 @@ def train_bert_hdf5(flags):
         flags.optimizer
     )
     if flags.optimizer.lower() == "adamw":
-        if flags.use_zero1:
-            optimizer = NeuronZero1Optimizer(
-                optimizer_grouped_parameters,
-                AdamW,
-                lr=flags.lr,
-                pin_layout=False,
-                sharding_groups=parallel_state.get_data_parallel_group(as_list=True),
-                grad_norm_groups=parallel_state.get_tensor_model_parallel_group(as_list=True),
-            )
-        else:
-            optimizer = AdamW(optimizer_grouped_parameters, flags.lr)
+        optimizer = nxd.initialize_parallel_optimizer(nxd_config, AdamW, optimizer_grouped_parameters, lr=flags.lr)
     elif flags.optimizer.lower() == "lamb":
         print(
             "Using LAMB with trust_ratio_clipping on, based on implementation from https://github.com/rwightman/pytorch-image-models/blob/master/timm/optim/lamb.py"
         )
-        optimizer = Lamb(optimizer_grouped_parameters, flags.lr, trust_clip=True)  # default turning trust_clip on
+        optimizer = nxd.initialize_parallel_optimizer(
+            nxd_config, Lamb, optimizer_grouped_parameters, lr=flags.lr, trust_clip=True
+        )
 
     optimizer.zero_grad()
 
@@ -540,25 +537,9 @@ def train_bert_hdf5(flags):
                 )
                 running_loss_reduced_detached = running_loss_reduced.detach()
                 running_loss.zero_()
-                if not flags.use_zero1:
-                    # all-reduce and then clip. Order matters.
-                    xm.reduce_gradients(optimizer, groups=parallel_state.get_data_parallel_group(as_list=True))
-                    grads.clip_grad_norm(model.parameters(), max_grad_norm)  # Gradient clipping is not in AdamW anymore
                 optimizer.step()
-
-                if flags.use_zero1:
-                    total_norm = None
-                else:
-                    with torch.no_grad():
-                        total_norm = torch.zeros(1, device=device)
-                        if flags.print_grad_norm and is_root:
-                            for p in model.parameters():
-                                param_norm_sq = torch.square(p.grad).sum()
-                                total_norm += param_norm_sq
-                            total_norm = torch.sqrt(total_norm)
-                            total_norm = total_norm.detach()
-
                 optimizer.zero_grad()
+                total_norm = optimizer.grad_norm
                 scheduler.step()
                 global_step += 1
 
@@ -747,7 +728,9 @@ def train_bert_hdf5(flags):
             del train_dataloader
             gc.collect()
             if is_pjrt_device():
-                train_dataloader, _ = create_pretraining_dataset(data_file, flags.max_pred_len, mini_batch_size, worker_init)
+                train_dataloader, _ = create_pretraining_dataset(
+                    data_file, flags.max_pred_len, mini_batch_size, worker_init
+                )
             else:
                 train_dataloader, _ = future_train_dataloader.result(timeout=1000)
             train_device_loader = pl.MpDeviceLoader(train_dataloader, device)
@@ -888,7 +871,8 @@ if __name__ == "__main__":
     # WORLD_SIZE is set by torchrun
     if os.environ.get("WORLD_SIZE"):
         if is_pjrt_device():
-            import torch_xla.experimental.pjrt_backend # noqa
+            import torch_xla.experimental.pjrt_backend  # noqa
+
             torch.distributed.init_process_group("xla", init_method="pjrt://")
         else:
             torch.distributed.init_process_group("xla")

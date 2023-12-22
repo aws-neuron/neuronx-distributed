@@ -12,9 +12,9 @@ import torch_xla.debug.metrics as met
 from commons import print_separator, set_random_seed
 
 from neuronx_distributed.parallel_layers import layers, parallel_state
+from neuronx_distributed.parallel_layers.pad import pad_model
 from neuronx_distributed.parallel_layers.random import model_parallel_xla_manual_seed
 from neuronx_distributed.parallel_layers.utils import is_pjrt_device
-from neuronx_distributed.parallel_layers.pad import pad_model
 
 datetime_str = str(datetime.now())
 
@@ -199,7 +199,7 @@ def test_row_parallel_linear_seq_parallel(tensor_model_parallel_size):
             bias=False,
             input_is_parallel=True,
             sequence_parallel_enabled=True,
-            init_master_weight=True,
+            keep_master_weight=True,
         ).to(device)
 
         with torch.no_grad():
@@ -294,7 +294,7 @@ def test_column_parallel_linear_seq_parallel(tensor_model_parallel_size):
             bias=False,
             gather_output=False,
             sequence_parallel_enabled=True,
-            init_master_weight=True,
+            keep_master_weight=True,
         ).to(device)
 
         with torch.no_grad():
@@ -338,7 +338,6 @@ def test_column_parallel_linear_seq_parallel(tensor_model_parallel_size):
         print("   error in output (parallel) on global rank {}: {}".format(torch.distributed.get_rank(), error))
         assert error < 1.0e-3, "error: {}".format(error)
 
-        
         if tensor_model_parallel_size_ == 1:
             expected_grad_chunk = ref_linear.weight.grad.chunk(
                 chunks=tensor_model_parallel_size_,
@@ -346,9 +345,8 @@ def test_column_parallel_linear_seq_parallel(tensor_model_parallel_size):
             )[parallel_state.get_tensor_model_parallel_rank()]
 
             error = linear.weight.grad.sub(expected_grad_chunk).abs().max()
-            print('   error in grad (parallel) on global rank {}: {}'.format(
-                torch.distributed.get_rank(), error))
-            assert error < 1.0e-3, 'error: {}'.format(error)
+            print("   error in grad (parallel) on global rank {}: {}".format(torch.distributed.get_rank(), error))
+            assert error < 1.0e-3, "error: {}".format(error)
 
         # Reset groups
         parallel_state.destroy_model_parallel()
@@ -392,14 +390,14 @@ def test_padding_attention_heads(tensor_model_parallel_size):
                 hidden_size,
                 bias=False,
                 gather_output=False,
-                init_master_weight=True,
+                keep_master_weight=True,
             ).to(device),
             layers.RowParallelLinear(
                 hidden_size,
                 hidden_size,
                 bias=False,
                 input_is_parallel=True,
-                init_master_weight=True,
+                keep_master_weight=True,
             ).to(device),
         )
         # Pad it to the desired TP_DEGREE
@@ -432,15 +430,15 @@ def test_padding_attention_heads(tensor_model_parallel_size):
                 hidden_size,
                 bias=False,
                 gather_output=False,
-                init_master_weight=True,
+                keep_master_weight=True,
             ).to(device),
             layers.RowParallelLinear(
                 hidden_size,
                 hidden_size,
                 bias=False,
                 input_is_parallel=True,
-                init_master_weight=True,
-            ).to(device)
+                keep_master_weight=True,
+            ).to(device),
         )
 
         # Get output (after both ColumnParallel/RowParallel, should be same size) and loss
@@ -500,7 +498,8 @@ def on_exit():
 
 if __name__ == "__main__":
     if is_pjrt_device():
-        import torch_xla.experimental.pjrt_backend
+        import torch_xla.experimental.pjrt_backend  # noqa
+
         torch.distributed.init_process_group("xla", init_method="pjrt://")
     else:
         torch.distributed.init_process_group("xla")
@@ -509,13 +508,18 @@ if __name__ == "__main__":
     while tensor_model_parallel_size <= world_size:
         print_separator("test parallel embedding")
         test_parallel_embedding(tensor_model_parallel_size)
+        xm.mark_step()
         print_separator("test initialize affine weight")
         test_initialize_affine_weight_cpu(tensor_model_parallel_size)
+        xm.mark_step()
         print_separator("test row_parallel_linear with seq_parallel")
         test_row_parallel_linear_seq_parallel(tensor_model_parallel_size)
+        xm.mark_step()
         print_separator("test column_parallel_linear with seq_parallel")
         test_column_parallel_linear_seq_parallel(tensor_model_parallel_size)
+        xm.mark_step()
         print_separator("test padding attention heads")
         test_padding_attention_heads(tensor_model_parallel_size)
+        xm.mark_step()
         tensor_model_parallel_size *= 2
     atexit.register(on_exit)

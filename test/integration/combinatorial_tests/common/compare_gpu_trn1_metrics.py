@@ -2,6 +2,7 @@ import tensorboard.backend.event_processing.event_accumulator as event_acc
 import argparse
 from collections import defaultdict
 import os
+import math
 
 
 def load_events(event_file):
@@ -54,6 +55,7 @@ def main():
 
             for trn in trn1_events[tag]:
                 trn1_value = trn.value
+                assert not math.isnan(trn1_value), f"trn1 value is nan for {tag}"
                 smoothed_trn_val = trn1_last_value * args.smoothed_weight + (1 - args.smoothed_weight) * trn1_value
                 smoothed_gpu_val = gpu_events_lookup[trn.step]
 

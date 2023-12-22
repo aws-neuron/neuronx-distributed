@@ -1,5 +1,13 @@
 import torch
 
+try:
+    # Method exists at least from PT 1.13-2.1
+    from torch.distributed.distributed_c10d import _get_default_store
+
+    TCP_STORE_AVAILABLE = True
+except ImportError:
+    TCP_STORE_AVAILABLE = False
+
 from ..utils.logger import get_logger
 
 logger = get_logger()
@@ -30,7 +38,9 @@ _MPU_TENSOR_MODEL_PARALLEL_RANK = None
 PP_GROUP_PG_GLOO = None
 
 
-def initialize_model_parallel(tensor_model_parallel_size: int = 1, pipeline_model_parallel_size: int = 1) -> None:
+def initialize_model_parallel(
+    tensor_model_parallel_size: int = 1,
+    pipeline_model_parallel_size: int = 1) -> None:
     """
     Initialize model data parallel groups.
 
@@ -304,9 +314,22 @@ def destroy_model_parallel():
     _PREV_RANK_GROUP_SPMD = None
 
 
+def is_tcp_store_available():
+    return TCP_STORE_AVAILABLE
+
+
+def get_tcp_store():
+    """
+    Getting the default tcp_store from the global group initialization
+    """
+    assert is_tcp_store_available(), f"Can not import _get_default_store from distributed_c10d"
+    return _get_default_store()
+
+
 def initialize_pp_gloo_groups():
     global PP_GROUP_PG_GLOO
     assert PP_GROUP_PG_GLOO is None, "pp gloo groups are already initialized!"
+    logger.info(f"initialize_pp_gloo_groups...")
     pp_group_spmd = get_pipeline_model_parallel_group(as_list=True)
     rank = torch.distributed.get_rank()
     for pp_group in pp_group_spmd:

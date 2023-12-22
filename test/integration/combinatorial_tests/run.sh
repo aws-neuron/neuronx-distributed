@@ -11,19 +11,15 @@ done < $experiment_file
 
 # Show the values read from the config file
 echo "TP_DEGREE: $TP_DEGREE"
-echo "CUSTOM_SOFTMAX: $CUSTOM_SOFTMAX"
 echo "NEURON_FLAGS: $NEURON_FLAGS"
 echo "GBS: $GBS"
 echo "MBS: $MBS"
 echo "SEQUENCE_PARALLEL: $SEQUENCE_PARALLEL"
 echo "SEQ_LEN: $SEQ_LEN"
 echo "PIPELINE_PARALLEL: $PIPELINE_PARALLEL" # TODO - enable pp when running model
-echo "ASYNC_RUNTIME: $ASYNC_RUNTIME"
 echo "USE_ZERO_1= $USE_ZERO_1" # 0: use pure DP; 1: use ZeRO-1
 echo "USE_MIX_PRECISION=$USE_MIX_PRECISION" # 0: bf16; 1: mixed precision
-echo "STOCHASTIC_ROUNDING_EN: $STOCHASTIC_ROUNDING_EN"
 echo "SELECTIVE_CHECKPOINT: $SELECTIVE_CHECKPOINT"
-export NEURON_RT_STOCHASTIC_ROUNDING_EN=$STOCHASTIC_ROUNDING_EN
 
 #############################################
 # User defined parameters and env vars
@@ -31,10 +27,10 @@ export NEURON_RT_STOCHASTIC_ROUNDING_EN=$STOCHASTIC_ROUNDING_EN
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 
 export NEURON_CC_FLAGS=$NEURON_FLAGS
-export NEURON_FUSE_SOFTMAX=$CUSTOM_SOFTMAX
+export NEURON_FUSE_SOFTMAX=1
 
 # Async Runtime
-export NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS=$ASYNC_RUNTIME
+export NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS=3
 
 # HOST OOM
 export MALLOC_ARENA_MAX=64
@@ -100,6 +96,7 @@ if [ $SELECTIVE_CHECKPOINT -gt 0 ]; then
 fi
 
 DP=$(($NEURON_RT_NUM_CORES * $WORLD_SIZE / $TP_DEGREE))
+#DP=$(($NEURON_RT_NUM_CORES * $WORLD_SIZE / $TP_DEGREE / $PP_DEGREE)) #TODO - use once PP is enabled
 ACC_STEPS=$(($GBS / $MBS / $DP))
 
 if [ $NEURON_EXTRACT_GRAPHS_ONLY -gt 0 ]; then
@@ -126,7 +123,7 @@ echo STEPS_THIS_RUN=$STEPS_THIS_RUN
 echo OUTPUT_LOG=$OUTPUT_LOG
 
 torchrun $DISTRIBUTED_ARGS \
-    $MODEL_PATH/../llama2_7B/tp_zero1_llama2_7b_hf_pretrain.py \
+    ～/ktest/NeuronxDistributed/examples/training/llama2/tp_zero1_llama2_7b_hf_pretrain/tp_zero1_llama2_7b_hf_pretrain.py \
     --model_path $MODEL_PATH \
     --data_dir $DATA_PATH \
     --tensor_parallel_size $TP_DEGREE \
@@ -143,7 +140,7 @@ torchrun $DISTRIBUTED_ARGS \
 # TODO update smoothed_weight factor and delta percentage based on experiments
 if [ "$NEURON_EXTRACT_GRAPHS_ONLY" != "1" ]; then
     echo "run pretraining gpu comparison"
-    python3 ./common/compare_gpu_trn1_metrics.py ~/gpu_benchmark/events.out.tfevents.1691458200.platform-queue-dy-platform-p4d24xlarge-5.7774.0 output/neuron_tblogs_*/events.out.* "step loss" --smoothed_weight=0.666 --delta_percentage=5.0 --comparison_start_step=250
+    python3 ./common/compare_gpu_trn1_metrics.py ~/gpu_benchmark/events.out.tfevents.1691458200.platform-queue-dy-platform-p4d24xlarge-5.7774.0 output/neuron_tblogs_*/events.out.* "step loss" --smoothed_weight=0.666 --delta_percentage=5.0 --comparison_start_step=0
     ret_val=$?
     echo $ret_val
     if [ $ret_val -eq 0 ]; then

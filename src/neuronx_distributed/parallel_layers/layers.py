@@ -51,7 +51,7 @@ def _initialize_affine_weight_neuron(weight, init_method, partition_dim, stride=
         init_method(weight)
 
 
-def create_local_weight_cpu(full_weight, partition_dim, per_partition_size, stride, out_weight=None):
+def create_local_weight(full_weight, partition_dim, per_partition_size, stride, out_weight=None):
     per_partition_per_stride_size = divide(per_partition_size, stride)
     weight_list = torch.split(full_weight, per_partition_per_stride_size, dim=partition_dim)
     rank = get_tensor_model_parallel_rank()
@@ -88,7 +88,7 @@ def _initialize_affine_weight_cpu(
 
     master_weight = master_weight.to(dtype=params_dtype)
 
-    create_local_weight_cpu(master_weight, partition_dim, per_partition_size, stride, out_weight=weight)
+    create_local_weight(master_weight, partition_dim, per_partition_size, stride, out_weight=weight)
     if return_master_weight:
         return master_weight
     return None
@@ -401,7 +401,7 @@ class ColumnParallelLinear(BaseParallelLinear):
         stride: int = 1,
         init_method: torch.nn.init = None,
         sequence_parallel_enabled: bool = False,
-        init_master_weight: bool = False,
+        keep_master_weight: bool = False,
     ):
         super().__init__()
 
@@ -415,7 +415,7 @@ class ColumnParallelLinear(BaseParallelLinear):
         self.output_size_per_partition = divide(output_size, world_size)
         self.dtype = dtype
         self.stride = stride
-        self.init_master_weight = init_master_weight
+        self.keep_master_weight = keep_master_weight
 
         # Parameters.
         # Note: torch.nn.functional.linear performs XA^T + b and as a result
@@ -466,7 +466,6 @@ class ColumnParallelLinear(BaseParallelLinear):
         if self.async_tensor_model_parallel_allreduce and self.sequence_parallel_enabled:
             raise RuntimeError(
                 "`async_tensor_model_parallel_allreduce` and `sequence_parallel_enabled` cannot be enabled at the same time."
-
             )
 
         self._forward_impl = linear_with_async_allreduce
@@ -481,7 +480,7 @@ class ColumnParallelLinear(BaseParallelLinear):
             self._init_weight,
             params_dtype=self.dtype,
             stride=self.stride,
-            return_master_weight=self.init_master_weight,
+            return_master_weight=self.keep_master_weight,
         )
 
     def forward(self, input: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -556,7 +555,7 @@ class RowParallelLinear(BaseParallelLinear):
         stride: int = 1,
         init_method: torch.nn.init = None,
         sequence_parallel_enabled: bool = False,
-        init_master_weight: bool = False,
+        keep_master_weight: bool = False,
     ):
         super().__init__()
 
@@ -573,7 +572,7 @@ class RowParallelLinear(BaseParallelLinear):
             raise RuntimeError("To enable `sequence_parallel_enabled`, `input_is_parallel` must be `True`")
         self.dtype = dtype
         self.stride = stride
-        self.init_master_weight = init_master_weight
+        self.keep_master_weight = keep_master_weight
 
         # Note: torch.nn.functional.linear performs XA^T + b and as a result
         # we allocate the transpose.
@@ -622,7 +621,7 @@ class RowParallelLinear(BaseParallelLinear):
             self._init_weight,
             params_dtype=self.dtype,
             stride=self.stride,
-            return_master_weight=self.init_master_weight,
+            return_master_weight=self.keep_master_weight,
         )
 
     def _init_bias(self):

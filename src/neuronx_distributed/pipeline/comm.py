@@ -1,4 +1,5 @@
 import pickle
+from collections import defaultdict
 
 import numpy as np
 import torch
@@ -7,11 +8,20 @@ import torch_xla.core.xla_model as xm
 from ..parallel_layers import parallel_state
 from ..parallel_layers.parallel_state import rmsg
 from ..utils.logger import get_logger
+from ..utils.serialization import compress_to_string, uncompress_from_string
 
 logger = get_logger()
 
-# max size of python object buffer to send between stages
+# max size of python object buffer to send between stages using gloo
 MAX_LENGTH = 2**20  # 1M
+
+# global dict to store the number of send/recvs using tcp store
+kv_tag_send_count = defaultdict(int)
+kv_tag_recv_count = defaultdict(int)
+
+# max retry when getting from tcp store
+# tested with 512 nodes cluster
+MAX_RETRY = 3
 
 
 """
@@ -63,12 +73,23 @@ Eager send/recv for python objects, mainly used for get tensor shapes.
 """
 
 
-def send_python_object(obj, send_next=True):
-    gloo_group = parallel_state.get_pp_gloo_group()
+def send_python_object(obj, send_next=True, method="tcp"):
     if send_next:
         dst_rank = parallel_state.get_pipeline_model_parallel_next_rank()
     else:
         dst_rank = parallel_state.get_pipeline_model_parallel_prev_rank()
+
+    if method == "gloo":
+        _send_with_gloo_group(obj, dst_rank)
+    else:
+        _send_with_tcp_store(obj, dst_rank)
+
+
+def _send_with_gloo_group(obj, dst_rank):
+    """
+    Convert the object into a torch cpu tensor and send it with the gloo group
+    """
+    gloo_group = parallel_state.get_pp_gloo_group()
     data = pickle.dumps(obj)
     data_length = len(data)
     # first 4 bytes will be data length
@@ -82,12 +103,39 @@ def send_python_object(obj, send_next=True):
     torch.distributed.send(tensor, dst_rank, group=gloo_group)
 
 
-def recv_python_object(recv_prev=True):
-    gloo_group = parallel_state.get_pp_gloo_group()
+def _send_with_tcp_store(obj, dst_rank):
+    """
+    Convert the object into a string and set it in the tcp store.
+    Each send/recv has unique tcp store key, with a suffix of the send/recv count.
+    The send/recv index should be sync on all ranks, i.e. for the same tag,
+    the send/recv ranks should have the same count
+    """
+    global kv_tag_send_count
+    tcp_store = parallel_state.get_tcp_store()
+    obj_str = compress_to_string(obj)
+    rank = torch.distributed.get_rank()
+    tag = f"{rank}_to_{dst_rank}"
+    kv_tag_send_count[tag] += 1
+    tcp_store.set(f"{tag}_{kv_tag_send_count[tag]}", obj_str)
+
+
+def recv_python_object(recv_prev=True, method="tcp"):
     if recv_prev:
         src_rank = parallel_state.get_pipeline_model_parallel_prev_rank()
     else:
         src_rank = parallel_state.get_pipeline_model_parallel_next_rank()
+
+    if method == "gloo":
+        return _recv_with_gloo_group(src_rank)
+    else:
+        return _recv_with_tcp_store(src_rank)
+
+
+def _recv_with_gloo_group(src_rank):
+    """
+    Receive a torch cpu tensor and convert it back to python object
+    """
+    gloo_group = parallel_state.get_pp_gloo_group()
     tensor = torch.zeros(MAX_LENGTH, dtype=torch.uint8, device="cpu")
     torch.distributed.recv(tensor, src=src_rank, group=gloo_group)
     data = tensor.cpu().numpy().tobytes()
@@ -95,3 +143,31 @@ def recv_python_object(recv_prev=True):
     length = int.from_bytes(data[:4], "big")
     data = data[4 : length + 4]
     return pickle.loads(data)
+
+
+def _recv_with_tcp_store(src_rank):
+    """
+    Getting the object from tcp store and uncompress it back to python object
+    """
+    global kv_tag_recv_count
+    tcp_store = parallel_state.get_tcp_store()
+    rank = torch.distributed.get_rank()
+    tag = f"{src_rank}_to_{rank}"
+    kv_tag_recv_count[tag] += 1
+    key = f"{tag}_{kv_tag_recv_count[tag]}"
+    count = 0
+    success = False
+    # Sometimes it will timeout for large cluster
+    while count < MAX_RETRY and not success:
+        try:
+            # Need to decode since tcp_store.get returns byte types
+            obj_str = tcp_store.get(key).decode("utf-8")
+            success = True
+        except:
+            count += 1
+    if not success:
+        raise RuntimeError(rmsg(f"Failed to receive object with key {key}"))
+    # After received the object, delete the key
+    tcp_store.delete_key(key)
+    obj = uncompress_from_string(obj_str)
+    return obj

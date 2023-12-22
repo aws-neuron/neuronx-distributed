@@ -1,12 +1,20 @@
 import inspect
 import math
 from abc import ABC
+from collections import defaultdict
+from contextlib import contextmanager
 from types import ModuleType
-from typing import Any, Callable, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 
 import torch
 import torch_xla.core.xla_model as xm
 from torch import nn
+
+try:
+    # In case this is removed in the future
+    from torch.fx._symbolic_trace import _create_wrapped_func  # noqa
+except ImportError:
+    _create_wrapped_func = None
 
 import neuronx_distributed
 from neuronx_distributed import parallel_layers
@@ -98,6 +106,32 @@ def get_tracer_class(model, tracer_cls=None):
     return tracer_cls
 
 
+@contextmanager
+def patch_obj_method(autowrap_obj_methods):
+    """
+    Patch the methods from a certain object, so FX's symbolic trace won't trace inside the method when it is called
+    """
+    enabled = _create_wrapped_func is not None and autowrap_obj_methods is not None
+    if enabled:
+        original_method = defaultdict(dict)
+        for obj, methods in autowrap_obj_methods.items():
+            assert isinstance(
+                methods, list
+            ), f"Expect autowrap_obj_methods has list as value but getting {type(methods)}"
+            for method in methods:
+                if not hasattr(obj, method):
+                    raise ValueError(f"Inside autowrap_obj_methods obj type {type(obj)} does not have method {method}")
+                original_method[obj][method] = getattr(obj, method)
+                setattr(obj, method, _create_wrapped_func(original_method[obj][method]))
+    try:
+        yield
+    finally:
+        if enabled:
+            for obj, methods in original_method.items():
+                for name, original_method in methods.items():
+                    setattr(obj, name, original_method)
+
+
 def trace_model(
     model: nn.Module,
     input_names: Optional[List[str]] = None,
@@ -105,7 +139,13 @@ def trace_model(
     leaf_modules: Optional[List[Any]] = None,
     autowrap_functions: Optional[List[Callable]] = None,
     autowrap_modules: Optional[List[ModuleType]] = None,
+    autowrap_obj_methods: Optional[Dict[Any, List[Callable]]] = None,
 ):
+    if _create_wrapped_func is None and autowrap_obj_methods is not None:
+        logger.warning(
+            f"Can not import _create_wrapped_func from torch.fx.__symbolic_trace, autowrap_obj_method will be ignored"
+        )
+
     tracer_cls = get_tracer_class(model, tracer_cls=tracer_cls)
 
     if input_names is None:
@@ -143,8 +183,9 @@ def trace_model(
         autowrap_modules=autowrap_modules,
         autowrap_functions=autowrap_functions,
     )
-    traced_graph = tracer.trace(model, concrete_args=concrete_args)
-    traced_model = torch.fx.GraphModule(model, traced_graph)
+    with patch_obj_method(autowrap_obj_methods):
+        traced_graph = tracer.trace(model, concrete_args=concrete_args)
+        traced_model = torch.fx.GraphModule(model, traced_graph)
 
     if is_hf_pretrained_model(model):
         traced_model.config = model.config

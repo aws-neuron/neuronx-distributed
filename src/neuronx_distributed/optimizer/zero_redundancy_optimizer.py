@@ -10,21 +10,50 @@ from torch_xla.distributed.zero_redundancy_optimizer import ZeroRedundancyOptimi
 from ..parallel_layers.checkpointing import ensure_directory_exists
 from ..parallel_layers.grads import clip_grad_norm
 from ..parallel_layers.parallel_state import (
+    get_data_parallel_group,
     get_data_parallel_rank,
-    get_data_parallel_size,
     get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_size,
+    model_parallel_is_initialized,
 )
-from ..parallel_layers.utils import (
-    get_local_world_size,
-    move_all_tensor_to_cpu,
-)
+from ..parallel_layers.utils import get_local_world_size, move_all_tensor_to_cpu
 from ..utils.logger import get_logger
 
 logger = get_logger()
 
 
 class NeuronZero1Optimizer(ZeroRedundancyOptimizer):
+    def __init__(self, *args, **kwargs):
+        if not model_parallel_is_initialized():
+            raise RuntimeError("initialize_model_parallel need to be called before creating NeuronZero1Optimizer")
+
+        # Default to use DP groups for sharding
+        if "sharding_groups" not in kwargs or kwargs["sharding_groups"] is None:
+            kwargs["sharding_groups"] = get_data_parallel_group(as_list=True)
+
+        # If use dp groups for sharding, calculate the grad norm with world group
+        if kwargs["sharding_groups"] == get_data_parallel_group(as_list=True):
+            self._use_world_for_grad_norm = True
+        else:
+            self._use_world_for_grad_norm = False
+
+        super().__init__(*args, **kwargs)
+
+    @property
+    def grad_norm(self):
+        return self._grad_norm
+
+    def _shard_parameters(self):
+        try:
+            return super()._shard_parameters()
+        except Exception as e:
+            if isinstance(e, AssertionError):
+                raise RuntimeError(
+                    "To use NeuronZero1Optimizer, all parameters passed in should on the same XLA device."
+                    "If you are using pipeline parallel, use `model.local_parameters` or `model.local_named_parameters`."
+                )
+            else:
+                raise e
+
     @torch.no_grad()
     def _clip_grad_norm(
         self,
@@ -41,12 +70,21 @@ class NeuronZero1Optimizer(ZeroRedundancyOptimizer):
                         shard.tensor_model_parallel = param.tensor_model_parallel
                     all_parameters.append(shard)
 
-        # [TODO] Find a way to expose global_norm to user
-        global_norm = clip_grad_norm(all_parameters, max_norm=max_norm, norm_type=norm_type, zero1_optimizer=True)
+        zero1_optimizer_groups = None if self._use_world_for_grad_norm else self._sharding_groups
+        self._grad_norm = clip_grad_norm(
+            all_parameters,
+            max_norm=max_norm,
+            norm_type=norm_type,
+            zero1_optimizer=True,
+            zero1_optimizer_groups=zero1_optimizer_groups,
+        )
 
-    # [TODO] Use the save/load function from parallel_layers/checkpointing.py
+    # [TODO] Remove this method
     def save_sharded_state_dict(self, output_dir: str, num_workers_per_step: int = 8) -> None:
         """Save a model checkpoint."""
+        logger.info(
+            "`NeuronZero1Optimizer.save_sharded_state_dict` is deprecated, please use `nxd.save_checkpoint` instead."
+        )
 
         if torch.distributed.is_initialized():
             if torch.distributed.get_rank() == 0:
@@ -77,8 +115,12 @@ class NeuronZero1Optimizer(ZeroRedundancyOptimizer):
 
         xm.rendezvous("optimizer checkpoint done")
 
-    # [TODO] Use the save/load function from parallel_layers/checkpointing.py
+    # [TODO] Remove this method
     def load_sharded_state_dict(self, output_dir: str, num_workers_per_step: int = 8) -> None:
+        logger.info(
+            "`NeuronZero1Optimizer.load_sharded_state_dict` is deprecated, please use `nxd.load_checkpoint` instead."
+        )
+
         chkpt_path = output_dir
         chkpt_path = os.path.join(
             chkpt_path,
@@ -100,4 +142,3 @@ class NeuronZero1Optimizer(ZeroRedundancyOptimizer):
                 del check_point
                 gc.collect()
             xm.rendezvous("optimizer.load_checkpoint" + str(worker))
-

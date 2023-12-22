@@ -1,12 +1,32 @@
 # Standard Library
+import base64
 import collections
 import copy
+import pickle
 from contextlib import contextmanager
 from enum import Enum
 from typing import Any, Dict, List, NamedTuple
 
 # Third Party
 import torch
+
+
+def compress_to_string(obj):
+    """
+    Compress: Serialize a Python object to a base64-encoded string
+    """
+    serialized_data_bytes = pickle.dumps(obj)
+    serialized_data_base64 = base64.b64encode(serialized_data_bytes).decode("utf-8")
+    return serialized_data_base64
+
+
+def uncompress_from_string(serialized_data_string):
+    """
+    Uncompress: Deserialize the base64-encoded string back to the original Python object
+    """
+    serialized_data_bytes = base64.b64decode(serialized_data_string.encode("utf-8"))
+    obj = pickle.loads(serialized_data_bytes)
+    return obj
 
 
 def is_instance_namedtuple(iterable):

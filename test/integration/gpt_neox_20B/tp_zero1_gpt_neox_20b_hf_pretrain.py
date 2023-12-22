@@ -15,48 +15,45 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import argparse
+import inspect
+import json
 import os
-import torch
+import queue
 import sys
 import time
-import argparse
-import json
-import queue
-from typing import Any, Dict, List
-from datetime import datetime, timezone
 from collections import namedtuple
+from datetime import datetime, timezone
+from typing import Any, Dict, List
+
+import datasets
+import numpy as np
+import requests
+import torch
+import torch.distributed as dist
 import torch_xla
 import torch_xla.core.xla_model as xm
-from torch.utils.data.dataloader import DataLoader
-from torch.utils.data import DistributedSampler
 import torch_xla.distributed.parallel_loader as pl
-import torch.distributed as dist
-import torch_xla.distributed.xla_multiprocessing as xmp
 import torch_xla.distributed.xla_backend
-import numpy as np
-from transformers import (
-    default_data_collator,
-    set_seed,
-    modeling_utils,
-    GPTNeoXConfig,
-)
+import torch_xla.distributed.xla_multiprocessing as xmp
+from neuronx_distributed.utils.adamw_fp32_optim_params import AdamW_FP32OptimParams
+from modeling_gpt_neox_nxd import GPTNeoXForCausalLMNxD
+from torch.utils.data import DistributedSampler
+from torch.utils.data.dataloader import DataLoader
+from torch.utils.tensorboard import SummaryWriter
+from transformers import GPTNeoXConfig, default_data_collator, modeling_utils, set_seed
 from transformers.optimization import get_linear_schedule_with_warmup
 
-from torch.utils.tensorboard import SummaryWriter
-import inspect
-import requests
-from neuronx_distributed.parallel_layers import parallel_state, checkpointing, move_model_to_device
+import neuronx_distributed as nxd
+from neuronx_distributed.parallel_layers import (
+    checkpointing,
+    move_model_to_device,
+    parallel_state,
+)
 from neuronx_distributed.parallel_layers.utils import is_pjrt_device
-import datasets
-
-from modeling_gpt_neox_nxd import GPTNeoXForCausalLMNxD
-from neuronx_distributed.optimizer import NeuronZero1Optimizer
-from common_utils.optimizer.adamw_fp32_optim_params import AdamW_FP32OptimParams
 
 datetime_str = str(datetime.now())
-results = {
-    "inference_success": 1
-}
+results = {"inference_success": 1}
 
 Metric = namedtuple("Metric", ["name", "value", "units", "additional_data"])
 
@@ -125,9 +122,7 @@ class TrainingMetrics:
 
 
 class Throughput:
-    def __init__(
-        self, batch_size, world_size, grad_accum_usteps, moving_avg_window_size=10
-    ):
+    def __init__(self, batch_size, world_size, grad_accum_usteps, moving_avg_window_size=10):
         self.seqs_per_iteration = batch_size * world_size * grad_accum_usteps
         self.moving_avg_window_size = moving_avg_window_size
         self.moving_avg_window = queue.Queue()
@@ -167,17 +162,13 @@ class Logger:
                 f"_{self.get_instance_type()}",
             )
         )
-        self.tb.add_text(
-            "script", "```\n" + inspect.getsource(sys.modules[__name__]) + "\n```", 0
-        )
+        self.tb.add_text("script", "```\n" + inspect.getsource(sys.modules[__name__]) + "\n```", 0)
         self.golden_steploss = []
         golden = "golden_steploss.txt"
         if os.path.exists(golden):
             with open(golden, "r") as f:
                 self.golden_steploss = [float(i) for i in f]
-            print(
-                f"Read {len(self.golden_steploss)} golden step loss values from {golden}"
-            )
+            print(f"Read {len(self.golden_steploss)} golden step loss values from {golden}")
 
     def get_instance_type(self):
         try:
@@ -211,9 +202,7 @@ class Logger:
         if not os.environ.get("NEURON_EXTRACT_GRAPHS_ONLY", None):
             step_0start = step - 1
             if step_0start < len(self.golden_steploss) and step_0start >= 0:
-                np.testing.assert_allclose(
-                    step_loss, self.golden_steploss[step_0start], rtol=2.3e-1
-                )
+                np.testing.assert_allclose(step_loss, self.golden_steploss[step_0start], rtol=2.3e-1)
 
 
 # Workaround because python functions are not picklable
@@ -224,9 +213,8 @@ class WorkerInitObj(object):
     def __call__(self, id):
         set_seed(self.seed)
 
-def create_pretraining_dataset(
-    data_dir, mini_batch_size, worker_init
-):
+
+def create_pretraining_dataset(data_dir, mini_batch_size, worker_init):
     train_data = datasets.load_from_disk(os.path.expanduser(data_dir))
     train_sampler = DistributedSampler(
         train_data,
@@ -247,6 +235,7 @@ def create_pretraining_dataset(
     )
     return train_dataloader
 
+
 def get_model(flags):
     model_name = "EleutherAI/gpt-neox-20b"
     config = GPTNeoXConfig.from_pretrained(model_name)
@@ -262,6 +251,7 @@ def get_model(flags):
         model.gradient_checkpointing_enable()
     return model
 
+
 def get_dtype(model) -> str:
     """
     Reference: https://pytorch.org/xla/release/1.12/index.html#xla-tensors-and-bfloat16
@@ -275,30 +265,19 @@ def get_dtype(model) -> str:
             return "torch.float32"
     return str(model.dtype)
 
-def allreduce_sequence_parallel_gradients(optimizer):
-    """ All-reduce layernorm parameters across model parallel nodes when sequence parallelism is used.
-        Modified from megatron-lm:
-        https://gitlab-master.nvidia.com/ADLR/megatron-lm/-/blob/3f91f09bb2ab32f9904b47f46f19d2fc3f518ed8/megatron/training.py#L425
-    """
-    from neuronx_distributed.parallel_layers.mappings import reduce_from_tensor_model_parallel_region
-    grads = []
-    for param_group in optimizer.__getstate__()['param_groups']:
-        for group, params in param_group.items():
-            if group == 'params':
-                for p in params:
-                    if isinstance(p, torch.Tensor) and p.grad is not None:
-                        sequence_parallel_param = getattr(p, 'sequence_parallel_enabled', False)
-                        if sequence_parallel_param:
-                            grads.append(p.grad.data)
-    for grad in grads:
-        reduce_from_tensor_model_parallel_region(grad)
 
 def train_gpt_neox(flags):
-    parallel_state.initialize_model_parallel(tensor_model_parallel_size=flags.tensor_parallel_size)
+    set_seed(flags.seed)
+
+    nxd_config = nxd.neuronx_distributed_config(
+        tensor_parallel_size=flags.tensor_parallel_size,
+        optimizer_config={"zero_one_enabled": True, "grad_clipping": True, "max_grad_norm": 1.0},
+        sequence_parallel=flags.sequence_parallel_enabled,
+    )
+
     world_size = parallel_state.get_data_parallel_size()
     is_root = xm.is_master_ordinal(local=False)
     extract_graphs_only = os.environ.get("NEURON_EXTRACT_GRAPHS_ONLY", None)
-    set_seed(flags.seed)
     worker_init = WorkerInitObj(flags.seed)
     device = xm.xla_device()
 
@@ -314,26 +293,17 @@ def train_gpt_neox(flags):
 
     optimizer_grouped_parameters = [
         {
-            "params": [
-                p for n, p in param_optimizer if not any(nd in n for nd in no_decay)
-            ],
+            "params": [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)],
             "weight_decay": 0.01,
         },
         {
-            "params": [
-                p for n, p in param_optimizer if any(nd in n for nd in no_decay)
-            ],
+            "params": [p for n, p in param_optimizer if any(nd in n for nd in no_decay)],
             "weight_decay": 0.0,
         },
     ]
 
-    optimizer = NeuronZero1Optimizer(
-        optimizer_grouped_parameters,
-        AdamW_FP32OptimParams,
-        lr=flags.lr,
-        pin_layout=False,
-        sharding_groups=parallel_state.get_data_parallel_group(as_list=True),
-        grad_norm_groups=parallel_state.get_tensor_model_parallel_group(as_list=True),
+    optimizer = nxd.initialize_parallel_optimizer(
+        nxd_config, AdamW_FP32OptimParams, optimizer_grouped_parameters, lr=flags.lr
     )
     optimizer.zero_grad()
 
@@ -343,9 +313,7 @@ def train_gpt_neox(flags):
         if not extract_graphs_only:
             logger = Logger(flags, world_size, model_dtype)
         metric_writer = TrainingMetrics(flags.metrics_file)
-        throughput = Throughput(
-            flags.batch_size, world_size, flags.grad_accum_usteps
-        )
+        throughput = Throughput(flags.batch_size, world_size, flags.grad_accum_usteps)
         print("--------TRAINING CONFIG----------")
         print(flags)
         print("--------MODEL CONFIG----------")
@@ -353,7 +321,7 @@ def train_gpt_neox(flags):
         print("---------------------------------")
         metric_writer.store_parameters(
             {
-                "Model": model.name_or_path,
+                "Model": model.config.model_type,
                 "Model configuration": str(model.config),
                 "World size": xm.xrt_world_size(),
                 "Data parallel degree": world_size,
@@ -373,9 +341,7 @@ def train_gpt_neox(flags):
             }
         )
 
-    def train_loop_fn(
-        model, optimizer, train_loader, epoch, global_step, training_ustep, running_loss
-    ):
+    def train_loop_fn(model, optimizer, train_loader, epoch, global_step, training_ustep, running_loss):
         for _, data in enumerate(train_loader):
             training_ustep += 1
             input_ids = data["input_ids"]
@@ -402,20 +368,9 @@ def train_gpt_neox(flags):
                 running_loss_reduced_detached = running_loss_reduced.detach()
                 running_loss.zero_()
 
-                # sequence parallel allreduce
-                allreduce_sequence_parallel_gradients(optimizer)
-
                 optimizer.step()
-
-                with torch.no_grad():
-                    total_norm = torch.zeros(1, device=device)
-                    if flags.print_grad_norm and is_root:
-                        for p in model.parameters():
-                            param_norm_sq = torch.square(p.grad).sum()
-                            total_norm += param_norm_sq
-                        total_norm = torch.sqrt(total_norm)
-
                 optimizer.zero_grad()
+                total_norm = optimizer.grad_norm
                 scheduler.step()
                 global_step += 1
 
@@ -434,9 +389,7 @@ def train_gpt_neox(flags):
                             total_norm_cpu,
                         )
 
-                xm.add_step_closure(
-                    _print_logs, (running_loss_reduced_detached, total_norm.detach())
-                )
+                xm.add_step_closure(_print_logs, (running_loss_reduced_detached, total_norm.detach()))
                 if global_step >= flags.steps_this_run:
                     # NOTE: Prevent runtime "Call to recv failed : Broken pipe" issue
                     xm.mark_step()
@@ -456,7 +409,7 @@ def train_gpt_neox(flags):
         global_step = state_dict["global_step"]
         epoch = state_dict["epoch"]
         scheduler_state_dict = state_dict["scheduler"]
-        optimizer.load_sharded_state_dict(flags.output_dir)
+        optimizer.load_state_dict_from(flags.output_dir)
     else:
         global_step = 0
         epoch = 0
@@ -473,14 +426,12 @@ def train_gpt_neox(flags):
     if scheduler_state_dict:
         scheduler.load_state_dict(scheduler_state_dict)
 
-    assert os.path.exists(
-        os.path.expanduser(flags.data_dir)
-    ), "ERROR: Data directory {} doesn't exist!".format(flags.data_dir)
+    assert os.path.exists(os.path.expanduser(flags.data_dir)), "ERROR: Data directory {} doesn't exist!".format(
+        flags.data_dir
+    )
 
     mini_batch_size = flags.batch_size
-    train_dataloader = create_pretraining_dataset(
-        flags.data_dir, mini_batch_size, worker_init
-    )
+    train_dataloader = create_pretraining_dataset(flags.data_dir, mini_batch_size, worker_init)
     train_device_loader = pl.MpDeviceLoader(train_dataloader, device)
 
     while True:
@@ -522,9 +473,7 @@ def train_gpt_neox(flags):
             }
             metric_data = [
                 Metric("Loss", final_loss, "", additional_data),
-                Metric(
-                    "Throughput", logger.throughputs[-1], "seq/s", additional_data
-                ),
+                Metric("Throughput", logger.throughputs[-1], "seq/s", additional_data),
             ]
             metric_writer.store_metrics(metric_data)
 
@@ -536,9 +485,7 @@ def train_gpt_neox(flags):
                     "Global step": global_step,
                     "Microstep": training_ustep,
                 }
-                average_throughput = round(
-                    sum(logger.throughputs) / len(logger.throughputs), 4
-                )
+                average_throughput = round(sum(logger.throughputs) / len(logger.throughputs), 4)
                 metric_data = [
                     Metric("Final loss", final_loss, "", additional_data),
                     Metric(
@@ -565,10 +512,10 @@ def train_gpt_neox(flags):
                 "model": model.state_dict(),
                 "global_step": global_step,
                 "epoch": epoch,
-                "scheduler": scheduler.state_dict()
+                "scheduler": scheduler.state_dict(),
             }
             checkpointing.save(state_dict, flags.output_dir, down_cast_bf16=True)
-            optimizer.save_sharded_state_dict(flags.output_dir)
+            optimizer.save_state_dict(flags.output_dir)
             return
 
         epoch += 1
@@ -578,6 +525,7 @@ def _mp_fn(index, flags):
     torch.set_default_tensor_type("torch.FloatTensor")
     train_gpt_neox(flags)
     xm.rendezvous("_mp_fn finished")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -632,17 +580,8 @@ if __name__ == "__main__":
         action="store_true",
         help="Whether to print grad norm",
     )
-    parser.add_argument(
-        "--resume_ckpt",
-        action="store_true",
-        help="Resume from checkpoint at resume_step."
-    )
-    parser.add_argument(
-        "--tensor_parallel_size",
-        default=8,
-        type=int,
-        help="Tensor parallel size"
-    )
+    parser.add_argument("--resume_ckpt", action="store_true", help="Resume from checkpoint at resume_step.")
+    parser.add_argument("--tensor_parallel_size", default=8, type=int, help="Tensor parallel size")
     parser.add_argument(
         "--num_layers",
         type=int,
@@ -674,7 +613,8 @@ if __name__ == "__main__":
     # WORLD_SIZE is set by torchrun
     if os.environ.get("WORLD_SIZE"):
         if is_pjrt_device():
-            import torch_xla.experimental.pjrt_backend # noqa
+            import torch_xla.experimental.pjrt_backend  # noqa
+
             dist.init_process_group("xla", init_method="pjrt://")
         else:
             dist.init_process_group("xla")

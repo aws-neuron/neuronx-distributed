@@ -1,5 +1,6 @@
 import copy
 import logging
+import time
 from types import MethodType, ModuleType
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
@@ -51,14 +52,21 @@ class NxDPPModel(nn.Module):
         return_mb_loss: bool = False,
         broadcast_and_average_loss: bool = False,
         use_zero1_optimizer: bool = False,
+        use_optimizer_wrapper: bool = False,
         pipeline_cuts: Optional[List[str]] = None,
         input_names: Optional[List[str]] = None,
         leaf_module_cls: Optional[List[Any]] = None,
         autowrap_functions: Optional[Tuple[ModuleType]] = None,
         autowrap_modules: Optional[Tuple[Callable, ...]] = None,
+        autowrap_obj_methods: Optional[Dict[Any, List[Callable]]] = None,
         tracer_cls: Optional[Union[str, Any]] = None,
         param_init_fn: Optional[Any] = None,
         trace_file_path: Optional[str] = None,
+        return_loss_on_cpu: Optional[bool] = True,
+        _use_gloo_for_metadata_comm: bool = False,
+        _debug_mode: bool = False,
+        _debug_pp_size: int = 8,
+        _debug_pp_rank: int = 0,
     ):
         """
         Model wrapper to run pipeline parallelism
@@ -89,7 +97,10 @@ class NxDPPModel(nn.Module):
                 return_mb_loss must be False
 
             use_zero1_optimizer:
-                Whether to use the zero1 optimizer. When setting to True the gradient average will be handled over.
+                Whether ZeRO-1 optimizer is used.
+
+            use_optimizer_wrapper
+                Whether optimizer wrapper is used.
 
             pipeline_cuts:
                 A list of layer names that will be used to annotate pipeline stage boundaries
@@ -111,6 +122,11 @@ class NxDPPModel(nn.Module):
                 Python functions that should be wrapped automatically without
                 needing to use fx.wrap().
                 reference https://github.com/pytorch/pytorch/blob/main/torch/fx/_symbolic_trace.py#L241
+
+            autowrap_obj_methods: (symbolic tracing only)
+                Wrapping the methods in certain object that you want to avoid tracing. Most common use case
+                is to wrap some methods in some modules. For example assume the top module is `model` and the method
+                that should skip tracing is `model.some_module.some_method`, one can pass autowrap_obj_methods={model.some_module: ["some_method"]}
 
             tracer_cls:
                 User provided tracer class for symbolic tracing. It can be "hf", "torch" or any tracer class
@@ -140,7 +156,7 @@ class NxDPPModel(nn.Module):
 
         """
         super(NxDPPModel, self).__init__()
-        if not parallel_state.model_parallel_is_initialized():
+        if not parallel_state.model_parallel_is_initialized() and not _debug_mode:
             raise RuntimeError(
                 "Model parallelism needs to be initialzed before applying NxDPPModel wrapper. Please call neuronx_distributed.parallel_layers.initialize_model_parallel(pipeline_model_parallel_size, tensor_model_parallel_size)"  # noqa: E501
             )
@@ -156,16 +172,26 @@ class NxDPPModel(nn.Module):
         self.return_mb_loss = return_mb_loss
         self.broadcast_and_average_loss = broadcast_and_average_loss
         self.use_zero1_optimizer = use_zero1_optimizer
+        self.use_optimizer_wrapper = use_optimizer_wrapper
+        self.return_loss_on_cpu = return_loss_on_cpu
         if self.broadcast_and_average_loss:
             assert not self.return_mb_loss, "When broadcast_and_average_loss is True return_mb_loss must be False"
         self.output_loss_value_spec = output_loss_value_spec
         self.transformer_layer_cls = transformer_layer_cls
         self.num_microbatches = num_microbatches
-        self.pipeline_parallel_size = parallel_state.get_pipeline_model_parallel_size()
-        self.pipeline_parallel_rank = parallel_state.get_pipeline_model_parallel_rank()
+        self.pipeline_parallel_size = (
+            parallel_state.get_pipeline_model_parallel_size() if not _debug_mode else _debug_pp_size
+        )
+        self.pipeline_parallel_rank = (
+            parallel_state.get_pipeline_model_parallel_rank() if not _debug_mode else _debug_pp_rank
+        )
         self.serialization_manager = SerializationManager()
         self.param_init_fn = param_init_fn
         self.input_names = None
+        self._metadata_comm_type = "gloo" if _use_gloo_for_metadata_comm else "tcp"
+        if not parallel_state.is_tcp_store_available() and self._metadata_comm_type == "tcp":
+            logger.warning(f"Can not get default tcp_store, fall back to use gloo for metadata communication")
+            self._metadata_comm_type = "gloo"
 
         # Internal attributes for amp
         self._autocast_enabled = False
@@ -181,9 +207,10 @@ class NxDPPModel(nn.Module):
         self.local_name_to_original_name = {}
         self.original_name_to_local_name = {}
         self.clear_minibatch_state()
-        self._set_distributed()
-        # timeline needs to be created after init dist
-        self.timeline = PPTimeline(trace_file_path, self.pipeline_parallel_rank)
+        if not _debug_mode:
+            self._set_distributed()
+            # timeline needs to be created after init dist
+            self.timeline = PPTimeline(trace_file_path, self.pipeline_parallel_rank)
         # If user set up the pipeline cuts in config, directly run tracing and partition
         if pipeline_cuts is not None and len(pipeline_cuts) > 0:
             self.trace(
@@ -191,6 +218,7 @@ class NxDPPModel(nn.Module):
                 leaf_modules=leaf_module_cls,
                 autowrap_functions=autowrap_functions,
                 autowrap_modules=autowrap_modules,
+                autowrap_obj_methods=autowrap_obj_methods,
                 tracer_cls=tracer_cls,
             )
             for pp_cut in pipeline_cuts:
@@ -232,6 +260,7 @@ class NxDPPModel(nn.Module):
         leaf_modules: Optional[List[Any]] = None,
         autowrap_functions: Optional[List[Callable]] = None,
         autowrap_modules: Optional[List[ModuleType]] = None,
+        autowrap_obj_methods: Optional[Dict[Any, List[Callable]]] = None,
         tracer_cls: Optional[Union[str, Any]] = None,
     ):
         """
@@ -266,8 +295,11 @@ class NxDPPModel(nn.Module):
             leaf_modules=leaf_modules,
             autowrap_functions=autowrap_functions,
             autowrap_modules=autowrap_modules,
+            autowrap_obj_methods=autowrap_obj_methods,
             tracer_cls=tracer_cls,
         )
+        if torch.distributed.get_rank() == 0:
+            logger.debug(rmsg(f"traced_model: {self.traced_model}"))
 
     def partition(self):
         if self.partitioned:
@@ -286,6 +318,16 @@ class NxDPPModel(nn.Module):
         # Partition
         qualname_map = {}
         self.paritioned_model = partition_traced_model(self.traced_model, qualname_map)
+        if torch.distributed.get_rank() == 0:
+            logger.debug(rmsg(f"paritioned_model: {self.paritioned_model}"))
+
+        # Extract the local module
+        self.partitions = []
+        for name, module in self.paritioned_model.named_children():
+            if torch.distributed.get_rank() == 0:
+                logger.debug(rmsg(f"partition {name}: {module}"))
+            self.partitions.append(module)
+
         (
             self.stage_id_to_IO_input_names,
             self.stage_id_to_model_input_names,
@@ -293,10 +335,6 @@ class NxDPPModel(nn.Module):
             self.stage_id_to_output_count,
         ) = analyze_pipeline_module(self.paritioned_model)
 
-        # Extract the local module
-        self.partitions = []
-        for _, module in self.paritioned_model.named_children():
-            self.partitions.append(module)
         assert self.pipeline_parallel_size == len(
             self.partitions
         ), f"pipeline_parallel_size {self.pipeline_parallel_size} != number submodules {len(self.paritioned_model)}"
@@ -474,6 +512,7 @@ class NxDPPModel(nn.Module):
         """
         if not self.shape_traced:
             logger.info(rmsg("Running tracing to infer tensor shapes..."))
+            start = time.time()
 
             self.tracing = True
             with torch.set_grad_enabled(train):
@@ -485,7 +524,8 @@ class NxDPPModel(nn.Module):
                 self.shape_traced = True
             self.tracing = False
             self._mark_step()
-            logger.info(rmsg("Tensor shapes inference finished..."))
+            end = time.time()
+            logger.info(rmsg(f"Tensor shapes inference finished, total consumed time {end-start}s"))
             logger.debug(
                 rmsg(
                     f"After tracing current stage's stage_id_to_IO_input_names {self.stage_id_to_IO_input_names[self.pipeline_parallel_rank]}"  # noqa: E501
@@ -503,7 +543,7 @@ class NxDPPModel(nn.Module):
         self._autocast_enabled = False
         self._autocast_dtype = None
         return loss
-    
+
     def run_eval(self, **kwargs):
         self._autocast_enabled = torch.is_autocast_enabled()
         self._autocast_dtype = torch.get_autocast_gpu_dtype()
@@ -624,7 +664,7 @@ class NxDPPModel(nn.Module):
         self.timeline.mark_event_start(f"mb_{self.current_mb}_ForwardStep")
 
         # [TODO]: From Torch 2.1 we can specify device_type='xla' or use torch_xla's autocast, need to revisit this once we have PT2.1 support
-        with torch.autocast(enabled=self._autocast_enabled, dtype=self._autocast_dtype, device_type='cuda'):
+        with torch.autocast(enabled=self._autocast_enabled, dtype=self._autocast_dtype, device_type="cuda"):
             outputs = self.local_module(*inputs)
 
         if not self.tracing:
@@ -743,7 +783,7 @@ class NxDPPModel(nn.Module):
             self.timeline.mark_event_start(f"mb_{self.current_mb}_ForwardRecv_{name}")
             if not self.shape_traced:
                 # Suppose to receive List(TensorMeta), python obj
-                tensor_meta, py_obj = recv_python_object()
+                tensor_meta, py_obj = recv_python_object(method=self._metadata_comm_type)
                 logger.debug(rmsg(f"recv tensor_meta {tensor_meta} py_obj {py_obj}"))
                 inp.metadata = tensor_meta
                 inp.obj = py_obj
@@ -819,7 +859,7 @@ class NxDPPModel(nn.Module):
             obj_stripped_of_tensors, tx_list, tensor_meta = self.serialization_manager.serialize(current_output)
             if not self.shape_traced:
                 logger.debug(rmsg(f"send tensor_meta {tensor_meta} py_obj {obj_stripped_of_tensors}"))
-                send_python_object((tensor_meta, obj_stripped_of_tensors))
+                send_python_object((tensor_meta, obj_stripped_of_tensors), method=self._metadata_comm_type)
             for idx, t in enumerate(tx_list):
                 logger.debug(rmsg(f"fwd mb {self.current_mb} send {name}'s {idx}th tensor meta {tensor_meta[idx]}"))
                 self.send_op(t, tracing=self.tracing)
@@ -882,13 +922,13 @@ class NxDPPModel(nn.Module):
     def _reduce_grads_task(self):
         """
         Major duties of for this task:
-        - Average the grads acorss data parallel ranks
+        - Average the grads acorss data parallel ranks if both optimizer wrapper and ZeRO-1 not used
         - Add the grads for shared weights
         """
         self.timeline.mark_event_start(f"mb_{self.current_mb}_ReduceGradsTask")
-        # Grad reduction will be handled by zero1_optimizer
-        # (TODO) Maybe completely remove when the optimizer wrapper is ready
-        if not self.use_zero1_optimizer:
+        # For backward compatibility:
+        #   If both optimizer wrapper and ZeRO-1 not used, average the grads acorss data parallel ranks
+        if not self.use_zero1_optimizer and not self.use_optimizer_wrapper:
             # Group for different dtypes and all-reduce
             dtype_groups = {}
             for param in self.local_parameters():
@@ -977,13 +1017,23 @@ class NxDPPModel(nn.Module):
 
     def local_modules(self):
         self._validate_partitioned()
-        for m in self.local_module.modules():
+        for n, m in self.local_named_modules():
             yield m
 
     def local_named_modules(self, memo: Optional[Set[nn.Module]] = None, prefix: str = ""):
         self._validate_partitioned()
         for n, m in self.local_module.named_modules(memo=memo, prefix=prefix):
             yield n, m
+
+    def local_children(self):
+        self._validate_partitioned()
+        for n, c in self.local_named_children():
+            yield c
+
+    def local_named_children(self):
+        self._validate_partitioned()
+        for n, c in self.local_module.named_children():
+            yield n, c
 
     def local_parameters(self, recurse: bool = True):
         self._validate_partitioned()
@@ -996,16 +1046,16 @@ class NxDPPModel(nn.Module):
             original_name = self.local_name_to_original_name[n]
             yield original_name, p
 
+    def local_buffers(self, recurse=True):
+        self._validate_partitioned()
+        for n, b in self.local_named_buffers(recurse=recurse):
+            yield b
+
     def local_named_buffers(self, prefix: str = "", recurse: bool = True):
         self._validate_partitioned()
         for name, buf in self.local_module.named_buffers(prefix=prefix, recurse=recurse):
             original_name = self.local_name_to_original_name[name]
             yield original_name, buf
-
-    def local_buffers(self, recurse=True):
-        self._validate_partitioned()
-        for n, b in self.local_named_buffers(recurse=recurse):
-            yield b
 
     def load_state_dict(self, state_dict, strict=True):
         self._validate_partitioned()
@@ -1043,7 +1093,8 @@ class NxDPPModel(nn.Module):
     """
 
     def _set_distributed(self):
-        parallel_state.initialize_pp_gloo_groups()
+        if self._metadata_comm_type == "gloo":
+            parallel_state.initialize_pp_gloo_groups()
         self.send_op = send
         self.recv_op = recv_from
 
@@ -1084,7 +1135,7 @@ class NxDPPModel(nn.Module):
             if not self.return_mb_loss:
                 if not self.broadcast_and_average_loss:
                     # cast to cpu so the following operation will not create extra graph
-                    loss_all = [loss.detach().cpu() for loss in loss_all]
+                    loss_all = [loss.detach().cpu() if self.return_loss_on_cpu else loss.detach() for loss in loss_all]
                 loss = torch.sum(torch.stack(loss_all), dim=0) / len(loss_all)
                 if self.broadcast_and_average_loss:
                     loss /= parallel_state.get_data_parallel_size()
@@ -1093,7 +1144,7 @@ class NxDPPModel(nn.Module):
                         loss, torch.distributed.get_rank(), group=parallel_state.get_pipeline_model_parallel_group()
                     )
                     self._mark_step()
-                return loss.detach().cpu()
+                return loss.detach().cpu() if self.return_loss_on_cpu else loss.detach()
             else:
                 return loss_all
         elif self.broadcast_and_average_loss:

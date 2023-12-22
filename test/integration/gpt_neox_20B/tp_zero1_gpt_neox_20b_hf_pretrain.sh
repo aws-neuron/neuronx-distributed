@@ -2,6 +2,7 @@
 
 #############################################
 # User defined parameters and env vars
+SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 
 export NEURON_CC_FLAGS="--model-type=transformer --enable-experimental-O1 --enable-saturate-infinity --retry_failed_compilation"
 export NEURON_FUSE_SOFTMAX=1
@@ -101,8 +102,8 @@ fi
 
 if [ -z "$NEURON_EXTRACT_GRAPHS_ONLY" ]; then
     echo "success=$success"
-    echo "update json with ../../../../dump_to_s3_update_test_json.sh"
-    dump_to_s3_update_json_scr=../../../../dump_to_s3_update_test_json.sh
+    echo "update json with $SCRIPT_DIR/../../../../dump_to_s3_update_test_json.sh"
+    dump_to_s3_update_json_scr=$SCRIPT_DIR/../../../../dump_to_s3_update_test_json.sh
     if [ -e $dump_to_s3_update_json_scr ]; then
         $dump_to_s3_update_json_scr $@ --key=inference_success --value=$success || echo "Unable to update test result JSON."
     else

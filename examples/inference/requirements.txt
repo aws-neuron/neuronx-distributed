@@ -1,0 +1,4 @@
+transformers @ git+https://github.com/huggingface/transformers.git@68afca3e699cf0d8e53598e75f21508a1bcabdd5
+torch==1.13
+sentencepiece
+protobuf

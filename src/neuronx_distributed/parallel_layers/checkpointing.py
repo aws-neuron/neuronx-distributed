@@ -6,10 +6,12 @@ import torch
 import torch_xla.core.xla_model as xm
 import torch_xla.utils.serialization as xser
 
+from ..trace.trace import NXD_SKIP_RENDEZVOUS
 from ..utils.logger import get_logger
-from .layers import create_local_weight_cpu
+from .layers import create_local_weight
 from .parallel_state import (
     get_data_parallel_rank,
+    get_data_parallel_size,
     get_pipeline_model_parallel_rank,
     get_pipeline_model_parallel_size,
     get_tensor_model_parallel_rank,
@@ -39,7 +41,7 @@ def get_sharded_model_dict(model: torch.nn.Module, model_state_dict: dict) -> di
                 raise Exception(f"Partiton value of 0,1 are supported, found {param.partition_dim}.")
             per_partition_size = model_state_dict[name].shape[param.partition_dim] // tp_size
             full_weight = model_state_dict[name]
-            model_state_dict[name] = create_local_weight_cpu(
+            model_state_dict[name] = create_local_weight(
                 full_weight, param.partition_dim, per_partition_size, param.partition_stride
             )
     return model_state_dict
@@ -51,6 +53,7 @@ def save(
     save_serially: bool = True,
     save_xser: bool = False,
     down_cast_bf16: bool = False,
+    master_dp_only: bool = True,
 ) -> None:
     """Save a model/optimizer checkpoint.
 
@@ -80,6 +83,9 @@ def save(
         chkpt_path,
         "tp_rank_{:02d}_pp_rank_{:02d}".format(get_tensor_model_parallel_rank(), get_pipeline_model_parallel_rank()),
     )
+    if not master_dp_only:
+        chkpt_path = chkpt_path + "_dp_rank_{:02d}".format(get_data_parallel_rank())
+
     if not save_xser:
         chkpt_path = os.path.join(chkpt_path, "checkpoint.pt")
 
@@ -90,13 +96,19 @@ def save(
     xm.rendezvous("Ensure directory exists Done")
 
     if save_xser:
-        master_only = get_data_parallel_rank() == 0
+        master_only = get_data_parallel_rank() == 0 or not master_dp_only
         xser.save(checkpoint, chkpt_path, (not master_only), global_master=True)
     elif save_serially:
         # TODO: optmization to save multiple ranks together
         for tp_rank in range(0, get_tensor_model_parallel_size()):
             for pp_rank in range(0, get_pipeline_model_parallel_size()):
                 # Staggering save checkpoints
+                if not master_dp_only:
+                    for dp_rank in range(0, get_data_parallel_size()):
+                        cpu_data = move_all_tensor_to_cpu(checkpoint)
+                        torch.save(cpu_data, chkpt_path)
+                        del cpu_data
+                        gc.collect()
                 if (
                     get_data_parallel_rank() == 0
                     and get_tensor_model_parallel_rank() == tp_rank
@@ -109,7 +121,7 @@ def save(
                 xm.rendezvous(f"ckpt-save-{tp_rank}")
     else:
         cpu_data = move_all_tensor_to_cpu(checkpoint, convert=(get_data_parallel_rank() == 0))
-        if get_data_parallel_rank() == 0:
+        if get_data_parallel_rank() == 0 or not master_dp_only:
             torch.save(cpu_data, chkpt_path)
             del cpu_data
             gc.collect()
@@ -125,6 +137,7 @@ def load(
     load_xser: bool = False,
     sharded: bool = True,
     strict: bool = True,
+    master_dp_only: bool = True,
 ) -> dict:
     """Load a checkpoint (model or optimizer) and return. In case the model/optimizer object is
     provided, it will load the model weights/optimizer stats. For large models/optimizers, to avoid
@@ -149,6 +162,8 @@ def load(
     else:
         logger.info("loading checkpoint from {}".format(chkpt_path))
         rank = 0
+
+    skip_rendezvous = os.environ.get(NXD_SKIP_RENDEZVOUS, None) == "1"
 
     if model_or_optimizer is not None:
         from ..pipeline.model import NxDPPModel
@@ -180,6 +195,8 @@ def load(
                 get_tensor_model_parallel_rank(), get_pipeline_model_parallel_rank()
             ),
         )
+        if not master_dp_only:
+            checkpoint_name = checkpoint_name + "_dp_rank_{:02d}".format(get_data_parallel_rank())
         if not load_xser:
             checkpoint_name = os.path.join(checkpoint_name, "checkpoint.pt")
     else:
@@ -216,10 +233,10 @@ def load(
             gc.collect()
 
         # Loading serially
-        if not load_xser:
+        if not load_xser and not skip_rendezvous:
             xm.rendezvous("neuron.load_checkpoint" + str(worker_start))
 
-    if load_xser:
+    if load_xser and not skip_rendezvous:
         xm.rendezvous("neuron.load_checkpoint")
 
     return check_point

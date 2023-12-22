@@ -1,11 +1,14 @@
+import math
 from contextlib import contextmanager
 from typing import Optional, Set
 
 import torch
+import torch_xla.core.xla_model as xm
 from torch import nn
 
 from ..parallel_layers.parallel_state import rmsg
 from ..parallel_layers.utils import (
+    get_local_world_size,
     is_torch_version_greater_than_2,
     set_tensor_model_parallel_attributes,
 )
@@ -254,3 +257,21 @@ def init_on_device(device: torch.device, include_buffers: bool = False):
             nn.Module.register_buffer = old_register_buffer
         for torch_function_name, old_torch_function in tensor_constructors_to_patch.items():
             setattr(torch, torch_function_name, old_torch_function)
+
+
+def get_model_sequential(model, device, sequential_move_factor=11, param_init_fn=None):
+    from ..pipeline import NxDPPModel
+
+    local_rank = xm.get_local_ordinal()
+    local_world_size = get_local_world_size()
+    for worker in range(math.ceil(local_world_size / sequential_move_factor)):
+        if local_rank // sequential_move_factor == worker:
+            if isinstance(model, NxDPPModel):
+                model.move_model_to_device()
+            else:
+                maybe_materalize_model(model)
+                if param_init_fn is not None:
+                    reinit_model(model, torch.device("cpu"), param_init_fn)
+                move_model_to_device(model, device)
+        xm.rendezvous("get_model_sequential" + str(worker))
+    return model

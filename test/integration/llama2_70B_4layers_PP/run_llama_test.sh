@@ -36,7 +36,7 @@ if [ -v SLURM_NTASKS ]; then
     export NEMO_EXPM_VERSION=$SLURM_JOB_ID
     export EXPLICIT_LOGDIR=null
     LOG_PATH=logs/$SLURM_JOB_ID/$NODEID
-    
+
     MASTER_ADDR=${HOSTS[0]}
     MASTER_PORT=44000
     NUM_NEURONCORES=$NEURON_RT_NUM_CORES
@@ -51,9 +51,9 @@ echo $DISTRIBUTED_ARGS
 
 : ${GBS=4}
 : ${SEQ_LEN=4096}
-PP_DEGREE=4
+: ${PP_DEGREE=4}
 TP_DEGREE=8
-NUM_LAYERS=4
+: ${NUM_LAYERS=4}
 HIDDEN_SIZE=2048
 DP=$(($NEURON_RT_NUM_CORES * $WORLD_SIZE / $TP_DEGREE / $PP_DEGREE))
 BS=$(($GBS / $DP))
@@ -67,10 +67,15 @@ else
     compare_loss=1
 fi
 
-torchrun $DISTRIBUTED_ARGS run_llama_nxd_test.py \
+EXTRA_ARGS=" "
+if [ $META_DEVICE_INIT -gt 0 ]; then
+    EXTRA_ARGS+=" --use_meta_device_init 1"
+fi
+
+torchrun $DISTRIBUTED_ARGS run_llama_nxd.py \
     --train_batch_size $BS \
     --training_dir $DATA_PATH \
-    --training_config $SCRIPT_DIR \
+    --training_config $SCRIPT_DIR/70B_config \
     --max_steps $max_steps \
     --num_layer $NUM_LAYERS \
     --hidden_size $HIDDEN_SIZE \
@@ -85,11 +90,12 @@ torchrun $DISTRIBUTED_ARGS run_llama_nxd_test.py \
     --weight_decay 0.1 \
     --warmup_steps 2000 \
     --constant_steps 0 \
-    --compare_loss $compare_loss |& tee $LOG_PATH/log
+    --compare_loss $compare_loss \
+    $EXTRA_ARGS |& tee $LOG_PATH/log
 
 ret_val=${PIPESTATUS[0]}
 
-if [ -v "$PERF_TEST" ];
+if [ -v PERF_TEST ];
 then
     echo "Performance test complete"
 else
@@ -101,8 +107,8 @@ else
 
   if [ -z "$NEURON_EXTRACT_GRAPHS_ONLY" ]; then
       echo "success=$success"
-      echo "update json with $SCRIPT_DIR/../../../../dump_to_s3_update_test_json.sh"
-      dump_to_s3_update_json_scr=$SCRIPT_DIR/../../../../dump_to_s3_update_test_json.sh
+      echo "update json with /home/ubuntu/ktest/dump_to_s3_update_test_json.sh"
+      dump_to_s3_update_json_scr=/home/ubuntu/ktest/dump_to_s3_update_test_json.sh
       if [ -e $dump_to_s3_update_json_scr ]; then
           $dump_to_s3_update_json_scr $@ --key=inference_success --value=$success || echo "Unable to update test result JSON."
       else
