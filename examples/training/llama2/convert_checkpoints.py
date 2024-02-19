@@ -26,7 +26,7 @@ def merge_llama_tp_checkpoints(args):
             if args.model_key is not None and args.model_key in partial_state:
                 partial_state = partial_state[args.model_key]
             for name, param in partial_state.items():
-                if "qkv_proj" in name:
+                if ("qkv_proj" in name or "o_proj" in name) and args.kv_size_multiplier > 1:
                     # qkv_proj would be a key if we are using the QKVLinear layer
                     partition_dim = 0
                     if name not in full_model:
@@ -41,18 +41,23 @@ def merge_llama_tp_checkpoints(args):
                         else:
                             # Since we do the replication of KV heads, the Q heads are placed as:
                             # Q0Q1Q8Q9...Q2Q3Q10Q11...
-                            # Hence when creating the merged checkpoint, we need to bring the Q heads in order.
-                            q_weights = full_weight.view(q_heads, head_dim, -1)
-                            q_weights_shape = q_weights.size()
-                            q_weights = q_weights.view(
-                                -1, q_heads // (kv_heads * args.kv_size_multiplier), head_dim, q_weights_shape[-1]
+                            # Hence when creating the merged checkpoint, we need to bring the Q heads and o_proj in order.
+                            if "o_proj" in name:
+                                # The shuffling is same for both o_proj and q, but o_proj is sharded on column.
+                                # Hence to reuse the same shuffling code, we just transpose, do the shuffling and 
+                                # transpose back
+                                full_weight = torch.transpose(full_weight, 0, 1)
+                            weights = full_weight.reshape(q_heads, head_dim, -1)
+                            weights_shape = weights.size()
+                            weights = weights.reshape(
+                                -1, q_heads // (kv_heads * args.kv_size_multiplier), head_dim, weights_shape[-1]
                             )
                             weight_splits = []
                             indicies = torch.arange(0, args.tp_size // kv_heads) * kv_heads
                             for i in range(kv_heads):
-                                weight_splits.append(q_weights[indicies + i].view(-1, q_weights_shape[-1]))
+                                weight_splits.append(weights[indicies + i].reshape(-1, weights_shape[-1]))
                             full_weight = torch.cat(weight_splits, dim=0)
-                            full_model[name] = full_weight
+                            full_model[name] = torch.transpose(full_weight, 0, 1) if "o_proj" in name else full_weight
                 elif (
                     "embed_tokens" in name
                     or "q_proj" in name
@@ -113,7 +118,7 @@ def translate_llama_full_state_dict_to_tp(
                 continue
 
         ##################### TP Slice #########################################
-        if ("q_proj" in name or "k_proj" in name or "v_proj" in name or "qkv_proj" in name) and kv_size_multiplier > 1:
+        if ("q_proj" in name or "k_proj" in name or "v_proj" in name or "qkv_proj" in name or "o_proj" in name) and kv_size_multiplier > 1:
             with open(config_json, "r") as f:
                 config = json.load(f)
             q_heads = config["num_attention_heads"]
@@ -136,22 +141,30 @@ def translate_llama_full_state_dict_to_tp(
                     )
                     partial_state[name] = to_load
             else:
-                # When GQAQKV linear with kv_multiplier is used, we need to reshuffle the order of Q heads so that
-                # they interact with the right KV heads.
-                q_weights = full_p.view(q_heads, head_dim, -1)
-                q_weights_shape = q_weights.size()
-                q_weights = q_weights.view(
-                    -1, q_heads // (kv_heads * kv_size_multiplier), head_dim, q_weights_shape[-1]
+                # When GQAQKV linear with kv_multiplier is used, we need to reshuffle the order of Q heads 
+                # so they interact with the right KV heads. Now since the heads are shuffled, we have to
+                # shuffle the o_proj rows since that translates the heads to hidden dim
+                if "o_proj" in name:
+                    # The shuffling is same for both o_proj and q, but o_proj is sharded on column.
+                    # Hence to reuse the same shuffling code, we just transpose, do the shuffling and 
+                    # transpose back
+                    full_p = torch.transpose(full_p, 0, 1)
+                weights = full_p.reshape(q_heads, head_dim, -1)
+                weights_shape = weights.size()
+                weights = weights.reshape(
+                    -1, q_heads // (kv_heads * kv_size_multiplier), head_dim, weights_shape[-1]
                 )
                 weight_splits = []
                 indicies = torch.arange(0, kv_heads) * tp_size // kv_heads
                 for i in range(tp_size // kv_heads):
-                    weight_splits.append(q_weights[indicies + i])
-                q_weights = torch.cat(weight_splits, dim=0)
+                    weight_splits.append(weights[indicies + i])
+                weights = torch.cat(weight_splits, dim=0)
                 with torch.no_grad():
-                    to_load = q_weights[tp_rank].view(-1, q_weights_shape[-1])
-                    name = ".".join(name.split(".")[:-2]) + ".qkv_proj.weight_q"
-                    print(name)
+                    to_load = weights[tp_rank].reshape(-1, weights_shape[-1])
+                    if "o_proj" in name:
+                        to_load = torch.transpose(to_load, 0, 1)
+                    else:
+                        name = ".".join(name.split(".")[:-2]) + ".qkv_proj.weight_q"
                     partial_state[name] = to_load
 
         elif (
@@ -314,3 +327,4 @@ if __name__ == "__main__":
         convert_from_xser(args)
     elif args.convert_to_xser:
         convert_to_xser(args)
+
