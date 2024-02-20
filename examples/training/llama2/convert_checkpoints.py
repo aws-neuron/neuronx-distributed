@@ -28,7 +28,7 @@ def merge_llama_tp_checkpoints(args):
             for name, param in partial_state.items():
                 if ("qkv_proj" in name or "o_proj" in name) and args.kv_size_multiplier > 1:
                     # qkv_proj would be a key if we are using the QKVLinear layer
-                    partition_dim = 0
+                    partition_dim = 1 if "o_proj" in name else 0
                     if name not in full_model:
                         full_model[name] = []
                     full_model[name].append(param)
