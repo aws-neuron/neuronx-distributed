@@ -20,6 +20,11 @@ class NxDModel(torch.nn.Module):
             return self.module.local_module
         return self.module
 
+    def original_module(self):
+        if self.pp_enabled:
+            return self.module.original_torch_module
+        return self.module
+
     def run_train(self, *args, **kwargs):
         if self.pp_enabled:
             return self.module.run_train(*args, **kwargs)
@@ -84,12 +89,12 @@ class NxDModel(torch.nn.Module):
 
     @property
     def dtype(self):
-        return self.local_module().dtype
+        return self.original_module().dtype
 
     @property
     def config(self):
-        return self.local_module().config
+        return self.original_module().config
 
     @property
     def name_or_path(self):
-        return self.local_module().name_or_path
+        return self.original_module().name_or_path

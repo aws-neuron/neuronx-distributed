@@ -1,6 +1,7 @@
 """ NxD GPTNeoX model """
 
 from typing import Optional, Tuple, Union
+from packaging import version
 
 import torch
 import torch.utils.checkpoint
@@ -374,7 +375,13 @@ class GPTNeoXModelNxD(GPTNeoXModel):
 
                     return custom_forward
 
-                outputs = torch.utils.checkpoint.checkpoint(
+                if version.parse(torch.__version__) >= version.parse("2.1"):
+                    from torch_xla.utils.checkpoint import checkpoint
+                    checkpoint_method = checkpoint
+                else:
+                    checkpoint_method = torch.utils.checkpoint.checkpoint
+
+                outputs = checkpoint_method(
                     create_custom_forward(layer),
                     hidden_states,
                     attention_mask,

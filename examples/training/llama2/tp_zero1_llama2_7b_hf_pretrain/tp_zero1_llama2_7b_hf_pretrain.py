@@ -1,6 +1,6 @@
 # coding=utf-8
 # Copyright (c) 2019 NVIDIA CORPORATION. All rights reserved.
-# Copyright 2018 The Google AI Language Team Authors and The HugginFace Inc. team.
+# Copyright 2018 The Google AI Language Team Authors and The HuggingFace Inc. team.
 # Modifications Copyright 2021 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,51 +15,36 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
+import argparse
 import math
-import torch
+import json
+import os
 import sys
 import time
-import argparse
-import json
-import queue
-from typing import Any, Dict, List
-from datetime import datetime, timezone
 from collections import namedtuple
-import torch_xla
-import torch_xla.core.xla_model as xm
-from torch.utils.data.dataloader import DataLoader
-from torch.utils.data import DistributedSampler
-import torch_xla.distributed.parallel_loader as pl
+from datetime import datetime, timezone
+from typing import Any, Dict, List
+
+import torch
 import torch.distributed as dist
+import torch_xla.core.xla_model as xm
+import torch_xla.distributed.parallel_loader as pl
 import torch_xla.distributed.xla_multiprocessing as xmp
-import torch_xla.distributed.xla_backend
-import numpy as np
-from transformers import (
-    AdamW,
-    default_data_collator,
-    set_seed,
-    LlamaConfig,
-)
+from logger import Logger
+from modeling_llama_nxd import CoreAttention, LlamaForCausalLM
+from training_utils import Throughput, create_llama_pretraining_dataset
+from transformers import AdamW, LlamaConfig, set_seed
 from transformers.optimization import get_linear_schedule_with_warmup
 
-import copy
-from torch.utils.tensorboard import SummaryWriter
-import inspect
-import requests
-
 import neuronx_distributed as nxd
-from neuronx_distributed.parallel_layers import parallel_state, layers, grads, checkpointing
-from neuronx_distributed.utils.model_utils import move_model_to_device
-from neuronx_distributed.parallel_layers.grads import bucket_allreduce_gradients
-from neuronx_distributed.parallel_layers.utils import is_pjrt_device
-import datasets
-
-from neuronx_distributed.optimizer import NeuronZero1Optimizer
+from neuronx_distributed.parallel_layers import (
+    checkpointing,
+    grads,
+    layers,
+    parallel_state,
+)
+from neuronx_distributed.parallel_layers.utils import requires_init_pg_override
 from neuronx_distributed.utils.adamw_fp32_optim_params import AdamW_FP32OptimParams
-
-from modeling_llama_nxd import CoreAttention,LlamaForCausalLM
-from logger import Logger
 
 # For PT autocast.
 torch.cuda.is_bf16_supported = lambda: True
@@ -72,9 +57,7 @@ if os.environ.get("XLA_USE_BF16") or os.environ.get("XLA_DOWNCAST_BF16"):
     modeling_utils.get_parameter_dtype = lambda x: torch.bfloat16
 
 datetime_str = str(datetime.now())
-results = {
-    "inference_success": 1
-}
+results = {"inference_success": 1}
 
 
 Metric = namedtuple("Metric", ["name", "value", "units", "additional_data"])
@@ -82,12 +65,13 @@ Metric = namedtuple("Metric", ["name", "value", "units", "additional_data"])
 
 class TrainingMetrics:
     """
-    This class is used for logging metrics to a json file. One can provide a 
-    dictionary of metrics that needs to be stored, and it wpuld get 
+    This class is used for logging metrics to a json file. One can provide a
+    dictionary of metrics that needs to be stored, and it wpuld get
     written to the file.
     Arguments:
         json_file: File used for logging. If no file exists, new file would be created.
     """
+
     def __init__(self, json_file):
         self.json_file = json_file
 
@@ -150,70 +134,12 @@ class TrainingMetrics:
         self.read_modify_write_file(**kwargs)
 
 
-class Throughput:
-    """
-    Used to calculate the throughput over a moving window. It records the step time
-    between two calls and uses that time to calculate the throughput.
-    """
-    def __init__(
-        self, batch_size, world_size, grad_accum_usteps, moving_avg_window_size=10, logging_interval=1
-    ):
-        self.seqs_per_iteration = batch_size * world_size * grad_accum_usteps*logging_interval
-        self.moving_avg_window_size = math.ceil(moving_avg_window_size/logging_interval)
-        self.moving_avg_window = queue.Queue()
-        self.window_time = 0
-        self.start_time = time.time()
-
-    def get_throughput(self):
-        step_time = time.time() - self.start_time
-        self.start_time += step_time
-        self.window_time += step_time
-        self.moving_avg_window.put(step_time)
-        window_size = self.moving_avg_window.qsize()
-        if window_size > self.moving_avg_window_size:
-            self.window_time -= self.moving_avg_window.get()
-            window_size -= 1
-        throughput = window_size * self.seqs_per_iteration / self.window_time
-        return throughput
-
-
-# Workaround because python functions are not picklable
-class WorkerInitObj(object):
-    def __init__(self, seed):
-        self.seed = seed
-
-    def __call__(self, id):
-        set_seed(self.seed)
-
-def create_pretraining_dataset(
-    data_dir, mini_batch_size, worker_init
-):
-    train_data = datasets.load_from_disk(os.path.expanduser(data_dir))
-    train_sampler = DistributedSampler(
-        train_data,
-        num_replicas=parallel_state.get_data_parallel_size(),
-        rank=parallel_state.get_data_parallel_rank(),
-        shuffle=False,
-        drop_last=True,
-    )
-    train_dataloader = DataLoader(
-        train_data,
-        collate_fn=default_data_collator,
-        sampler=train_sampler,
-        batch_size=mini_batch_size,
-        num_workers=0,
-        worker_init_fn=worker_init,
-        drop_last=True,
-        pin_memory=True,
-    )
-    return train_dataloader
-
 def get_model(flags):
     model_path, seq_len = flags.model_path, flags.seq_len
     config = LlamaConfig.from_pretrained(model_path)
     config.use_cache = False
-    config.kv_shared_group_size = args.kv_replicator
-    config.qkv_linear = args.qkv_linear
+    config.kv_shared_group_size = flags.kv_replicator
+    config.qkv_linear = flags.qkv_linear
     config.max_position_embeddings = max(config.max_position_embeddings, seq_len)
     if flags.num_layers > 0:
         config.num_hidden_layers = flags.num_layers
@@ -223,6 +149,7 @@ def get_model(flags):
         config.selective_checkpoint_enabled = True
     xm.master_print(config)
     model = LlamaForCausalLM(config)
+
     def get_sin_cos_matrix(config):
         head_dim = config.hidden_size // config.num_attention_heads
         base = 10000
@@ -232,6 +159,7 @@ def get_model(flags):
         # Different from paper, but it uses a different permutation in order to obtain the same calculation
         emb = torch.cat((freqs, freqs), dim=-1)
         return emb.cos()[None, None, :, :].to(torch.float32), emb.sin()[None, None, :, :].to(torch.float32)
+
     # Here we make sure we use the same sine and cosine matrices for all layers.
     # Making use of same tensors would make the CSE algorithm eliminate the lookup call
     # from layers, keeping only lookup from first layer.
@@ -242,6 +170,7 @@ def get_model(flags):
             layer.self_attn.rotary_emb.sin_cached = sin
     xm.master_print(model)
     return model
+
 
 def get_dtype(model) -> str:
     """
@@ -254,26 +183,31 @@ def get_dtype(model) -> str:
             return "torch.bfloat16"
         if "torch.double" in str(model.dtype):
             return "torch.float32"
-    return str(model.dtype)    
+    return str(model.dtype)
+
 
 def allreduce_sequence_parallel_gradients(optimizer):
-    """ All-reduce layernorm parameters across model parallel nodes when sequence parallelism is used.
-        Modified from megatron-lm:
-        https://gitlab-master.nvidia.com/ADLR/megatron-lm/-/blob/3f91f09bb2ab32f9904b47f46f19d2fc3f518ed8/megatron/training.py#L425
+    """All-reduce layernorm parameters across model parallel nodes when sequence parallelism is used.
+    Modified from megatron-lm:
+    https://gitlab-master.nvidia.com/ADLR/megatron-lm/-/blob/3f91f09bb2ab32f9904b47f46f19d2fc3f518ed8/megatron/training.py#L425
     """
-    from neuronx_distributed.parallel_layers.mappings import reduce_from_tensor_model_parallel_region
+    from neuronx_distributed.parallel_layers.mappings import (
+        reduce_from_tensor_model_parallel_region,
+    )
+
     grads = []
-    for param_group in optimizer.__getstate__()['param_groups']:
+    for param_group in optimizer.__getstate__()["param_groups"]:
         for group, params in param_group.items():
-            if group == 'params':
+            if group == "params":
                 for p in params:
                     if isinstance(p, torch.Tensor) and p.grad is not None:
-                        sequence_parallel_param = getattr(p, 'sequence_parallel_enabled', False)
+                        sequence_parallel_param = getattr(p, "sequence_parallel_enabled", False)
                         if sequence_parallel_param:
                             grads.append(p.grad.data)
     for grad in grads:
         # sum v.s. average: sum
         reduce_from_tensor_model_parallel_region(grad)
+
 
 def train_llama(flags):
     set_seed(flags.seed)
@@ -301,7 +235,6 @@ def train_llama(flags):
     world_size = parallel_state.get_data_parallel_size()
     is_root = xm.is_master_ordinal(local=False)
     extract_graphs_only = os.environ.get("NEURON_EXTRACT_GRAPHS_ONLY", None)
-    worker_init = WorkerInitObj(flags.seed)
     device = xm.xla_device()
 
     model_dtype = get_dtype(model)
@@ -312,15 +245,11 @@ def train_llama(flags):
 
     optimizer_grouped_parameters = [
         {
-            "params": [
-                p for n, p in param_optimizer if not any(nd in n for nd in no_decay)
-            ],
+            "params": [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)],
             "weight_decay": 0.01,
         },
         {
-            "params": [
-                p for n, p in param_optimizer if any(nd in n for nd in no_decay)
-            ],
+            "params": [p for n, p in param_optimizer if any(nd in n for nd in no_decay)],
             "weight_decay": 0.0,
         },
     ]
@@ -341,7 +270,7 @@ def train_llama(flags):
             logger = Logger(flags, world_size, model_dtype)
         metric_writer = TrainingMetrics(flags.metrics_file)
         throughput = Throughput(
-            flags.batch_size, world_size, flags.grad_accum_usteps, logging_interval=args.logging_interval
+            flags.batch_size, world_size, flags.grad_accum_usteps, logging_interval=flags.logging_interval
         )
         print("--------TRAINING CONFIG----------")
         print(flags)
@@ -370,9 +299,7 @@ def train_llama(flags):
             }
         )
 
-    def train_loop_fn(
-        model, optimizer, train_loader, epoch, global_step, training_ustep, running_loss, use_zero_1
-    ):
+    def train_loop_fn(model, optimizer, train_loader, epoch, global_step, training_ustep, running_loss, use_zero_1):
         for _, data in enumerate(train_loader):
             training_ustep += 1
             input_ids = data["input_ids"]
@@ -401,7 +328,7 @@ def train_llama(flags):
                 running_loss.zero_()
 
                 optimizer.step()
-                total_norm = optimizer.grad_norm # Global norm before clipping
+                total_norm = optimizer.grad_norm  # Global norm before clipping
                 optimizer.zero_grad()
                 scheduler.step()
                 global_step += 1
@@ -426,24 +353,22 @@ def train_llama(flags):
                     # the tracing for next step. Also, we are logging every N steps.
                     # This is done to reduce the overhead of copying tensors to CPU.
                     # Tensor copy is expensive since it prevents the next step to start.
-                    xm.add_step_closure(
-                        _print_logs, (running_loss_reduced_detached, total_norm.detach())
-                    )
+                    xm.add_step_closure(_print_logs, (running_loss_reduced_detached, total_norm.detach()))
                 # Save checkpoint using checkpoint API
-                if (args.checkpoint_freq > 0) and (global_step % args.checkpoint_freq == 0):
+                if (flags.checkpoint_freq > 0) and (global_step % flags.checkpoint_freq == 0):
                     xm.add_step_closure(
                         nxd.save_checkpoint,
                         (
-                            args.checkpoint_dir, # checkpoint directory
-                            f"step_{global_step}", # tag
-                            model, # model
-                            optimizer, # optimizer
-                            scheduler, # scheduler
-                            {"epoch": epoch, "global_step": global_step, "cli_args": args.__dict__}, # user content
-                            8, # num_workers
-                            True, # use_xser
-                            args.num_kept_checkpoint, #num_kept_ckpts
-                        )
+                            flags.checkpoint_dir,  # checkpoint directory
+                            f"step_{global_step}",  # tag
+                            model,  # model
+                            optimizer,  # optimizer
+                            scheduler,  # scheduler
+                            {"epoch": epoch, "global_step": global_step, "cli_args": flags.__dict__},  # user content
+                            8,  # num_workers
+                            True,  # use_xser
+                            flags.num_kept_checkpoint,  # num_kept_ckpts
+                        ),
                     )
 
                 if global_step >= flags.steps_this_run:
@@ -458,7 +383,6 @@ def train_llama(flags):
             running_loss_reduced_detached.cpu().item(),
         )
 
-
     train_start = time.time()
     training_ustep = 0
 
@@ -469,10 +393,20 @@ def train_llama(flags):
         last_epoch=-1,
     )
 
-    if flags.resume_ckpt:
+    def get_loading_tag(flags):
+        if flags.loading_step == "-1":
+            return "-1"
+
+        if flags.loading_step == "latest_if_exists":
+            return None if nxd.has_checkpoint(flags.checkpoint_dir) else "-1"
+
+        return f"step_{flags.loading_step}"
+
+    tag = get_loading_tag(flags)
+    if tag != "-1":
         user_content = nxd.load_checkpoint(
-            args.checkpoint_dir,
-            tag=f"step_{args.loading_step}",
+            flags.checkpoint_dir,
+            tag=tag,
             model=model,
             optimizer=optimizer,
             scheduler=scheduler,
@@ -480,17 +414,35 @@ def train_llama(flags):
         if user_content is not None:
             epoch = user_content["epoch"]
             global_step = user_content["global_step"]
+    elif flags.pretrained_weight: # 1 (exist) or 0
+        user_content = nxd.load_checkpoint(
+           flags.checkpoint_dir,
+           tag="pretrained_weight",
+           model=model,
+           optimizer=None,
+           scheduler=None,
+        )
+        global_step = 0
+        epoch = 0
+        if flags.use_zero_1:
+            # We need to do init_zero1 here since after loading model weights, we
+            # need to sync the new params with base optimzier params.
+            optimizer.optimizer.init_zero()
     else:
         global_step = 0
         epoch = 0
 
-    assert os.path.exists(
-        os.path.expanduser(flags.data_dir)
-    ), "ERROR: Data directory {} doesn't exist!".format(flags.data_dir)
+    assert os.path.exists(os.path.expanduser(flags.data_dir)), "ERROR: Data directory {} doesn't exist!".format(
+        flags.data_dir
+    )
 
     mini_batch_size = flags.batch_size
-    train_dataloader = create_pretraining_dataset(
-        flags.data_dir, mini_batch_size, worker_init
+    train_dataloader, _ = create_llama_pretraining_dataset(
+        flags.data_dir,
+        mini_batch_size,
+        parallel_state.get_data_parallel_size(),
+        parallel_state.get_data_parallel_rank(),
+        flags.seed,
     )
     # We wrap the dataloader with MpDeviceLoader. This dataloader should take
     # care of copying the tensors to device and also inserting the mark_step at
@@ -537,9 +489,7 @@ def train_llama(flags):
             }
             metric_data = [
                 Metric("Loss", final_loss, "", additional_data),
-                Metric(
-                    "Throughput", logger.throughputs[-1], "seq/s", additional_data
-                ),
+                Metric("Throughput", logger.throughputs[-1], "seq/s", additional_data),
             ]
             metric_writer.store_metrics(metric_data)
 
@@ -551,9 +501,14 @@ def train_llama(flags):
                     "Global step": global_step,
                     "Microstep": training_ustep,
                 }
+                min_throughput_index = math.ceil(10 / args.logging_interval)
+                if len(logger.throughputs) > min_throughput_index:
+                    throughputs_to_average = logger.throughputs[min_throughput_index:]
+                else:
+                    throughputs_to_average = logger.throughputs
                 average_throughput = round(
-                    sum(logger.throughputs) / len(logger.throughputs), 4
-                )
+                    sum(throughputs_to_average) / len(throughputs_to_average), 4
+                ) if len(logger.throughputs) > 0 else None
                 metric_data = [
                     Metric("Final loss", final_loss, "", additional_data),
                     Metric(
@@ -577,7 +532,7 @@ def train_llama(flags):
                 ]
                 metric_writer.store_metrics(metric_data)
             return
-        
+
         epoch += 1
 
 
@@ -647,29 +602,10 @@ if __name__ == "__main__":
         action="store_true",
         help="Whether to print grad norm",
     )
-    parser.add_argument(
-        "--resume_ckpt",
-        action="store_true",
-        help="Resume from checkpoint at resume_step."
-    )
-    parser.add_argument(
-        "--tensor_parallel_size",
-        default=2,
-        type=int,
-        help="Tensor parallel size"
-    )
-    parser.add_argument(
-        "--seq_len",
-        default=2048,
-        type=int,
-        help="Sequence length"
-    )
-    parser.add_argument(
-        "--use_mix_precision", action="store_true", help="Use mix precision."
-    )
-    parser.add_argument(
-        "--use_zero_1", action="store_true", help="Use ZeRO-1."
-    )
+    parser.add_argument("--tensor_parallel_size", default=2, type=int, help="Tensor parallel size")
+    parser.add_argument("--seq_len", default=2048, type=int, help="Sequence length")
+    parser.add_argument("--use_mix_precision", action="store_true", help="Use mix precision.")
+    parser.add_argument("--use_zero_1", action="store_true", help="Use ZeRO-1.")
     parser.add_argument(
         "--num_layers",
         type=int,
@@ -713,12 +649,23 @@ if __name__ == "__main__":
         help="KV replication number",
     )
 
-    #Checkpointing
+    # Checkpointing
     parser.add_argument("--checkpoint_freq", type=int, default=100000, help="save checkpoint freq")
     parser.add_argument("--checkpoint_dir", type=str, default=None)
-    parser.add_argument("--loading_step", type=int, default=-1, help="load from step, -1 means no load")
-    parser.add_argument("--num_kept_checkpoint", type=int, default=-1, help="number of checkpoints kept, old checkpoint will get deleted")
-    
+    parser.add_argument("--pretrained_weight", default=False, action="store_true")
+    parser.add_argument(
+        "--loading_step",
+        type=str,
+        default="-1",
+        help='resume from checkpoint generated by the step, "-1" means no load, "latest_if_exists" is a valid option to resume from latest',
+    )
+    parser.add_argument(
+        "--num_kept_checkpoint",
+        type=int,
+        default=-1,
+        help="number of checkpoints kept, old checkpoint will get deleted",
+    )
+
     args = parser.parse_args(sys.argv[1:])
 
     if args.steps_this_run < 0:
@@ -726,18 +673,18 @@ if __name__ == "__main__":
 
     os.environ["NEURON_RT_STOCHASTIC_ROUNDING_EN"] = "1"
     if args.use_mix_precision:
-        os.environ["XLA_DOWNCAST_BF16"]="1"
+        os.environ["XLA_DOWNCAST_BF16"] = "1"
     else:
-        os.environ["XLA_USE_BF16"]="1"
-
+        os.environ["XLA_USE_BF16"] = "1"
 
     # WORLD_SIZE is set by torchrun
     if os.environ.get("WORLD_SIZE"):
-        if is_pjrt_device():
+        if requires_init_pg_override():
+            pass
             import torch_xla.experimental.pjrt_backend
             dist.init_process_group("xla", init_method="pjrt://")
         else:
-            dist.init_process_group("xla") 
+            dist.init_process_group("xla")
         _mp_fn(0, args)
     else:
         xmp.spawn(_mp_fn, args=(args,))

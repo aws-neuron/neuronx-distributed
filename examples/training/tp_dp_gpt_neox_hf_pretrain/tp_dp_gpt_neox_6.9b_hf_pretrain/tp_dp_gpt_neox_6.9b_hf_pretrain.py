@@ -1,6 +1,6 @@
 # coding=utf-8
 # Copyright (c) 2019 NVIDIA CORPORATION. All rights reserved.
-# Copyright 2018 The Google AI Language Team Authors and The HugginFace Inc. team.
+# Copyright 2018 The Google AI Language Team Authors and The HuggingFace Inc. team.
 # Modifications Copyright 2021 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,52 +15,58 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import argparse
+import inspect
+import json
+import math
 import os
-import torch
+import queue
 import sys
 import time
-import argparse
-import json
-import queue
-from typing import Any, Dict, List
-from datetime import datetime, timezone
 from collections import namedtuple
-import torch_xla
-import torch_xla.core.xla_model as xm
-from torch.utils.data.dataloader import DataLoader
-from torch.utils.data import DistributedSampler
-import torch_xla.distributed.parallel_loader as pl
-import torch.distributed as dist
-import torch_xla.distributed.xla_multiprocessing as xmp
-import torch_xla.distributed.xla_backend
+from datetime import datetime, timezone
+from typing import Any, Dict, List
+
+import datasets
 import numpy as np
+import requests
+import torch
+import torch.distributed as dist
+import torch_xla.core.xla_model as xm
+import torch_xla.distributed.parallel_loader as pl
+import torch_xla.distributed.xla_multiprocessing as xmp
+from adamw_fp32_optim_params import AdamW_FP32OptimParams
+from torch.utils.data import DistributedSampler
+from torch.utils.data.dataloader import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
     default_data_collator,
-    set_seed,
     modeling_utils,
+    set_seed,
 )
+from modeling_gpt_neox_nxd import GPTNeoXForCausalLMNxD
 from transformers.optimization import get_linear_schedule_with_warmup
 
-from torch.utils.tensorboard import SummaryWriter
-import inspect
-import requests
-from neuronx_distributed.parallel_layers import parallel_state, checkpointing, move_model_to_device
-import datasets
-import math
-
-from transformers.models.gpt_neox import modeling_gpt_neox
-from neuronx_distributed.parallel_layers.layers import ParallelEmbedding, ColumnParallelLinear, RowParallelLinear
-from neuronx_distributed.parallel_layers.parallel_state import get_tensor_model_parallel_size
 import neuronx_distributed.parallel_layers.utils as neuronx_dist_utils
 from neuronx_distributed.optimizer import NeuronZero1Optimizer
-from adamw_fp32_optim_params import AdamW_FP32OptimParams
+from neuronx_distributed.parallel_layers import (
+    checkpointing,
+    move_model_to_device,
+    parallel_state,
+)
+from neuronx_distributed.parallel_layers.layers import (
+    ColumnParallelLinear,
+    ParallelEmbedding,
+    RowParallelLinear,
+)
+from neuronx_distributed.parallel_layers.parallel_state import (
+    get_tensor_model_parallel_size,
+)
 
 datetime_str = str(datetime.now())
-results = {
-    "inference_success": 1
-}
+results = {"inference_success": 1}
 
 Metric = namedtuple("Metric", ["name", "value", "units", "additional_data"])
 
@@ -129,9 +135,7 @@ class TrainingMetrics:
 
 
 class Throughput:
-    def __init__(
-        self, batch_size, world_size, grad_accum_usteps, moving_avg_window_size=10
-    ):
+    def __init__(self, batch_size, world_size, grad_accum_usteps, moving_avg_window_size=10):
         self.seqs_per_iteration = batch_size * world_size * grad_accum_usteps
         self.moving_avg_window_size = moving_avg_window_size
         self.moving_avg_window = queue.Queue()
@@ -171,17 +175,13 @@ class Logger:
                 f"_{self.get_instance_type()}",
             )
         )
-        self.tb.add_text(
-            "script", "```\n" + inspect.getsource(sys.modules[__name__]) + "\n```", 0
-        )
+        self.tb.add_text("script", "```\n" + inspect.getsource(sys.modules[__name__]) + "\n```", 0)
         self.golden_steploss = []
         golden = "golden_steploss.txt"
         if os.path.exists(golden):
             with open(golden, "r") as f:
                 self.golden_steploss = [float(i) for i in f]
-            print(
-                f"Read {len(self.golden_steploss)} golden step loss values from {golden}"
-            )
+            print(f"Read {len(self.golden_steploss)} golden step loss values from {golden}")
 
     def get_instance_type(self):
         try:
@@ -215,9 +215,7 @@ class Logger:
         if not os.environ.get("NEURON_EXTRACT_GRAPHS_ONLY", None):
             step_0start = step - 1
             if step_0start < len(self.golden_steploss) and step_0start >= 0:
-                np.testing.assert_allclose(
-                    step_loss, self.golden_steploss[step_0start], rtol=2.3e-1
-                )
+                np.testing.assert_allclose(step_loss, self.golden_steploss[step_0start], rtol=2.3e-1)
 
 
 # Workaround because python functions are not picklable
@@ -228,9 +226,8 @@ class WorkerInitObj(object):
     def __call__(self, id):
         set_seed(self.seed)
 
-def create_pretraining_dataset(
-    data_dir, mini_batch_size, worker_init
-):
+
+def create_pretraining_dataset(data_dir, mini_batch_size, worker_init):
     train_data = datasets.load_from_disk(os.path.expanduser(data_dir))
     train_sampler = DistributedSampler(
         train_data,
@@ -251,136 +248,19 @@ def create_pretraining_dataset(
     )
     return train_dataloader
 
+
 def get_model():
-    class GPTNeoXAttention(modeling_gpt_neox.GPTNeoXAttention):
-        def __init__(self, config):
-            super().__init__(config)
-            self.num_attention_heads = neuronx_dist_utils.divide(config.num_attention_heads, get_tensor_model_parallel_size())
-            self.query_key_value = ColumnParallelLinear(
-                config.hidden_size,
-                3 * config.hidden_size,
-                stride=3,
-                gather_output=False,
-            )
-            self.dense = RowParallelLinear(
-                config.hidden_size,
-                config.hidden_size,
-                input_is_parallel=True,
-            )
-            self.query_key_value.weight.data.normal_(mean=0.0, std=config.initializer_range)
-            self.dense.weight.data.normal_(mean=0.0, std=config.initializer_range)
-            with torch.no_grad():
-                self.query_key_value.bias.data.zero_()
-                self.dense.bias.data.zero_()
-
-        def _attn(self, query, key, value, attention_mask=None, head_mask=None):
-            # q, k, v: [bs, num_attention_heads, seq_len, attn_head_size]
-            # compute causal mask from causal mask buffer
-            batch_size, num_attention_heads, query_length, attn_head_size = query.size()
-            key_length = key.size(-2)
-
-            causal_mask = self.bias[:, :, key_length - query_length : key_length, :key_length].bool()
-
-            query = query.view(batch_size * num_attention_heads, query_length, attn_head_size)
-            key = key.view(batch_size * num_attention_heads, key_length, attn_head_size)
-            attn_scores = torch.zeros(
-                batch_size * num_attention_heads,
-                query_length,
-                key_length,
-                dtype=query.dtype,
-                device=key.device,
-            )
-            attn_scores = torch.baddbmm(
-                attn_scores,
-                query,
-                key.transpose(1, 2),
-                beta=1.0,
-                alpha=(torch.tensor(1.0, dtype=self.norm_factor.dtype, device=self.norm_factor.device) / self.norm_factor),
-            )
-            attn_scores = attn_scores.view(batch_size, num_attention_heads, query_length, key_length)
-
-            # Need to be a tensor, otherwise we get error: `RuntimeError: expected scalar type float but found double`.
-            # Need to be on the same device, otherwise `RuntimeError: ..., x and y to be on the same device`
-            # Use a negative number for mask_value instead of dtype.min for a compiler walk-around
-            mask_value = torch.tensor(-10000.0, dtype=attn_scores.dtype).to(attn_scores.device)
-            attn_scores = torch.where(causal_mask, attn_scores, mask_value)
-
-            if attention_mask is not None:
-                # Apply the attention mask
-                attn_scores = attn_scores + attention_mask
-
-            attn_weights = torch.nn.functional.softmax(attn_scores, dim=-1)
-            attn_weights = attn_weights.to(value.dtype)
-
-            # Mask heads if we want to
-            if head_mask is not None:
-                attn_weights = attn_weights * head_mask
-
-            attn_output = torch.matmul(attn_weights, value)
-            return attn_output, attn_weights
-
-    class GPTNeoXMLP(modeling_gpt_neox.GPTNeoXMLP):
-        def __init__(self, config):
-            super().__init__(config)
-            self.dense_h_to_4h = ColumnParallelLinear(
-                config.hidden_size,
-                config.intermediate_size,
-                gather_output=False,
-            )
-            self.dense_4h_to_h = RowParallelLinear(
-                config.intermediate_size,
-                config.hidden_size,
-                input_is_parallel=True,
-            )
-            self.dense_h_to_4h.weight.data.normal_(mean=0.0, std=config.initializer_range)
-            self.dense_4h_to_h.weight.data.normal_(mean=0.0, std=config.initializer_range)
-            with torch.no_grad():
-                self.dense_h_to_4h.bias.data.zero_()
-                self.dense_4h_to_h.bias.data.zero_()
-
-    def get_sharded_data(data, dim):
-        tp_rank = parallel_state.get_tensor_model_parallel_rank()
-        per_partition_size = data.shape[dim] // parallel_state.get_tensor_model_parallel_size()
-        if dim == 0:
-            return data[
-                per_partition_size * tp_rank : per_partition_size * (tp_rank + 1)
-            ].clone()
-        elif dim == 1:
-            return data[
-                :, per_partition_size * tp_rank : per_partition_size * (tp_rank + 1)
-            ].clone()
-        else:
-            raise Exception(
-                f"Partiton value of 0,1 are supported, found {dim}."
-            )
-
     model_name = "EleutherAI/pythia-6.9b"
     config = AutoConfig.from_pretrained(model_name)
+    config.sequence_parallel_enabled = False
     config.use_cache = False
     xm.master_print(config)
-    model = AutoModelForCausalLM.from_config(config)
+    model = GPTNeoXForCausalLMNxD(config)
     model.gradient_checkpointing_enable()
-
-    for layer in model.gpt_neox.layers:
-        orig_attn = layer.attention
-        layer.attention = GPTNeoXAttention(config)
-        layer.attention.query_key_value.weight.data = get_sharded_data(orig_attn.query_key_value.weight.data, 0)
-        layer.attention.dense.weight.data = get_sharded_data(orig_attn.dense.weight.data, 1)
-        del orig_attn
-
-        orig_mlp = layer.mlp
-        layer.mlp = GPTNeoXMLP(config)
-        layer.mlp.dense_h_to_4h.weight.data = get_sharded_data(orig_mlp.dense_h_to_4h.weight.data, 0)
-        layer.mlp.dense_4h_to_h.weight.data = get_sharded_data(orig_mlp.dense_4h_to_h.weight.data, 1)
-        del orig_mlp
-
-    orig_embed_in = model.gpt_neox.embed_in
-    model.gpt_neox.embed_in = ParallelEmbedding(config.vocab_size, config.hidden_size,)
-    model.gpt_neox.embed_in.weight.data = get_sharded_data(orig_embed_in.weight.data, 0)
-    del orig_embed_in
 
     xm.master_print(model)
     return model
+
 
 def get_and_move_model_sequential(device, num_workers_per_step=11):
     local_rank = xm.get_local_ordinal()
@@ -391,6 +271,7 @@ def get_and_move_model_sequential(device, num_workers_per_step=11):
             move_model_to_device(model, device)
         xm.rendezvous("get_and_move_model_sequential" + str(worker))
     return model
+
 
 def get_dtype(model) -> str:
     """
@@ -404,6 +285,7 @@ def get_dtype(model) -> str:
         if "torch.double" in str(model.dtype):
             return "torch.float32"
     return str(model.dtype)
+
 
 def train_gpt_neox(flags):
     parallel_state.initialize_model_parallel(tensor_model_parallel_size=flags.tensor_parallel_size)
@@ -425,15 +307,11 @@ def train_gpt_neox(flags):
 
     optimizer_grouped_parameters = [
         {
-            "params": [
-                p for n, p in param_optimizer if not any(nd in n for nd in no_decay)
-            ],
+            "params": [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)],
             "weight_decay": 0.01,
         },
         {
-            "params": [
-                p for n, p in param_optimizer if any(nd in n for nd in no_decay)
-            ],
+            "params": [p for n, p in param_optimizer if any(nd in n for nd in no_decay)],
             "weight_decay": 0.0,
         },
     ]
@@ -454,9 +332,7 @@ def train_gpt_neox(flags):
         if not extract_graphs_only:
             logger = Logger(flags, world_size, model_dtype)
         metric_writer = TrainingMetrics(flags.metrics_file)
-        throughput = Throughput(
-            flags.batch_size, world_size, flags.grad_accum_usteps
-        )
+        throughput = Throughput(flags.batch_size, world_size, flags.grad_accum_usteps)
         print("--------TRAINING CONFIG----------")
         print(flags)
         print("--------MODEL CONFIG----------")
@@ -484,9 +360,7 @@ def train_gpt_neox(flags):
             }
         )
 
-    def train_loop_fn(
-        model, optimizer, train_loader, epoch, global_step, training_ustep, running_loss
-    ):
+    def train_loop_fn(model, optimizer, train_loader, epoch, global_step, training_ustep, running_loss):
         max_grad_norm = 1.0
 
         for _, data in enumerate(train_loader):
@@ -543,9 +417,7 @@ def train_gpt_neox(flags):
                             total_norm_cpu,
                         )
 
-                xm.add_step_closure(
-                    _print_logs, (running_loss_reduced_detached, total_norm.detach())
-                )
+                xm.add_step_closure(_print_logs, (running_loss_reduced_detached, total_norm.detach()))
                 if global_step >= flags.steps_this_run:
                     # NOTE: Prevent runtime "Call to recv failed : Broken pipe" issue
                     xm.mark_step()
@@ -582,14 +454,12 @@ def train_gpt_neox(flags):
     if scheduler_state_dict:
         scheduler.load_state_dict(scheduler_state_dict)
 
-    assert os.path.exists(
-        os.path.expanduser(flags.data_dir)
-    ), "ERROR: Data directory {} doesn't exist!".format(flags.data_dir)
+    assert os.path.exists(os.path.expanduser(flags.data_dir)), "ERROR: Data directory {} doesn't exist!".format(
+        flags.data_dir
+    )
 
     mini_batch_size = flags.batch_size
-    train_dataloader = create_pretraining_dataset(
-        flags.data_dir, mini_batch_size, worker_init
-    )
+    train_dataloader = create_pretraining_dataset(flags.data_dir, mini_batch_size, worker_init)
     train_device_loader = pl.MpDeviceLoader(train_dataloader, device)
 
     while True:
@@ -631,9 +501,7 @@ def train_gpt_neox(flags):
             }
             metric_data = [
                 Metric("Loss", final_loss, "", additional_data),
-                Metric(
-                    "Throughput", logger.throughputs[-1], "seq/s", additional_data
-                ),
+                Metric("Throughput", logger.throughputs[-1], "seq/s", additional_data),
             ]
             metric_writer.store_metrics(metric_data)
 
@@ -645,9 +513,7 @@ def train_gpt_neox(flags):
                     "Global step": global_step,
                     "Microstep": training_ustep,
                 }
-                average_throughput = round(
-                    sum(logger.throughputs) / len(logger.throughputs), 4
-                )
+                average_throughput = round(sum(logger.throughputs) / len(logger.throughputs), 4)
                 metric_data = [
                     Metric("Final loss", final_loss, "", additional_data),
                     Metric(
@@ -670,14 +536,15 @@ def train_gpt_neox(flags):
                     ),
                 ]
                 metric_writer.store_metrics(metric_data)
-            state_dict = {
-                "model": model.state_dict(),
-                "global_step": global_step,
-                "epoch": epoch,
-                "scheduler": scheduler.state_dict()
-            }
-            checkpointing.save(state_dict, flags.output_dir, down_cast_bf16=True)
-            optimizer.save_sharded_state_dict(flags.output_dir)
+            if not os.environ.get("NEURON_EXTRACT_GRAPHS_ONLY", None): # Do not save checkpoint during pre-compile
+                state_dict = {
+                    "model": model.state_dict(),
+                    "global_step": global_step,
+                    "epoch": epoch,
+                    "scheduler": scheduler.state_dict(),
+                }
+                checkpointing.save(state_dict, flags.output_dir, down_cast_bf16=True)
+                optimizer.save_sharded_state_dict(flags.output_dir)
             return
 
         epoch += 1
@@ -687,6 +554,7 @@ def _mp_fn(index, flags):
     torch.set_default_tensor_type("torch.FloatTensor")
     train_gpt_neox(flags)
     xm.rendezvous("_mp_fn finished")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -741,17 +609,8 @@ if __name__ == "__main__":
         action="store_true",
         help="Whether to print grad norm",
     )
-    parser.add_argument(
-        "--resume_ckpt",
-        action="store_true",
-        help="Resume from checkpoint at resume_step."
-    )
-    parser.add_argument(
-        "--tensor_parallel_size",
-        default=8,
-        type=int,
-        help="Tensor parallel size"
-    )
+    parser.add_argument("--resume_ckpt", action="store_true", help="Resume from checkpoint at resume_step.")
+    parser.add_argument("--tensor_parallel_size", default=8, type=int, help="Tensor parallel size")
 
     args = parser.parse_args(sys.argv[1:])
 

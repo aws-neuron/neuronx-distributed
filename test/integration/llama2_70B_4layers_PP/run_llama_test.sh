@@ -90,7 +90,6 @@ torchrun $DISTRIBUTED_ARGS run_llama_nxd.py \
     --weight_decay 0.1 \
     --warmup_steps 2000 \
     --constant_steps 0 \
-    --compare_loss $compare_loss \
     $EXTRA_ARGS |& tee $LOG_PATH/log
 
 ret_val=${PIPESTATUS[0]}
@@ -107,8 +106,8 @@ else
 
   if [ -z "$NEURON_EXTRACT_GRAPHS_ONLY" ]; then
       echo "success=$success"
-      echo "update json with /home/ubuntu/ktest/dump_to_s3_update_test_json.sh"
-      dump_to_s3_update_json_scr=/home/ubuntu/ktest/dump_to_s3_update_test_json.sh
+      echo "update json with $HOME/ktest/dump_to_s3_update_test_json.sh"
+      dump_to_s3_update_json_scr=$HOME/ktest/dump_to_s3_update_test_json.sh
       if [ -e $dump_to_s3_update_json_scr ]; then
           $dump_to_s3_update_json_scr $@ --key=inference_success --value=$success || echo "Unable to update test result JSON."
       else

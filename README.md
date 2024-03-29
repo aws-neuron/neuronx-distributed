@@ -16,6 +16,6 @@ It should place the wheel at `dist/`
 
 ## API Reference Guide
 
-For a detailed API reference guide, please refer to: https://awsdocs-neuron.readthedocs-hosted.com/en/latest/libraries/neuronx-distributed/tp_api_guide.html#tp-api-guide
+For a detailed API reference guide, please refer to: https://awsdocs-neuron.readthedocs-hosted.com/en/latest/libraries/neuronx-distributed/api_guide.html#api-guide
 
 

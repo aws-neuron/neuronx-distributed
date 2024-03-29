@@ -18,6 +18,7 @@ class Logger:
             self.writer = SummaryWriter(log_dir=tb_dir)
         else:
             self.writer = None
+        self.throughputs = []
 
 
 
@@ -42,3 +43,4 @@ class Logger:
                 torch.sum(input_ids.detach().cpu()).item(),
                 total_steps,
             )
+        self.throughputs.append(tps)

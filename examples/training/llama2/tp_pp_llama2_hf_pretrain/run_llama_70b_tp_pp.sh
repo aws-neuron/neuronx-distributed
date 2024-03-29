@@ -12,7 +12,7 @@ export NEURON_FUSE_SOFTMAX=1
 export NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS=7
 export MALLOC_ARENA_MAX=128
 export XLA_DOWNCAST_BF16=1
-export NEURON_CC_FLAGS="--model-type=transformer --distribution-strategy=llm-training --cache_dir=/home/ubuntu/cache_dir_neuron/"
+export NEURON_CC_FLAGS="--model-type=transformer --distribution-strategy=llm-training --cache_dir=$HOME/cache_dir_neuron/"
 
 PROCESSES_PER_NODE=32
 WORLD_SIZE=1
@@ -45,7 +45,7 @@ echo "Nodeinfo NODEID $NODEID hostname $HOSTNAME"
 echo $DISTRIBUTED_ARGS
 
 # Global batch size
-GBS=1024
+: ${GBS:=1024}
 # Input sequence length
 SEQ_LEN=4096
 # Pipeline parallel degree
@@ -59,15 +59,19 @@ BS=$(($GBS / $DP))
 # Number microbatches for pipeline execution
 # Setting same as BS so each microbatch contains a single datasample
 NUM_MICROBATCHES=$BS
-DATA_PATH="/home/ubuntu/examples_datasets/wikicorpus_llama2_7B_tokenized_4k"
+DATA_PATH="$HOME/examples_datasets/wikicorpus_llama2_7B_tokenized_4k"
 
 
 if [ "$NEURON_EXTRACT_GRAPHS_ONLY" = "1" ]; then
     max_steps=10
-    tb_dir="~/tensorboard/llama70B_compile"
+    tb_dir="/shared/tensorboard/llama70B_compile"
+elif [ -v PERF_TEST ] && [ $PERF_TEST -gt 0 ]; then
+    max_steps=100
+    tb_dir="/shared/tensorboard/llama70B_32nodes_${JOB_ID}"
+    mkdir -p $tb_dir
 else
     max_steps=30000
-    tb_dir="~/tensorboard/llama70B_32nodes_${JOB_ID}"
+    tb_dir="/shared/tensorboard/llama70B_32nodes_${JOB_ID}"
     mkdir -p $tb_dir
 fi
 
@@ -93,3 +97,4 @@ torchrun $DISTRIBUTED_ARGS run_llama_nxd.py \
     --qkv_linear 1 \
     --kv_replicator 4 \
     --tb_dir $tb_dir |& tee $LOG_PATH/log
+exit ${PIPESTATUS[0]}

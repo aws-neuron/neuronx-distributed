@@ -1,6 +1,6 @@
 # coding=utf-8
 # Copyright (c) 2019 NVIDIA CORPORATION. All rights reserved.
-# Copyright 2018 The Google AI Language Team Authors and The HugginFace Inc. team.
+# Copyright 2018 The Google AI Language Team Authors and The HuggingFace Inc. team.
 # Modifications Copyright 2021 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,59 +25,53 @@
 # - Changed arg defaults
 # - Added logger class to print log and also log to TensorBoard database
 
-import os
-import math
-import torch
+import argparse
 import glob
-import h5py
+import json
+import math
+import os
+import queue
+import random
 import sys
 import time
-import argparse
-import random
-import json
-import queue
-import atexit
-import traceback
-from typing import Any, Dict, List
+from collections import namedtuple
 from datetime import datetime, timezone
-from collections import deque, namedtuple
-import torch_xla
-import torch.nn as nn
-import torch_xla.core.xla_model as xm
-from torch.utils.data.dataloader import DataLoader
-from torch.utils.data import DistributedSampler
-from torch.utils.data import Dataset
-import torch_xla.debug.metrics as met
-import torch_xla.distributed.parallel_loader as pl
-import torch.distributed as dist
-import torch_xla.distributed.xla_multiprocessing as xmp
-import torch_xla.distributed.xla_backend
+from typing import Any, Dict, List
+
+import h5py
 import numpy as np
-from transformers import BertForPreTraining
+import torch
+import torch.distributed as dist
+import torch_xla.core.xla_model as xm
+import torch_xla.distributed.parallel_loader as pl
+import torch_xla.distributed.xla_multiprocessing as xmp
+from torch.utils.data import Dataset, DistributedSampler
+from torch.utils.data.dataloader import DataLoader
+from transformers import AdamW, BertForPreTraining, set_seed
 from transformers.models.bert.modeling_bert import BertSelfAttention, BertSelfOutput
-from transformers import (
-    AdamW,
-    set_seed,
-)
 from transformers.optimization import get_linear_schedule_with_warmup
 
 try:
     from lamb import Lamb
 except ImportError:
-    print(
-        "No LAMB optimizer implementation available to import, proceed with AdamW by default"
-    )
+    print("No LAMB optimizer implementation available to import, proceed with AdamW by default")
 import copy
-from torch.utils.tensorboard import SummaryWriter
-from concurrent.futures import ThreadPoolExecutor
-import inspect
-import requests
 import gc
-from neuronx_distributed.parallel_layers import parallel_state, layers, grads, checkpointing, move_model_to_device
+import inspect
+from concurrent.futures import ThreadPoolExecutor
 
-os.environ["NEURON_CC_FLAGS"] = (
-    os.environ.get("NEURON_CC_FLAGS", "") + " --model-type=transformer"
+import requests
+from torch.utils.tensorboard import SummaryWriter
+
+from neuronx_distributed.parallel_layers import (
+    checkpointing,
+    grads,
+    layers,
+    move_model_to_device,
+    parallel_state,
 )
+
+os.environ["NEURON_CC_FLAGS"] = os.environ.get("NEURON_CC_FLAGS", "") + " --model-type=transformer"
 
 # For PT autocast.
 torch.cuda.is_bf16_supported = lambda: True
@@ -90,9 +84,7 @@ if os.environ.get("XLA_USE_BF16") or os.environ.get("XLA_DOWNCAST_BF16"):
     modeling_utils.get_parameter_dtype = lambda x: torch.bfloat16
 
 datetime_str = str(datetime.now())
-results = {
-    "inference_success": 1
-}
+results = {"inference_success": 1}
 
 
 Metric = namedtuple("Metric", ["name", "value", "units", "additional_data"])
@@ -164,9 +156,7 @@ class TrainingMetrics:
 
 
 class Throughput:
-    def __init__(
-        self, batch_size, world_size, grad_accum_usteps, moving_avg_window_size=10
-    ):
+    def __init__(self, batch_size, world_size, grad_accum_usteps, moving_avg_window_size=10):
         self.seqs_per_iteration = batch_size * world_size * grad_accum_usteps
         self.moving_avg_window_size = moving_avg_window_size
         self.moving_avg_window = queue.Queue()
@@ -209,17 +199,13 @@ class Logger:
                 f"_{self.get_instance_type()}",
             )
         )
-        self.tb.add_text(
-            "script", "```\n" + inspect.getsource(sys.modules[__name__]) + "\n```", 0
-        )
+        self.tb.add_text("script", "```\n" + inspect.getsource(sys.modules[__name__]) + "\n```", 0)
         self.golden_steploss = []
         golden = "golden_steploss.txt"
         if os.path.exists(golden):
             with open(golden, "r") as f:
                 self.golden_steploss = [float(i) for i in f]
-            print(
-                f"Read {len(self.golden_steploss)} golden step loss values from {golden}"
-            )
+            print(f"Read {len(self.golden_steploss)} golden step loss values from {golden}")
 
     def get_instance_type(self):
         try:
@@ -253,9 +239,7 @@ class Logger:
         if not os.environ.get("NEURON_EXTRACT_GRAPHS_ONLY", None):
             step_0start = step - 1
             if step_0start < len(self.golden_steploss) and step_0start >= 0:
-                np.testing.assert_allclose(
-                    step_loss, self.golden_steploss[step_0start], rtol=2.3e-1
-                )
+                np.testing.assert_allclose(step_loss, self.golden_steploss[step_0start], rtol=2.3e-1)
 
 
 # Workaround because python functions are not picklable
@@ -267,12 +251,8 @@ class WorkerInitObj(object):
         set_seed(self.seed)
 
 
-def create_pretraining_dataset(
-    input_file, max_pred_length, mini_batch_size, worker_init
-):
-    train_data = pretraining_dataset(
-        input_file=input_file, max_pred_length=max_pred_length
-    )
+def create_pretraining_dataset(input_file, max_pred_length, mini_batch_size, worker_init):
+    train_data = pretraining_dataset(input_file=input_file, max_pred_length=max_pred_length)
     train_sampler = DistributedSampler(
         train_data,
         num_replicas=parallel_state.get_data_parallel_size(),
@@ -368,14 +348,17 @@ def get_model(flags):
             self.query = layers.ColumnParallelLinear(config.hidden_size, self.all_head_size, gather_output=False)
             self.key = layers.ColumnParallelLinear(config.hidden_size, self.all_head_size, gather_output=False)
             self.value = layers.ColumnParallelLinear(config.hidden_size, self.all_head_size, gather_output=False)
-            # BERT initializes the model with normal distribution. Here we scale the std, since the weights are 
+            # BERT initializes the model with normal distribution. Here we scale the std, since the weights are
             # sharded
             self.query.weight.data.normal_(
-                mean=0.0, std=config.initializer_range/math.sqrt(parallel_state.get_tensor_model_parallel_size()))
+                mean=0.0, std=config.initializer_range / math.sqrt(parallel_state.get_tensor_model_parallel_size())
+            )
             self.key.weight.data.normal_(
-                mean=0.0, std=config.initializer_range/math.sqrt(parallel_state.get_tensor_model_parallel_size()))
+                mean=0.0, std=config.initializer_range / math.sqrt(parallel_state.get_tensor_model_parallel_size())
+            )
             self.value.weight.data.normal_(
-                mean=0.0, std=config.initializer_range/math.sqrt(parallel_state.get_tensor_model_parallel_size()))
+                mean=0.0, std=config.initializer_range / math.sqrt(parallel_state.get_tensor_model_parallel_size())
+            )
             with torch.no_grad():
                 self.query.bias.data.zero_()
                 self.key.bias.data.zero_()
@@ -386,14 +369,13 @@ def get_model(flags):
     class ParallelSelfOutput(BertSelfOutput):
         def __init__(self, config):
             super().__init__(config)
-            self.dense = layers.RowParallelLinear(config.hidden_size,
-                                       config.hidden_size,
-                                       input_is_parallel=True)
+            self.dense = layers.RowParallelLinear(config.hidden_size, config.hidden_size, input_is_parallel=True)
             self.dense.weight.data.normal_(
-                mean=0.0, std=config.initializer_range/math.sqrt(parallel_state.get_tensor_model_parallel_size()))
+                mean=0.0, std=config.initializer_range / math.sqrt(parallel_state.get_tensor_model_parallel_size())
+            )
             with torch.no_grad():
                 self.dense.bias.data.zero_()
-    
+
     for layer in my_model.bert.encoder.layer:
         layer.attention.self = ParallelSelfAttention(my_config)
         layer.attention.output = ParallelSelfOutput(my_config)
@@ -413,8 +395,9 @@ def get_dtype(model) -> str:
             return "torch.bfloat16"
         if "torch.double" in str(model.dtype):
             return "torch.float32"
-    return str(model.dtype)    
-    
+    return str(model.dtype)
+
+
 def train_bert_hdf5(flags):
     parallel_state.initialize_model_parallel(tensor_model_parallel_size=flags.tensor_parallel_size)
     rank = xm.get_ordinal()
@@ -440,15 +423,11 @@ def train_bert_hdf5(flags):
 
     optimizer_grouped_parameters = [
         {
-            "params": [
-                p for n, p in param_optimizer if not any(nd in n for nd in no_decay)
-            ],
+            "params": [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)],
             "weight_decay": 0.01,
         },
         {
-            "params": [
-                p for n, p in param_optimizer if any(nd in n for nd in no_decay)
-            ],
+            "params": [p for n, p in param_optimizer if any(nd in n for nd in no_decay)],
             "weight_decay": 0.0,
         },
     ]
@@ -465,9 +444,7 @@ def train_bert_hdf5(flags):
         print(
             "Using LAMB with trust_ratio_clipping on, based on implementation from https://github.com/rwightman/pytorch-image-models/blob/master/timm/optim/lamb.py"
         )
-        optimizer = Lamb(
-            optimizer_grouped_parameters, flags.lr, trust_clip=True
-        )  # default turning trust_clip on
+        optimizer = Lamb(optimizer_grouped_parameters, flags.lr, trust_clip=True)  # default turning trust_clip on
 
     optimizer.zero_grad()
 
@@ -477,9 +454,7 @@ def train_bert_hdf5(flags):
         if not extract_graphs_only:
             logger = Logger(flags, world_size, model_dtype)
         metric_writer = TrainingMetrics(flags.metrics_file)
-        throughput = Throughput(
-            flags.batch_size, world_size, flags.grad_accum_usteps
-        )
+        throughput = Throughput(flags.batch_size, world_size, flags.grad_accum_usteps)
         print("--------TRAINING CONFIG----------")
         print(flags)
         print("--------MODEL CONFIG----------")
@@ -507,9 +482,7 @@ def train_bert_hdf5(flags):
             }
         )
 
-    def train_loop_fn(
-        model, optimizer, train_loader, epoch, global_step, training_ustep, running_loss
-    ):
+    def train_loop_fn(model, optimizer, train_loader, epoch, global_step, training_ustep, running_loss):
         max_grad_norm = 1.0
 
         for i, data in enumerate(train_loader):
@@ -544,12 +517,8 @@ def train_bert_hdf5(flags):
                 running_loss_reduced_detached = running_loss_reduced.detach()
                 running_loss.zero_()
                 # all-reduce and then clip. Order matters.
-                xm.reduce_gradients(
-                    optimizer, groups=parallel_state.get_data_parallel_group(as_list=True)
-                )
-                grads.clip_grad_norm(
-                    model.parameters(), max_grad_norm
-                )  # Gradient clipping is not in AdamW anymore
+                xm.reduce_gradients(optimizer, groups=parallel_state.get_data_parallel_group(as_list=True))
+                grads.clip_grad_norm(model.parameters(), max_grad_norm)  # Gradient clipping is not in AdamW anymore
                 optimizer.step()
 
                 with torch.no_grad():
@@ -579,9 +548,7 @@ def train_bert_hdf5(flags):
                             total_norm_cpu,
                         )
 
-                xm.add_step_closure(
-                    _print_logs, (running_loss_reduced_detached, total_norm.detach())
-                )
+                xm.add_step_closure(_print_logs, (running_loss_reduced_detached, total_norm.detach()))
                 if global_step >= flags.steps_this_run:
                     # NOTE: Prevent runtime "Call to recv failed : Broken pipe" issue
                     xm.mark_step()
@@ -621,23 +588,17 @@ def train_bert_hdf5(flags):
 
     thread_pool = ThreadPoolExecutor(1)
 
-    assert os.path.exists(
-        os.path.expanduser(flags.data_dir)
-    ), "ERROR: Data directory {} doesn't exist!".format(flags.data_dir)
+    assert os.path.exists(os.path.expanduser(flags.data_dir)), "ERROR: Data directory {} doesn't exist!".format(
+        flags.data_dir
+    )
     while True:
-        files = glob.glob(
-            os.path.expanduser(flags.data_dir) + "/*_{}_*.hdf5".format("training")
-        )
+        files = glob.glob(os.path.expanduser(flags.data_dir) + "/*_{}_*.hdf5".format("training"))
         files.sort()
         random.Random(epoch).shuffle(files)
         file_start_idx = 0
 
         num_files = len(files)
-        assert (
-            num_files > 0
-        ), "ERROR: There are no tokenized dataset shard files in {}".format(
-            flags.data_dir
-        )
+        assert num_files > 0, "ERROR: There are no tokenized dataset shard files in {}".format(flags.data_dir)
         assert (
             world_size <= num_files
         ), "ERROR: Please ensure there are at least {} (world_size) tokenized dataset shards in {} (currently I see only {}).".format(
@@ -647,9 +608,7 @@ def train_bert_hdf5(flags):
         # prep first iteration input data file
         data_file = files[(file_start_idx)]
         prev_file = data_file
-        train_dataloader, _ = create_pretraining_dataset(
-            data_file, flags.max_pred_len, mini_batch_size, worker_init
-        )
+        train_dataloader, _ = create_pretraining_dataset(data_file, flags.max_pred_len, mini_batch_size, worker_init)
         if flags.seq_len is not None:
             assert flags.seq_len == train_dataloader.dataset.sequence_length, (
                 f"ERROR: User-specified sequence length ({flags.seq_len}) does not match "
@@ -657,9 +616,7 @@ def train_bert_hdf5(flags):
             )
         train_device_loader = pl.MpDeviceLoader(train_dataloader, device)
         if is_root:
-            metric_writer.store_parameters(
-                {"Sequence length": train_dataloader.dataset.sequence_length}
-            )
+            metric_writer.store_parameters({"Sequence length": train_dataloader.dataset.sequence_length})
 
         # use DP dataloader
         for f in range(file_start_idx + 1, len(files)):
@@ -713,9 +670,7 @@ def train_bert_hdf5(flags):
                 }
                 metric_data = [
                     Metric("Loss", final_loss, "", additional_data),
-                    Metric(
-                        "Throughput", logger.throughputs[-1], "seq/s", additional_data
-                    ),
+                    Metric("Throughput", logger.throughputs[-1], "seq/s", additional_data),
                 ]
                 metric_writer.store_metrics(metric_data)
 
@@ -727,9 +682,7 @@ def train_bert_hdf5(flags):
                         "Global step": global_step,
                         "Microstep": training_ustep,
                     }
-                    average_throughput = round(
-                        sum(logger.throughputs) / len(logger.throughputs), 4
-                    )
+                    average_throughput = round(sum(logger.throughputs) / len(logger.throughputs), 4)
                     metric_data = [
                         Metric("Final loss", final_loss, "", additional_data),
                         Metric(
@@ -757,7 +710,7 @@ def train_bert_hdf5(flags):
                     "global_step": global_step,
                     "epoch": epoch,
                     "optimizer": optimizer.state_dict(),
-                    "scheduler": scheduler.state_dict()
+                    "scheduler": scheduler.state_dict(),
                 }
                 checkpointing.save(state_dict, flags.output_dir)
                 return
@@ -835,9 +788,7 @@ if __name__ == "__main__":
         default=None,
         help="Sequence length; if specified, must match that of the pre-tokenized dataset, else derived from the dataset (via `--data_dir`)",
     )
-    parser.add_argument(
-        "--debug", action="store_true", help="Debug mode to help debug scripting."
-    )
+    parser.add_argument("--debug", action="store_true", help="Debug mode to help debug scripting.")
     parser.add_argument(
         "--max_pred_len",
         type=int,
@@ -856,9 +807,7 @@ if __name__ == "__main__":
         default=64,
         help="Gradient accumulation micro-steps (an accumulation-step has <value> micro-steps.",
     )
-    parser.add_argument(
-        "--enable_pt_autocast", action="store_true", help="Enable pytorch autocast."
-    )
+    parser.add_argument("--enable_pt_autocast", action="store_true", help="Enable pytorch autocast.")
     parser.add_argument(
         "--print_grad_norm",
         default=False,
@@ -866,39 +815,22 @@ if __name__ == "__main__":
         help="Whether to print grad norm",
     )
     parser.add_argument(
-        "--minimal_ckpt", 
-        default=False, 
-        action='store_true', 
-        help="When specified, don't store optimizer/lr-schedule states in checkpoints."
-    )
-    parser.add_argument(
-        "--test_checkpointing", 
-        action='store_true', 
-        help="When specified, validate save and load ccheckpoint"
-    )
-    parser.add_argument(
-        "--resume_ckpt",
+        "--minimal_ckpt",
+        default=False,
         action="store_true",
-        help="Resume from checkpoint at resume_step."
+        help="When specified, don't store optimizer/lr-schedule states in checkpoints.",
     )
+    parser.add_argument(
+        "--test_checkpointing", action="store_true", help="When specified, validate save and load ccheckpoint"
+    )
+    parser.add_argument("--resume_ckpt", action="store_true", help="Resume from checkpoint at resume_step.")
     parser.add_argument(
         "--resume_ckpt_path",
-        help=
-        "Checkpoint file to use rather than default. If not specified, then resume from last checkpoint or at resume_step (default file output/ckpt_<step>.pt)."
+        help="Checkpoint file to use rather than default. If not specified, then resume from last checkpoint or at resume_step (default file output/ckpt_<step>.pt).",
     )
-    parser.add_argument(
-        "--resume_step",
-        default=-1,
-        type=int,
-        help="Step to resume training from."
-    )
-    parser.add_argument(
-        "--tensor_parallel_size",
-        default=2,
-        type=int,
-        help="Tensor parallel size"
-    )
-    
+    parser.add_argument("--resume_step", default=-1, type=int, help="Step to resume training from.")
+    parser.add_argument("--tensor_parallel_size", default=2, type=int, help="Tensor parallel size")
+
     args = parser.parse_args(sys.argv[1:])
 
     if args.steps_this_run < 0:

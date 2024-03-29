@@ -2,18 +2,22 @@ import argparse
 import logging
 import os
 import pprint
+import json
 from functools import partial
 
-import benchmark
 import torch
 from transformers import AutoTokenizer, PreTrainedModel
-
 from neuronx_distributed.trace import parallel_model_save, parallel_model_trace
+from benchmark import Benchmark, BENCHMARK_REPORT_FILENAME
 
-CONTEXT_ENCODING_MODEL_NAME = "context_encoding_model"
-TOKEN_GENERATION_MODEL_NAME = "token_generation_model"
+END_TO_END_MODEL = "e2e_model"
+CONTEXT_ENCODING_MODEL = "context_encoding_model"
+TOKEN_GENERATION_MODEL = "token_generation_model"
 LM_HEAD_NAME = "lm_head.pt"
 
+BASE_COMPILER_WORK_DIR = "tmp/nxd_model/"
+CTX_ENC_MODEL_COMPILER_WORK_DIR = BASE_COMPILER_WORK_DIR + CONTEXT_ENCODING_MODEL + "/"
+TKN_GEN_MODEL_COMPILER_WORK_DIR = BASE_COMPILER_WORK_DIR + TOKEN_GENERATION_MODEL + "/"
 
 class InferenceRunner:
     """
@@ -113,8 +117,11 @@ class InferenceRunner:
             logging.debug("padded tokenized input %s : %s", idx, tokenizer.decode(input))
 
         generate_ids = model.generate(
-            inputs.input_ids, attention_mask=inputs.attention_mask, max_new_tokens=max_new_tokens, 
-            top_k=1, do_sample=True
+            inputs.input_ids,
+            attention_mask=inputs.attention_mask,
+            max_new_tokens=max_new_tokens,
+            top_k=1,
+            do_sample=True,
         )
         outputs = tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
         return generate_ids, outputs
@@ -130,7 +137,7 @@ class InferenceRunner:
         torch.testing.assert_close(generate_ids_actual, generate_ids_expected)
         print("The output from Neuronx NxD is accurate!")
 
-    def trace(self, traced_model_path, tp_degree, batch_size, max_context_length, max_new_tokens):
+    def trace(self, traced_model_path, tp_degree, batch_size, max_context_length, max_new_tokens, inline_weights_to_neff):
         """
         Function to trace a model with neuronx NxD
         """
@@ -146,8 +153,10 @@ class InferenceRunner:
             # into the parallel NxD layers
             if not os.path.exists(saved_dir):
                 os.makedirs(saved_dir)
-            model = hf_model.model
-            torch.save({"model": model.state_dict()}, model_save_path)
+            model_sd = hf_model.model.state_dict()
+            lm_head_sd = hf_model.lm_head.state_dict()
+            model_sd["lm_head.weight"] = lm_head_sd["weight"]
+            torch.save({"model": model_sd}, model_save_path)
 
         if traced_model_path is not None:
             if not os.path.exists(traced_model_path):
@@ -161,71 +170,121 @@ class InferenceRunner:
         config.max_context_length = max_context_length
         config.max_new_tokens = max_new_tokens
         config.batch_size = batch_size
-        config.save_pretrained(traced_model_path)
 
+        if (config.torch_dtype != torch.float32 and config.torch_dtype != torch.bfloat16):
+            raise ValueError(f"Type {config.torch_dtype} is not supported for this model at this time. Please choose float32 or bfloat16.")
+
+
+        config.save_pretrained(traced_model_path)
         config_path = traced_model_path  # We have the config in the trace_model_path
 
         # Copy the tokenizer into the traced_model_path
         self.load_tokenizer().save_pretrained(traced_model_path)
 
-        # Save the lm_head to the trace path.
-        torch.save(hf_model.lm_head.state_dict(), traced_model_path + LM_HEAD_NAME)
-
         trace_callable = self.get_trace_callable()
         callable = partial(trace_callable, config_path, model_save_path)
 
         # Trace the context encoding model
-        input_ids = torch.zeros((batch_size, max_length), dtype=torch.int64)
-        attention_mask = torch.zeros((batch_size, max_length), dtype=torch.int64)
-        position_ids = torch.zeros((batch_size, max_length), dtype=torch.int64)
-        sample_inputs = (input_ids, attention_mask, position_ids)
+        sample_inputs = self.get_sample_inputs(CONTEXT_ENCODING_MODEL, config)
 
         traced_model = parallel_model_trace(
             callable,
             sample_inputs,
             tp_degree=tp_degree,
-            compiler_workdir="/tmp/nxd-model/ctx-encoding-model/",
+            compiler_workdir=CTX_ENC_MODEL_COMPILER_WORK_DIR,
             compiler_args="--enable-saturate-infinity --auto-cast=none",
             max_parallel_compilations=8,
+            inline_weights_to_neff=inline_weights_to_neff
         )
 
-        ctx_encoding_path = traced_model_path + CONTEXT_ENCODING_MODEL_NAME
+        ctx_encoding_path = traced_model_path + CONTEXT_ENCODING_MODEL
         parallel_model_save(traced_model, ctx_encoding_path)
         print("Successfully traced the context encoding model!")
 
         # Trace the token generation model
-        input_ids = torch.zeros((batch_size, 1), dtype=torch.int64)
-        attention_mask = torch.zeros((batch_size, max_length + 1), dtype=torch.int64)
-        position_ids = torch.zeros((batch_size, 1), dtype=torch.int64)
-        sample_inputs = (input_ids, attention_mask, position_ids)
+        sample_inputs = self.get_sample_inputs(TOKEN_GENERATION_MODEL, config)
 
         traced_model = parallel_model_trace(
             callable,
             sample_inputs,
             tp_degree=tp_degree,
-            compiler_workdir="/tmp/nxd-model/tkn-gen-model/",
+            compiler_workdir=TKN_GEN_MODEL_COMPILER_WORK_DIR,
             compiler_args="--enable-saturate-infinity --auto-cast=none",
             max_parallel_compilations=8,
+            inline_weights_to_neff=inline_weights_to_neff
         )
-        tkn_gen_path = traced_model_path + TOKEN_GENERATION_MODEL_NAME
+        tkn_gen_path = traced_model_path + TOKEN_GENERATION_MODEL
         parallel_model_save(traced_model, tkn_gen_path)
 
         print("Successfully traced the token generation model!")
 
     def benchmark_sampling(self, traced_model_path):
-        # So we can reconstruct the tokenizer we used during the tracing 
-        self.tokenizer_path = traced_model_path
-
         config_cls = self.get_config_cls()
-
         config = config_cls.from_pretrained(traced_model_path)
         tokenizer = self.load_tokenizer()
+        model = self.load_neuron_model(traced_model_path)
 
-        model_load_fn = self.load_neuron_model
+        report = {}
 
-        report = benchmark.benchmark_sampling(config.batch_size, config.max_length, 
-                                              traced_model_path, tokenizer, model_load_fn)
+        # Benchmark E2E model
+        batch_encoding = self.get_sample_inputs(END_TO_END_MODEL, config, tokenizer)
+        input_param = {
+            "input_ids": batch_encoding["input_ids"], 
+            "attention_mask": batch_encoding["attention_mask"], 
+            "max_new_tokens": config.max_new_tokens, 
+            "top_k": 1,
+            "do_sample": True,
+        }
+        e2e_benchmark = Benchmark(model.generate, input_param, config, 
+                                  preprocess_func=model.reset)
+        report[END_TO_END_MODEL] = e2e_benchmark.run()
+
+        # Benchmark context encoding model
+        input_param = self.get_sample_inputs(CONTEXT_ENCODING_MODEL, config)
+        ctx_enc_benchmark = Benchmark(model.context_encoding_model, input_param, config)
+        report[CONTEXT_ENCODING_MODEL] = ctx_enc_benchmark.run()
+
+        # Benchmark token generation model
+        input_param = self.get_sample_inputs(TOKEN_GENERATION_MODEL, config)
+        tkn_gen_benchmark = Benchmark(model.token_generation_model, input_param, config)
+        report[TOKEN_GENERATION_MODEL] = tkn_gen_benchmark.run()
+
+        print("Benchmark completed and its result is as following")
+        print(json.dumps(report, indent=4))
+        with open(BENCHMARK_REPORT_FILENAME, "w") as f:
+            json.dump(report, f)
+        print("Completed saving result to " + BENCHMARK_REPORT_FILENAME)
+
         return report
+    
+    def get_sample_inputs(self, model_type, config, tokenizer=None):
+        max_length = config.max_length
+        batch_size = config.batch_size
+
+        sample_inputs = None
+        if model_type == END_TO_END_MODEL:
+            sample_inputs = tokenizer(
+                ["I believe the meaning of life is"] * batch_size, 
+                max_length=max_length, 
+                truncation=True, 
+                padding="max_length", 
+                return_tensors="pt"
+            )
+        
+        elif model_type == CONTEXT_ENCODING_MODEL:
+            input_ids = torch.zeros((batch_size, max_length), dtype=torch.int64)
+            attention_mask = torch.zeros((batch_size, max_length), dtype=torch.int64)
+            position_ids = torch.zeros((batch_size, max_length), dtype=torch.int64)
+            sample_inputs = (input_ids, attention_mask, position_ids)
+
+        elif model_type == TOKEN_GENERATION_MODEL:
+            input_ids = torch.zeros((batch_size, 1), dtype=torch.int64)
+            attention_mask = torch.zeros((batch_size, max_length + 1), dtype=torch.int64)
+            position_ids = torch.zeros((batch_size, 1), dtype=torch.int64)
+            sample_inputs = (input_ids, attention_mask, position_ids)
+        
+        return sample_inputs
+
 
     @classmethod
     def cmd_execute(cls):
@@ -278,6 +337,12 @@ class InferenceRunner:
             type=int,
             help="max output tokens generated",
         )
+        parser.add_argument(
+            "--enable_weight_separation",
+            action="store_true",
+            help="Enables weight separation for tp models"
+        )
+        parser.set_defaults(enable_weight_separation=False)
         args = parser.parse_args()
 
         action = args.action
@@ -290,6 +355,7 @@ class InferenceRunner:
         batch_size = args.batch_size
         max_context_length = args.max_context_length
         max_new_tokens = args.max_new_tokens
+        inline_weights_to_neff = not args.enable_weight_separation
 
         if args.debug:
             from imp import reload
@@ -315,7 +381,7 @@ class InferenceRunner:
             assert max_context_length != None, "Required parameter --max_context_length not passed"
             assert max_new_tokens != None, "Required parameter --max_new_tokens not passed"
             assert tp_degree != None, "Required parameter --tp_degree not passed"
-            runner.trace(traced_model_path, tp_degree, batch_size, max_context_length, max_new_tokens)
+            runner.trace(traced_model_path, tp_degree, batch_size, max_context_length, max_new_tokens, inline_weights_to_neff)
 
         elif action == "infer":
             assert prompt != None and len(prompt) > 0, "Required parameter --prompt not passed with valid values"

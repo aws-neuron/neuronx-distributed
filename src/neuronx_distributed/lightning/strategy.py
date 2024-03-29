@@ -1,5 +1,5 @@
 import os
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, Optional, Union
 
 import torch
 from lightning_fabric.plugins.environments import (
@@ -7,10 +7,8 @@ from lightning_fabric.plugins.environments import (
     XLAEnvironment,
 )
 from lightning_fabric.utilities.types import _PATH, ReduceOp
-from pytorch_lightning.core.optimizer import LightningOptimizer
 from pytorch_lightning.strategies import XLAStrategy
 from torch import Tensor
-from torch.optim import Optimizer
 
 from neuronx_distributed.parallel_layers.parallel_state import (
     get_data_parallel_rank,
@@ -21,9 +19,9 @@ from neuronx_distributed.parallel_layers.parallel_state import (
     model_parallel_is_initialized,
 )
 
+from .accelerator import NeuronXLAAccelerator
 from .checkpoint_io import NeuronCheckpointIO
 from .launcher import _NeuronXLALauncher
-from .accelerator import NeuronXLAAccelerator
 
 
 class NeuronXLAStrategy(XLAStrategy):
@@ -87,7 +85,8 @@ class NeuronXLAStrategy(XLAStrategy):
             import torch_xla.core.xla_model as xm
 
             global_rank = xm.get_ordinal()
-        if os.environ.get("PJRT_DEVICE", None) == "NEURON":
+        if (torch.__version__.startswith('2.0')):
+            pass
             import torch_xla.experimental.pjrt_backend
 
             dist.init_process_group("xla", init_method="pjrt://", rank=global_rank)
@@ -119,6 +118,30 @@ class NeuronXLAStrategy(XLAStrategy):
         # PTL will call model_to_device during setup
         pass
 
+    def batch_to_device(self, batch: Any, device: Optional[torch.device] = None, dataloader_idx: int = 0) -> Any:
+        """Moves the batch to the correct device.
+
+        The returned batch is of the same type as the input batch, just
+        having all tensors on the correct device.
+
+        Args:
+            batch: The batch of samples to move to the correct device
+            device: The target device
+            dataloader_idx: The index of the dataloader to which the batch belongs.
+
+        """
+
+        model = self.lightning_module
+        device = device or self.root_device
+
+        # For PP we're not moving to cpu
+        if self.pipeline_parallel_size > 1:
+            device = torch.device("cpu")
+
+        if model is not None:
+            return model._apply_batch_transfer_handler(batch, device=device, dataloader_idx=dataloader_idx)
+        return move_data_to_device(batch, device)
+
     def reduce(
         self, output: Union[Tensor, Any], group: Optional[Any] = None, reduce_op: Optional[Union[ReduceOp, str]] = None
     ) -> Tensor:
@@ -135,6 +158,7 @@ class NeuronXLAStrategy(XLAStrategy):
 
         # Replace xm.mesh_reduce since it will cause error in PT2.x
         import torch_xla.core.xla_model as xm
+
         xm.mark_step()
 
         torch.distributed.all_reduce(output, op=torch.distributed.ReduceOp.SUM)

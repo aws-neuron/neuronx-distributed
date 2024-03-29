@@ -40,6 +40,10 @@ def checkpoint_wrapper(
             # PTXLA2.1: XLA currently does not support use_reentrant==False
             use_reentrant=True
         )
+        # We have to explicitly set the impl to REENTRANT for >=2.1 because
+        # the torch=2.1 first parses the implementation value before even checking 
+        # the checkpoint_fn
+        checkpoint_impl = CheckpointImpl.REENTRANT
     return NxDCheckpointWrapper(
         module,
         checkpoint_impl,

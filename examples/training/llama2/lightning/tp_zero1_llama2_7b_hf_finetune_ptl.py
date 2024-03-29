@@ -1,6 +1,6 @@
 # coding=utf-8
 # Copyright (c) 2019 NVIDIA CORPORATION. All rights reserved.
-# Copyright 2018 The Google AI Language Team Authors and The HugginFace Inc. team.
+# Copyright 2018 The Google AI Language Team Authors and The HuggingFace Inc. team.
 # Modifications Copyright 2021 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,43 +16,38 @@
 # limitations under the License.
 
 import argparse
-import inspect
 import json
 import os
-import queue
 import sys
-import time
+
+import numpy as np
+
+current = os.path.dirname(os.path.realpath(__file__))
+parent = os.path.dirname(current)
+sys.path.append(parent)
 
 import torch
-import torch.distributed as dist
 import torch_xla.core.xla_model as xm
-import torch_xla.distributed.parallel_loader as pl
-import torch_xla.distributed.xla_multiprocessing as xmp
+from data_module import NeuronLightningDataModule
 from modeling_llama_nxd import CoreAttention, LlamaForCausalLM
-from neuronx_distributed.utils.adamw_fp32_optim_params import AdamW_FP32OptimParams
-from transformers import AdamW, LlamaConfig, set_seed
-from transformers.optimization import get_linear_schedule_with_warmup
-
+from module_llama import NeuronLlamaLTModule
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint
+from torchmetrics.text.rouge import ROUGEScore
+from training_utils import create_instruction_based_dataset
+from transformers import AdamW, LlamaConfig, LlamaTokenizer, set_seed
+from transformers.optimization import get_linear_schedule_with_warmup
 
 import neuronx_distributed as nxd
-from neuronx_distributed.parallel_layers import checkpointing, parallel_state
-from neuronx_distributed.parallel_layers.utils import is_pjrt_device
-
 from neuronx_distributed.lightning import (
-    NeuronXLAStrategy,
-    NeuronXLAPrecisionPlugin,
     NeuronTensorBoardLogger,
     NeuronTQDMProgressBar,
+    NeuronXLAPrecisionPlugin,
+    NeuronXLAStrategy,
 )
+from neuronx_distributed.parallel_layers import parallel_state
+from neuronx_distributed.utils.adamw_fp32_optim_params import AdamW_FP32OptimParams
 
-from module_llama import NeuronLlamaLTModule
-from data_module import NeuronLightningDataModule
-
-from training_utils import (
-    create_llama_pretraining_dataset,
-)
 # For PT autocast.
 torch.cuda.is_bf16_supported = lambda: True
 
@@ -68,7 +63,6 @@ def train_llama(flags):
     print(f"Namespace: {flags}")
     set_seed(flags.seed)
 
-
     nxd_config = nxd.neuronx_distributed_config(
         tensor_parallel_size=flags.tensor_parallel_size,
         optimizer_config={"zero_one_enabled": flags.use_zero_1, "grad_clipping": True, "max_grad_norm": 1.0},
@@ -77,7 +71,9 @@ def train_llama(flags):
     )
 
     model_config = LlamaConfig.from_pretrained(flags.model_path)
+    model_config.pretrained_ckpt = flags.pretrained_ckpt
     model_config.use_cache = False
+    model_config.separate_qkv = flags.separate_qkv
     model_config.kv_shared_group_size = args.kv_replicator
     model_config.qkv_linear = args.qkv_linear
     model_config.max_position_embeddings = max(model_config.max_position_embeddings, flags.seq_len)
@@ -94,7 +90,7 @@ def train_llama(flags):
     else:
         optimizer_cls = AdamW
 
-    def configure_scheduler(optimizer, warmup_steps, max_steps): # PTLTODO: check loading scheduler state dict here
+    def configure_scheduler(optimizer, warmup_steps, max_steps):  # PTLTODO: check loading scheduler state dict here
         return get_linear_schedule_with_warmup(
             optimizer,
             num_warmup_steps=warmup_steps,
@@ -102,31 +98,35 @@ def train_llama(flags):
             last_epoch=-1,
         )
 
+    BASE_MODEL = "NousResearch/Llama-2-7b-hf"
+    tokenizer = LlamaTokenizer.from_pretrained(BASE_MODEL)
 
     model = NeuronLlamaLTModule(
-        model_fn = LlamaForCausalLM,
-        nxd_config = nxd_config,
-        model_args = (model_config,),
-        opt_cls = optimizer_cls,
-        scheduler_cls = configure_scheduler,
-        opt_kwargs = {
+        tokenizer=tokenizer,
+        model_fn=LlamaForCausalLM,
+        nxd_config=nxd_config,
+        model_args=(model_config,),
+        opt_cls=optimizer_cls,
+        scheduler_cls=configure_scheduler,
+        opt_kwargs={
             "lr": flags.lr,
         },
-        scheduler_args = (flags.warmup_steps, flags.max_steps),
-        grad_accum_steps = flags.grad_accum_usteps,
-        manual_opt = True, 
+        scheduler_args=(flags.warmup_steps, flags.max_steps),
+        grad_accum_steps=flags.grad_accum_usteps,
+        manual_opt=True,
     )
 
     dm = NeuronLightningDataModule(
-        create_llama_pretraining_dataset,
+        create_instruction_based_dataset,
         flags.data_dir,
         flags.batch_size,
-        data_args = (flags.seed,),
+        data_args=(flags.seed,),
+        data_kwargs={"tokenizer": tokenizer, "task": flags.task},
     )
 
     strategy = NeuronXLAStrategy(
-        nxd_config = nxd_config,
-        save_load_xser = flags.save_load_xser,
+        nxd_config=nxd_config,
+        save_load_xser=flags.save_load_xser,
     )
 
     plugins = []
@@ -138,22 +138,23 @@ def train_llama(flags):
     if flags.save_checkpoint:
         callbacks.append(
             ModelCheckpoint(
-                save_top_k = flags.num_kept_checkpoint,
+                save_top_k=flags.num_kept_checkpoint,
                 monitor="global_step",
                 mode="max",
-                every_n_train_steps = flags.checkpoint_freq,
-                dirpath = flags.checkpoint_dir,
+                every_n_train_steps=flags.checkpoint_freq,
+                dirpath=flags.checkpoint_dir,
             )
         )
-    
+
     trainer = Trainer(
-        strategy = strategy, 
-        max_steps = flags.steps_this_run,
-        plugins = plugins,
-        enable_checkpointing = flags.save_checkpoint,
-        logger = NeuronTensorBoardLogger(save_dir=flags.log_dir),
-        log_every_n_steps = 1,
-        callbacks = callbacks,
+        strategy=strategy,
+        max_steps=flags.steps_this_run,
+        max_epochs=flags.num_train_epochs,
+        plugins=plugins,
+        enable_checkpointing=flags.save_checkpoint,
+        logger=NeuronTensorBoardLogger(save_dir=flags.log_dir),
+        log_every_n_steps=1,
+        callbacks=callbacks,
     )
     if flags.resume_ckpt:
         ckpt_path = os.path.join(
@@ -165,7 +166,65 @@ def train_llama(flags):
     else:
         trainer.fit(model=model, datamodule=dm)
 
-    print(f"Training finished!")
+    xm.master_print(f"Training finished!")
+
+    if flags.do_eval and not os.environ.get("NEURON_EXTRACT_GRAPHS_ONLY", None):
+        evaluate(model, tokenizer, dm.test_dataloader(), args.golden_rouge_score_path)
+        xm.master_print("Evaluation Finished!")
+
+
+def evaluate(model, tokenizer, test_loader, golden_rouge_score_path):
+    # Need to run 
+    # python3 -c "import nltk; nltk.download('punkt')" 
+    # before this run
+    rouge = ROUGEScore(compute_on_cpu=True, sync_on_compute=False)
+    model.eval()
+    with torch.no_grad():
+        for step, batch in enumerate(test_loader):
+            input_ids = batch["input_ids"]
+            labels = batch["labels"]
+            input_length = input_ids.shape[-1]
+            output_sequences = model.generate(
+                input_ids=input_ids,
+                max_new_tokens=128,
+                do_sample=True,
+                temperature=0.9,
+                top_k=50,
+                top_p=0.9,
+                num_beams=4,
+            )
+            prompt = tokenizer.decode(input_ids[0], clean_up_tokenization_spaces=True)
+            predicted_text = tokenizer.decode(
+                output_sequences[0][input_length:].cpu(), clean_up_tokenization_spaces=True
+            )
+            label_text = tokenizer.decode(labels[0].cpu(), clean_up_tokenization_spaces=True)
+            rouge.update(predicted_text, label_text)
+            if parallel_state.get_tensor_model_parallel_rank() == 0:
+                print(f"=== PROMPT ===")
+                print(prompt)
+                print("=== GENERATED SEQUENCE ===")
+                print(predicted_text)
+                print("=== LABEL ===")
+                print(f"{label_text}\n")
+
+    rouge_scores = rouge.compute()
+    aggregated_rouge_scores = {}
+    for key, value in rouge_scores.items():
+        aggregated_val = xm.mesh_reduce(key, value.item(), np.mean)
+        aggregated_rouge_scores[key] = aggregated_val
+    xm.master_print("=== Evaluation Rouge Scores ===")
+    xm.master_print(aggregated_rouge_scores)
+    if golden_rouge_score_path is not None and xm.is_master_ordinal(local=False):
+        tol = 1.0
+        xm.master_print(
+            f"Comparing eval rouge scores to golden file {golden_rouge_score_path} with abs tolerance {tol}."
+        )
+        with open(golden_rouge_score_path, "r") as f:
+            golden_rouge_scores = json.load(f)
+        for rouge_key in golden_rouge_scores.keys():
+            assert rouge_key in aggregated_rouge_scores
+            assert abs(golden_rouge_scores[rouge_key] - aggregated_rouge_scores[rouge_key]) <= tol
+        xm.master_print("Evaluation rouge scores matched goldens!")
 
 
 def _mp_fn(index, flags):
@@ -183,7 +242,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--data_dir",
         type=str,
-        help="Pre-tokenized dataset directory.",
+        help="Dataset name or directory.",
+    )
+    parser.add_argument(
+        "--task",
+        type=str,
+        default=None,
+        help="The downstream task type that the model is fine-tuned with.",
     )
     parser.add_argument(
         "--output_dir",
@@ -196,6 +261,11 @@ if __name__ == "__main__":
         "--max_steps",
         type=int,
         help="Maximum total accumulation-steps to run.",
+    )
+    parser.add_argument(
+        "--num_train_epochs",
+        type=int,
+        help="Maximum numer of epochs to run.",
     )
     parser.add_argument(
         "--steps_this_run",
@@ -223,9 +293,20 @@ if __name__ == "__main__":
     )
     parser.add_argument("--load_step", type=int, default=0, help="step to load checkpoint from")
     parser.add_argument("--load_epoch", type=int, default=0, help="epoch to load checkpoint from")
-    parser.add_argument("--log_dir", type=str, default=os.getcwd()+"/llama7B-logs", help="Directory for log files")
+    parser.add_argument(
+        "--pretrained_ckpt",
+        type=str,
+        default=os.getcwd() + "/llama7B-pretrained",
+        help="Directory for pretrained weights",
+    )
+    parser.add_argument("--log_dir", type=str, default=os.getcwd() + "/llama7B-logs", help="Directory for log files")
     parser.add_argument("--save_checkpoint", action="store_true", help="Save checkpoints")
-    parser.add_argument("--num_kept_checkpoint", type=int, default=10000, help="number of checkpoints kept, old checkpoint will get deleted")
+    parser.add_argument(
+        "--num_kept_checkpoint",
+        type=int,
+        default=10000,
+        help="number of checkpoints kept, old checkpoint will get deleted",
+    )
     parser.add_argument("--checkpoint_freq", type=int, default=100000, help="save checkpoint freq")
     parser.add_argument("--checkpoint_dir", type=str, default=None)
     parser.add_argument("--resume_ckpt", action="store_true", help="Resume from checkpoint at resume_step.")
@@ -254,9 +335,9 @@ if __name__ == "__main__":
         help="Enable selective checkpoint",
     )
     parser.add_argument(
-        "--qkv_linear", 
-        default=0, 
-        type=int, 
+        "--qkv_linear",
+        default=0,
+        type=int,
         help="Use QKV Linear module",
     )
     parser.add_argument(
@@ -265,7 +346,16 @@ if __name__ == "__main__":
         type=int,
         help="KV replication number",
     )
-
+    parser.add_argument(
+        "--separate_qkv",
+        default=False,
+        action="store_true",
+        help="Use separate q,k,v proj weight tensors when saving/loading Llama model.",
+    )
+    parser.add_argument("--do_eval", action="store_true", help="Do evaluation after fine-tuning.")
+    parser.add_argument(
+        "--golden_rouge_score_path", default=None, type=str, help="Path to golden eval rouge score file."
+    )
 
     args = parser.parse_args(sys.argv[1:])
 
@@ -279,5 +369,5 @@ if __name__ == "__main__":
         os.environ["XLA_USE_BF16"] = "1"
 
     # WORLD_SIZE is set by torchrun
-  
+
     _mp_fn(0, args)

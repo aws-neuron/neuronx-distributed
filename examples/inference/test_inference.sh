@@ -7,8 +7,9 @@ MAX_NEW_TOKENS=384
 BATCH_SIZE=2
 TP_DEGREE=32
 
-STORE_PATH="/home/ubuntu/model_hf/llama-2-7b/"
-TRACED_PATH="/home/ubuntu/traced_model/llama2_7b/"
+# The directory separator (/) at the end is needed
+STORE_PATH="$HOME/model_hf/llama-2-7b/"
+TRACED_PATH="$HOME/traced_model/llama2_7b/"
 
 if [ "$1" = "trace" ]
 then
@@ -61,6 +62,8 @@ elif [ "$1" = "benchmark" ]
 then
   python runner.py  benchmark-sampling \
                             --model LlamaForCausalLM \
+                            --model_path $STORE_PATH \
+                            --tokenizer_path $STORE_PATH \
                             --traced_model_path $TRACED_PATH \
                             2>&1 | tee stdout.log
 

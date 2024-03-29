@@ -17,17 +17,16 @@
 # AdamW adapted from HuggingFace, with high-precision optimizer states for BF16/FP32 training.
 # source: https://github.com/huggingface/transformers/blob/main/src/transformers/optimization.py#L358
 
-import os
 import math
+import os
 import warnings
-from functools import partial
-from typing import Callable, Iterable, Optional, Tuple, Union
+from typing import Callable, Iterable, Tuple
 
 import torch
 from torch import nn
 from torch.optim import Optimizer
-from transformers.utils import logging
 from transformers.utils.versions import require_version
+
 
 class AdamW_FP32OptimParams(Optimizer):
     """
@@ -60,6 +59,7 @@ class AdamW_FP32OptimParams(Optimizer):
         correct_bias: bool = True,
         no_deprecation_warning: bool = True,
         differentiable: bool = False,
+        capturable: bool = False,
     ):
         if not no_deprecation_warning:
             warnings.warn(
@@ -77,8 +77,15 @@ class AdamW_FP32OptimParams(Optimizer):
             raise ValueError(f"Invalid beta parameter: {betas[1]} - should be in [0.0, 1.0)")
         if not 0.0 <= eps:
             raise ValueError(f"Invalid epsilon value: {eps} - should be >= 0.0")
-        defaults = {"lr": lr, "betas": betas, "eps": eps, "weight_decay": weight_decay, "correct_bias": correct_bias}
-        self.upcast_optim_states = os.environ.get('XLA_DOWNCAST_BF16', '0') == '1'
+        defaults = {
+            "lr": lr,
+            "betas": betas,
+            "eps": eps,
+            "weight_decay": weight_decay,
+            "correct_bias": correct_bias,
+            "capturable": capturable,
+        }
+        self.upcast_optim_states = os.environ.get("XLA_DOWNCAST_BF16", "0") == "1"
         super().__init__(params, defaults)
 
     def step(self, closure: Callable = None):

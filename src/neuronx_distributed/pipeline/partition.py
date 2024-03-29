@@ -248,3 +248,27 @@ def analyze_shared_weights_across_stages(top_module, partitions):
         if len(weights) > 1:
             shared_weights.append(weights)
     return shared_weights
+
+
+def create_partitions(pipeline_parallel_size, model_layer_names):
+    """
+    Evenly split the transformer layers between the PP ranks.
+    If the transformer layers are not evenly divisible by the PP ranks, we distribute the remaining layers to the
+    latter pipeline ranks.
+    """
+    num_hidden_layers = len(model_layer_names)
+    num_layer_per_partition = num_hidden_layers // pipeline_parallel_size
+    layers_per_partition = [num_layer_per_partition for x in range(pipeline_parallel_size)]
+    remainder = num_hidden_layers % pipeline_parallel_size
+    if remainder > 0:
+        for i in range(-remainder, 0):
+            layers_per_partition[i] += 1
+    assert sum(layers_per_partition) == num_hidden_layers
+
+    pipeline_cuts = []
+    current_cut = 0
+    for layers in layers_per_partition[:-1]:
+        current_cut += layers
+        pipeline_cuts.append(model_layer_names[current_cut - 1])
+    assert len(pipeline_cuts) == (pipeline_parallel_size - 1)
+    return pipeline_cuts

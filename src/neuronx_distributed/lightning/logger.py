@@ -3,7 +3,6 @@ from typing import Any, Callable, Mapping, Optional
 
 from lightning_fabric.utilities.cloud_io import _is_dir
 from lightning_fabric.utilities.logger import _add_prefix
-from lightning_fabric.utilities.types import _PATH
 from pytorch_lightning.core.saving import save_hparams_to_yaml
 from pytorch_lightning.loggers.tensorboard import TensorBoardLogger
 from torch import Tensor
@@ -19,9 +18,10 @@ from neuronx_distributed.parallel_layers.parallel_state import (
 
 
 class NeuronTensorBoardLogger(TensorBoardLogger):
-    def __init__(self, **kwargs):
+    def __init__(self, log_rank0: bool = False, **kwargs):
         super().__init__(**kwargs)
         self._print_step = -1
+        self.log_rank0 = log_rank0
 
     @property
     def print_step(self):
@@ -128,10 +128,11 @@ class NeuronTensorBoardLogger(TensorBoardLogger):
     def should_print(self):
         # For NxD we should log on the last PP
         assert model_parallel_is_initialized(), f"NxD model parallel not initialized"
+        print_pp_rank = 0 if self.log_rank0 else get_pipeline_model_parallel_size() - 1
         return (
             get_data_parallel_rank() == 0
             and get_tensor_model_parallel_rank() == 0
-            and get_pipeline_model_parallel_rank() == get_pipeline_model_parallel_size() - 1
+            and get_pipeline_model_parallel_rank() == print_pp_rank
             and self.print_step >= 0
         )
 
