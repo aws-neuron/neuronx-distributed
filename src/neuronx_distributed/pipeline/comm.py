@@ -63,6 +63,9 @@ def recv_from(tensor_meta, recv_prev=True, tracing=False):
         groups = parallel_state.get_next_rank_group(as_list=True)
     logger.debug(rmsg(f"recv with groups {groups}"))
     tensor_recv_next = xm.all_reduce(xm.REDUCE_SUM, tensor_recv_next, groups=groups)
+    # PT XLA >= 2.1 requires_grad attr is not preserved after CC comm
+    # TODO: check with XLA team
+    tensor_recv_next.requires_grad_(tensor_meta.requires_grad)
     if not tracing:
         xm.mark_step()
     return tensor_recv_next

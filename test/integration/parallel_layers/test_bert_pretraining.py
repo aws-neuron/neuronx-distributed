@@ -1,6 +1,6 @@
 # coding=utf-8
 # Copyright (c) 2019 NVIDIA CORPORATION. All rights reserved.
-# Copyright 2018 The Google AI Language Team Authors and The HugginFace Inc. team.
+# Copyright 2018 The Google AI Language Team Authors and The HuggingFace Inc. team.
 # Modifications Copyright 2021 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -69,6 +69,7 @@ from neuronx_distributed.parallel_layers import (
     parallel_state,
 )
 from neuronx_distributed.parallel_layers.utils import is_pjrt_device
+from neuronx_distributed.parallel_layers.utils import requires_init_pg_override
 from neuronx_distributed.utils.model_utils import move_model_to_device
 
 os.environ["NEURON_CC_FLAGS"] = os.environ.get("NEURON_CC_FLAGS", "") + " --model-type=transformer"
@@ -870,7 +871,7 @@ if __name__ == "__main__":
 
     # WORLD_SIZE is set by torchrun
     if os.environ.get("WORLD_SIZE"):
-        if is_pjrt_device():
+        if requires_init_pg_override():
             import torch_xla.experimental.pjrt_backend  # noqa
 
             torch.distributed.init_process_group("xla", init_method="pjrt://")

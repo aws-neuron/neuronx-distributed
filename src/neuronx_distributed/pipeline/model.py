@@ -22,6 +22,7 @@ from neuronx_distributed.pipeline.comm import (
 from neuronx_distributed.pipeline.partition import (
     analyze_pipeline_module,
     analyze_shared_weights_across_stages,
+    create_partitions,
     partition_traced_model,
 )
 from neuronx_distributed.pipeline.scheduler import InferenceSchedule, TrainSchedule
@@ -63,6 +64,7 @@ class NxDPPModel(nn.Module):
         param_init_fn: Optional[Any] = None,
         trace_file_path: Optional[str] = None,
         return_loss_on_cpu: Optional[bool] = True,
+        auto_partition: Optional[bool] = False,
         _use_gloo_for_metadata_comm: bool = False,
         _debug_mode: bool = False,
         _debug_pp_size: int = 8,
@@ -140,6 +142,8 @@ class NxDPPModel(nn.Module):
             trace_file_path:
                 The file location to save the timeline file. Setting to None will not create timeline
 
+            auto_partition:
+                Boolean to indicate whether to use auto_partition. If auto_partition is True, pipeline_cuts should not be provided by the user as they will be selected during initialization.
 
         Usage:
             User can feed the partition config into the NxDPPModel, then tracing and partition will
@@ -211,7 +215,22 @@ class NxDPPModel(nn.Module):
             self._set_distributed()
             # timeline needs to be created after init dist
             self.timeline = PPTimeline(trace_file_path, self.pipeline_parallel_rank)
-        # If user set up the pipeline cuts in config, directly run tracing and partition
+        if auto_partition and pipeline_cuts is not None and len(pipeline_cuts) > 0:
+            raise RuntimeError(
+                "auto_partition is True and pipeline_cuts are provided. If auto_partition is set to True, pipeline_cuts must not be set as the cuts will automatically be computed. If pipeline cuts are provided then auto_partition should be False."
+            )
+        elif auto_partition and self.pipeline_parallel_size > 1:
+            # Auto partition the model layers
+            model_layers = self.get_model_layers(self.original_torch_module, self.transformer_layer_cls)
+            if len(model_layers) == 0:
+                raise ValueError(f"No modules of type {self.transformer_layer_cls} found in the model.")
+            if torch.distributed.get_rank() == 0:
+                logger.info("Model transformer layers are: \n{}".format(model_layers))
+            pipeline_cuts = create_partitions(self.pipeline_parallel_size, model_layers)
+            if torch.distributed.get_rank() == 0:
+                logger.info("Pipeline cuts are: \n{}".format(pipeline_cuts))
+
+        # If pipeline cuts are set, directly run tracing and partition
         if pipeline_cuts is not None and len(pipeline_cuts) > 0:
             self.trace(
                 input_names=input_names,
@@ -634,6 +653,18 @@ class NxDPPModel(nn.Module):
             self.model_inputs_iter = iter(self.get_batch_iterator(inputs_))
             self.input_name_to_iter_idx = input_name_to_iter_idx
 
+    def _handle_stage_outputs(self, outputs, stage):
+        # If there is only a single output from graph
+        # make output a list so the indexing will be right
+        if self.stage_id_to_output_count[stage] == 1:
+            outputs = [outputs]
+        else:
+            if len(outputs) != self.stage_id_to_output_count[stage]:
+                raise RuntimeError(
+                    f"Stage {stage} number outputs ({len(outputs)}) mismatches with compiled result ({self.stage_id_to_output_count[stage]})"  # noqa: E501
+                )
+        return outputs
+
     def _fwd_step_task(self):
         """
         Major duties of for this task:
@@ -680,6 +711,7 @@ class NxDPPModel(nn.Module):
                 )
             self.losses.append(current_mb_loss)
         else:
+            outputs = self._handle_stage_outputs(outputs, self.pipeline_parallel_rank)
             self.current_mb_stage_output = (outputs, self.current_mb)
             if self.training and not self.tracing:
                 # Need to collect the mb_to_outputs_for_grads here since _fwd_postprocess_task sometimes run after _bwd_preprocess_task   # noqa: E501
@@ -834,15 +866,6 @@ class NxDPPModel(nn.Module):
         outputs = self.current_mb_stage_output[0]
         self.current_mb_stage_output = None
 
-        # If there is only a single output
-        if self.stage_id_to_output_count[self.pipeline_parallel_rank] == 1:
-            outputs = [outputs]
-        else:
-            if len(outputs) != self.stage_id_to_output_count[self.pipeline_parallel_rank]:
-                raise RuntimeError(
-                    f"Stage {self.pipeline_parallel_rank} number outputs ({len(outputs)}) mismatches with compiled result ({self.stage_id_to_output_count[self.pipeline_parallel_rank]})"  # noqa: E501
-                )
-
         current_stage_output_IO = self.stage_id_to_IO_input_names[self.pipeline_parallel_rank + 1]
         for name, out in current_stage_output_IO.items():
             self.timeline.mark_event_start(f"mb_{self.current_mb}_ForwardSend_{name}")
@@ -875,6 +898,7 @@ class NxDPPModel(nn.Module):
         """
         self.timeline.mark_event_start(f"mb_{self.current_mb}_BackwardPreprocessTask")
         # Last stage do not need to recv
+        # (fewu) Will we ever reach here?
         if self.pipeline_parallel_rank == self.pipeline_parallel_size - 1:
             return None, None
 
@@ -977,6 +1001,17 @@ class NxDPPModel(nn.Module):
                 self._exec_instr = MethodType(self._INSTRUCTION_MAP[type(task)], self)
                 self._exec_instr()
                 logger.debug(rmsg(f"Task {task} finished"))
+
+    def get_model_layers(self, module, target_module_type, current_path=None):
+        current_path = current_path or []
+        result = []
+        for name, child_module in module.named_children():
+            if isinstance(child_module, target_module_type):
+                result.append(".".join(current_path + [name]))
+            else:
+                result.extend(self.get_model_layers(child_module, target_module_type, current_path + [name]))
+
+        return result
 
     def forward(self, *args, **kwargs):
         """Disabled for pipeline parallel training."""

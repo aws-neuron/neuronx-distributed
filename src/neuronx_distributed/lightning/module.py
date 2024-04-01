@@ -1,5 +1,5 @@
 import numbers
-from typing import IO, Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Optional, Tuple, Union
 
 import torch
 import torch_xla.core.xla_model as xm
@@ -12,9 +12,8 @@ from pytorch_lightning.utilities.exceptions import MisconfigurationException
 from pytorch_lightning.utilities.signature_utils import is_param_in_hook_signature
 from pytorch_lightning.utilities.types import _METRIC
 from torch import Tensor
-from torchmetrics import Metric, MetricCollection
+from torchmetrics import Metric
 
-from neuronx_distributed.parallel_layers.grads import get_grad_norm
 from neuronx_distributed.trainer import (
     initialize_parallel_model,
     initialize_parallel_optimizer,
@@ -24,7 +23,6 @@ from neuronx_distributed.trainer import (
 class NeuronLTModule(LightningModule):
     def __init__(
         self,
-        model_fn: Callable,
         nxd_config: Dict,
         opt_cls: Callable,
         scheduler_cls: Callable,
@@ -34,7 +32,11 @@ class NeuronLTModule(LightningModule):
         opt_kwargs: Dict = {},
         scheduler_args: Tuple = (),
         scheduler_kwargs: Dict = {},
+        model_fn: Callable = None,
         grad_accum_steps: int = 1,
+        train_batch_size: int = 16,
+        logging_interval: int = 1,
+        log_rank0: bool = False,
         manual_opt: bool = True,
     ):
         super().__init__()
@@ -49,6 +51,9 @@ class NeuronLTModule(LightningModule):
         self.scheduler_args = scheduler_args
         self.scheduler_kwargs = scheduler_kwargs
         self.grad_accum_steps = grad_accum_steps
+        self.train_batch_size = train_batch_size
+        self.logging_interval = logging_interval
+        self.log_rank0 = log_rank0
 
         self.automatic_optimization = not manual_opt
 
@@ -101,6 +106,7 @@ class NeuronLTModule(LightningModule):
             **self.model_kwargs,
         )
         self.averaged_loss = torch.zeros(1, dtype=torch.double).to(xm.xla_device())
+        self.print_pp_rank = 0 if self.log_rank0 else self.trainer.strategy.pipeline_parallel_size - 1
 
     def state_dict(self):
         return self.model.state_dict()
@@ -110,7 +116,11 @@ class NeuronLTModule(LightningModule):
 
     def get_param_groups_by_weight_decay(self):
         """Get param groups. Customers can override this to have their own way of weight_decay"""
-        param_optimizer = list(self.model.named_parameters())
+        if hasattr(self.model, "local_named_parameters"):
+            # Zero1 use the first param in opt to decide the device
+            param_optimizer = list(self.model.local_named_parameters())
+        else:
+            param_optimizer = list(self.model.named_parameters())
         no_decay = ["bias", "LayerNorm"]  # gamma/beta are in LayerNorm.weight
 
         optimizer_grouped_parameters = [

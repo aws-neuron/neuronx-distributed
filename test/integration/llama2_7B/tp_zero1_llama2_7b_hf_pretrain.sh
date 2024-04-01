@@ -90,7 +90,7 @@ if [ $NEURON_EXTRACT_GRAPHS_ONLY -gt 0 ]; then
     STEPS_THIS_RUN=2
     OUTPUT_LOG=log_compile-$NODE_ID.log
 else
-    STEPS_THIS_RUN=50
+    STEPS_THIS_RUN=150
     OUTPUT_LOG=log_exe-$NODE_ID.log
 fi
 
@@ -145,8 +145,8 @@ else
 
   if [ -z "$NEURON_EXTRACT_GRAPHS_ONLY" ]; then
       echo "success=$success"
-      echo "update json with /home/ubuntu/ktest/dump_to_s3_update_test_json.sh"
-      dump_to_s3_update_json_scr=/home/ubuntu/ktest/dump_to_s3_update_test_json.sh
+      echo "update json with $HOME/ktest/dump_to_s3_update_test_json.sh"
+      dump_to_s3_update_json_scr=$HOME/ktest/dump_to_s3_update_test_json.sh
       if [ -e $dump_to_s3_update_json_scr ]; then
           $dump_to_s3_update_json_scr $@ --key=inference_success --value=$success || echo "Unable to update test result JSON."
       else

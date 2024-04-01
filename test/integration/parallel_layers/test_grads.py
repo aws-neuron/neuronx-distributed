@@ -13,7 +13,7 @@ from commons import print_separator, set_random_seed
 from neuronx_distributed.optimizer import NeuronZero1Optimizer
 from neuronx_distributed.parallel_layers.grads import get_grad_norm
 from neuronx_distributed.parallel_layers import layers, parallel_state
-from neuronx_distributed.parallel_layers.utils import is_pjrt_device
+from neuronx_distributed.parallel_layers.utils import requires_init_pg_override
 from neuronx_distributed.utils.model_utils import move_model_to_device
 
 datetime_str = str(datetime.now())
@@ -158,7 +158,7 @@ def on_exit():
 
 
 if __name__ == "__main__":
-    if is_pjrt_device():
+    if requires_init_pg_override():
         import torch_xla.experimental.pjrt_backend  # noqa
 
         torch.distributed.init_process_group("xla", init_method="pjrt://")

@@ -2,38 +2,42 @@ from abc import ABC, abstractmethod
 
 
 class PipelineTask:
-    def __init__(self, mb):
+    def __init__(self, mb, model_chunk=0):
         self.mb = mb
+        self.model_chunk = model_chunk
+
+    def __eq__(self, other) -> bool:
+        return type(self) == type(other) and self.mb == other.mb and self.model_chunk == other.model_chunk
 
 
 class ForwardStepTask(PipelineTask):
     def __repr__(self):
-        return f"ForwardStepTask_microbatch_{self.mb}"
+        return f"ForwardStepTask_microbatch_{self.mb}_modelchunk_{self.model_chunk}"
 
 
 class ForwardPreprocessTask(PipelineTask):
     def __repr__(self):
-        return f"ForwardPreprocessTask_microbatch_{self.mb}"
+        return f"ForwardPreprocessTask_microbatch_{self.mb}_modelchunk_{self.model_chunk}"
 
 
 class ForwardPostprocessTask(PipelineTask):
     def __repr__(self):
-        return f"ForwardPostprocessTask_microbatch_{self.mb}"
+        return f"ForwardPostprocessTask_microbatch_{self.mb}_modelchunk_{self.model_chunk}"
 
 
 class BackwardStepTask(PipelineTask):
     def __repr__(self):
-        return f"BackwardStepTask_microbatch_{self.mb}"
+        return f"BackwardStepTask_microbatch_{self.mb}_modelchunk_{self.model_chunk}"
 
 
 class BackwardPreprocessTask(PipelineTask):
     def __repr__(self):
-        return f"BackwardPreprocessTask_microbatch_{self.mb}"
+        return f"BackwardPreprocessTask_microbatch_{self.mb}_modelchunk_{self.model_chunk}"
 
 
 class BackwardPostprocessTask(PipelineTask):
     def __repr__(self):
-        return f"BackwardPostprocessTask_microbatch_{self.mb}"
+        return f"BackwardPostprocessTask_microbatch_{self.mb}_modelchunk_{self.model_chunk}"
 
 
 class PostProcessTask:
@@ -48,6 +52,9 @@ class ReduceGradsTask(PostProcessTask):
     def __repr__(self):
         return f"ReduceGradsTask"
 
+    def __eq__(self, other) -> bool:
+        return type(self) == type(other)
+
 
 class PipeSchedule(ABC):
     """Directs the execution of a pipeline engine by generating sequences of
@@ -60,14 +67,14 @@ class PipeSchedule(ABC):
     deadlock.
 
     Args:
-        micro_batches (int): The number of micro-batches that comprise a batch.
+        num_microbatches (int): The number of micro-batches that comprise a batch.
         stages (int): The number of pipeline stages.
         stage_id (int): The pipe stage that will execute the generated schedule.
     """
 
-    def __init__(self, micro_batches, stages, stage_id):
+    def __init__(self, num_microbatches, stages, stage_id):
         super().__init__()
-        self.micro_batches = micro_batches
+        self.num_microbatches = num_microbatches
         self.stages = stages
         self.stage_id = stage_id
         self.prev_stage = self.stage_id - 1
@@ -85,7 +92,7 @@ class PipeSchedule(ABC):
         """
 
     def _valid_micro_batch(self, micro_batch_id):
-        return 0 <= micro_batch_id < self.micro_batches
+        return 0 <= micro_batch_id < self.num_microbatches
 
     def _valid_stage(self, stage_id):
         return 0 <= stage_id < self.stages
@@ -99,11 +106,6 @@ class PipeSchedule(ABC):
     def num_stages(self):
         """The number of total pipeline stages used to configure this schedule."""
         return self.stages
-
-    @property
-    def num_micro_batches(self):
-        """The number of total micro_batches used to configure this schedule."""
-        return self.micro_batches
 
     @property
     def is_first_stage(self):
@@ -129,7 +131,7 @@ class InferenceSchedule(PipeSchedule):
     """A schedule for inferencing batches using pipeline parallelism."""
 
     def steps(self):
-        total_steps = self.micro_batches
+        total_steps = self.num_microbatches
         for micro_batch_id in range(total_steps):
             cmds = []
             cmds.append(ForwardPreprocessTask(micro_batch_id))
@@ -138,6 +140,339 @@ class InferenceSchedule(PipeSchedule):
             yield cmds
 
 
+class Train1F1BSchedule(PipeSchedule):
+    """
+    Refactor the TrainSchedule to be microbatch based schedule,
+    which will be more aligned with the interleaved scheduler
+
+    1F1B non-interleaved scheduler, below is an example with PP4 and 6 microbatches
+          |-Warmup-|             |-------steady--------|      |--remaining--|     # noqa
+    PP0   F0  F1  F2              F3  B0  F4  B1  F5  B2      B3     B4    B5
+    PP1       F0  F1          F2  B0  F3  B1  F4  B2  F5  B3      B4    B5
+    PP2           F0      F1  B0  F2  B1  F3  B2  F4  B3  F5  B4     B5
+    PP3               F0  B0  F1  B1  F2  B2  F3  B3  F4  B4  F5  B5
+
+    There are three states
+    - Warmup state, forward only
+    - Steady state, 1 forward and 1 backward
+    - Remaining state, backward only
+    """
+
+    def __init__(self, num_microbatches, stages, stage_id):
+        super().__init__(num_microbatches, stages, stage_id)
+        self.get_microbatche_schedule()
+
+    def get_microbatche_schedule(self):
+        num_warmup_steps: int = self.stages - self.stage_id - 1
+        num_warmup_steps: int = min(num_warmup_steps, self.num_microbatches)
+        self.num_warmup_steps = num_warmup_steps
+        self.num_steady_state_microbatches = self.num_microbatches - num_warmup_steps
+        self.num_remaining_microbatches = num_warmup_steps
+
+    def _step_to_micro_batch(self, step_id):
+        """
+        Given a step id, return the corresponding microbatch id and whether current step is doing forward
+        """
+        if step_id < self.num_warmup_steps:
+            return step_id, True
+        elif step_id < self.num_warmup_steps + self.num_steady_state_microbatches * 2:
+            current_1f1b_step = step_id - self.num_warmup_steps
+            is_forward = current_1f1b_step % 2 == 0
+            if is_forward:
+                current_mb = current_1f1b_step // 2 + self.num_warmup_steps
+            else:
+                current_mb = current_1f1b_step // 2
+            return current_mb, is_forward
+        else:
+            current_remaining_step = step_id - self.num_warmup_steps - self.num_steady_state_microbatches * 2
+            current_mb = self.num_steady_state_microbatches + current_remaining_step
+            return current_mb, False
+
+    def steps(self):
+        total_steps = 2 * self.num_microbatches + 1
+        prev_micro_batch_id = -1
+        for step_id in range(total_steps):
+            # Last step for grad reduction
+            cmds = []
+            if step_id == total_steps - 1:
+                cmds.append(ReduceGradsTask())
+                yield cmds
+                return
+
+            micro_batch_id, is_forward = self._step_to_micro_batch(step_id)
+
+            # Preprocess
+            if is_forward:
+                # Always do ForwardPreprocessTask, which only recv fwd when PP rank > 0
+                cmds.append(ForwardPreprocessTask(micro_batch_id))
+            else:
+                # Once enter the 1F1B steady states
+                # Need to recv bwd before sending fwd to avoid deadlock
+                # Recv bwd for non-last-stage
+                if self._valid_stage(self.next_stage):
+                    cmds.append(BackwardPreprocessTask(micro_batch_id))
+                # Send fwd during steady state
+                if micro_batch_id < self.num_steady_state_microbatches and self._valid_stage(self.next_stage):
+                    cmds.append(ForwardPostprocessTask(prev_micro_batch_id))
+
+            # Computation
+            if is_forward:
+                cmds.append(ForwardStepTask(micro_batch_id))
+            else:
+                cmds.append(BackwardStepTask(micro_batch_id))
+
+            # Postprocess
+            if not is_forward:
+                # Send bwd
+                if self._valid_stage(self.prev_stage):
+                    cmds.append(BackwardPostprocessTask(micro_batch_id))
+            else:
+                # Only send fwd during warmup, steady states this send is handled by bwd mbs
+                if micro_batch_id < self.num_warmup_steps and self._valid_stage(self.next_stage):
+                    cmds.append(ForwardPostprocessTask(micro_batch_id))
+
+            # Prepare state for next time
+            prev_micro_batch_id = micro_batch_id
+            yield cmds
+
+
+class TrainInterleavedSchedule(PipeSchedule):
+    """
+    Interleaved pipelining schedule adopted from Megatron/Apex
+    https://github.com/NVIDIA/apex/blob/master/apex/transformer/pipeline_parallel/schedules/fwd_bwd_pipelining_with_interleaving.py
+    Communication general rules
+        - Recv forward: recvs from the previous stage ---> recv_prev
+        - Send forward: sends to the next stage ---> send_next
+        - Recv backward: recvs from next stage ---> recv_next
+        - Send backward: send to previous stage ---> send_prev
+    Priciples
+        - Send is always for the current step microbatch/model_chunk
+        - Recv is always for the next step microbatch/model_chunk
+    Step:
+        A step can contain different components in different pipeline phases
+            - Warmup phase: A step contains a single mb forward for a model chunk
+            - Steady states: A step contains a forward and a backward, can be different mb and model chunk
+            - Cool down phase: A step contains a single mb backward for a model chunk
+    """
+
+    def __init__(self, num_microbatches, num_model_chunks, stages, stage_id):
+        super().__init__(num_microbatches, stages, stage_id)
+        self.num_model_chunks = num_model_chunks
+        self.get_step_schedule()
+
+    def get_step_schedule(self):
+        """
+        Run all forward passes and then all backward passes if number of
+        microbatches is just the number of pipeline stages.
+        Otherwise, perform (num_model_chunks-1)*pipeline_parallel_size on
+        all workers, followed by more microbatches after depending on
+        stage ID (more forward passes for earlier stages, later stages can
+        immediately start with 1F1B).
+        """
+        if self.num_microbatches % self.stages != 0:
+            raise ValueError(
+                f"Interleaved pipeline requires num_microbatches % pipeline_parallel_size == 0, current num_microbatches {self.num_microbatches} and pipeline_parallel_size {self.stages}"
+            )
+        self.num_microbatches_steps: int = self.num_microbatches * self.num_model_chunks
+        if self.num_microbatches == self.stages:
+            self.num_warmup_steps = self.num_microbatches_steps
+        else:
+            num_warmup_steps = (self.stages - self.stage_id - 1) * 2
+            num_warmup_steps += (self.num_model_chunks - 1) * self.stages
+            self.num_warmup_steps = min(num_warmup_steps, self.num_microbatches_steps)
+        self.num_steady_state_steps: int = self.num_microbatches_steps - self.num_warmup_steps
+        self.num_remaining_steps: int = self.num_warmup_steps
+
+    def get_model_chunk_id(self, step_id, is_forward=True):
+        """
+        Helper function to get the model chunk ID given the iteration number.
+
+        Each model chunk processes pipeline_parallel_size microbatches
+        at a time. We assume that the number of microbatches is a
+        multiple of pipeline_parallel_size*num_model_chunks.
+        """
+        # backward is late compared with fwd for num_warmup_steps
+        if not is_forward:
+            step_id -= self.num_warmup_steps
+        microbatch_group_size = self.stages * self.num_model_chunks
+        microbatch_id_in_group = step_id % microbatch_group_size
+        model_chunk_id = microbatch_id_in_group // self.stages
+        if not is_forward:
+            model_chunk_id = self.num_model_chunks - model_chunk_id - 1
+        return model_chunk_id
+
+    def get_microbatch_id(self, step_id, is_forward=True):
+        """
+        Helper function to get the microbatch ID given the iteration number.
+
+        Each microbatch group contains PP_size microbatches for all model chunks.
+        We first decide which microbatch group the current step belongs, then find the microbatch index
+        in the microbatch group.
+        """
+        # backward is late compared with fwd for num_warmup_steps
+        if not is_forward:
+            step_id -= self.num_warmup_steps
+        microbatch_group_size = self.stages * self.num_model_chunks
+        microbatch_group_id = step_id // microbatch_group_size
+        microbatch_id_in_group = step_id % microbatch_group_size
+        passed_microbatches = self.stages * microbatch_group_id
+        microbatch_idx_current_group = microbatch_id_in_group % self.stages
+        return passed_microbatches + microbatch_idx_current_group
+
+    def _should_recv_fwd_send_bwd(self, step_id, is_forward=True):
+        """
+        recv_prev: fwd started from first stage first model chunk
+        send_prev: bwd stopped at first stage first model chunk
+        recv_prev/send_prev = next_mb/mb not is_first_stage_and_first_model_chunk
+        """
+        # recv_prev for next step forward
+        if is_forward:
+            step_id += 1
+        # send_next for current step backward
+        model_chunk = self.get_model_chunk_id(step_id, is_forward=is_forward)
+        return not (self.stage_id == 0 and model_chunk == 0)
+
+    def _should_recv_bwd_send_fwd(self, step_id, is_forward=True):
+        """
+        recv_next: bwd started from last stage last model chunk
+        send_next: fwd stopped at last stage last model chunk
+        recv_next/send_next = next_mb/mb not is_last_stage_and_last_model_chunk
+        """
+        # recv_next for next step backward
+        if not is_forward:
+            step_id += 1
+        # send_next for current step forward
+        model_chunk = self.get_model_chunk_id(step_id, is_forward=is_forward)
+        return not (self.stage_id == self.stages - 1 and model_chunk == self.num_model_chunks - 1)
+
+    def _get_forward_preprocess_task(self, step_id):
+        """
+        Recv forward, this is for next step
+        """
+        next_mb_fwd = self.get_microbatch_id(step_id + 1, is_forward=True)
+        next_model_chunk_fwd = self.get_model_chunk_id(step_id + 1, is_forward=True)
+        return ForwardPreprocessTask(next_mb_fwd, model_chunk=next_model_chunk_fwd)
+
+    def _get_forward_postprocess_task(self, step_id):
+        """
+        Send forward, this is for current step
+        """
+        current_mb_fwd = self.get_microbatch_id(step_id, is_forward=True)
+        current_model_chunk_fwd = self.get_model_chunk_id(step_id, is_forward=True)
+        return ForwardPostprocessTask(current_mb_fwd, model_chunk=current_model_chunk_fwd)
+
+    def _get_backward_preprocess_task(self, step_id):
+        """
+        Recv backward, this is for next step
+        """
+        next_mb_bwd = self.get_microbatch_id(step_id + 1, is_forward=False)
+        next_model_chunk_bwd = self.get_model_chunk_id(step_id + 1, is_forward=False)
+        return BackwardPreprocessTask(next_mb_bwd, model_chunk=next_model_chunk_bwd)
+
+    def _get_backward_postprocess_task(self, step_id):
+        """
+        Send backward, this is for current step
+        """
+        current_mb_bwd = self.get_microbatch_id(step_id, is_forward=False)
+        current_model_chunk_bwd = self.get_model_chunk_id(step_id, is_forward=False)
+        return BackwardPostprocessTask(current_mb_bwd, model_chunk=current_model_chunk_bwd)
+
+    def _get_forward_step_task(self, step_id):
+        current_mb_bwd = self.get_microbatch_id(step_id, is_forward=True)
+        current_model_chunk_fwd = self.get_model_chunk_id(step_id, is_forward=True)
+        return ForwardStepTask(current_mb_bwd, model_chunk=current_model_chunk_fwd)
+
+    def _get_backward_step_task(self, step_id):
+        current_mb_bwd = self.get_microbatch_id(step_id, is_forward=False)
+        current_model_chunk_bwd = self.get_model_chunk_id(step_id, is_forward=False)
+        return BackwardStepTask(current_mb_bwd, model_chunk=current_model_chunk_bwd)
+
+    def _add_pre_post_processing_tasks(self, step_id, cmds, fwd_pre=True, fwd_post=True, bwd_pre=True, bwd_post=True):
+        """
+        send_fwd, recv_fwd, send_bwd, recv_bwd
+        Specialy handling for last stage to send first before recv to remove deadlocks
+        """
+        if not self.stage_id == self.num_stages - 1:
+            # recv fwd
+            if fwd_pre:
+                cmds.append(self._get_forward_preprocess_task(step_id))
+            # send fwd
+            if fwd_post:
+                cmds.append(self._get_forward_postprocess_task(step_id))
+            # recv bwd
+            if bwd_pre:
+                cmds.append(self._get_backward_preprocess_task(step_id))
+            # send bwd
+            if bwd_post:
+                cmds.append(self._get_backward_postprocess_task(step_id))
+        else:
+            # send_fwd
+            if fwd_post:
+                cmds.append(self._get_forward_postprocess_task(step_id))
+            # recv_fwd
+            if fwd_pre:
+                cmds.append(self._get_forward_preprocess_task(step_id))
+            # send_bwd
+            if bwd_post:
+                cmds.append(self._get_backward_postprocess_task(step_id))
+            # recv_bwd
+            if bwd_pre:
+                cmds.append(self._get_backward_preprocess_task(step_id))
+
+    def steps(self):
+        total_steps = self.num_warmup_steps + self.num_steady_state_steps + self.num_remaining_steps + 1
+        for step_id in range(total_steps):
+            cmds = []
+            if step_id == total_steps - 1:
+                cmds.append(ReduceGradsTask())
+                yield cmds
+                return
+
+            # Warmup
+            if step_id < self.num_warmup_steps:
+                # Recv forward for the first mb
+                if step_id == 0:
+                    cmds.append(self._get_forward_preprocess_task(-1))
+                cmds.append(self._get_forward_step_task(step_id))
+                # Do not recv fwd if it is all warmup batches and we have reached the last warmup batch
+                recv_fwd = step_id != (self.num_microbatches_steps - 1)
+                send_fwd = self._should_recv_bwd_send_fwd(step_id, is_forward=True)
+                # Only recv bwd when we are at the last warm up batch
+                recv_bwd = step_id == self.num_warmup_steps - 1 and self._should_recv_bwd_send_fwd(
+                    step_id, is_forward=False
+                )
+                send_bwd = False
+                self._add_pre_post_processing_tasks(
+                    step_id, cmds, fwd_pre=recv_fwd, fwd_post=send_fwd, bwd_pre=recv_bwd, bwd_post=send_bwd
+                )
+            # Steady state
+            elif step_id < self.num_warmup_steps + self.num_steady_state_steps:
+                cmds.append(self._get_forward_step_task(step_id))
+                cmds.append(self._get_backward_step_task(step_id))
+                # If this is the last step for steady state, do not recv fwd
+                # since there is no further forward steps
+                recv_fwd = step_id != (self.num_warmup_steps + self.num_steady_state_steps - 1)
+                send_fwd = self._should_recv_bwd_send_fwd(step_id, is_forward=True)
+                recv_bwd = self._should_recv_bwd_send_fwd(step_id, is_forward=False)
+                send_bwd = self._should_recv_fwd_send_bwd(step_id, is_forward=False)
+                self._add_pre_post_processing_tasks(
+                    step_id, cmds, fwd_pre=recv_fwd, fwd_post=send_fwd, bwd_pre=recv_bwd, bwd_post=send_bwd
+                )
+            # Cool down
+            else:
+                cmds.append(self._get_backward_step_task(step_id))
+                recv_fwd = False
+                send_fwd = False
+                recv_bwd = step_id != total_steps - 2 and self._should_recv_bwd_send_fwd(step_id, is_forward=False)
+                send_bwd = self._should_recv_fwd_send_bwd(step_id, is_forward=False)
+                self._add_pre_post_processing_tasks(
+                    step_id, cmds, fwd_pre=recv_fwd, fwd_post=send_fwd, bwd_pre=recv_bwd, bwd_post=send_bwd
+                )
+
+            yield cmds
+
+
+# Deprecated, kept for reference
 class TrainSchedule(PipeSchedule):
     """
     1F1B schedule for training a batch using pipeline parallelism.
@@ -156,9 +491,9 @@ class TrainSchedule(PipeSchedule):
 
     def steps(self):
         prev_micro_batch_id = -1
-        # 2 * self.micro_batches for fwd+bwd steps
+        # 2 * self.num_microbatches for fwd+bwd steps
         # 2 * (self.stages - 1) for bubbles
-        total_steps = 2 * (self.micro_batches + self.stages - 1)
+        total_steps = 2 * (self.num_microbatches + self.stages - 1)
         for step_id in range(total_steps):
             # Map the step of the pipeline to the micro-batch id and also whether it is a
             # forward or backward pass step.

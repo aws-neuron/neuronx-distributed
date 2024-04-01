@@ -3,9 +3,7 @@
 #############################################
 # User defined parameters and env vars
 
-SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
-
-export NEURON_CC_FLAGS="--model-type transformer --distribution-strategy=llm-training --cache_dir=~/neuron_compile_cache/"
+export NEURON_CC_FLAGS="--model-type=transformer --enable-experimental-O1 --enable-saturate-infinity"
 export NEURON_FUSE_SOFTMAX=1
 
 # Async Runtime
@@ -21,33 +19,33 @@ USE_MIX_PRECISION=1
 # 0: use pure DP; 1: use ZeRO-1
 USE_ZERO_1=1
 # global batch size
-GBS=1024
+GBS=256
 # micro batch size
 MBS=1
 # number of steps to run
 TOTAL_STEPS=10000
 # warmup steps
-WARMUP_STEPS=100
+WARMUP_STEPS=2000
 # learning rate
-LR=3.0e-4
+LR=2.0e-5
 # model path
-MODEL_PATH=$SCRIPT_DIR
+MODEL_PATH="${HOME}/examples/codegen25-7b-mono"
 # data path
-DATA_PATH="~/examples_datasets/wikicorpus_llama2_7B_tokenized_4k"
+DATA_PATH="${HOME}/example_datasets/bigcode-stack-java_tokenized_infill/train"
 # sequence length
-SEQ_LEN=4096
+SEQ_LEN=2048
 
 #############################################
 
-export NUM_NEURONCORES=32
+export NEURON_NUM_DEVICES=32
 NODE_ID=0
 WORLD_SIZE=1
-DISTRIBUTED_ARGS="--nproc_per_node $NUM_NEURONCORES"
+DISTRIBUTED_ARGS="--nproc_per_node $NEURON_NUM_DEVICES"
 if [ ! -z "$SLURM_NTASKS" ]; then
     WORLD_SIZE=$SLURM_NTASKS
     NODE_ID=$SLURM_NODEID
     MASTER_ADDRESS=(`scontrol show hostnames $SLURM_JOB_NODELIST`)
-    DISTRIBUTED_ARGS="--nproc_per_node $NUM_NEURONCORES --nnodes $WORLD_SIZE --node_rank $NODE_ID --master_addr $MASTER_ADDRESS --master_port 44000"
+    DISTRIBUTED_ARGS="--nproc_per_node $NEURON_NUM_DEVICES --nnodes $WORLD_SIZE --node_rank $NODE_ID --master_addr $MASTER_ADDRESS --master_port 44000"
     if [ $NODE_ID -eq 0 ]; then
         echo "WORLD_SIZE=$WORLD_SIZE"
         echo "NODE_ID=$NODE_ID"
@@ -65,7 +63,7 @@ echo "MASTER_ADDRESS=$MASTER_ADDRESS"
 sudo sysctl -w net.ipv4.ip_local_reserved_ports=44000,48620
 
 export NEURON_RT_NUM_CORES=32
-export NUM_NEURONCORES=$NEURON_RT_NUM_CORES
+export NEURON_NUM_DEVICES=$NEURON_RT_NUM_CORES
 export TPU_NUM_DEVICES=$NEURON_RT_NUM_CORES
 export TPU_CHIPS_PER_HOST_BOUNDS=$NEURON_RT_NUM_CORES
 export NEURON_RT_ROOT_COMM_ID=localhost:48620
@@ -111,7 +109,7 @@ echo STEPS_THIS_RUN=$STEPS_THIS_RUN
 echo OUTPUT_LOG=$OUTPUT_LOG
 
 torchrun $DISTRIBUTED_ARGS \
-    tp_zero1_llama2_7b_hf_pretrain_ptl.py \
+    tp_zero1_llama2_7b_hf_pretrain.py \
     --model_path $MODEL_PATH \
     --data_dir $DATA_PATH \
     --tensor_parallel_size $TP_DEGREE \

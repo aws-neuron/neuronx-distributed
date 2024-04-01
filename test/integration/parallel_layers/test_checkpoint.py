@@ -12,7 +12,7 @@ from commons import print_separator
 
 from neuronx_distributed.optimizer import NeuronZero1Optimizer
 from neuronx_distributed.parallel_layers import parallel_state
-from neuronx_distributed.parallel_layers.utils import is_pjrt_device
+from neuronx_distributed.parallel_layers.utils import requires_init_pg_override
 
 datetime_str = str(datetime.now())
 
@@ -85,7 +85,7 @@ def on_exit():
 
 
 if __name__ == "__main__":
-    if is_pjrt_device():
+    if requires_init_pg_override():
         import torch_xla.experimental.pjrt_backend  # noqa
         torch.distributed.init_process_group("xla", init_method="pjrt://")
     else:

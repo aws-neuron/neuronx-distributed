@@ -21,7 +21,7 @@ USE_MIX_PRECISION=1
 # 0: use pure DP; 1: use ZeRO-1
 USE_ZERO_1=1
 # global batch size
-GBS=1024
+: ${GBS:=1024}
 # micro batch size
 MBS=1
 # number of steps to run
@@ -87,6 +87,9 @@ ACC_STEPS=$(($GBS / $MBS / $DP))
 if [ $NEURON_EXTRACT_GRAPHS_ONLY -gt 0 ]; then
     STEPS_THIS_RUN=2
     OUTPUT_LOG=log_compile-$NODE_ID.log
+elif [ -v PERF_TEST ] && [ $PERF_TEST -gt 0 ]; then
+    STEPS_THIS_RUN=100
+    OUTPUT_LOG=log_exe-$NODE_ID.log
 else
     STEPS_THIS_RUN=-1
     OUTPUT_LOG=log_exe-$NODE_ID.log
@@ -126,3 +129,4 @@ torchrun $DISTRIBUTED_ARGS \
     --selective_checkpoint_enabled \
     --logging_interval 10 \
     $EXTRA_ARGS |& tee $OUTPUT_LOG
+exit ${PIPESTATUS[0]}

@@ -94,6 +94,6 @@ class Logger:
             step_0start = step - 1
             if step_0start < len(self.golden_steploss) and step_0start >= 0:
                 np.testing.assert_allclose(
-                    step_loss, self.golden_steploss[step_0start], rtol=2.3e-1
+                    step_loss, self.golden_steploss[step_0start], rtol=1.5e-1
                 )
 

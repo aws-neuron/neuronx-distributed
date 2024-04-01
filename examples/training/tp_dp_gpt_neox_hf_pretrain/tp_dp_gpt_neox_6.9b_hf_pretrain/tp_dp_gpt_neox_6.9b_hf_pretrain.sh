@@ -85,3 +85,4 @@ torchrun $DISTRIBUTED_ARGS \
     --warmup_steps $WARMUP_STEPS \
     --lr $LR \
     --grad_accum_usteps $ACC_STEPS |& tee $OUTPUT_LOG
+exit ${PIPESTATUS[0]}

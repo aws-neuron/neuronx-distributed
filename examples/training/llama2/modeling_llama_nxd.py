@@ -234,6 +234,9 @@ class LlamaAttention(LlamaAttentionHF):
         if not hasattr(config, "qkv_linear"):
             config.qkv_linear = False
 
+        if not hasattr(config, "separate_qkv"):
+            config.separate_qkv = False
+
         if (self.head_dim * self.num_heads) != self.hidden_size:
             raise ValueError(
                 f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
@@ -242,7 +245,7 @@ class LlamaAttention(LlamaAttentionHF):
         self._init_rope()
 
         init_method = partial(_init_normal, config.initializer_range)
-        if self.num_heads == self.num_key_value_heads:
+        if not self.config.separate_qkv and self.num_heads == self.num_key_value_heads:
             self.qkv_proj = ColumnParallelLinear(
                 self.hidden_size,
                 3 * self.num_heads * self.head_dim,
@@ -314,6 +317,7 @@ class LlamaAttention(LlamaAttentionHF):
         output_attentions: bool = False,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        assert use_cache is False, "KV-Cache flow is not fully supported"
         bsz, q_len, _ = hidden_states.size()
 
         if self.config.sequence_parallel_enabled:
@@ -336,7 +340,7 @@ class LlamaAttention(LlamaAttentionHF):
             value_states = torch.cat(value_states, dim=-1)
 
         else:
-            if self.num_heads == self.num_key_value_heads and self.config.kv_shared_group_size == 1:
+            if not self.config.separate_qkv and self.num_heads == self.num_key_value_heads and self.config.kv_shared_group_size == 1:
                 qkv_states = self.qkv_proj(hidden_states)
                 query_states, key_states, value_states = qkv_states.split(self.split_size, dim=2)
             elif self.config.qkv_linear:

@@ -18,7 +18,8 @@ class Logger:
             self.writer = SummaryWriter(log_dir=tb_dir)
         else:
             self.writer = None
-        
+        self.throughputs = []
+
         self.gpu_losses_to_compare = None
         if os.getenv("GOLDEN_EVENT_FILE", None) is not None and os.environ.get("NEURON_EXTRACT_GRAPHS_ONLY", None) is None:
             self.gpu_losses_to_compare = torch.load(os.getenv("GOLDEN_EVENT_FILE"))
@@ -45,11 +46,12 @@ class Logger:
                 torch.sum(input_ids.detach().cpu()).item(),
                 total_steps,
             )
-        
+        self.throughputs.append(tps)
+
         if self.gpu_losses_to_compare is not None:
             if total_steps < len(self.gpu_losses_to_compare):
                 if not torch.allclose(
-                    loss.cpu().float(), self.gpu_losses_to_compare[total_steps].float(), rtol=2.3e-1
+                    loss.cpu().float(), self.gpu_losses_to_compare[total_steps].float(), rtol=1.5e-1
                 ):
                     raise RuntimeError(
                         f"Loss mismtach with golden, Trn {loss.item()} GPU {self.gpu_losses_to_compare[total_steps].item()}"

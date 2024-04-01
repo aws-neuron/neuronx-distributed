@@ -38,9 +38,7 @@ _MPU_TENSOR_MODEL_PARALLEL_RANK = None
 PP_GROUP_PG_GLOO = None
 
 
-def initialize_model_parallel(
-    tensor_model_parallel_size: int = 1,
-    pipeline_model_parallel_size: int = 1) -> None:
+def initialize_model_parallel(tensor_model_parallel_size: int = 1, pipeline_model_parallel_size: int = 1) -> None:
     """
     Initialize model data parallel groups.
 
@@ -402,5 +400,11 @@ def rmsg(msg):
     except AssertionError:
         # Parallel state is not initialized
         pp_rank, tp_rank, dp_rank = -1, -1, -1
-    global_rank = torch.distributed.get_rank()
+    try:
+        global_rank = torch.distributed.get_rank()
+    except RuntimeError:
+        # torch distributed not initialized, mainly in PTL case
+        import torch_xla.core.xla_model as xm
+
+        global_rank = xm.get_ordinal()
     return f"[rank_{global_rank}_pp{pp_rank}_tp{tp_rank}_dp{dp_rank}] {msg}"

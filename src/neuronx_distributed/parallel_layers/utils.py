@@ -115,9 +115,11 @@ def split_tensor_along_last_dim(
 def is_torch_version_greater_than_2():
     return torch.__version__.startswith("2")
 
-
 def is_pjrt_device():
     return os.environ.get("PJRT_DEVICE", None) == "NEURON"
+
+def requires_init_pg_override():
+    return torch.__version__.startswith('2.0')
 
 
 def cast_tensor(tensor, from_dtype=torch.float32, to_dtype=torch.bfloat16):

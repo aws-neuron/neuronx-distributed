@@ -1,77 +1,60 @@
-import os
+import time
+import numpy as np
+from functools import partial
 
-import neuronperf as npf
-import torch
+BENCHMARK_REPORT_FILENAME = "benchmark_report.json"
 
+class Benchmark:
+    def __init__(self, 
+                 benchmark_func, 
+                 input_param, 
+                 config, 
+                 num_runs=20, 
+                 preprocess_func=None) -> None:
+        if isinstance(input_param, (tuple, list)):
+            self.benchmark_func = partial(benchmark_func, *input_param)
+        elif isinstance(input_param, dict):
+            self.benchmark_func = partial(benchmark_func, **input_param)
+        else:
+            self.benchmark_func = partial(benchmark_func, input_param)
+        
+        self.config = config
+        self.num_runs = num_runs
+        self.preprocess_func = preprocess_func
+    
+    def run(self):
+        # Warmp up
+        if self.preprocess_func:
+            self.preprocess_func()
+        self.benchmark_func()
 
-class ModelWrapper(torch.nn.Module):
-    def __init__(self, model):
-        super().__init__()
-        self.model = model
+        latency_list = []
+        e2e_start = time.time()
+        for _ in range(self.num_runs):
+            start = time.time()
+            if self.preprocess_func:
+                self.preprocess_func()
+            self.benchmark_func()
+            latency_list.append(time.time() - start)
+        e2e_time = time.time() - e2e_start
 
-    def forward(self, *inputs):
-        input_ids, attention_mask = inputs
-        # reset the model so it can generate multiple times
-        self.model.reset()
-        output_ids = self.model.generate(
-            input_ids=input_ids, attention_mask=attention_mask, 
-            max_new_tokens=self.model.config.max_new_tokens, 
-            top_k=1, do_sample=True
-        )
-        num_new_tokens = output_ids.numel() - input_ids.numel()
-        return output_ids, num_new_tokens
+        return self.process_metrics(latency_list, e2e_time, self.config)
+    
+    def process_metrics(self, latency_list, e2e_time, config):
+        latency_array = np.array(latency_list)
 
+        max_length = config.max_length
+        batch_size = config.batch_size
+        n_runs = self.num_runs
+        throughput = (max_length * n_runs * batch_size) / e2e_time
 
-def benchmark_sampling(batch_size, max_length, traced_model_path, tokenizer, model_load_fn):
-    def load_fn(model_dir, **kwargs):
-        model = model_load_fn(model_dir)
-        generate_wrapper = ModelWrapper(model)
-        return generate_wrapper
-
-    def preprocess_fn(inputs):
-        batch_encoding = tokenizer(
-            inputs, max_length=max_length, truncation=True, padding="max_length", return_tensors="pt"
-        )
-        input_ids = batch_encoding["input_ids"]
-        attention_mask = batch_encoding["attention_mask"]
-        return input_ids, attention_mask
-
-    global num_total_new_tokens
-    num_total_new_tokens = 0
-    def postprocess_fn(outputs):
-        output_ids, num_new_tokens = outputs
-        output = tokenizer.batch_decode(output_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-        global num_total_new_tokens
-        num_total_new_tokens += num_new_tokens
-        return output
-
-    def env_setup_fn(*_):
-        del os.environ["NEURON_RT_VISIBLE_CORES"]
-
-    prompt = ["I believe the meaning of life is"] * batch_size
-    num_runs = 10
-    reports = npf.benchmark(
-        load_fn=load_fn,
-        model_filename=traced_model_path,
-        inputs=[prompt],
-        batch_sizes=batch_size,
-        n_models=1,
-        max_infers=num_runs,
-        max_duration=0,
-        workers_per_model=1,
-        env_setup_fn=env_setup_fn,
-        preprocess_fn=preprocess_fn,
-        postprocess_fn=postprocess_fn,
-        multiprocess=False,
-    )
-
-    report = reports[0]
-    report["num_new_tokens_per_batch"] = round(num_total_new_tokens / num_runs / batch_size, 2)
-    report["throughput_avg"] = round(report["num_new_tokens_per_batch"] * batch_size / (report["latency_ms_avg"] / 1000), 2)
-    report["latency_per_token_ms_p50"] = round(report["latency_ms_p50"] / report["num_new_tokens_per_batch"], 2)
-    report["latency_per_token_ms_p99"] = round(report["latency_ms_p99"] / report["num_new_tokens_per_batch"], 2)
-
-    # display and save results
-    npf.print_reports(reports, cols=["num_new_tokens_per_batch", "throughput_avg", "latency_per_token_ms_p50", "latency_per_token_ms_p99"])
-    print(f"Results saved to: {npf.write_json(report)}")
-    return report
+        metrics = {
+            "latency_ms_p50": np.percentile(latency_array, 50) * 1000,
+            "latency_ms_p90": np.percentile(latency_array, 90) * 1000,
+            "latency_ms_p95": np.percentile(latency_array, 95) * 1000,
+            "latency_ms_p99": np.percentile(latency_array, 99) * 1000,
+            "latency_ms_p100": np.percentile(latency_array, 100) * 1000,
+            "latency_ms_avg": np.average(latency_array) * 1000,
+            "throughput": throughput, 
+        }
+        return metrics

@@ -1,6 +1,6 @@
 # coding=utf-8
 # Copyright (c) 2019 NVIDIA CORPORATION. All rights reserved.
-# Copyright 2018 The Google AI Language Team Authors and The HugginFace Inc. team.
+# Copyright 2018 The Google AI Language Team Authors and The HuggingFace Inc. team.
 # Modifications Copyright 2021 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -36,7 +36,6 @@ import torch_xla.core.xla_model as xm
 import torch_xla.distributed.parallel_loader as pl
 import torch_xla.distributed.xla_backend
 import torch_xla.distributed.xla_multiprocessing as xmp
-from neuronx_distributed.utils.adamw_fp32_optim_params import AdamW_FP32OptimParams
 from modeling_gpt_neox_nxd import GPTNeoXForCausalLMNxD
 from torch.utils.data import DistributedSampler
 from torch.utils.data.dataloader import DataLoader
@@ -50,7 +49,8 @@ from neuronx_distributed.parallel_layers import (
     move_model_to_device,
     parallel_state,
 )
-from neuronx_distributed.parallel_layers.utils import is_pjrt_device
+from neuronx_distributed.parallel_layers.utils import requires_init_pg_override
+from neuronx_distributed.utils.adamw_fp32_optim_params import AdamW_FP32OptimParams
 
 datetime_str = str(datetime.now())
 results = {"inference_success": 1}
@@ -202,7 +202,7 @@ class Logger:
         if not os.environ.get("NEURON_EXTRACT_GRAPHS_ONLY", None):
             step_0start = step - 1
             if step_0start < len(self.golden_steploss) and step_0start >= 0:
-                np.testing.assert_allclose(step_loss, self.golden_steploss[step_0start], rtol=2.3e-1)
+                np.testing.assert_allclose(step_loss, self.golden_steploss[step_0start], rtol=1.5e-1)
 
 
 # Workaround because python functions are not picklable
@@ -612,7 +612,7 @@ if __name__ == "__main__":
 
     # WORLD_SIZE is set by torchrun
     if os.environ.get("WORLD_SIZE"):
-        if is_pjrt_device():
+        if requires_init_pg_override():
             import torch_xla.experimental.pjrt_backend  # noqa
 
             dist.init_process_group("xla", init_method="pjrt://")
