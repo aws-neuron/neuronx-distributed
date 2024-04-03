@@ -4,6 +4,7 @@ from typing import Any, Callable, Dict, Optional, Tuple, Union
 import torch
 import torch_xla.core.xla_model as xm
 from lightning_utilities.core.apply_func import apply_to_collection
+from lightning_utilities.core.rank_zero import rank_zero_warn
 from pytorch_lightning import LightningModule
 from pytorch_lightning.trainer.connectors.logger_connector.fx_validator import (
     _FxValidator,
