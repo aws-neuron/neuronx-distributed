@@ -6,7 +6,7 @@ from .parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_size,
 )
-from .utils import split_tensor_along_last_dim
+from .utils import split_tensor_along_last_dim, split_tensor_along_second_dim
 
 if "all_gather_into_tensor" not in dir(torch.distributed):
     torch.distributed.all_gather_into_tensor = torch.distributed._all_gather_base
@@ -46,6 +46,46 @@ def _split_along_last_dim(input_: torch.Tensor) -> torch.Tensor:
     return output
 
 
+def _split_along_second_dim(input_: torch.Tensor) -> torch.Tensor:
+    """Split the tensor along its second dimension and keep the
+    corresponding slice."""
+
+    world_size = get_tensor_model_parallel_size()
+    # Bypass the function if we are using only 1 device.
+    if world_size == 1:
+        return input_
+
+    # Split along second dimension, numbered starting from 1
+    input_list = split_tensor_along_second_dim(input_, world_size)
+
+    # Note: torch.split does not create contiguous tensors by default.
+    rank = get_tensor_model_parallel_rank()
+    output = input_list[rank].contiguous()
+
+    return output
+
+
+def _gather_along_second_dim(input_: torch.Tensor) -> torch.Tensor:
+    """Gather tensors and concatenate along the last dimension."""
+
+    world_size = get_tensor_model_parallel_size()
+    # Bypass the function if we are using only 1 device.
+    if world_size == 1:
+        return input_
+
+    # Size and dimension.
+    rank = get_tensor_model_parallel_rank()
+
+    tensor_list = [torch.empty_like(input_) for _ in range(world_size)]
+    tensor_list[rank] = input_
+    torch.distributed.all_gather(tensor_list, input_, group=get_tensor_model_parallel_group())
+
+    # Note: torch.cat already creates a contiguous tensor.
+    output = torch.cat(tensor_list, dim=1).contiguous()
+
+    return output
+
+
 def _split_along_first_dim(input_: torch.Tensor) -> torch.Tensor:
     """Split the tensor along its first dimension and keep the corresponding slice."""
     world_size = get_tensor_model_parallel_size()
@@ -75,7 +115,6 @@ def _gather_along_last_dim(input_: torch.Tensor) -> torch.Tensor:
     rank = get_tensor_model_parallel_rank()
 
     tensor_list = [torch.empty_like(input_) for _ in range(world_size)]
-    tensor_list[rank] = input_
     torch.distributed.all_gather(tensor_list, input_, group=get_tensor_model_parallel_group())
 
     # Note: torch.cat already creates a contiguous tensor.
@@ -195,8 +234,27 @@ class _GatherFromModelParallelRegion(torch.autograd.Function):
         return _split_along_last_dim(grad_output)
 
 
+class _GatherFromModelParallelRegionSecondDim(torch.autograd.Function):
+    """Gather the input from tensor model parallel region along the 2nd dim of the tensor and concatenate."""
+
+    # FIXME(mkozuki): Definition of static symbolic methods don't look correct according to
+    # https://pytorch.org/docs/stable/onnx.html#static-symbolic-method
+    @staticmethod
+    def symbolic(graph, input_):
+        return _gather_along_second_dim(input_)
+
+    @staticmethod
+    def forward(ctx, input_):
+        return _gather_along_second_dim(input_)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return _split_along_second_dim(grad_output)
+
+
 class _ScatterToSequenceParallelRegion(torch.autograd.Function):
     """Split the input and keep only the corresponding chunk to the rank."""
+
     @staticmethod
     def symbolic(graph, input_):
         return _split_along_first_dim(input_)
@@ -250,6 +308,22 @@ class _ReduceScatterToSequenceParallelRegion(torch.autograd.Function):
         return _gather_along_first_dim(grad_output)
 
 
+class _ScatterInputChannelsToModelParallelRegion(torch.autograd.Function):
+    """Split the input and keep only the corresponding chuck to the rank."""
+
+    @staticmethod
+    def symbolic(graph, input_):
+        return _split_along_second_dim(input_)
+
+    @staticmethod
+    def forward(ctx, input_):
+        return _split_along_second_dim(input_)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return _gather_along_second_dim(grad_output)
+
+
 # -----------------
 # Helper functions.
 # -----------------
@@ -263,12 +337,20 @@ def reduce_from_tensor_model_parallel_region(input_):
     return _ReduceFromModelParallelRegion.apply(input_)
 
 
+def scatter_input_channels_to_tensor_model_parallel_region(input_):
+    return _ScatterInputChannelsToModelParallelRegion.apply(input_)
+
+
 def scatter_to_tensor_model_parallel_region(input_):
     return _ScatterToModelParallelRegion.apply(input_)
 
 
 def gather_from_tensor_model_parallel_region(input_):
     return _GatherFromModelParallelRegion.apply(input_)
+
+
+def gather_from_tensor_model_parallel_region_second_dim(input_):
+    return _GatherFromModelParallelRegionSecondDim.apply(input_)
 
 
 def scatter_to_sequence_parallel_region(input_: torch.Tensor) -> torch.Tensor:

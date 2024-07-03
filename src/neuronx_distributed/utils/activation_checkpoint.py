@@ -1,13 +1,13 @@
 from functools import partial
-from packaging import version
 
 import torch
-from torch_xla.utils.checkpoint import checkpoint as torch_xla_utils_checkpoint
+from packaging import version
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     _CHECKPOINT_PREFIX,
     CheckpointImpl,
     CheckpointWrapper,
 )
+from torch_xla.utils.checkpoint import checkpoint as torch_xla_utils_checkpoint
 
 from neuronx_distributed.parallel_layers.parallel_state import rmsg
 from neuronx_distributed.pipeline import NxDPPModel
@@ -38,10 +38,10 @@ def checkpoint_wrapper(
         checkpoint_fn = partial(
             torch_xla_utils_checkpoint,
             # PTXLA2.1: XLA currently does not support use_reentrant==False
-            use_reentrant=True
+            use_reentrant=True,
         )
         # We have to explicitly set the impl to REENTRANT for >=2.1 because
-        # the torch=2.1 first parses the implementation value before even checking 
+        # the torch=2.1 first parses the implementation value before even checking
         # the checkpoint_fn
         checkpoint_impl = CheckpointImpl.REENTRANT
     return NxDCheckpointWrapper(
@@ -65,14 +65,17 @@ def apply_activation_checkpointing(
         )
         activation_checkpoint_module = model.transformer_layer_cls
         check_fn = lambda m: isinstance(m, activation_checkpoint_module)
-        model = model.local_module
+        models = model.local_stage_modules
     elif isinstance(model, NxDModel):
-        model = model.local_module()
-    _recursive_wrap(
-        module=model,
-        auto_wrap_policy=partial(lambda_auto_wrap_policy, lambda_fn=check_fn),
-        wrapper_cls=checkpoint_wrapper_fn,
-        ignored_modules=set(),
-        ignored_params=set(),
-        only_wrap_children=True,
-    )
+        models = model.local_modules()
+    else:
+        models = [model]
+    for model in models:
+        _recursive_wrap(
+            module=model,
+            auto_wrap_policy=partial(lambda_auto_wrap_policy, lambda_fn=check_fn),
+            wrapper_cls=checkpoint_wrapper_fn,
+            ignored_modules=set(),
+            ignored_params=set(),
+            only_wrap_children=True,
+        )

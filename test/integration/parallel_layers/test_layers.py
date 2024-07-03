@@ -4,6 +4,7 @@ import json
 import os
 import traceback
 from datetime import datetime
+import sys
 
 import torch
 import torch.nn.init as init
@@ -17,6 +18,15 @@ from neuronx_distributed.parallel_layers.random import model_parallel_xla_manual
 from neuronx_distributed.parallel_layers.utils import requires_init_pg_override
 
 datetime_str = str(datetime.now())
+
+# Get the parent directory of the current directory
+parentdir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+
+# Add the parent directory to the sys.path
+sys.path.append(parentdir)
+
+# Import the module from the parent directory
+from common.integration_test_utils import test_init, test_cleanup, test_modules
 
 
 def parse_args():
@@ -99,8 +109,78 @@ def test_parallel_embedding(tensor_model_parallel_size):
         raise
 
 
-def test_initialize_affine_weight_cpu(tensor_model_parallel_size):
-    def _test_initialize_affine_weight_cpu():
+def test_parallel_embedding_shard_over_embedding_dim(tensor_model_parallel_size):
+    def _test_parallel_embedding():
+        device = xm.xla_device()
+        tensor_model_parallel_size_ = tensor_model_parallel_size
+        parallel_state.initialize_model_parallel(tensor_model_parallel_size_)
+        tensor_model_parallel_size_ = parallel_state.get_tensor_model_parallel_size()
+
+        batch_size = 1
+        seq_length = 2048
+        vocab_size = 30432
+        hidden_size = 1024
+        seed = 1234
+
+        set_random_seed(seed)
+        input_data = torch.LongTensor(size=(batch_size, seq_length)).random_(0, vocab_size).to(device)
+        loss_weight = torch.randn([batch_size, seq_length, hidden_size]).to(device)
+
+        set_random_seed(seed)
+        embedding_original = torch.nn.Embedding(vocab_size, hidden_size).to(device)
+
+        output = embedding_original(input_data)
+        loss_original = torch.mul(output, loss_weight).sum()
+        loss_original.backward()
+
+        set_random_seed(seed)
+        embedding_parallel = layers.ParallelEmbedding(
+            vocab_size, hidden_size, init_method=init.normal_, shard_across_embedding=True
+        ).to(device)
+        output_nxd = embedding_parallel(input_data)
+        loss_parallel = torch.mul(output_nxd, loss_weight).sum()
+        loss_parallel.backward()
+
+        torch.distributed.barrier()
+
+        print(
+            "  error in output (parallel) on global rank {}: {}".format(
+                torch.distributed.get_rank(), torch.sub(output, output_nxd).max()
+            )
+        )
+        assert torch.allclose(output, output_nxd, rtol=1e-05)
+
+        error = loss_parallel.sub(loss_original).abs()
+        print("   error in loss (parallel) on global rank {}: {}".format(torch.distributed.get_rank(), error))
+        assert error < 1.0e-3, "error: {}".format(error)
+
+        weight_grad_orig = torch.split(embedding_original.weight.grad, hidden_size // tensor_model_parallel_size_, 1)[
+            parallel_state.get_tensor_model_parallel_rank()
+        ]
+        error = embedding_parallel.weight.grad.sub(weight_grad_orig).abs().max()
+        print("   error in grad (parallel) on global rank {}: {}".format(torch.distributed.get_rank(), error))
+        # assert error < 1.0e-5, 'error: {}'.format(error) #Error is 2.09
+
+        # Reset groups
+        parallel_state.destroy_model_parallel()
+
+        torch.distributed.barrier()
+        if torch.distributed.get_rank() == 0:
+            print("test passed")
+
+        del device
+
+    global results
+    try:
+        _test_parallel_embedding()
+    except:
+        results["inference_success"] = 0
+        print(traceback.format_exc())
+        raise
+
+
+def test_initialize_parameter_cpu(tensor_model_parallel_size):
+    def _test_initialize_parameter_cpu():
         tensor_model_parallel_size_ = tensor_model_parallel_size
         parallel_state.initialize_model_parallel(tensor_model_parallel_size_)
         tensor_model_parallel_size_ = parallel_state.get_tensor_model_parallel_size()
@@ -116,9 +196,7 @@ def test_initialize_affine_weight_cpu(tensor_model_parallel_size):
         # ---------------
         weight = torch.empty(output_size_coeff, input_size)
         set_random_seed(seed)
-        layers._initialize_affine_weight_cpu(
-            weight, output_size, input_size, output_size_coeff, 0, torch.nn.init.normal_
-        )
+        layers._initialize_parameter_cpu(weight, 0, torch.nn.init.normal_)
         # Target.
         set_random_seed(seed)
         master_weight = torch.empty(output_size, input_size)
@@ -140,9 +218,7 @@ def test_initialize_affine_weight_cpu(tensor_model_parallel_size):
         # ------------
         weight = torch.empty(output_size, input_size_coeff)
         set_random_seed(seed)
-        layers._initialize_affine_weight_cpu(
-            weight, output_size, input_size, input_size_coeff, 1, torch.nn.init.normal_
-        )
+        layers._initialize_parameter_cpu(weight, 1, torch.nn.init.normal_)
         # Target.
         set_random_seed(seed)
         master_weight = torch.empty(output_size, input_size)
@@ -170,7 +246,7 @@ def test_initialize_affine_weight_cpu(tensor_model_parallel_size):
 
     global results
     try:
-        _test_initialize_affine_weight_cpu()
+        _test_initialize_parameter_cpu()
     except:
         results["inference_success"] = 0
         print(traceback.format_exc())
@@ -483,6 +559,186 @@ def test_padding_attention_heads(tensor_model_parallel_size):
         raise
 
 
+
+def test_output_channel_parallel_conv(tensor_model_parallel_size):
+    def _test_output_channel_parallel_conv():
+        test_init(tensor_model_parallel_size, 1234)
+        # Real dims taken from 768x768 Stable Diffusion UNet
+        # (conv1): LoRACompatibleConv(320, 640, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+        batch_size = 1
+        input_channels = 320
+        output_channels = 640
+        kernel_size = (3, 3)
+        stride = (1, 1)
+        padding = (1, 1)
+        # H and W
+        spatial_dim = 128
+        tensor_shape = (batch_size, input_channels, spatial_dim, spatial_dim)
+
+        test_conv = layers.OutputChannelParallelConv2d(
+            input_channels,
+            output_channels,
+            kernel_size,
+            stride,
+            padding,
+            bias=True,
+            # Gather output because we're just testing the single layer here
+            gather_output=True,
+            # Need keep_master_weight so we can use the same weight for our reference layer
+            keep_master_weight=True,
+        )
+
+        control_conv = torch.nn.Conv2d(
+            input_channels,
+            output_channels,
+            kernel_size,
+            stride,
+            padding,
+            bias=True,
+        )
+
+        # Create input tensor, copy weights from test layer to control layer
+        with torch.no_grad():
+            orig_input_tensor = (torch.randn(tensor_shape, requires_grad=True),)
+
+            control_conv.weight.copy_(test_conv.master_weight)
+            control_conv.bias.copy_(test_conv.master_bias)
+
+        test_modules(test_conv, control_conv, orig_input_tensor)
+        # If we reach this point, test has passed
+        test_cleanup()
+
+    global results
+    try:
+        _test_output_channel_parallel_conv()
+        xm.master_print("test passed")
+    except:
+        results["inference_success"] = 0
+        print(traceback.format_exc())
+        raise
+
+def test_input_channel_parallel_conv(tensor_model_parallel_size):
+    def _test_input_channel_parallel_conv():
+        test_init(tensor_model_parallel_size, 1234)
+        # Real dims taken from 768x768 Stable Diffusion UNet
+        # (conv1): LoRACompatibleConv(320, 640, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+        batch_size = 1
+        input_channels = 320
+        output_channels = 640
+        kernel_size = (3, 3)
+        stride = (1, 1)
+        padding = (1, 1)
+        # H and W
+        spatial_dim = 128
+        tensor_shape = (batch_size, input_channels, spatial_dim, spatial_dim)
+
+        test_conv = layers.InputChannelParallelConv2d(
+            input_channels,
+            output_channels,
+            kernel_size,
+            stride,
+            padding,
+            bias=True,
+            # Gather output because we're just testing the single layer here
+            input_is_parallel=False,
+            # Need keep_master_weight so we can use the same weight for our reference layer
+            keep_master_weight=True,
+        )
+
+        control_conv = torch.nn.Conv2d(
+            input_channels,
+            output_channels,
+            kernel_size,
+            stride,
+            padding,
+            bias=True,
+        )
+
+        # Create input tensor, copy weights from test layer to control layer
+        with torch.no_grad():
+            orig_input_tensor = (torch.randn(tensor_shape, requires_grad=True),)
+            control_conv.weight.copy_(test_conv.master_weight)
+            control_conv.bias.copy_(test_conv.master_bias)
+
+        test_modules(test_conv, control_conv, orig_input_tensor)
+        # If we reach this point, test has passed
+        test_cleanup()
+
+    global results
+    try:
+        _test_input_channel_parallel_conv()
+        xm.master_print("test passed")
+    except:
+        results["inference_success"] = 0
+        print(traceback.format_exc())
+        raise
+
+class BackToBackConvs(torch.nn.Module):
+    def __init__(self, conv1_args, conv2_args, parallel: bool = False):
+        super().__init__()
+        if parallel:
+            # Need keep_master_weight so we can use the same weight for our reference layer
+            self.conv1 = layers.OutputChannelParallelConv2d(
+                *conv1_args,
+                gather_output=False,
+                keep_master_weight=True,
+            )
+            self.conv2 = layers.InputChannelParallelConv2d(
+                *conv2_args,
+                input_is_parallel=True,
+                keep_master_weight=True,
+            )
+        else:
+            self.conv1 = torch.nn.Conv2d(*conv1_args)
+            self.conv2 = torch.nn.Conv2d(*conv2_args)
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = torch.relu(x)
+        x = self.conv2(x)
+        return x
+
+
+def test_back_to_back_parallel_convs(tensor_model_parallel_size):
+    def _test_back_to_back_parallel_convs():
+        test_init(tensor_model_parallel_size, 1234)
+
+        # Real dims taken from 768x768 Stable Diffusion UNet
+        # (conv1): LoRACompatibleConv(320, 640, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+        # (conv2): LoRACompatibleConv(640, 640, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+        conv1_args = (160, 320, (3, 3), (1, 1), (1, 1))
+        conv2_args = (320, 320, (3, 3), (1, 1), (1, 1))
+        batch_size = 1
+        # H and W
+        spatial_dim = 128
+        tensor_shape = (batch_size, 160, spatial_dim, spatial_dim)
+
+        test_model = BackToBackConvs(conv1_args, conv2_args, parallel=True)
+        control_model = BackToBackConvs(conv1_args, conv2_args, parallel=False)
+
+        # Create input tensor, copy weights from test layer to control layer
+        with torch.no_grad():
+            orig_input_tensor = (torch.randn(tensor_shape, requires_grad=True),)
+
+            control_model.conv1.weight.copy_(test_model.conv1.master_weight)
+            control_model.conv1.bias.copy_(test_model.conv1.master_bias)
+            control_model.conv2.weight.copy_(test_model.conv2.master_weight)
+            control_model.conv2.bias.copy_(test_model.conv2.master_bias)
+
+        # TODO: assert_close fails when autocast is enabled V1305356298
+        test_modules(test_model, control_model, orig_input_tensor, assert_close_on_output_tensor=False)
+        # If we reach this point, test has passed
+        test_cleanup()
+
+    global results
+    try:
+        _test_back_to_back_parallel_convs()
+        xm.master_print("test passed")
+    except:
+        results["inference_success"] = 0
+        print(traceback.format_exc())
+        raise
+
 def upload_to_s3():
     os.system(f'aws s3 cp --no-progress "{datetime_str}" {S3_BUCKET_NAME}')
     print(met.metrics_report())
@@ -509,8 +765,11 @@ if __name__ == "__main__":
         print_separator("test parallel embedding")
         test_parallel_embedding(tensor_model_parallel_size)
         xm.mark_step()
+        print_separator("test parallel embedding with shard over embedding dim")
+        test_parallel_embedding_shard_over_embedding_dim(tensor_model_parallel_size)
+        xm.mark_step()
         print_separator("test initialize affine weight")
-        test_initialize_affine_weight_cpu(tensor_model_parallel_size)
+        test_initialize_parameter_cpu(tensor_model_parallel_size)
         xm.mark_step()
         print_separator("test row_parallel_linear with seq_parallel")
         test_row_parallel_linear_seq_parallel(tensor_model_parallel_size)
@@ -520,6 +779,15 @@ if __name__ == "__main__":
         xm.mark_step()
         print_separator("test padding attention heads")
         test_padding_attention_heads(tensor_model_parallel_size)
+        xm.mark_step()
+        print_separator("test output_channel_parallel_conv2d")
+        test_output_channel_parallel_conv(tensor_model_parallel_size)
+        xm.mark_step()
+        print_separator("test input_channel_parallel_conv2d")
+        test_input_channel_parallel_conv(tensor_model_parallel_size)
+        xm.mark_step()
+        print_separator("test test_back_to_back_parallel_conv2d")
+        test_back_to_back_parallel_convs(tensor_model_parallel_size)
         xm.mark_step()
         tensor_model_parallel_size *= 2
     atexit.register(on_exit)

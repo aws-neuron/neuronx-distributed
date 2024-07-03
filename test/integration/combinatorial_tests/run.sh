@@ -85,6 +85,11 @@ EXTRA_ARGS=" "
 if [ $USE_MIX_PRECISION -gt 0 ]; then
     EXTRA_ARGS+=" --use_mix_precision"
 fi
+if [ $GPU_COMPATIBLE_PRECISION -gt 0 ]; then
+    EXTRA_ARGS+=" --use_gpu_compatible_precision 1"
+else
+    EXTRA_ARGS+=" --use_gpu_compatible_precision 0"
+fi
 if [ $USE_ZERO_1 -gt 0 ]; then
     EXTRA_ARGS+=" --use_zero_1"
 fi
@@ -123,7 +128,7 @@ echo STEPS_THIS_RUN=$STEPS_THIS_RUN
 echo OUTPUT_LOG=$OUTPUT_LOG
 
 torchrun $DISTRIBUTED_ARGS \
-    $HOME/ktest/NeuronxDistributed/examples/training/llama2/tp_zero1_llama2_7b_hf_pretrain/tp_zero1_llama2_7b_hf_pretrain.py \
+    $HOME/ktest/NeuronxDistributed/examples/training/llama/tp_zero1_llama_hf_pretrain/tp_zero1_llama_hf_pretrain.py \
     --model_path $MODEL_PATH \
     --data_dir $DATA_PATH \
     --tensor_parallel_size $TP_DEGREE \
@@ -140,7 +145,7 @@ torchrun $DISTRIBUTED_ARGS \
 # TODO update smoothed_weight factor and delta percentage based on experiments
 if [ "$NEURON_EXTRACT_GRAPHS_ONLY" != "1" ]; then
     echo "run pretraining gpu comparison"
-    python3 ./common/compare_gpu_trn1_metrics.py ~/gpu_benchmark/events.out.tfevents.1691458200.platform-queue-dy-platform-p4d24xlarge-5.7774.0 output/neuron_tblogs_*/events.out.* "step loss" --smoothed_weight=0.666 --delta_percentage=5.0 --comparison_start_step=0
+    python3 ./common/compare_gpu_trn1_metrics.py ~/gpu_benchmark/events.out.tfevents.1691458200.platform-queue-dy-platform-p4d24xlarge-5.7774.0 output/neuron_tblogs_*/events.out.* "step loss" --rtol=0.05 --comparison_start_step=0
     ret_val=$?
     echo $ret_val
     if [ $ret_val -eq 0 ]; then

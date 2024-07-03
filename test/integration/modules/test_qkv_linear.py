@@ -2,11 +2,11 @@ import argparse
 import atexit
 import json
 import os
-import numpy as np
 import random
 import traceback
 from datetime import datetime
 
+import numpy as np
 import torch
 import torch_xla.core.xla_model as xm
 
@@ -55,8 +55,7 @@ def test_qkv_linear_with_kv_multipler_1(tensor_model_parallel_size):
 
         device = xm.xla_device()
         tensor_model_parallel_size_ = tensor_model_parallel_size
-        parallel_state.initialize_model_parallel(
-            tensor_model_parallel_size=tensor_model_parallel_size_)
+        parallel_state.initialize_model_parallel(tensor_model_parallel_size=tensor_model_parallel_size_)
         tensor_model_parallel_size_ = parallel_state.get_tensor_model_parallel_size()
 
         set_random_seed(seed)
@@ -155,13 +154,31 @@ def test_qkv_linear_with_kv_multipler_1(tensor_model_parallel_size):
             output.detach().cpu().numpy(), expected_output.detach().cpu().numpy(), rtol=1e-2, atol=1e-2
         ), "final output doesn't match rank{}".format(xm.get_ordinal())
         assert np.allclose(
-            output_q.detach().cpu().numpy(), expected_q.chunk(tensor_model_parallel_size_, dim=2)[parallel_state.get_tensor_model_parallel_rank()].detach().cpu().numpy(), rtol=1e-2, atol=1e-2
+            output_q.detach().cpu().numpy(),
+            expected_q.chunk(tensor_model_parallel_size_, dim=2)[parallel_state.get_tensor_model_parallel_rank()]
+            .detach()
+            .cpu()
+            .numpy(),
+            rtol=1e-2,
+            atol=1e-2,
         ), "output_q doesn't match rank{}".format(xm.get_ordinal())
         assert np.allclose(
-            output_k.detach().cpu().numpy(), expected_k.chunk(tensor_model_parallel_size_, dim=2)[parallel_state.get_tensor_model_parallel_rank()].detach().cpu().numpy(), rtol=1e-2, atol=1e-2
+            output_k.detach().cpu().numpy(),
+            expected_k.chunk(tensor_model_parallel_size_, dim=2)[parallel_state.get_tensor_model_parallel_rank()]
+            .detach()
+            .cpu()
+            .numpy(),
+            rtol=1e-2,
+            atol=1e-2,
         ), "output_k doesn't match rank{}".format(xm.get_ordinal())
         assert np.allclose(
-            output_v.detach().cpu().numpy(), expected_v.chunk(tensor_model_parallel_size_, dim=2)[parallel_state.get_tensor_model_parallel_rank()].detach().cpu().numpy(), rtol=1e-2, atol=1e-2
+            output_v.detach().cpu().numpy(),
+            expected_v.chunk(tensor_model_parallel_size_, dim=2)[parallel_state.get_tensor_model_parallel_rank()]
+            .detach()
+            .cpu()
+            .numpy(),
+            rtol=1e-2,
+            atol=1e-2,
         ), "output_v doesn't match rank{}".format(xm.get_ordinal())
 
         # if tensor_model_parallel_size_ == 1:
@@ -171,7 +188,10 @@ def test_qkv_linear_with_kv_multipler_1(tensor_model_parallel_size):
         )[parallel_state.get_tensor_model_parallel_rank()]
 
         assert np.allclose(
-            col_linear.weight_q.grad.detach().cpu().numpy(), expected_q_grad_chunk.detach().cpu().numpy(), rtol=1e-2, atol=1e-2
+            col_linear.weight_q.grad.detach().cpu().numpy(),
+            expected_q_grad_chunk.detach().cpu().numpy(),
+            rtol=1e-2,
+            atol=1e-2,
         ), "grad_q doesn't match rank{}".format(xm.get_ordinal())
 
         expected_k_grad_chunk = ref_k_linear.weight.grad.chunk(
@@ -180,7 +200,10 @@ def test_qkv_linear_with_kv_multipler_1(tensor_model_parallel_size):
         )[parallel_state.get_tensor_model_parallel_rank()]
 
         assert np.allclose(
-            col_linear.weight_k.grad.detach().cpu().numpy(), expected_k_grad_chunk.detach().cpu().numpy(), rtol=1e-2, atol=1e-2
+            col_linear.weight_k.grad.detach().cpu().numpy(),
+            expected_k_grad_chunk.detach().cpu().numpy(),
+            rtol=1e-2,
+            atol=1e-2,
         ), "grad_k doesn't match rank{}".format(xm.get_ordinal())
 
         expected_v_grad_chunk = ref_v_linear.weight.grad.chunk(
@@ -189,7 +212,10 @@ def test_qkv_linear_with_kv_multipler_1(tensor_model_parallel_size):
         )[parallel_state.get_tensor_model_parallel_rank()]
 
         assert np.allclose(
-            col_linear.weight_v.grad.detach().cpu().numpy(), expected_v_grad_chunk.detach().cpu().numpy(), rtol=1e-2, atol=1e-2
+            col_linear.weight_v.grad.detach().cpu().numpy(),
+            expected_v_grad_chunk.detach().cpu().numpy(),
+            rtol=1e-2,
+            atol=1e-2,
         ), "grad_v doesn't match rank{}".format(xm.get_ordinal())
 
         # Reset groups
@@ -222,8 +248,7 @@ def test_qkv_linear_with_kv_multipler_4(tensor_model_parallel_size):
 
         device = xm.xla_device()
         tensor_model_parallel_size_ = tensor_model_parallel_size
-        parallel_state.initialize_model_parallel(
-            tensor_model_parallel_size=tensor_model_parallel_size_)
+        parallel_state.initialize_model_parallel(tensor_model_parallel_size=tensor_model_parallel_size_)
         tensor_model_parallel_size_ = parallel_state.get_tensor_model_parallel_size()
 
         set_random_seed(seed)
@@ -331,7 +356,10 @@ def test_qkv_linear_with_kv_multipler_4(tensor_model_parallel_size):
             dim=0,
         )[parallel_state.get_tensor_model_parallel_rank()]
         assert np.allclose(
-            col_linear.weight_q.grad.detach().cpu().numpy(), expected_q_grad_chunk.detach().cpu().numpy(), rtol=1e-2, atol=1e-2
+            col_linear.weight_q.grad.detach().cpu().numpy(),
+            expected_q_grad_chunk.detach().cpu().numpy(),
+            rtol=1e-2,
+            atol=1e-2,
         ), "grad_q doesn't match rank{}".format(xm.get_ordinal())
 
         expected_k_grad_chunk = ref_k_linear.weight.grad.chunk(
@@ -348,13 +376,15 @@ def test_qkv_linear_with_kv_multipler_4(tensor_model_parallel_size):
         )[parallel_state.get_tensor_model_parallel_rank() % 8]
 
         assert np.allclose(
-            col_linear.weight_v.grad.detach().cpu().numpy(), expected_v_grad_chunk.detach().cpu().numpy(), rtol=5e-2, atol=1e-1
+            col_linear.weight_v.grad.detach().cpu().numpy(),
+            expected_v_grad_chunk.detach().cpu().numpy(),
+            rtol=5e-2,
+            atol=1e-1,
         ), "grad_v doesn't match rank{}".format(xm.get_ordinal())
 
         # Reset groups
         parallel_state.destroy_model_parallel()
         qkv_linear.destroy_kv_group()
-
 
         torch.distributed.barrier()
         if torch.distributed.get_rank() == 0:
@@ -381,7 +411,8 @@ def on_exit():
 
 if __name__ == "__main__":
     if requires_init_pg_override():
-        import torch_xla.experimental.pjrt_backend
+        import torch_xla.experimental.pjrt_backend  # noqa
+
         torch.distributed.init_process_group("xla", init_method="pjrt://")
     else:
         torch.distributed.init_process_group("xla")

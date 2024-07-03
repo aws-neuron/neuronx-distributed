@@ -75,7 +75,7 @@ fi
 torchrun $DISTRIBUTED_ARGS run_llama_nxd.py \
     --train_batch_size $BS \
     --training_dir $DATA_PATH \
-    --training_config $SCRIPT_DIR/70B_config \
+    --training_config $SCRIPT_DIR/70B_config_llama2 \
     --max_steps $max_steps \
     --num_layer $NUM_LAYERS \
     --hidden_size $HIDDEN_SIZE \
@@ -90,6 +90,7 @@ torchrun $DISTRIBUTED_ARGS run_llama_nxd.py \
     --weight_decay 0.1 \
     --warmup_steps 2000 \
     --constant_steps 0 \
+    --use_gpu_compatible_precision 0 \
     $EXTRA_ARGS |& tee $LOG_PATH/log
 
 ret_val=${PIPESTATUS[0]}

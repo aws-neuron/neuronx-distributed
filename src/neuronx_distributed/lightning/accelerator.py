@@ -1,11 +1,16 @@
 import functools
-from typing import Any, Dict, List, Union
+from typing import List, Union
 
 import torch
-from pytorch_lightning.accelerators import XLAAccelerator
-from lightning_fabric.accelerators.xla import _XLA_AVAILABLE, _using_pjrt, _parse_tpu_devices_str
 from lightning_fabric.accelerators.registry import _AcceleratorRegistry
+from lightning_fabric.accelerators.xla import (
+    _XLA_AVAILABLE,
+    _parse_tpu_devices_str,
+    _using_pjrt,
+)
 from lightning_fabric.utilities.device_parser import _check_data_type
+from pytorch_lightning.accelerators import XLAAccelerator
+
 
 class NeuronXLAAccelerator(XLAAccelerator):
     """
@@ -13,12 +18,12 @@ class NeuronXLAAccelerator(XLAAccelerator):
     parse_devices(), get_parallel_devices() are directly copied from XLAAccelerator
     since they have call to _check_tpu_devices_valid() method which we're overriding
     """
-    
+
     @staticmethod
     def parse_devices(devices: Union[int, str, List[int]]) -> Union[int, List[int]]:
         """Accelerator device parsing logic."""
         return _parse_tpu_devices(devices)
-    
+
     @staticmethod
     def get_parallel_devices(devices: Union[int, List[int]]) -> List[torch.device]:
         """Gets parallel devices for the Accelerator."""
@@ -35,9 +40,6 @@ class NeuronXLAAccelerator(XLAAccelerator):
         # accelerator connector init). However, there doesn't seem to be a problem with instantiating `torch.device`.
         # it will be replaced with `xla_device` (also a torch.device`, but with extra logic) in the strategy
 
-
-    
-
     @staticmethod
     # XLA's multiprocessing will pop the TPU_NUM_DEVICES key, so we need to cache it
     # https://github.com/pytorch/xla/blob/v2.0.0/torch_xla/distributed/xla_multiprocessing.py#L280
@@ -48,13 +50,12 @@ class NeuronXLAAccelerator(XLAAccelerator):
         """
         if not _XLA_AVAILABLE:
             return 0
-        
+
         import torch_xla.core.xla_env_vars as xenv
         from torch_xla.utils.utils import getenv_as
-        
+
         return getenv_as(xenv.TPU_NUM_DEVICES, int, 8)
 
-    
     @staticmethod
     @functools.lru_cache(maxsize=1)
     def is_available() -> bool:
@@ -64,8 +65,6 @@ class NeuronXLAAccelerator(XLAAccelerator):
             # XLA may raise these exceptions if it's not properly configured. This needs to be avoided for the cases
             # when `torch_xla` is imported but not used
             return False
-    
-
 
     @classmethod
     def register_accelerators(cls, accelerator_registry: _AcceleratorRegistry) -> None:
@@ -81,6 +80,7 @@ def _parse_tpu_devices(devices: Union[int, str, List[int]]) -> Union[int, List[i
         devices = _parse_tpu_devices_str(devices)
     _check_tpu_devices_valid(devices)
     return devices
+
 
 def _check_tpu_devices_valid(devices: object) -> None:
     # Changing XLAAccelerator to NeuronXLAAccelerator

@@ -125,6 +125,41 @@ class TestNxDConfig(unittest.TestCase):
             update_result({"inference_success": 0})
             raise
 
+    @patch("neuronx_distributed.parallel_layers.layers.get_tensor_model_parallel_size", MagicMock(return_value=8))
+    @patch("neuronx_distributed.parallel_layers.layers.get_tensor_model_parallel_rank", MagicMock(return_value=1))
+    @patch("neuronx_distributed.pipeline.model.parallel_state.initialize_model_parallel", MagicMock(return_value=None))
+    @patch(
+        "neuronx_distributed.pipeline.model.parallel_state.model_parallel_is_initialized", MagicMock(return_value=True)
+    )
+    @patch(
+        "neuronx_distributed.pipeline.model.parallel_state.get_pipeline_model_parallel_size", MagicMock(return_value=4)
+    )
+    @patch(
+        "neuronx_distributed.pipeline.model.parallel_state.get_pipeline_model_parallel_rank", MagicMock(return_value=1)
+    )
+    @patch("torch.distributed.get_rank")
+    def test_neuronx_distributed_config3(self, rank_mock):
+        try:
+            mixed_precision_config = {
+                "use_master_weights": True,
+                "use_fp32_grad_acc": True,
+                "use_master_weights_in_ckpt": False,
+            }
+            nxd_config = nxd.neuronx_distributed_config(
+                tensor_parallel_size=8,
+                pipeline_parallel_size=4,
+                pipeline_config=None,
+                optimizer_config=None,
+                activation_checkpoint_config=None,
+                pad_model=False,
+                sequence_parallel=False,
+            )
+
+            assert nxd_config["mixed_precision_config"] == mixed_precision_config
+        except:
+            update_result({"inference_success": 0})
+            raise
+
 
 if __name__ == "__main__":
     unittest.main()

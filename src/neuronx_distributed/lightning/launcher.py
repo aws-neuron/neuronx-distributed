@@ -4,7 +4,6 @@ from typing import Any, Callable, Optional
 
 import pytorch_lightning as pl
 import torch.multiprocessing as mp
-from lightning_fabric.accelerators.xla import _XLA_AVAILABLE
 from lightning_fabric.strategies.launchers.xla import _rank_teardown
 from pytorch_lightning.strategies.launchers.multiprocessing import _GlobalStateSnapshot
 from pytorch_lightning.strategies.launchers.xla import _XLALauncher

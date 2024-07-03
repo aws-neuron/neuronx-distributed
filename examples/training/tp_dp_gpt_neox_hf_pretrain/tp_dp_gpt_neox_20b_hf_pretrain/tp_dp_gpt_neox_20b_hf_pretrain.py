@@ -259,28 +259,6 @@ def get_dtype(model) -> str:
     return str(model.dtype)
 
 
-def allreduce_sequence_parallel_gradients(optimizer):
-    """All-reduce layernorm parameters across model parallel nodes when sequence parallelism is used.
-    Modified from megatron-lm:
-    https://gitlab-master.nvidia.com/ADLR/megatron-lm/-/blob/3f91f09bb2ab32f9904b47f46f19d2fc3f518ed8/megatron/training.py#L425
-    """
-    from neuronx_distributed.parallel_layers.mappings import (
-        reduce_from_tensor_model_parallel_region,
-    )
-
-    grads = []
-    for param_group in optimizer.__getstate__()["param_groups"]:
-        for group, params in param_group.items():
-            if group == "params":
-                for p in params:
-                    if isinstance(p, torch.Tensor) and p.grad is not None:
-                        sequence_parallel_param = getattr(p, "sequence_parallel_enabled", False)
-                        if sequence_parallel_param:
-                            grads.append(p.grad.data)
-    for grad in grads:
-        reduce_from_tensor_model_parallel_region(grad)
-
-
 def train_gpt_neox(flags):
     parallel_state.initialize_model_parallel(tensor_model_parallel_size=flags.tensor_parallel_size)
     world_size = parallel_state.get_data_parallel_size()
@@ -381,9 +359,6 @@ def train_gpt_neox(flags):
                 )
                 running_loss_reduced_detached = running_loss_reduced.detach()
                 running_loss.zero_()
-
-                # sequence parallel allreduce
-                allreduce_sequence_parallel_gradients(optimizer)
 
                 optimizer.step()
 

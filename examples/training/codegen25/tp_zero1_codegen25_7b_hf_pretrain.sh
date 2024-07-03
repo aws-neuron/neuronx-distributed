@@ -109,7 +109,7 @@ echo STEPS_THIS_RUN=$STEPS_THIS_RUN
 echo OUTPUT_LOG=$OUTPUT_LOG
 
 torchrun $DISTRIBUTED_ARGS \
-    tp_zero1_llama2_7b_hf_pretrain.py \
+    tp_zero1_llama_hf_pretrain.py \
     --model_path $MODEL_PATH \
     --data_dir $DATA_PATH \
     --tensor_parallel_size $TP_DEGREE \

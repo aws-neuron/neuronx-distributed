@@ -3,9 +3,50 @@
 #############################################
 # User defined parameters and env vars
 
+if [ -z "$SEQ_LEN" ];
+then
+    DATA_PATH="$HOME/wikicorpus_datasets/wikicorpus_llama_v2_tokenized_4k"
+    SEQ_LEN=4096
+    n_layers=-1
+    GBS=256
+    total_steps=150
+    TP_DEGREE=8
+    use_flash_attention=0
+elif [[ $SEQ_LEN = 8192 ]];
+then
+    DATA_PATH="$HOME/wikicorpus_datasets/wikicorpus_llama_v2_tokenized_8k"
+    SEQ_LEN=8192
+    n_layers=8
+    GBS=16
+    total_steps=30
+    TP_DEGREE=32
+    use_flash_attention=1
+elif [[ $SEQ_LEN = 16384 ]];
+then
+    DATA_PATH="$HOME/wikicorpus_datasets/wikicorpus_llama_v2_tokenized_16k"
+    SEQ_LEN=16384
+    n_layers=8
+    GBS=16
+    total_steps=30
+    TP_DEGREE=32
+    use_flash_attention=1
+elif [[ $SEQ_LEN = 32768 ]];
+then
+    DATA_PATH="$HOME/wikicorpus_datasets/wikicorpus_llama_v2_tokenized_32k"
+    SEQ_LEN=32768
+    n_layers=8
+    GBS=16
+    total_steps=30
+    TP_DEGREE=32
+    use_flash_attention=1
+else
+    echo "got unexpected seq len $SEQ_LEN"
+    exit 1
+fi
+
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 
-export NEURON_CC_FLAGS="--model-type transformer --distribution-strategy=llm-training"
+export NEURON_CC_FLAGS="--model-type transformer --distribution-strategy=llm-training --cache_dir=$HOME/neuron_compile_cache$SEQ_LEN/ --retry_failed_compilation"
 export NEURON_FUSE_SOFTMAX=1
 
 # Async Runtime
@@ -14,14 +55,10 @@ export NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS=3
 # HOST OOM
 export MALLOC_ARENA_MAX=64
 
-# TP degree
-TP_DEGREE=8
 # 0: bf16; 1: mixed precision
 USE_MIX_PRECISION=1
 # 0: use pure DP; 1: use ZeRO-1
 USE_ZERO_1=1
-# global batch size
-: ${GBS=256}
 # micro batch size
 MBS=1
 # number of steps to run
@@ -32,10 +69,6 @@ WARMUP_STEPS=100
 LR=3.0e-4
 # model path
 MODEL_PATH=$SCRIPT_DIR
-# data path
-DATA_PATH="$HOME/wikicorpus_datasets/wikicorpus_llama_v2_tokenized_4k"
-# sequence length
-: ${SEQ_LEN=4096}
 # Output dir
 : ${OUTPUT_DIR="./output"}
 
@@ -88,10 +121,10 @@ ACC_STEPS=$(($GBS / $MBS / $DP))
 
 if [ $NEURON_EXTRACT_GRAPHS_ONLY -gt 0 ]; then
     STEPS_THIS_RUN=2
-    OUTPUT_LOG=log_compile-$NODE_ID.log
+    OUTPUT_LOG=log_compile-$SEQ_LEN.log
 else
-    STEPS_THIS_RUN=150
-    OUTPUT_LOG=log_exe-$NODE_ID.log
+    STEPS_THIS_RUN=$total_steps
+    OUTPUT_LOG=log_exe-$SEQ_LEN.log
 fi
 
 echo TP_DEGREE=$TP_DEGREE
@@ -128,7 +161,9 @@ torchrun $DISTRIBUTED_ARGS \
     --use_selective_checkpoint 1 \
     --use_fp32_optimizer 1 \
     --use_zero1_optimizer 1 \
-    --scheduler_type 'linear' |& tee $OUTPUT_LOG
+    --scheduler_type 'linear' \
+    --num_layers $n_layers \
+    --use_flash_attention=$use_flash_attention |& tee $OUTPUT_LOG
 
 ret_val=${PIPESTATUS[0]}
 echo ret_val=$ret_val

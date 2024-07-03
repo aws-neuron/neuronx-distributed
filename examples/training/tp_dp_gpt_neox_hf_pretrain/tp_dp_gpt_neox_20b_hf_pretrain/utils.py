@@ -1,8 +1,11 @@
 import torch
+
 from neuronx_distributed.parallel_layers import mappings
+
 
 class _ScatterToSequenceParallelRegion(torch.autograd.Function):
     """Split the input and keep only the corresponding chunk to the rank."""
+
     @staticmethod
     def symbolic(graph, input_):
         return mappings._split_along_first_dim(input_)

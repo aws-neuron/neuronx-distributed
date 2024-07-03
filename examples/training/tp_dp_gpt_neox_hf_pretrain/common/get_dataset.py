@@ -1,7 +1,8 @@
+import os
+from itertools import chain
+
 from datasets import load_dataset
 from transformers import AutoTokenizer
-from itertools import chain
-import os
 
 dataset_name = "wikicorpus"
 dataset_config_name = "raw_en"
@@ -21,8 +22,10 @@ tokenizer = AutoTokenizer.from_pretrained(model_name)
 column_names = raw_datasets["train"].column_names
 text_column_name = "text" if "text" in column_names else column_names[0]
 
+
 def tokenize_function(examples):
     return tokenizer(examples[text_column_name])
+
 
 tokenized_datasets = raw_datasets.map(
     tokenize_function,
@@ -36,6 +39,7 @@ if block_size > tokenizer.model_max_length:
     print("block_size > tokenizer.model_max_length")
 block_size = min(block_size, tokenizer.model_max_length)
 
+
 # Main data processing function that will concatenate all texts from our dataset and generate chunks of block_size.
 def group_texts(examples):
     # Concatenate all texts.
@@ -46,11 +50,11 @@ def group_texts(examples):
     total_length = (total_length // block_size) * block_size
     # Split by chunks of max_len.
     result = {
-        k: [t[i : i + block_size] for i in range(0, total_length, block_size)]
-        for k, t in concatenated_examples.items()
+        k: [t[i : i + block_size] for i in range(0, total_length, block_size)] for k, t in concatenated_examples.items()
     }
     result["labels"] = result["input_ids"].copy()
     return result
+
 
 lm_datasets = tokenized_datasets.map(
     group_texts,

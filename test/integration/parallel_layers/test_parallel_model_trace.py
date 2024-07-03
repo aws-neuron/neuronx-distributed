@@ -1,11 +1,6 @@
-import os
-
 import torch
-import torch_neuronx
-import transformers
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
-from transformers.models.bert.modeling_bert import (BertSelfAttention,
-                                                    BertSelfOutput)
+from transformers.models.bert.modeling_bert import BertSelfAttention, BertSelfOutput
 
 import neuronx_distributed
 from neuronx_distributed.parallel_layers import layers, parallel_state
@@ -13,16 +8,12 @@ from neuronx_distributed.parallel_layers import layers, parallel_state
 
 def encode(tokenizer, *inputs, max_length=128, batch_size=1):
     tokens = tokenizer.encode_plus(
-        *inputs,
-        max_length=max_length,
-        padding='max_length',
-        truncation=True,
-        return_tensors="pt"
+        *inputs, max_length=max_length, padding="max_length", truncation=True, return_tensors="pt"
     )
     return (
-        torch.repeat_interleave(tokens['input_ids'], batch_size, 0),
-        torch.repeat_interleave(tokens['attention_mask'], batch_size, 0),
-        torch.repeat_interleave(tokens['token_type_ids'], batch_size, 0),
+        torch.repeat_interleave(tokens["input_ids"], batch_size, 0),
+        torch.repeat_interleave(tokens["attention_mask"], batch_size, 0),
+        torch.repeat_interleave(tokens["token_type_ids"], batch_size, 0),
     )
 
 
@@ -39,8 +30,10 @@ sequence_2 = "HuggingFace's headquarters are situated in Manhattan"
 paraphrase = encode(tokenizer, sequence_1, sequence_2)
 not_paraphrase = encode(tokenizer, sequence_1, sequence_1)
 
+
 def get_model():
     model = AutoModelForSequenceClassification.from_pretrained(name, torchscript=True)
+
     # Here we build a model with tensor-parallel layers.
     # Note: If you already have a Model class that does this, we can use that directly
     # and load the checkpoint in it.
@@ -56,9 +49,7 @@ def get_model():
     class ParallelSelfOutput(BertSelfOutput):
         def __init__(self, config):
             super().__init__(config)
-            self.dense = layers.RowParallelLinear(config.hidden_size,
-                                    config.hidden_size,
-                                    input_is_parallel=True)
+            self.dense = layers.RowParallelLinear(config.hidden_size, config.hidden_size, input_is_parallel=True)
 
     for layer in model.bert.encoder.layer:
         layer.attention.self = ParallelSelfAttention(model.config)
@@ -73,12 +64,14 @@ def get_model():
 
     return model, {}
 
-def infer():
 
+def infer():
     # Note how we are passing a function that returns a model object, which needs to be traced.
     # This is mainly done, since the model initialization needs to happen within the processes
     # that get launched internally withing the parallel_model_trace.
-    model = neuronx_distributed.trace.parallel_model_trace(get_model, paraphrase, tp_degree=2, compiler_args=" --model-type=transformer")
+    model = neuronx_distributed.trace.parallel_model_trace(
+        get_model, paraphrase, tp_degree=2, compiler_args=" --model-type=transformer"
+    )
 
     # Once traced, we now save the trace model for future inference. This API takes care
     # of saving the checkpoint from each tensor parallel worker

@@ -64,14 +64,15 @@ class TestCheckpoint(unittest.TestCase):
         "neuronx_distributed.pipeline.model.parallel_state.get_tensor_model_parallel_rank", MagicMock(return_value=1)
     )
     @patch("neuronx_distributed.pipeline.partition.get_pipeline_model_parallel_rank", MagicMock(return_value=1))
+    @patch("neuronx_distributed.pipeline.partition.get_pipeline_model_parallel_size", MagicMock(return_value=8))
     @patch("neuronx_distributed.pipeline.model.NxDPPModel._create_pg_with_ranks", MagicMock(return_value=None))
     @patch(
         "neuronx_distributed.parallel_layers.parallel_state.get_data_parallel_group",
-        MagicMock(return_value=[ [i] for i in range(64)]),
+        MagicMock(return_value=[[i] for i in range(64)]),
     )
     @patch(
         "neuronx_distributed.trainer.checkpoint.get_data_parallel_group",
-        MagicMock(return_value=[ [i] for i in range(64)]),
+        MagicMock(return_value=[[i] for i in range(64)]),
     )
     @patch(
         "neuronx_distributed.parallel_layers.parallel_state.get_tensor_model_parallel_group",
@@ -83,7 +84,7 @@ class TestCheckpoint(unittest.TestCase):
     )
     @patch(
         "neuronx_distributed.optimizer.zero_redundancy_optimizer.get_data_parallel_group",
-        MagicMock(return_value=[ [i] for i in range(64)]),
+        MagicMock(return_value=[[i] for i in range(64)]),
     )
     @patch("neuronx_distributed.utils.model_utils.get_local_world_size", MagicMock(return_value=32))
     @patch("neuronx_distributed.trainer.checkpoint.get_tensor_model_parallel_rank", MagicMock(return_value=1))

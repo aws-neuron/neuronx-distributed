@@ -38,7 +38,7 @@ def get_model_nxd(num_layers):
 class TestAutoPartition(unittest.TestCase):
     @patch("neuronx_distributed.parallel_layers.layers.get_tensor_model_parallel_size", MagicMock(return_value=1))
     @patch("neuronx_distributed.parallel_layers.layers.get_tensor_model_parallel_rank", MagicMock(return_value=1))
-    @patch("neuronx_distributed.parallel_layers.layers._initialize_affine_weight_cpu", MagicMock(return_value=None))
+    @patch("neuronx_distributed.parallel_layers.layers._initialize_parameter_cpu", MagicMock(return_value=None))
     @patch("neuronx_distributed.parallel_layers.layers._initialize_affine_weight_neuron", MagicMock(return_value=None))
     @patch(
         "neuronx_distributed.pipeline.model.parallel_state.model_parallel_is_initialized", MagicMock(return_value=True)
@@ -72,7 +72,7 @@ class TestAutoPartition(unittest.TestCase):
 
     @patch("neuronx_distributed.parallel_layers.layers.get_tensor_model_parallel_size", MagicMock(return_value=1))
     @patch("neuronx_distributed.parallel_layers.layers.get_tensor_model_parallel_rank", MagicMock(return_value=1))
-    @patch("neuronx_distributed.parallel_layers.layers._initialize_affine_weight_cpu", MagicMock(return_value=None))
+    @patch("neuronx_distributed.parallel_layers.layers._initialize_parameter_cpu", MagicMock(return_value=None))
     @patch("neuronx_distributed.parallel_layers.layers._initialize_affine_weight_neuron", MagicMock(return_value=None))
     @patch(
         "neuronx_distributed.pipeline.model.parallel_state.model_parallel_is_initialized", MagicMock(return_value=True)

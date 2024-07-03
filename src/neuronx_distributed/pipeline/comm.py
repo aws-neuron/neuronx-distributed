@@ -35,22 +35,33 @@ whereas worker 1 which entered steady state 1 step later, would try to load its 
 """
 
 
-def send(tensor, send_next=True, tracing=False):
-    if not tracing:
-        xm.mark_step()
+def send(tensor, send_next=True, all_reduce_send_recv=False):
     if send_next:
         groups = parallel_state.get_next_rank_group(as_list=True)
     else:
         groups = parallel_state.get_prev_rank_group(as_list=True)
     logger.debug(rmsg(f"send with groups {groups}"))
-    _ = xm.all_reduce(xm.REDUCE_SUM, tensor, groups=groups)
-    if not tracing:
-        xm.mark_step()
+
+    if not all_reduce_send_recv:
+        # Use all_gather instead of all_reduce for send/recv
+        rank = xm.get_ordinal()
+        split_index = 0
+        for group in groups:
+            if rank in group:
+                split_index = sorted(group).index(rank)
+                break
+        size = tensor.size(dim=0)
+        tensor = xm.all_gather(tensor, groups=groups, pin_layout=False)
+        requires_grad = tensor.requires_grad
+        tensor = torch.split(tensor, size, dim=0)[split_index].detach().clone()
+        tensor.requires_grad_(requires_grad)
+        return tensor
+    else:
+        tensor = xm.all_reduce(xm.REDUCE_SUM, tensor, groups=groups)
+        return tensor
 
 
-def recv_from(tensor_meta, recv_prev=True, tracing=False):
-    if not tracing:
-        xm.mark_step()
+def recv_from(tensor_meta, recv_prev=True, tracing=False, all_reduce_send_recv=False):
     tensor_recv_next = torch.zeros(
         tensor_meta.shape,
         requires_grad=tensor_meta.requires_grad,
@@ -62,12 +73,24 @@ def recv_from(tensor_meta, recv_prev=True, tracing=False):
     else:
         groups = parallel_state.get_next_rank_group(as_list=True)
     logger.debug(rmsg(f"recv with groups {groups}"))
-    tensor_recv_next = xm.all_reduce(xm.REDUCE_SUM, tensor_recv_next, groups=groups)
-    # PT XLA >= 2.1 requires_grad attr is not preserved after CC comm
-    # TODO: check with XLA team
+
+    if not all_reduce_send_recv:
+        # Use all_gather instead of all_reduce for send/recv
+        rank = xm.get_ordinal()
+        split_index = 0
+        gr = []
+        for group in groups:
+            if rank in group:
+                gr = group
+                split_index = sorted(group).index(rank)
+                break
+        split_index = 1 - split_index
+        size = tensor_recv_next.size(dim=0)
+        tensor_recv_next = xm.all_gather(tensor_recv_next, groups=groups, pin_layout=False)
+        tensor_recv_next = torch.split(tensor_recv_next, size, dim=0)[split_index].detach().clone()
+    else:
+        tensor_recv_next = xm.all_reduce(xm.REDUCE_SUM, tensor_recv_next, groups=groups)
     tensor_recv_next.requires_grad_(tensor_meta.requires_grad)
-    if not tracing:
-        xm.mark_step()
     return tensor_recv_next
 
 

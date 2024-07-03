@@ -2,17 +2,16 @@ import collections
 import os
 from typing import List, Sequence
 
+import numpy as np
 import torch
 import torch_xla
 import torch_xla.core.xla_env_vars as xenv
 import torch_xla.core.xla_model as xm
 
 from neuronx_distributed.parallel_layers.parallel_state import (
-    get_tensor_model_parallel_rank
+    get_tensor_model_parallel_rank,
 )
 from neuronx_distributed.utils.logger import get_logger
-
-import numpy as np
 
 _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {
     "tensor_model_parallel": False,
@@ -88,6 +87,15 @@ def divide(numerator, denominator):
     return numerator // denominator
 
 
+def get_padding_length(numerator, denominator):
+    """Value to pad numerator with to make it evenly divisible by the denominator"""
+    if numerator % denominator != 0:
+        mod = numerator % denominator
+        return denominator - mod
+    else:
+        return 0
+
+
 def split_tensor_along_last_dim(
     tensor: torch.Tensor,
     num_partitions: int,
@@ -112,14 +120,39 @@ def split_tensor_along_last_dim(
     return tensor_list
 
 
+def split_tensor_along_second_dim(
+    tensor: torch.Tensor,
+    num_partitions: int,
+    contiguous_split_chunks: bool = False,
+) -> List[torch.Tensor]:
+    """Split a tensor along its second dimension (numbered starting at 1)
+    Arguments:
+        tensor: input tensor.
+        num_partitions: number of partitions to split the tensor
+        contiguous_split_chunks: If True, make each chunk contiguous
+                                 in memory.
+    """
+    # Get the size and dimension.
+    last_dim_size = divide(tensor.size()[1], num_partitions)
+    # Split.
+    tensor_list = torch.split(tensor, last_dim_size, dim=1)
+    # Note: torch.split does not create contiguous tensors by default.
+    if contiguous_split_chunks:
+        return tuple(chunk.contiguous() for chunk in tensor_list)
+
+    return tensor_list
+
+
 def is_torch_version_greater_than_2():
     return torch.__version__.startswith("2")
+
 
 def is_pjrt_device():
     return os.environ.get("PJRT_DEVICE", None) == "NEURON"
 
+
 def requires_init_pg_override():
-    return torch.__version__.startswith('2.0')
+    return torch.__version__.startswith("2.0")
 
 
 def cast_tensor(tensor, from_dtype=torch.float32, to_dtype=torch.bfloat16):
@@ -141,6 +174,7 @@ def cast_all(state, from_dtype=torch.float32, to_dtype=torch.bfloat16):
             # We only cast Tensor, list, tuple or dict of tensors.
             return state
 
+
 # Refering to https://github.com/NVIDIA/apex/blob/master/apex/_autocast_utils.py#L22
 def cast_if_autocast_enabled(*args):
     if not torch.is_autocast_enabled():
@@ -148,13 +182,11 @@ def cast_if_autocast_enabled(*args):
     else:
         return _cast(args, torch.get_autocast_gpu_dtype())
 
+
 # Modifying from https://github.com/pytorch/pytorch/blob/main/torch/cuda/amp/autocast_mode.py#L57, removed check for cuda device
 def _cast(value, dtype):
     if isinstance(value, torch.Tensor):
-        is_eligible = (
-            value.is_floating_point()
-            and (value.dtype is not torch.float64)
-        )
+        is_eligible = value.is_floating_point() and (value.dtype is not torch.float64)
         return value.to(dtype) if is_eligible else value
     elif isinstance(value, (str, bytes)):
         return value
@@ -170,6 +202,7 @@ def _cast(value, dtype):
             return iterable
     else:
         return value
+
 
 def move_all_tensor_to_cpu(data, convert=True):
     def is_xla_tensor(tensor):
@@ -206,13 +239,16 @@ def move_model_to_device(model: torch.nn.Module, device: torch.device) -> None:
 
     model_utils.move_model_to_device(model, device)
 
+
 def verify_casted_dtype(value):
     """Veryfy whether the input values have been casted correctly"""
     if not torch.is_autocast_enabled():
         return
     else:
         if isinstance(value, torch.Tensor):
-            assert value.dtype == torch.get_autocast_gpu_dtype(), f"Datatype of tensor is expected to be {torch.get_autocast_gpu_dtype()}, got {value.dtype} instead"
+            assert (
+                value.dtype == torch.get_autocast_gpu_dtype()
+            ), f"Datatype of tensor is expected to be {torch.get_autocast_gpu_dtype()}, got {value.dtype} instead"
         elif isinstance(value, collections.abc.Mapping):
             for k, v in value.items():
                 verify_casted_dtype(k)

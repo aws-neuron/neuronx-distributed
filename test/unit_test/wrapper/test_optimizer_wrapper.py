@@ -71,6 +71,7 @@ class TestOptimizerWrapper(unittest.TestCase):
         "neuronx_distributed.pipeline.model.parallel_state.get_tensor_model_parallel_rank", MagicMock(return_value=1)
     )
     @patch("neuronx_distributed.pipeline.partition.get_pipeline_model_parallel_rank", MagicMock(return_value=1))
+    @patch("neuronx_distributed.pipeline.partition.get_pipeline_model_parallel_size", MagicMock(return_value=8))
     @patch("neuronx_distributed.pipeline.model.NxDPPModel._create_pg_with_ranks", MagicMock(return_value=None))
     @patch(
         "neuronx_distributed.parallel_layers.parallel_state.get_data_parallel_group",
@@ -162,6 +163,7 @@ class TestOptimizerWrapper(unittest.TestCase):
         "neuronx_distributed.pipeline.model.parallel_state.get_tensor_model_parallel_rank", MagicMock(return_value=1)
     )
     @patch("neuronx_distributed.pipeline.partition.get_pipeline_model_parallel_rank", MagicMock(return_value=1))
+    @patch("neuronx_distributed.pipeline.partition.get_pipeline_model_parallel_size", MagicMock(return_value=8))
     @patch("neuronx_distributed.pipeline.model.NxDPPModel._create_pg_with_ranks", MagicMock(return_value=None))
     @patch(
         "neuronx_distributed.parallel_layers.parallel_state.get_data_parallel_group",

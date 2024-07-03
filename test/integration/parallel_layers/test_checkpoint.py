@@ -45,8 +45,12 @@ def test_zero1_checkpoint():
         p = [torch.nn.Parameter(torch.randn(32, 32).to(xm.xla_device()))]
         p[0].grad = torch.randn(32, 32).to(xm.xla_device())
         opt = NeuronZero1Optimizer(
-            p, torch.optim.SGD, lr=0.01, momentum=0.9, pin_layout=False, 
-            grad_clipping=False, 
+            p,
+            torch.optim.SGD,
+            lr=0.01,
+            momentum=0.9,
+            pin_layout=False,
+            grad_clipping=False,
             sharding_groups=parallel_state.get_data_parallel_group(as_list=True),
             grad_norm_groups=parallel_state.get_tensor_model_parallel_group(as_list=True),
         )
@@ -87,10 +91,10 @@ def on_exit():
 if __name__ == "__main__":
     if requires_init_pg_override():
         import torch_xla.experimental.pjrt_backend  # noqa
+
         torch.distributed.init_process_group("xla", init_method="pjrt://")
     else:
         torch.distributed.init_process_group("xla")
     print_separator("test zero1 checkpoint")
     test_zero1_checkpoint()
     atexit.register(on_exit)
-
