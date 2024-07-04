@@ -1,7 +1,10 @@
 from torch import nn
 from torch.nn import functional as F
-from neuronx_distributed.parallel_layers.layers import ColumnParallelLinear, RowParallelLinear
-from neuronx_distributed.utils.model_utils import is_hf_pretrained_model
+
+from neuronx_distributed.parallel_layers.layers import (
+    ColumnParallelLinear,
+    RowParallelLinear,
+)
 
 
 def get_number_of_extra_heads(n_head, tp_degree):
@@ -67,6 +70,7 @@ def pad_model(model, tp_degree, n_heads, wrapped_classes=(), pad_hook_fn=None):
     Returns:
         torch.nn.Module: padded model
     """
+
     def pad_helper(model, tgt_src_ratio, should_pad, pad_hook_fn):
         # Recursive helper to not repeat any initial calculations/work and allow us to easily track when to pad.
         for _, module in model.named_children():

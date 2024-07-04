@@ -1,43 +1,34 @@
-import os 
-
+import os
 from typing import Any, Dict, Optional
 
 from lightning_fabric.plugins.io import XLACheckpointIO
-from lightning_fabric.utilities.types import _PATH
 from lightning_fabric.utilities.cloud_io import get_filesystem
+from lightning_fabric.utilities.types import _PATH
 from lightning_utilities.core.apply_func import apply_to_collection
 from lightning_utilities.core.imports import RequirementCache
 
-from neuronx_distributed.parallel_layers.checkpointing import save, load
+from neuronx_distributed.parallel_layers.checkpointing import load, save
+
 
 class NeuronCheckpointIO(XLACheckpointIO):
-
-    def __init__(self, 
-        save_load_xser: bool = True, 
-        *args: Any, 
-        **kwargs: Any
-        ) -> None:
+    def __init__(self, save_load_xser: bool = True, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.save_load_xser = save_load_xser
 
     def load_checkpoint(
-        self, 
+        self,
         checkpoint_path: _PATH,
-        master_dp_only: bool = True, 
+        master_dp_only: bool = True,
     ) -> Dict[str, Any]:
-        return load(
-            chkpt_path = checkpoint_path,
-            load_xser = self.save_load_xser,
-            master_dp_only = master_dp_only
-        )
+        return load(chkpt_path=checkpoint_path, load_xser=self.save_load_xser, master_dp_only=master_dp_only)
 
     def save_checkpoint(
-        self, 
-        checkpoint: Dict[str, Any], 
-        path: _PATH, 
+        self,
+        checkpoint: Dict[str, Any],
+        path: _PATH,
         storage_options: Optional[Any] = None,
         master_dp_only: bool = True,
-        ) -> None:
+    ) -> None:
         """Save model/training states as a checkpoint file through state-dump and file-write.
 
         Args:
@@ -64,9 +55,4 @@ class NeuronCheckpointIO(XLACheckpointIO):
 
             checkpoint = apply_to_collection(checkpoint, (DictConfig, ListConfig), OmegaConf.to_container)
 
-        save(
-            checkpoint = checkpoint,
-            output_dir = path,
-            save_xser = self.save_load_xser,
-            master_dp_only = master_dp_only
-        )
+        save(checkpoint=checkpoint, output_dir=path, save_xser=self.save_load_xser, master_dp_only=master_dp_only)

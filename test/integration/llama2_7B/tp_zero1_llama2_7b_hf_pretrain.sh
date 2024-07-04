@@ -14,6 +14,9 @@ export NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS=3
 # HOST OOM
 export MALLOC_ARENA_MAX=64
 
+MODEL_SIZE="7B"
+LLAMA_VERSION='2'
+
 # TP degree
 TP_DEGREE=8
 # 0: bf16; 1: mixed precision
@@ -31,7 +34,7 @@ WARMUP_STEPS=100
 # learning rate
 LR=3.0e-4
 # model path
-MODEL_PATH=$SCRIPT_DIR
+MODEL_PATH=$SCRIPT_DIR/${MODEL_SIZE}_config_llama${LLAMA_VERSION}
 # data path
 DATA_PATH="$HOME/wikicorpus_datasets/wikicorpus_llama_v2_tokenized_4k"
 # sequence length
@@ -113,7 +116,7 @@ echo STEPS_THIS_RUN=$STEPS_THIS_RUN
 echo OUTPUT_LOG=$OUTPUT_LOG
 
 torchrun $DISTRIBUTED_ARGS \
-    tp_zero1_llama2_7b_hf_pretrain.py \
+    tp_zero1_llama_hf_pretrain.py \
     --metrics_file /tmp/test_dict.json \
     --model_path $MODEL_PATH \
     --data_dir $DATA_PATH \

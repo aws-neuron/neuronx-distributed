@@ -1,9 +1,11 @@
 import concurrent.futures
-import filecmp
+import gc
 import logging
 import multiprocessing
 import os
 import pathlib
+import shutil
+from collections import defaultdict
 from typing import Any, Callable, List, Optional, Union
 
 import torch
@@ -12,15 +14,37 @@ import torch_xla.core.xla_model as xm
 import torch_xla.distributed.xla_multiprocessing as xmp
 from torch_neuronx import BucketModelConfig
 from torch_neuronx.xla_impl.bucket_trace import create_bucket_model
-from torch_neuronx.xla_impl.trace import generate_hlo, hlo_compile, setup_compiler_dirs
+from torch_neuronx.xla_impl.torchscript import replace_weights
 from torch_xla.utils.utils import get_free_tcp_ports
 
 from neuronx_distributed.parallel_layers import parallel_state
-from neuronx_distributed.parallel_layers.utils import requires_init_pg_override
+from neuronx_distributed.parallel_layers.checkpointing import NXD_SKIP_RENDEZVOUS
+from neuronx_distributed.parallel_layers.layers import (
+    ColumnParallelLinear,
+    ParallelEmbedding,
+    RowParallelLinear,
+)
+from neuronx_distributed.parallel_layers.utils import (
+    divide,
+    is_torch_version_greater_than_2,
+    requires_init_pg_override,
+)
+from neuronx_distributed.quantization.quantization_layers import (
+    QuantizedColumnParallel,
+    QuantizedRowParallel,
+)
+from neuronx_distributed.utils.model_utils import init_on_device
 
 logger = logging.getLogger("Neuron")
 
-NXD_SKIP_RENDEZVOUS = "NXD_SKIP_RENDEZVOUS"
+# Varible to specify the types of Moduels that are currently Sharded
+__SUPPORTED_SHARDED_MODULES = (
+    ColumnParallelLinear,
+    RowParallelLinear,
+    ParallelEmbedding,
+    QuantizedRowParallel,
+    QuantizedColumnParallel,
+)
 
 
 class ParallelModel(torch.nn.Module):
@@ -134,49 +158,6 @@ def generate_ranked_folder(tp_rank, bucket_rank, bucket_degree):
     return f"_tp{tp_rank}" + (f"_bk{bucket_rank}" if bucket_degree > 1 else "")
 
 
-def _compile_model_shard(
-    tp_rank,
-    rank_hlo,
-    compiler_workdir,
-    compiler_args,
-    inline_weights_to_neff,
-    bucket_rank,
-    bucket_degree,
-):
-    rank_folder = generate_ranked_folder(tp_rank, bucket_rank, bucket_degree)
-    ranked_compiler_workdir = os.path.join(compiler_workdir, rank_folder)
-
-    neff_filename = None
-    logging.debug(f"Current TP Rank: {tp_rank} | SPMD Target Rank: 0")
-    if tp_rank == 0:
-        logger.debug(f"SPMD Target Rank 0 Compilation Started")
-        neff_filename = hlo_compile(
-            rank_hlo,
-            ranked_compiler_workdir,
-            compiler_args,
-        )
-    else:
-        zero_rank_folder = generate_ranked_folder(0, bucket_rank, bucket_degree)
-        shard_dir = os.path.join(compiler_workdir, zero_rank_folder)
-        shard_hlo = os.path.join(shard_dir, "model/graph.hlo")
-        # verify that hlo for current tp rank is the same as the one being compiled
-        if (filecmp.cmp(rank_hlo, shard_hlo)) and (not inline_weights_to_neff):
-            neff_filename = os.path.join(shard_dir, "graph.neff")
-        else:
-            if not inline_weights_to_neff:
-                logger.warning(
-                    f"TP Rank {tp_rank} HLO differs from SPMD Target TP Rank 0 HLO, and will therefore need an extra compilation. This potentially indicates unoptimal use of Neuronx-Distributed Parallel Layers."
-                )
-            # perform parallel compilation if hlo is different from target shard
-            neff_filename = hlo_compile(
-                rank_hlo,
-                ranked_compiler_workdir,
-                compiler_args,
-            )
-
-    return neff_filename
-
-
 def _trace(
     rank: int,
     func: Callable,
@@ -215,35 +196,16 @@ def _trace(
                 # processes to finish checkpoint loading.
                 func_kwargs = bucket_config.get_func_kwargs_for_bucket_rank(bucket_rank) if bucket_config else {}
                 model, input_output_alias = _get_model_shard(func, func_kwargs)
+                rank_folder = generate_ranked_folder(tp_rank, bucket_rank, bucket_degree)
 
-                (hlo, constant_parameter_tensors, flattener, packer, metaneff, weights) = generate_hlo(
+                neff_filename, metaneff, flattener, packer, weights = torch_neuronx.xla_impl.trace._trace(
                     model,
                     example_inputs[bucket_rank],
-                    states=states,
-                    input_output_aliases=input_output_alias,
-                    inline_weights_to_neff=inline_weights_to_neff,
-                )
-                rank_folder = generate_ranked_folder(tp_rank, bucket_rank, bucket_degree)
-                rank_hlo = setup_compiler_dirs(
-                    hlo, os.path.join(compiler_workdir, rank_folder), constant_parameter_tensors, inline_weights_to_neff
-                )
-
-                artifacts_collection.append((rank_hlo, input_output_alias, flattener, packer, metaneff, weights))
-
-        if tp_rank == 0:
-            xm.rendezvous("tp-rank-0-hlos-generated-and-saved")
-
-        if rank == tp_rank:
-            for bucket_rank, artifacts in enumerate(artifacts_collection):
-                (rank_hlo, input_output_alias, flattener, packer, metaneff, weights) = artifacts
-                neff_filename = _compile_model_shard(
-                    tp_rank,
-                    rank_hlo,
-                    compiler_workdir,
+                    states,
+                    input_output_alias,
+                    os.path.join(compiler_workdir, rank_folder),
                     compiler_args,
                     inline_weights_to_neff,
-                    bucket_rank,
-                    bucket_degree,
                 )
                 mp_q.put(
                     (
@@ -258,7 +220,6 @@ def _trace(
                         bucket_rank,
                     )
                 )
-
         if max_parallel_compilations is not None and (tp_rank + 1) % max_parallel_compilations == 0:
             xm.rendezvous(f"compilation-step-{tp_rank + 1}")
     xm.rendezvous("compilation-done")
@@ -274,6 +235,10 @@ def parallel_model_trace(
     bucket_config: Optional[BucketModelConfig] = None,
     tp_degree: int = 1,
     max_parallel_compilations: int = None,
+    spmd_mode: bool = False,
+    checkpoint_loader_callable: Optional[Callable] = None,
+    force_custom_init_on_device: bool = False,
+    serialization_path: str = None,
 ) -> ParallelModel:
     """
     Trace a distributed module/function to produce a compiled Neuron ScriptModule.
@@ -298,7 +263,14 @@ def parallel_model_trace(
         max_parallel_compilations: If specified, this function will only trace these number
             of models in parallel, which can be necessary to prevent OOMs while tracing. The default
             is None, which means the number of parallel compilations is equal to the `tp_degree`.
-
+        spmd_mode: If True, it compiles a single rank. This compiled model is then loaded with
+            the rank specific weights to generate the other ranks.
+        checkpoint_loader_callable: A callable method to load the model's checkpoint.  When using
+            spmd_mode, checkpoint_loader_callable is a required argument.
+        force_custom_init_on_device: Bool to indidcate whether to force use custom init_on_device functionality
+            NOTE: If you are trying to use it for Quantized api, make sure this bool is set to True
+        serialization_path: A path to store the serialized traced model if provided. Currently only works
+            for SPMD mode.
     Returns:
         A wrapper Module which wraps individual HLO computation which is a
         fused neuron::foward operation.
@@ -307,6 +279,20 @@ def parallel_model_trace(
     if bucket_config is not None and inline_weights_to_neff:
         raise ValueError(
             "Bucketing is not supported when inline_weights_to_neff=True. Set inline_weights_to_neff=False, if using the bucketing feature."
+        )
+
+    if spmd_mode is True and inline_weights_to_neff:
+        raise ValueError(
+            "Spmd mode is not supported when inline_weights_to_neff=True. Set inline_weights_to_neff=False, if using the spmd mode."
+        )
+
+    if spmd_mode is True and checkpoint_loader_callable is None:
+        raise ValueError(
+            "Argument checkpoint_loader_callable not provided. When using spmd mode you do not need to load the weights in func, instead pass checkpoint_loader_callable to parallel_model_trace"
+        )
+    if spmd_mode is False and serialization_path is not None:
+        raise ValueError(
+            "Currently serializing traced model during tracing is only supported for SPMD mode. Please either turn on SPMD mode or set serialization_path as None."
         )
 
     ctx = multiprocessing.get_context("spawn")
@@ -325,44 +311,86 @@ def parallel_model_trace(
     if bucket_config:
         bucket_config.store_example_inputs(example_inputs)
 
-    xmp.spawn(
-        _trace,
-        args=(
+    if spmd_mode:
+        models = _spmd_trace(
             func,
             example_inputs,
-            mp_q,
+            checkpoint_loader_callable,
+            tp_degree,
             states,
             compiler_workdir,
             compiler_args,
-            inline_weights_to_neff,
             bucket_config,
-            tp_degree,
-            max_parallel_compilations if max_parallel_compilations != None else tp_degree,
-        ),
-        start_method="spawn",
-        nprocs=tp_degree,
-    )
-    collector_func = collect_tp_neuron_models if not bucket_config else collect_tp_bucket_neuron_models
-    models = [None if not bucket_config else [None] * bucket_config.bucket_degree] * tp_degree
+            force_custom_init_on_device=force_custom_init_on_device,
+            serialization_path=serialization_path,
+        )
+    else:
+        logging.warn(
+            f"Using non SPMD mode. Set spmd_mode=True if the worlkload is SPMD for a faster trace. Tracing in non SPMD mode for large models can run into OOM errors as we compile all ranks"
+        )
+        xmp.spawn(
+            _trace,
+            args=(
+                func,
+                example_inputs,
+                mp_q,
+                states,
+                compiler_workdir,
+                compiler_args,
+                inline_weights_to_neff,
+                bucket_config,
+                tp_degree,
+                max_parallel_compilations if max_parallel_compilations != None else tp_degree,
+            ),
+            start_method="spawn",
+            nprocs=tp_degree,
+        )
+        collector_func = collect_tp_neuron_models if not bucket_config else collect_tp_bucket_neuron_models
+        models = [None if not bucket_config else [None] * bucket_config.bucket_degree] * tp_degree
 
-    # models will be collected by the collector func depending on if bucketing is enabled
-    collector_func(models, mp_q, bucket_config, tp_degree)
+        # models will be collected by the collector func depending on if bucketing is enabled
+        collector_func(models, mp_q, bucket_config, tp_degree)
 
     torch.multiprocessing.set_sharing_strategy(prev_sharing_strategy)
     return TensorParallelNeuronModel(models)
 
 
+def _save_traced_model(model, save_dir, rank):
+    torch.jit.save(model, f"{save_dir}/tp_{rank}.pt")
+
+
 def parallel_model_save(model: ParallelModel, save_dir: str) -> None:
     pathlib.Path(save_dir).mkdir(parents=True, exist_ok=True)
     for i, model in enumerate(model.models):
-        torch.jit.save(model, f"{save_dir}/tp_{i}.pt")
+        _save_traced_model(model, save_dir, i)
+
+
+def find_unique_dtypes(model):
+    state_dict = model.state_dict()
+    dtype_map = defaultdict(int)
+    for _, value in state_dict.items():
+        dtype_map[value.dtype] += 1
+    return dict(dtype_map)
+
+
+def _load_script_modules(model_dir: str) -> List[torch.ScriptModule]:
+    models = []
+    with torch_neuronx.contexts.disable_nrt_load():
+        model_rank_files = sorted(
+            [pth for pth in os.listdir(model_dir)], key=lambda x: int(x.replace(".pt", "").replace("tp_", ""))
+        )
+        for file_name in model_rank_files:
+            models.append(torch.jit.load(f"{model_dir}/{file_name}"))
+    return models, model_rank_files
 
 
 def parallel_model_load(model_dir: str) -> ParallelModel:
-    models = []
-    with torch_neuronx.contexts.disable_nrt_load():
-        for file_name in os.listdir(model_dir):
-            models.append(torch.jit.load(f"{model_dir}/{file_name}"))
+    models, model_rank_files = _load_script_modules(model_dir)
+
+    for count, file_name in enumerate(model_rank_files):
+        path = os.path.relpath(os.path.join(model_dir, file_name), os.path.dirname(os.path.dirname(model_dir)))
+        logging.debug(f"{path}: {find_unique_dtypes(models[count])}")
+
     return TensorParallelNeuronModel(models)
 
 
@@ -380,3 +408,296 @@ def _get_model_shard(func, func_kwargs=None):
         return func(**func_kwargs)
     finally:
         del os.environ[NXD_SKIP_RENDEZVOUS]
+
+
+def _spmd_trace(
+    func,
+    example_inputs: Any,
+    checkpoint_loader_callable: Callable,
+    tp_degree,
+    states,
+    compiler_workdir: Optional[Union[str, pathlib.Path]] = None,
+    compiler_args: Optional[Union[List[str], str]] = None,
+    bucket_config: Optional[BucketModelConfig] = None,
+    force_custom_init_on_device: bool = False,
+    serialization_path: str = None,
+):
+    """
+    Xla trace a signle rank and compile it with neuronx-cc.
+    The single rank model has it's weight replaced to build the model for all tp ranks.
+    """
+    # This does not validate if the HLOs are same across all ranks.
+    _validate_traceable(func, tp_degree, force_custom_init_on_device=force_custom_init_on_device)
+
+    xmp.spawn(
+        _single_rank_trace,
+        args=(
+            func,
+            example_inputs,
+            states,
+            compiler_workdir,
+            compiler_args,
+            bucket_config,
+            tp_degree,
+        ),
+        start_method="spawn",
+        nprocs=tp_degree,
+    )
+
+    if serialization_path is None:
+        model = _load_weight_into_model(
+            tp_degree, func, compiler_workdir, checkpoint_loader_callable, force_custom_init_on_device
+        )
+    else:
+        model = _load_weight_and_serialize(
+            tp_degree,
+            func,
+            compiler_workdir,
+            checkpoint_loader_callable,
+            serialization_path,
+            force_custom_init_on_device,
+        )
+    return model
+
+
+def _load_weight_into_model(tp_degree, func, compiler_workdir, checkpoint_loader_callable, force_custom_init_on_device):
+    """
+    Load the weight for each sub-model while keeping them in memory, and then return it
+
+    This works faster on small models which doesn't need much memory
+    """
+    models = []
+    checkpoint = checkpoint_loader_callable()
+    for rank in range(0, tp_degree):
+        model = _load_weights(rank, func, compiler_workdir, checkpoint, tp_degree, force_custom_init_on_device)
+        models.append(model)
+        gc.collect()
+    return models
+
+
+def _load_weight_and_serialize(
+    tp_degree, func, compiler_workdir, checkpoint_loader_callable, serialization_path, force_custom_init_on_device
+):
+    """
+    Load the weight for each sub-model, serialize it and then move to the next sub-model. It
+    will load all the sub-models at the end to return the traced model.
+
+    This works better for large models which needs more memory
+    """
+    checkpoint = checkpoint_loader_callable()
+
+    pathlib.Path(serialization_path).mkdir(parents=True, exist_ok=True)
+    for rank in range(0, tp_degree):
+        model = _load_weights(rank, func, compiler_workdir, checkpoint, tp_degree, force_custom_init_on_device)
+        _save_traced_model(model, serialization_path, rank)
+
+    del checkpoint, model
+    gc.collect()
+    models, _ = _load_script_modules(serialization_path)
+    return models
+
+
+def _validate_traceable(func: Callable, tp_degree: int, force_custom_init_on_device: bool = False):
+    """
+    Perform model architecture level validation if the model is
+    SPMD traceable.
+    """
+    _mock_parallel_state(tp_degree, rank=0)
+    with init_on_device(torch.device("meta"), force_custom_init_on_device=force_custom_init_on_device):
+        model, _ = func()
+
+    def _validate_children(module: torch.nn.Module):
+        if module == None:
+            return
+
+        # Sharding across vocab dimension requires rank level constants for intput masking.
+        if isinstance(module, ParallelEmbedding):
+            if not module.shard_across_embedding:
+                raise ValueError(
+                    "Sharding across vocab dimension in ParallelEmbedding is not supported when tracing with spmd_mode=True"
+                )
+
+        for child in module.children():
+            if child is not None:
+                _validate_children(child)
+
+    _validate_children(model)
+
+
+def _single_rank_trace(rank, func, example_inputs, states, compiler_workdir, compiler_args, bucket_config, tp_degree):
+    os.environ["RANK"] = str(rank)
+    if requires_init_pg_override():
+        torch.distributed.init_process_group("xla", init_method="pjrt://")
+    else:
+        torch.distributed.init_process_group("xla")
+
+    parallel_state.initialize_model_parallel(tensor_model_parallel_size=tp_degree)
+    # refer to this github issue for context: https://github.com/pytorch/pytorch/issues/11201
+    torch.multiprocessing.set_sharing_strategy("file_system")
+
+    if rank == 0:
+        if compiler_workdir is None:
+            compiler_workdir = "/tmp/trace_compiler_workdir/"
+        if pathlib.Path(compiler_workdir).exists():
+            shutil.rmtree(compiler_workdir)
+
+        bucket_degree = bucket_config.bucket_degree if bucket_config else 1
+        if not bucket_config:
+            # bucket rank is 1
+            example_inputs = [example_inputs]
+        weights = None
+        flattener = None
+        packer = None
+        input_output_aliases = []
+        models = []
+        neff_filename = None
+        for bucket_rank in range(bucket_degree):
+            # Set flag to stop parallel_layes.load() from waiting on all
+            # processes to finish checkpoint loading.
+            func_kwargs = bucket_config.get_func_kwargs_for_bucket_rank(bucket_rank) if bucket_config else {}
+            model, input_output_alias = _get_model_shard(func, func_kwargs)
+            input_output_aliases.append(input_output_alias)
+            rank_folder = generate_ranked_folder(rank, bucket_rank, bucket_degree)
+
+            neff_filename, metaneff, flattener, packer, weights = torch_neuronx.xla_impl.trace._trace(
+                model,
+                example_inputs[bucket_rank],
+                states,
+                input_output_alias,
+                os.path.join(compiler_workdir, rank_folder),
+                compiler_args,
+                False,
+            )
+
+            with open(neff_filename, "rb") as handle:
+                neff = handle.read()
+
+            models.append((neff, metaneff))
+
+        if bucket_degree == 1:
+            traced_model = torch_neuronx.xla_impl.trace.create_neuron_model(
+                neff_filename, models[0][1], flattener, packer, example_inputs[0], input_output_aliases[0], weights
+            )
+        else:
+            traced_model = create_bucket_model(models, bucket_config, flattener, packer, weights, input_output_aliases)
+        pathlib.Path(compiler_workdir).mkdir(parents=True, exist_ok=True)
+        torch.jit.save(traced_model, os.path.join(compiler_workdir, "tp_0.pt"))
+    xm.rendezvous("done-strict-tracing")
+
+
+def _load_weights(
+    rank, func, compiler_workdir, checkpoint_source, tp_degree, force_custom_init_on_device: bool = False
+):
+    """
+    Replaces the rank specific weights into the compiled
+    torchscript model.
+    """
+
+    checkpoint = checkpoint_source.copy()
+    _mock_parallel_state(tp_degree, rank)
+    with init_on_device(torch.device("meta"), force_custom_init_on_device=force_custom_init_on_device):
+        model, _ = func()
+
+    invoke_preshard_hook(model, checkpoint, "")
+
+    dtype = None
+    if hasattr(model, "config") and hasattr(model.config, "torch_dtype"):
+        dtype = model.config.torch_dtype
+
+    # Shards the checkpoint to the right weight for the rank
+    shard_children(model, checkpoint, "", dtype, rank, tp_degree)
+
+    with torch_neuronx.contexts.disable_nrt_load():
+        rank_0_path = os.path.join(compiler_workdir, "tp_0.pt")
+        traced_model = torch.jit.load(rank_0_path)
+        replace_weights(traced_model, checkpoint)
+        return traced_model
+
+
+def create_local_weight(rank, world_size, full_weight, partition_dim, per_partition_size, stride, out_weight=None):
+    per_partition_per_stride_size = divide(per_partition_size, stride)
+    weight_list = torch.split(full_weight, per_partition_per_stride_size, dim=partition_dim)
+    my_weight_list = weight_list[rank::world_size]
+
+    with torch.no_grad():
+        return torch.cat(my_weight_list, dim=partition_dim, out=out_weight)
+
+
+def _mock_parallel_state(tp_degree: int, rank: int):
+    """
+    Set correct values in parallel_state to let Neuron Models
+    load on CPU. This is done to load Neuron models outside
+    torch distributed process group.
+    """
+
+    class Mock:
+        def __init__(self, world_size):
+            self.world_size = world_size
+
+        def size(self):
+            return tp_degree
+
+    parallel_state._TENSOR_MODEL_PARALLEL_GROUP = Mock(tp_degree)
+    parallel_state._DATA_PARALLEL_GROUP = Mock(1)
+    parallel_state._MPU_TENSOR_MODEL_PARALLEL_RANK = rank
+
+
+def invoke_preshard_hook(module, checkpoint, prefix):
+    """
+    Preshard hooks are hooks to manipulate checkpoints
+    Checkpoint manipulation for GQA replication is one usecase.
+    """
+    if module == None:
+        return
+
+    # This is temporary until we formailze the preshard_hook in src
+    if hasattr(module, "preshard_hook"):
+        module.preshard_hook(checkpoint, prefix + "weight")
+        return
+
+    for name, child in module._modules.items():
+        if child is not None:
+            invoke_preshard_hook(child, checkpoint, prefix + name + ".")
+
+
+def shard_children(module, checkpoint, prefix, dtype, rank, tp_degree):
+    """
+    Checkpoint weights are sharded based on rank and tp_degree
+    """
+
+    if module == None:
+        return
+
+    for name, child in module._modules.items():
+        if child is not None:
+            shard_children(child, checkpoint, prefix + name + ".", dtype, rank, tp_degree)
+
+    if not isinstance(module, __SUPPORTED_SHARDED_MODULES):
+        return
+
+    module_parameter: torch.nn.Parameter = None
+    for module_parameter_name, module_parameter in module.named_parameters():
+        parameter_name = prefix + module_parameter_name
+
+        # If a few cases, the module parameter name might not appear exactly in the state dict
+        # This is true especially for pytorch quantized models. In that case add the attribute,
+        # get_tensor_from_state_dict, for that parameter
+        if hasattr(module_parameter, "get_tensor_from_state_dict"):
+            tensor = module_parameter.get_tensor_from_state_dict(prefix, checkpoint)
+        else:
+            if parameter_name not in checkpoint:
+                return
+            if dtype and checkpoint[parameter_name].dtype != dtype:
+                checkpoint[parameter_name] = checkpoint[parameter_name].to(dtype)
+            tensor = checkpoint[parameter_name]
+
+        if hasattr(module_parameter, "tensor_model_parallel") and module_parameter.tensor_model_parallel:
+            partition_dim = module_parameter.partition_dim
+            stride = module_parameter.partition_stride
+
+            per_partition_size = tensor.shape[partition_dim] // tp_degree
+            checkpoint[parameter_name] = create_local_weight(
+                rank, tp_degree, tensor, partition_dim, per_partition_size, stride
+            )
+        else:
+            checkpoint[parameter_name] = tensor

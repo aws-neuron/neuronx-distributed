@@ -4,16 +4,17 @@ import json
 import os
 import traceback
 from datetime import datetime
-import numpy as np
 
+import numpy as np
 import torch
 import torch_xla.core.xla_model as xm
 from commons import print_separator, set_random_seed
 
 from neuronx_distributed.optimizer import NeuronZero1Optimizer
-from neuronx_distributed.parallel_layers.grads import get_grad_norm
 from neuronx_distributed.parallel_layers import layers, parallel_state
+from neuronx_distributed.parallel_layers.grads import get_grad_norm
 from neuronx_distributed.parallel_layers.utils import requires_init_pg_override
+from neuronx_distributed.pipeline.model import NxDPPModel
 from neuronx_distributed.utils.model_utils import move_model_to_device
 
 datetime_str = str(datetime.now())
@@ -37,6 +38,84 @@ def parse_args():
 
 test_config, S3_BUCKET_NAME, args = parse_args()
 results = {"inference_success": 1}
+
+
+class SingleLinearBlock(torch.nn.Module):
+    def __init__(self, in_dim, out_dim):
+        super().__init__()
+        self.lin = torch.nn.Linear(in_dim, out_dim)
+
+    def forward(self, x):
+        x = torch.transpose(x, 0, 1)
+        x = self.lin(x)
+        x = torch.relu(x)
+        x = torch.transpose(x, 0, 1)
+        return x
+
+
+class SingleLayerOutputModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layers = torch.nn.ModuleList([SingleLinearBlock(4, 4) for _ in range(8)])
+        self.output_proj = torch.nn.Linear(4, 4)
+
+    def forward(self, x):
+        x = torch.transpose(x, 0, 1)
+        for layer in self.layers:
+            x = layer(x)
+        x = torch.transpose(x, 0, 1)
+        return torch.sum(self.output_proj(x))
+
+
+def test_single_layer_output_module():
+    def _test_single_layer_output_module():
+        seed = 1234
+        set_random_seed(seed)
+        pipeline_parallel_size = 4
+        parallel_state.initialize_model_parallel(1, pipeline_parallel_size)
+        global_batch_size = 32
+        per_model_replica_batch = global_batch_size // parallel_state.get_data_parallel_size()
+        dp_rank = parallel_state.get_data_parallel_rank()
+        model = SingleLayerOutputModule()
+        example_input = torch.randn(global_batch_size, 4, 4)
+        out = model(example_input)
+        out /= global_batch_size
+        out.backward()
+        cpu_param_name_to_grads = {n: p.grad.detach().clone() for n, p in model.named_parameters()}
+        for _, p in model.named_parameters():
+            p.grad = None
+        current_dp_batch = (
+            example_input.narrow(0, dp_rank * per_model_replica_batch, per_model_replica_batch).detach().clone()
+        )
+        pp_model = NxDPPModel(
+            model,
+            transformer_layer_cls=SingleLinearBlock,
+            auto_partition=True,
+            num_microbatches=pipeline_parallel_size,
+            output_loss_value_spec=True,
+            input_names=["x"],
+        )
+        _ = pp_model.run_train(x=current_dp_batch)
+        for n, p in pp_model.local_named_parameters():
+            grad = p.grad.detach().cpu()
+            assert torch.allclose(
+                grad, cpu_param_name_to_grads[n], rtol=5e-2
+            ), f"param {n} grad mismatching! CPU {cpu_param_name_to_grads[n]} PP grad {grad}"
+
+        torch.distributed.barrier()
+        # Reset groups
+        parallel_state.destroy_model_parallel()
+
+        if torch.distributed.get_rank() == 0:
+            print("test passed")
+
+    global results
+    try:
+        _test_single_layer_output_module()
+    except:
+        results["inference_success"] = 0
+        print(traceback.format_exc())
+        raise
 
 
 def test_tp_zero1_pp_gradient_clipping(tensor_parallel_size, pipeline_parallel_size):
@@ -169,4 +248,5 @@ if __name__ == "__main__":
     test_tp_zero1_pp_gradient_clipping(tensor_parallel_size=32, pipeline_parallel_size=1)
     test_tp_zero1_pp_gradient_clipping(tensor_parallel_size=8, pipeline_parallel_size=1)
     test_tp_zero1_pp_gradient_clipping(tensor_parallel_size=2, pipeline_parallel_size=4)
+    test_single_layer_output_module()
     atexit.register(on_exit)

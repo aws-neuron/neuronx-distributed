@@ -1,3 +1,5 @@
+import os
+
 import torch
 
 try:
@@ -79,23 +81,55 @@ def initialize_model_parallel(tensor_model_parallel_size: int = 1, pipeline_mode
         print("> initializing tensor model parallel with size {}".format(tensor_model_parallel_size))
         print("> initializing pipeline model parallel with size {}".format(pipeline_model_parallel_size))
         print("> initializing data parallel with size {}".format(data_parallel_size))
+    
+    # We create a dummy neff and execute it across all workers in the world.
+    # This is done to initialize the collectives. Collectives initialization
+    # requires all workers in the world to participate and this soometimes
+    # may not be guranteed. Hence as a workaround, we run this dummy neff, and 
+    # get the collectives initialized.
+    temp = torch.rand([1], device='xla')
+    torch.distributed.all_reduce(temp, group=torch.distributed.group.WORLD)
+    import torch_xla.core.xla_model as xm
+    xm.mark_step()
 
     num_tensor_model_parallel_groups: int = world_size // tensor_model_parallel_size
     num_pipeline_model_parallel_groups: int = world_size // pipeline_model_parallel_size
 
     rank = torch.distributed.get_rank()
+    compress_rg = int(os.getenv("NEURON_EXPERIMENTAL_COMPRESS_RG", "0"))
 
     # Build the data-parallel groups.
     global _DATA_PARALLEL_GROUP
     global _DATA_PARALLEL_GROUP_SPMD
     assert _DATA_PARALLEL_GROUP is None, "data parallel group is already initialized"
     all_data_parallel_group_ranks = []
-    for i in range(pipeline_model_parallel_size):
-        start_rank = i * num_pipeline_model_parallel_groups
-        end_rank = (i + 1) * num_pipeline_model_parallel_groups
-        for j in range(tensor_model_parallel_size):
-            ranks = range(start_rank + j, end_rank, tensor_model_parallel_size)
-            all_data_parallel_group_ranks.append(list(ranks))
+
+    # On trn1, TP=4 is a special case where each TP group consists of locally connected, non-contiguous
+    # ranks grouped within each node to avoid cross-node TP.
+    # Ex: for TP=4 PP=1 on 2 trn1.32xl nodes (64 NeuronCores):
+    #   16 TP groups: [ [0, 8, 16, 24], [1, 9, 17, 25], [2, 10, 18, 26], ... [7, 15, 23, 31],
+    #                   [32, 40, 48, 56], [33, 41, 49, 57], [34, 42, 50, 58], ... [39, 47, 55, 63] ]
+    #    4 DP groups: [ [0, 1, 2, 3, 4, 5, 6, 7, 32, 33, 34, 35, 36, 37, 38, 39]
+    #                   [8, 9, 10, 11, 12, 13, 14, 15, 40, 41, 42, 43, 44, 45, 46, 47]
+    #                   [16, 17, 18, 19, 20, 21, 22, 23, 48, 49, 50, 51, 52, 53, 54, 55]
+    #                   [24, 25, 26, 27, 28, 29, 30, 31, 56, 57, 58, 59, 60, 61, 62, 63] ]
+    #   64 PP groups: [ [0], [1], [2] .. [63] ]  (No pipeline parallelism)
+    if tensor_model_parallel_size == 4:
+        for p in range(pipeline_model_parallel_size):
+            start_rank = p * num_pipeline_model_parallel_groups
+            end_rank = (p + 1) * num_pipeline_model_parallel_groups
+            for i in range(tensor_model_parallel_size):
+                ranks = []
+                for j in range(start_rank + i * 8, end_rank, 32):
+                    ranks += range(j, j + 8)
+                all_data_parallel_group_ranks.append(list(ranks))
+    else:
+        for i in range(pipeline_model_parallel_size):
+            start_rank = i * num_pipeline_model_parallel_groups
+            end_rank = (i + 1) * num_pipeline_model_parallel_groups
+            for j in range(tensor_model_parallel_size):
+                ranks = range(start_rank + j, end_rank, tensor_model_parallel_size)
+                all_data_parallel_group_ranks.append(list(ranks))
 
     _DATA_PARALLEL_GROUP_SPMD = all_data_parallel_group_ranks
     for ranks in all_data_parallel_group_ranks:
@@ -109,10 +143,25 @@ def initialize_model_parallel(tensor_model_parallel_size: int = 1, pipeline_mode
     global _TENSOR_MODEL_PARALLEL_GROUP_SPMD
     all_tensor_parallel_group_ranks = []
     assert _TENSOR_MODEL_PARALLEL_GROUP is None, "tensor model parallel group is already initialized"
-    for i in range(num_tensor_model_parallel_groups):
-        ranks = range(i * tensor_model_parallel_size, (i + 1) * tensor_model_parallel_size)
-        all_tensor_parallel_group_ranks.append(list(ranks))
+    # See note re: TP=4, above
+    if tensor_model_parallel_size == 4:
+        for i in range(0, world_size, 32):
+            for j in range(8):
+                ranks = range(i + j, i + 32, 8)
+                all_tensor_parallel_group_ranks.append(list(ranks))
+    else:
+        for i in range(num_tensor_model_parallel_groups):
+            ranks = range(i * tensor_model_parallel_size, (i + 1) * tensor_model_parallel_size)
+            all_tensor_parallel_group_ranks.append(list(ranks))
+
     _TENSOR_MODEL_PARALLEL_GROUP_SPMD = all_tensor_parallel_group_ranks
+    if compress_rg:
+        # When scaling to large number of nodes, the size of the replica groups becomes huge.
+        # This increases the overall HLO hashing time which in turn causes framework overhead.
+        # This can be reduced by passing the first tp replica only. All the other ranks would
+        # infer their groups depending on the size of the replica group and the start and end ranks
+        # Note: this works only for cases where the ranks are continuous. It won't work for TP=4 case.
+        _TENSOR_MODEL_PARALLEL_GROUP_SPMD = [all_tensor_parallel_group_ranks[0]]
     for ranks in all_tensor_parallel_group_ranks:
         pg_options = {"xla_pg_options": {"mesh": _TENSOR_MODEL_PARALLEL_GROUP_SPMD}}
         group = torch.distributed.new_group(ranks, pg_options=pg_options)
@@ -159,7 +208,25 @@ def initialize_model_parallel(tensor_model_parallel_size: int = 1, pipeline_mode
         logger.debug(rmsg(f"_PIPELINE_MODEL_PARALLEL_GROUP_SPMD {_PIPELINE_MODEL_PARALLEL_GROUP_SPMD}"))
         logger.debug(rmsg(f"_TENSOR_MODEL_PARALLEL_GROUP_SPMD {_TENSOR_MODEL_PARALLEL_GROUP_SPMD}"))
         logger.debug(rmsg(f"_DATA_PARALLEL_GROUP_SPMD {_DATA_PARALLEL_GROUP_SPMD}"))
+    try_set_nki_parallel_state()
 
+
+def try_set_nki_parallel_state():
+    """
+    Inject parallel state information into NkiKernel, if compatible torch_neuronx exists.
+    """
+    try:
+        from torch_neuronx.xla_impl.ops import NkiKernel
+
+        NkiKernel._parallel_state = dict(
+            parallel_group=get_tensor_model_parallel_group(as_list=True),
+            rank=get_tensor_model_parallel_rank(),
+            world_size=get_tensor_model_parallel_size(),
+        )
+        logger.debug(rmsg(f"Successfully initialized NKI parallel state."))
+    except Exception as e:
+        logger.warning(rmsg(f"Failed to initialize NKI parallel state with exception {e}." 
+                            "Proceeding without distributed NKI support."))
 
 def model_parallel_is_initialized():
     """Check if model and data parallel groups are initialized."""
@@ -340,6 +407,12 @@ def get_pp_gloo_group():
     global PP_GROUP_PG_GLOO
     assert PP_GROUP_PG_GLOO is not None, "pp gloo groups are not initialized!"
     return PP_GROUP_PG_GLOO
+
+def is_global_rank_zero():
+    # TODO: Change this to torch.distributed.get_rank when PTL fix of init_process
+    # before nxd_config is added.
+    import torch_xla.core.xla_model as xm
+    return xm.get_ordinal() == 0
 
 
 def create_pg_with_ranks(ranks):

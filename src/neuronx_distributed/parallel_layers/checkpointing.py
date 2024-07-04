@@ -1,12 +1,11 @@
 import gc
 import os
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import torch
 import torch_xla.core.xla_model as xm
 import torch_xla.utils.serialization as xser
 
-from ..trace.trace import NXD_SKIP_RENDEZVOUS
 from ..utils.logger import get_logger
 from .layers import create_local_weight
 from .parallel_state import (
@@ -21,11 +20,29 @@ from .utils import cast_all, get_local_world_size, move_all_tensor_to_cpu
 
 logger = get_logger()
 
+NXD_SKIP_RENDEZVOUS = "NXD_SKIP_RENDEZVOUS"
+
 
 def ensure_directory_exists(filename: str) -> None:
     """Build filename's path if it does not already exists."""
     dirname = os.path.dirname(filename)
     os.makedirs(dirname, exist_ok=True)
+
+
+PreShardHookFn = Callable[[torch.nn.Module, dict, str], bool]
+
+
+def _invoke_preshard_hook(module: torch.nn.Module, model_state_dict: dict, prefix: str = "") -> dict:
+    if module == None:
+        return
+
+    # This is temporary until we formailze the preshard_hook in src
+    if hasattr(module, "preshard_hook"):
+        module.preshard_hook(model_state_dict, prefix + "weight")
+        return
+
+    for name, child in module.named_children():
+        _invoke_preshard_hook(child, model_state_dict, prefix + name + ".")
 
 
 def get_sharded_model_dict(model: torch.nn.Module, model_state_dict: dict) -> dict:
@@ -34,6 +51,9 @@ def get_sharded_model_dict(model: torch.nn.Module, model_state_dict: dict) -> di
     tp_size = get_tensor_model_parallel_size()
     if isinstance(model, NxDPPModel):
         model = model.original_torch_module
+
+    _invoke_preshard_hook(model, model_state_dict)
+
     # Use state_dict to keep the shared parameters
     for name, param in model.state_dict(keep_vars=True).items():
         if hasattr(param, "tensor_model_parallel") and param.tensor_model_parallel:

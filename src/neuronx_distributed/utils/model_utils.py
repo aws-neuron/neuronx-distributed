@@ -34,6 +34,12 @@ try:
 except ImportError:
     _TORCHDISTX_AVAIL = False
 
+_NXTT_AVAIL = True
+try:
+    from neuronx_training_toolkit.models.megatron.module import MegatronModule
+except ImportError:
+    _NXTT_AVAIL = False
+
 
 def analyze_shared_parameters(module, shared_parameters=None, prefix=""):
     """
@@ -92,6 +98,12 @@ def is_hf_transformers_available():
 
 def is_hf_accelerate_available():
     return _Accelerate_AVAIL
+
+def is_nxtt_pretrained_model(model):
+    return _NXTT_AVAIL and isinstance(model, MegatronModule)
+
+def is_nxtt_available():
+    return _NXTT_AVAIL
 
 
 @contextmanager
@@ -196,18 +208,22 @@ def has_fake_tensors(
 
 
 @contextmanager
-def init_on_device(device: torch.device, include_buffers: bool = False):
+def init_on_device(device: torch.device, include_buffers: bool = False, force_custom_init_on_device: bool = False):
     """
     A context manager under which models are initialized with all parameters on the specified device.
     Referred from: https://github.com/huggingface/accelerate/blob/main/src/accelerate/big_modeling.py#L82
+
+    NOTE: force_custom_init_on_device is set to force the custom implementation as there is a bug in the Huggingface implementation
+    where if the parameter requires_grad =False, it will set to True when it reinitializes the parameter as 'module._parameters[name].__dict__'
+    Does not have an attribute requires_grad when its set to False.
     """
     # Directly use accelerate implementation if available
-    if is_hf_accelerate_available():
+    if is_hf_accelerate_available() and not force_custom_init_on_device:
         with hf_init_on_device(device, include_buffers=include_buffers):
             yield
         return
 
-    if is_torch_version_greater_than_2() and include_buffers:
+    if is_torch_version_greater_than_2() and include_buffers and not force_custom_init_on_device:
         with device:
             yield
         return
@@ -221,7 +237,15 @@ def init_on_device(device: torch.device, include_buffers: bool = False):
         if param is not None:
             param_cls = type(module._parameters[name])
             kwargs = module._parameters[name].__dict__
-            module._parameters[name] = param_cls(module._parameters[name].to(device), **kwargs)
+            kwargs["requires_grad"] = module._parameters[name].requires_grad
+            # When we have a case of tensor2 = tensor1, it would call the set_attr
+            # of param, which in turn would call the register_parameter API.
+            # In this case, the new param is already on meta-device, since it was moved
+            # previously when it was initialized. Hence, when resetting, you can
+            # directly assign that tensor instead of re-init. If you re-init you would
+            # lose the relationship.
+            module._parameters[name] = param if param.device == device else \
+                            param_cls(module._parameters[name].to(device), **kwargs)
 
     def register_empty_buffer(module, name, buffer, persistent=True):
         old_register_buffer(module, name, buffer, persistent=persistent)
@@ -267,6 +291,7 @@ def get_model_sequential(model, device, sequential_move_factor=11, param_init_fn
     for worker in range(math.ceil(local_world_size / sequential_move_factor)):
         if local_rank // sequential_move_factor == worker:
             if isinstance(model, NxDPPModel):
+                model.maybe_materialize_local_module()
                 model.move_model_to_device()
             else:
                 maybe_materalize_model(model)

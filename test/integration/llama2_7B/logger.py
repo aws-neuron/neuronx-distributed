@@ -1,14 +1,13 @@
+import inspect
 import os
 import sys
 import time
 
-import inspect
-import requests
-
-import torch
-from torch.utils.tensorboard import SummaryWriter
-from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 import numpy as np
+import requests
+from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+from torch.utils.tensorboard import SummaryWriter
+
 
 def load_events(event_file):
     accumulator = EventAccumulator(event_file)
@@ -19,6 +18,7 @@ def load_events(event_file):
     for tag in tags["scalars"]:
         data[tag] = accumulator.Scalars(tag)
     return data
+
 
 class Logger:
     def __init__(self, args, world_size, model_dtype):
@@ -40,10 +40,7 @@ class Logger:
                 f"_{self.get_instance_type()}",
             )
         )
-        self.tb.add_text(
-            "script", "```\n" + inspect.getsource(sys.modules[__name__]) + "\n```", 0
-        )
-
+        self.tb.add_text("script", "```\n" + inspect.getsource(sys.modules[__name__]) + "\n```", 0)
 
         self.golden_steploss = []
         event_file = os.getenv("GOLDEN_EVENT_FILE") if not os.environ.get("NEURON_EXTRACT_GRAPHS_ONLY", None) else None
@@ -57,7 +54,6 @@ class Logger:
                 with open(golden, "r") as f:
                     self.golden_steploss = [float(i) for i in f]
                 print(f"Read {len(self.golden_steploss)} golden step loss values from {golden}")
-
 
     def get_instance_type(self):
         try:
@@ -93,7 +89,4 @@ class Logger:
         if not os.environ.get("NEURON_EXTRACT_GRAPHS_ONLY", None):
             step_0start = step - 1
             if step_0start < len(self.golden_steploss) and step_0start >= 0:
-                np.testing.assert_allclose(
-                    step_loss, self.golden_steploss[step_0start], rtol=1.5e-1
-                )
-
+                np.testing.assert_allclose(step_loss, self.golden_steploss[step_0start], rtol=1.5e-1)

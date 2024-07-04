@@ -6,19 +6,22 @@ import torch
 import torch_xla.core.xla_model as xm
 from torch.nn.parameter import Parameter
 
-from neuronx_distributed.parallel_layers.layers import create_local_weight, BaseParallelLinear
+from neuronx_distributed.parallel_layers.layers import (
+    BaseParallelLinear,
+    create_local_weight,
+)
+from neuronx_distributed.parallel_layers.mappings import (
+    copy_to_tensor_model_parallel_region,
+    gather_from_tensor_model_parallel_region,
+)
 from neuronx_distributed.parallel_layers.parallel_state import (
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_size,
 )
-from neuronx_distributed.parallel_layers.mappings import (
-    gather_from_tensor_model_parallel_region,
-    copy_to_tensor_model_parallel_region,
-)
 from neuronx_distributed.parallel_layers.random import get_xla_rng_tracker
 from neuronx_distributed.parallel_layers.utils import (
-    divide,
     cast_if_autocast_enabled,
+    divide,
     set_tensor_model_parallel_attributes,
     verify_casted_dtype,
 )
@@ -26,6 +29,7 @@ from neuronx_distributed.parallel_layers.utils import (
 _KV_SHARED_GROUP = None
 _KV_SHARED_GROUP_SPMD = None
 _KV_GROUP_SIZE = None
+
 
 def _initialize_kv_group(kv_shared_group_size=1):
     # Build the kv-shared model-parallel groups.
@@ -37,26 +41,32 @@ def _initialize_kv_group(kv_shared_group_size=1):
     world_size = torch.distributed.get_world_size()
     num_tensor_model_parallel_groups = world_size // tensor_model_parallel_size
     if _KV_SHARED_GROUP is not None:
-        assert kv_shared_group_size == _KV_GROUP_SIZE, "Currently the library supports only single KV size for all layers"
+        assert (
+            kv_shared_group_size == _KV_GROUP_SIZE
+        ), "Currently the library supports only single KV size for all layers"
         return
-    
+
     assert tensor_model_parallel_size % kv_shared_group_size == 0, (
-                f"kv_shared_group_size: {kv_shared_group_size}, "
-                f"should divide tensor model parallel group {tensor_model_parallel_size} "
-            )
+        f"kv_shared_group_size: {kv_shared_group_size}, "
+        f"should divide tensor model parallel group {tensor_model_parallel_size} "
+    )
     _KV_GROUP_SIZE = kv_shared_group_size
     rank = torch.distributed.get_rank()
     if rank == 0:
         print("> initializing kv group with size {}".format(kv_shared_group_size))
     for i in range(num_tensor_model_parallel_groups):
-        for j in range(tensor_model_parallel_size//kv_shared_group_size):
+        for j in range(tensor_model_parallel_size // kv_shared_group_size):
             ranks = list(
-                range(i * tensor_model_parallel_size+j, (i + 1) * tensor_model_parallel_size, tensor_model_parallel_size//kv_shared_group_size)
+                range(
+                    i * tensor_model_parallel_size + j,
+                    (i + 1) * tensor_model_parallel_size,
+                    tensor_model_parallel_size // kv_shared_group_size,
+                )
             )
             all_kv_shred_group_ranks.append(ranks)
     _KV_SHARED_GROUP_SPMD = all_kv_shred_group_ranks
     for ranks in all_kv_shred_group_ranks:
-        pg_options = {'xla_pg_options': {'mesh': _KV_SHARED_GROUP_SPMD}}
+        pg_options = {"xla_pg_options": {"mesh": _KV_SHARED_GROUP_SPMD}}
         if rank in ranks:
             group = torch.distributed.new_group(ranks, pg_options=pg_options)
             _KV_SHARED_GROUP = group
@@ -127,10 +137,10 @@ def _linear_forward(input, weight, bias):
 
 def _compute_gradients(input, weight, grad_output, use_bias):
     """
-        This method computes the gradients for the weight and bias, 
-        given the output gradient and input.
-        grad_weight = grad_output.T*input
-        grad_bias = sum(grad_output, dim=0)
+    This method computes the gradients for the weight and bias,
+    given the output gradient and input.
+    grad_weight = grad_output.T*input
+    grad_bias = sum(grad_output, dim=0)
     """
     grad_output = grad_output.view(grad_output.shape[0] * grad_output.shape[1], grad_output.shape[2])
     grad_weight = grad_output.t().matmul(input)
@@ -206,10 +216,10 @@ class GQAQKVLinearWithAsyncCommunication(torch.autograd.Function):
                 total_input = input
 
         if ctx.kv_size_multiplier > 1:
-            # Since we repeat the K and V by a factor of kv_size_multipler, we need to 
-            # sum up the gradients from the repeated portions. get_kv_shared_group() 
+            # Since we repeat the K and V by a factor of kv_size_multipler, we need to
+            # sum up the gradients from the repeated portions. get_kv_shared_group()
             # returns the ranks which have the same K and V heads, and hence allows us to
-            # sum up from the distributed ranks. 
+            # sum up from the distributed ranks.
             handlek = torch.distributed.all_reduce(grad_output_k, group=get_kv_shared_group())
             handlev = torch.distributed.all_reduce(grad_output_v, group=get_kv_shared_group())
 
@@ -219,12 +229,11 @@ class GQAQKVLinearWithAsyncCommunication(torch.autograd.Function):
         # Here we need to divide the grad_input_k and grad_input_v by a factor of kv_size_multipler,
         # because after this step we are going to do an all-reduce over the entire tp group which
         # would cause the K and V duplicate factor to be counted twice.
-        grad_input = grad_input_q + (grad_input_k + grad_input_v)/ctx.kv_size_multiplier
+        grad_input = grad_input_q + (grad_input_k + grad_input_v) / ctx.kv_size_multiplier
 
         if ctx.async_grad_allreduce:
             # Asynchronous all-reduce
-            handle = torch.distributed.all_reduce(
-                        grad_input, group=get_tensor_model_parallel_group())
+            handle = torch.distributed.all_reduce(grad_input, group=get_tensor_model_parallel_group())
 
         # if no weight gradient, immediately return
         if not ctx.compute_weight_gradient:
@@ -274,15 +283,9 @@ class GQAQKVLinearWithAsyncCommunication(torch.autograd.Function):
                 pin_layout=False,
             )
 
-        grad_weight_q, grad_bias_q = _compute_gradients(
-            total_input, weight_q, grad_output_q, use_bias
-        )
-        grad_weight_k, grad_bias_k = _compute_gradients(
-            total_input, weight_k, grad_output_k, use_bias
-        )
-        grad_weight_v, grad_bias_v = _compute_gradients(
-            total_input, weight_v, grad_output_v, use_bias
-        )
+        grad_weight_q, grad_bias_q = _compute_gradients(total_input, weight_q, grad_output_q, use_bias)
+        grad_weight_k, grad_bias_k = _compute_gradients(total_input, weight_k, grad_output_k, use_bias)
+        grad_weight_v, grad_bias_v = _compute_gradients(total_input, weight_v, grad_output_v, use_bias)
 
         if ctx.sequence_parallel_enabled:
             return (
@@ -352,17 +355,17 @@ class GQAQKVColumnParallelLinear(BaseParallelLinear):
     .. note::
         Input is supposed to be three dimensional and each dimension
         is expected to be batch,sequence and hidden feature, respectively.
-    
+
     Example usage:
         # here we initialize the kv_shared_group_size to 4. This would replicate
-        # KV heads 4 times. The 4 devices that have the same KV head would be put 
+        # KV heads 4 times. The 4 devices that have the same KV head would be put
         # into the same replica group inside get_kv_shared_group()
         kv_shared_group_size = 4
         tensor_model_parallel_size = 32
         num_heads_kv_group = 8
         num_heads = 32
         parallel_state.initialize_model_parallel(
-                                        tensor_model_parallel_size=tensor_model_parallel_size, 
+                                        tensor_model_parallel_size=tensor_model_parallel_size,
                                         kv_shared_group_size=kv_shared_group_size)
         col_linear = qkv_linear.GQAQKVColumnParallelLinear(
             input_size = hidden_size,
@@ -415,7 +418,9 @@ class GQAQKVColumnParallelLinear(BaseParallelLinear):
         world_size = get_tensor_model_parallel_size()
         self.kv_size_multiplier = kv_size_multiplier
         assert world_size % kv_size_multiplier == 0, "tp_world_size should be divisible by kv_size_multiplier"
-        assert (output_sizes[1]*kv_size_multiplier) % world_size == 0, "kv_output_dim*kv_size_multiplier should be divisible by tp_world_size"
+        assert (
+            output_sizes[1] * kv_size_multiplier
+        ) % world_size == 0, "kv_output_dim*kv_size_multiplier should be divisible by tp_world_size"
         _initialize_kv_group(kv_size_multiplier)
         self.q_output_size_per_partition = divide(output_sizes[0], world_size)
         self.kv_output_size_per_partition = divide(output_sizes[1] * kv_size_multiplier, world_size)
@@ -459,7 +464,7 @@ class GQAQKVColumnParallelLinear(BaseParallelLinear):
             self.register_parameter("bias_q", None)
             self.register_parameter("bias_k", None)
             self.register_parameter("bias_v", None)
-    
+
     def initialize_weight_biases(self):
         # Initialize weight.
         self.master_weight_q = self._init_per_layer_weight(

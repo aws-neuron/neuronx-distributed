@@ -6,6 +6,7 @@ from torch.fx.passes.split_module import split_module
 
 from neuronx_distributed.parallel_layers.parallel_state import (
     get_pipeline_model_parallel_rank,
+    get_pipeline_model_parallel_size,
     rmsg,
 )
 from neuronx_distributed.utils.logger import get_logger
@@ -222,29 +223,55 @@ def analyze_pipeline_module(top_mod):
     )
 
 
+def stage_to_pipeline_parallel_rank(stage, pp_size=None):
+    if pp_size is None:
+        pp_size = get_pipeline_model_parallel_size()
+    return stage % pp_size
+
+
 def analyze_shared_weights_across_stages(top_module, partitions):
     """
-    Find the shared weight between stages.
+    Find the shared weight between pp ranks.
     Output:
         shared_weights(list): A list that each entry is a list of shared parameter info tuple
                               with (name, stage). Note name is from local module.
     """
+
+    def _is_shared_param_and_should_record(p, pipeline_parallel_rank, param_to_partition):
+        """
+        Only record the param if
+        - It is the first occurance of this parameter
+        - It is a shared parameter acorss the PP ranks
+        Only the parameter shared arocss PP ranks requires grad sync
+        """
+        # If this is the first occurance of the param, it is not shared
+        if len(param_to_partition[p]) == 0:
+            return False, True
+        for _, rank in param_to_partition[p]:
+            if rank == pipeline_parallel_rank:
+                # If this param is shared but in the same pp rank with previous param
+                # mark it as not shared since we do not need to allreduce grads for this param
+                return False, False
+        # param appears before but not in the same pp rank with any previous occurance
+        # mark it as shared
+        return True, True
+
     param_to_partition = {p: [] for p in top_module.parameters()}
     for stage, partition in enumerate(partitions):
         for name, p in partition.named_parameters():
-            if stage == get_pipeline_model_parallel_rank():
+            pp_rank = stage_to_pipeline_parallel_rank(stage)
+            is_shared, should_record = _is_shared_param_and_should_record(p, pp_rank, param_to_partition)
+            if pp_rank == get_pipeline_model_parallel_rank():
                 # For the parameters that belong to current pipeline stage
                 # mark if it is shared parameter
-                if len(param_to_partition[p]) == 0:
-                    # not shared parameter or shared parameter on first occurance stage
-                    # this attr will be use to calculate global grad norm
-                    setattr(p, "shared", False)
-                else:
-                    # shared parameter on rest stages
-                    setattr(p, "shared", True)
-            param_to_partition[p].append((name, stage))
+                # This will be used to calculate the global grad norm
+                setattr(p, "shared", is_shared)
+            if should_record:
+                param_to_partition[p].append((name, pp_rank))
     shared_weights = []
     for weights in param_to_partition.values():
+        # This guarantees the parameter is shared across the PP ranks
+        # and for each PP rank the shared paramerter will only appear once
         if len(weights) > 1:
             shared_weights.append(weights)
     return shared_weights

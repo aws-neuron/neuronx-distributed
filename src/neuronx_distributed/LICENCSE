@@ -1,5 +1,5 @@
 ** DeepSpeed; version v0.10.0 -- https://github.com/microsoft/DeepSpeed/tree/v0.10.0
- 
+
                                  Apache License
                            Version 2.0, January 2004
                         http://www.apache.org/licenses/
@@ -210,7 +210,7 @@
 ------
 
 ** Hugging face Transformers; version 4.26.0 -- https://github.com/huggingface/transformers
- 
+
 Copyright 2018- The Hugging Face team. All rights reserved.
 
                                  Apache License
@@ -449,7 +449,7 @@ authors and The HuggingFace Inc. team.
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
- 
+
 All rights reserved.
 
 Redistribution and use in source and binary forms, with or without modification,

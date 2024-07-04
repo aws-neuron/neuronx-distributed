@@ -63,7 +63,7 @@ class NeuronZero1Optimizer(ZeroRedundancyOptimizer):
         all_parameters = []
         for param_group, sharded_param_group in zip(self.param_groups, self.base_optimizer.param_groups):
             for param, shard in zip(param_group["params"], sharded_param_group["params"]):
-                if param.grad is not None:
+                if shard.grad is not None:
                     if hasattr(param, "shared"):
                         shard.shared = param.shared
                     if hasattr(param, "tensor_model_parallel"):

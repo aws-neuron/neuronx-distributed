@@ -1,6 +1,6 @@
 # Standard Library
 import unittest
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
 # Third Party
 import torch
@@ -8,7 +8,9 @@ import torch
 import neuronx_distributed.pipeline.trace as tracer
 from neuronx_distributed.parallel_layers.layers import ColumnParallelLinear
 from neuronx_distributed.parallel_layers.loss_functions import parallel_cross_entropy
+
 from .. import update_result
+
 
 class MyModule(torch.nn.Module):
     def __init__(self):
@@ -25,24 +27,24 @@ class MyModule(torch.nn.Module):
         x = self.linear2(x) + self.linear3(x)
         trans_x = self._transform(x)
         return trans_x
-    
-class NestedModule(torch.nn.Module):
-    
-        def __init__(self):
-            super().__init__()
-            self.my_mod = MyModule()
-            self.linear4 = torch.nn.Linear(2, 2)
-    
-        def forward(self, x):
-            x = self.my_mod(x)
-            return self.linear4(x)
-    
-class NestedNxDModule(torch.nn.Module):
 
+
+class NestedModule(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.my_mod = MyModule()
-        self.cpl = ColumnParallelLinear(10,10)
+        self.linear4 = torch.nn.Linear(2, 2)
+
+    def forward(self, x):
+        x = self.my_mod(x)
+        return self.linear4(x)
+
+
+class NestedNxDModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.my_mod = MyModule()
+        self.cpl = ColumnParallelLinear(10, 10)
         self.linear4 = torch.nn.Linear(2, 2)
 
     def forward(self, x):
@@ -51,12 +53,13 @@ class NestedNxDModule(torch.nn.Module):
         x = parallel_cross_entropy(x)
         return self.linear4(x)
 
+
 class TestTrace(unittest.TestCase):
     def test_get_concrete_args(self):
         try:
             mod = MyModule()
             args = tracer.get_concrete_args(mod, [])
-            assert 'x' in args
+            assert "x" in args
             assert len(args) == 1
         except:
             update_result({"inference_success": 0})
@@ -98,47 +101,65 @@ class TestTrace(unittest.TestCase):
             update_result({"inference_success": 0})
             raise
 
-    @patch('torch.distributed.get_rank')   
+    @patch("torch.distributed.get_rank")
     def test_trace_model(self, rank_mock):
         try:
             mod = MyModule()
-            traced_model = tracer.trace_model(model=mod, input_names=['x'])
-            expected_nodes = [{'op': 'placeholder', 'name': 'x'}, {'op': 'call_module', 'name': 'linear1'}, 
-                            {'op': 'call_module', 'name': 'linear2'}, {'op': 'call_module', 'name': 'linear3'}, 
-                            {'op': 'call_function', 'name': 'add'}, {'op': 'call_method', 'name': 'transpose'}, 
-                            {'op': 'output', 'name': 'output'}]
+            traced_model = tracer.trace_model(model=mod, input_names=["x"])
+            expected_nodes = [
+                {"op": "placeholder", "name": "x"},
+                {"op": "call_module", "name": "linear1"},
+                {"op": "call_module", "name": "linear2"},
+                {"op": "call_module", "name": "linear3"},
+                {"op": "call_function", "name": "add"},
+                {"op": "call_method", "name": "transpose"},
+                {"op": "output", "name": "output"},
+            ]
             ops = [{"op": node.op, "name": node.name} for node in traced_model.graph.nodes]
             assert ops == expected_nodes
         except:
             update_result({"inference_success": 0})
             raise
 
-    @patch('torch.distributed.get_rank')   
+    @patch("torch.distributed.get_rank")
     def test_trace_model_will_leaf_module(self, rank_mock):
         try:
             mod = NestedModule()
-            traced_model = tracer.trace_model(model=mod, input_names=['x'], leaf_modules=['MyModule'])
-            expected_nodes = [{'op': 'placeholder', 'name': 'x'}, {'op': 'call_module', 'name': 'my_mod'}, 
-                            {'op': 'call_module', 'name': 'linear4'}, {'op': 'output', 'name': 'output'}]
+            traced_model = tracer.trace_model(model=mod, input_names=["x"], leaf_modules=["MyModule"])
+            expected_nodes = [
+                {"op": "placeholder", "name": "x"},
+                {"op": "call_module", "name": "my_mod"},
+                {"op": "call_module", "name": "linear4"},
+                {"op": "output", "name": "output"},
+            ]
             ops = [{"op": node.op, "name": node.name} for node in traced_model.graph.nodes]
             assert ops == expected_nodes
         except:
             update_result({"inference_success": 0})
             raise
 
-    @patch('neuronx_distributed.parallel_layers.layers.get_tensor_model_parallel_size', MagicMock(return_value=1))
-    @patch('neuronx_distributed.parallel_layers.layers.get_tensor_model_parallel_rank', MagicMock(return_value=1))
-    @patch('neuronx_distributed.parallel_layers.layers._initialize_affine_weight_cpu', MagicMock(return_value=None))
-    @patch('neuronx_distributed.parallel_layers.layers._initialize_affine_weight_neuron', MagicMock(return_value=None))
-    @patch('torch.distributed.get_rank')   
+    @patch("neuronx_distributed.parallel_layers.layers.get_tensor_model_parallel_size", MagicMock(return_value=1))
+    @patch("neuronx_distributed.parallel_layers.layers.get_tensor_model_parallel_rank", MagicMock(return_value=1))
+    @patch("neuronx_distributed.parallel_layers.layers._initialize_parameter_cpu", MagicMock(return_value=None))
+    @patch("neuronx_distributed.parallel_layers.layers._initialize_affine_weight_neuron", MagicMock(return_value=None))
+    @patch("torch.distributed.get_rank")
     def test_nxd_trace_model_will_leaf_module(self, rank_mock):
         try:
             mod = NestedNxDModule()
-            traced_model = tracer.trace_model(model=mod, input_names=['x'], leaf_modules=['MyModule', 'ColumnParallelLinear'], 
-                                            autowrap_functions=[parallel_cross_entropy])
-            expected_nodes = [{'op': 'placeholder', 'name': 'x'}, {'op': 'call_module', 'name': 'my_mod'}, 
-                            {'op': 'call_module', 'name': 'cpl'}, {'op': 'call_function', 'name': 'parallel_cross_entropy'}, 
-                            {'op': 'call_module', 'name': 'linear4'}, {'op': 'output', 'name': 'output'}]
+            traced_model = tracer.trace_model(
+                model=mod,
+                input_names=["x"],
+                leaf_modules=["MyModule", "ColumnParallelLinear"],
+                autowrap_functions=[parallel_cross_entropy],
+            )
+            expected_nodes = [
+                {"op": "placeholder", "name": "x"},
+                {"op": "call_module", "name": "my_mod"},
+                {"op": "call_module", "name": "cpl"},
+                {"op": "call_function", "name": "parallel_cross_entropy"},
+                {"op": "call_module", "name": "linear4"},
+                {"op": "output", "name": "output"},
+            ]
             ops = [{"op": node.op, "name": node.name} for node in traced_model.graph.nodes]
             assert ops == expected_nodes
         except:

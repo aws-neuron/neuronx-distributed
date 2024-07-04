@@ -1,11 +1,8 @@
-from functools import partial
 from typing import Any, Callable
 
 from lightning_fabric.accelerators.xla import _XLA_AVAILABLE
-from lightning_fabric.plugins.precision.xla import _PRECISION_INPUT
 from lightning_fabric.utilities.types import Optimizable
 from pytorch_lightning.plugins.precision import XLAPrecisionPlugin
-from pytorch_lightning.utilities.exceptions import MisconfigurationException
 
 
 class NeuronXLAPrecisionPlugin(XLAPrecisionPlugin):
@@ -22,7 +19,7 @@ class NeuronXLAPrecisionPlugin(XLAPrecisionPlugin):
         closure: Callable[[], Any],
         **kwargs: Any,
     ) -> Any:
-        import torch_xla.core.xla_model as xm
+        pass
 
         # TODO: currently using manual optimization, need further modification here for auto optimization
         optimizer.step()

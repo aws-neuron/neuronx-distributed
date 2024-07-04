@@ -2,50 +2,64 @@ from abc import ABC, abstractmethod
 
 
 class PipelineTask:
-    def __init__(self, mb, model_chunk=0):
+    def __init__(self, mb, model_chunk=0, graph_break=True):
         self.mb = mb
         self.model_chunk = model_chunk
+        self.graph_break = graph_break
 
     def __eq__(self, other) -> bool:
-        return type(self) == type(other) and self.mb == other.mb and self.model_chunk == other.model_chunk
+        return (
+            type(self) == type(other)
+            and self.mb == other.mb
+            and self.model_chunk == other.model_chunk
+            and self.graph_break == other.graph_break
+        )
 
 
 class ForwardStepTask(PipelineTask):
     def __repr__(self):
-        return f"ForwardStepTask_microbatch_{self.mb}_modelchunk_{self.model_chunk}"
+        return f"ForwardStepTask_microbatch_{self.mb}_modelchunk_{self.model_chunk}_graphbreak_{self.graph_break}"
 
 
 class ForwardPreprocessTask(PipelineTask):
     def __repr__(self):
-        return f"ForwardPreprocessTask_microbatch_{self.mb}_modelchunk_{self.model_chunk}"
+        return f"ForwardPreprocessTask_microbatch_{self.mb}_modelchunk_{self.model_chunk}_graphbreak_{self.graph_break}"
 
 
 class ForwardPostprocessTask(PipelineTask):
     def __repr__(self):
-        return f"ForwardPostprocessTask_microbatch_{self.mb}_modelchunk_{self.model_chunk}"
+        return (
+            f"ForwardPostprocessTask_microbatch_{self.mb}_modelchunk_{self.model_chunk}_graphbreak_{self.graph_break}"
+        )
 
 
 class BackwardStepTask(PipelineTask):
     def __repr__(self):
-        return f"BackwardStepTask_microbatch_{self.mb}_modelchunk_{self.model_chunk}"
+        return f"BackwardStepTask_microbatch_{self.mb}_modelchunk_{self.model_chunk}_graphbreak_{self.graph_break}"
 
 
 class BackwardPreprocessTask(PipelineTask):
     def __repr__(self):
-        return f"BackwardPreprocessTask_microbatch_{self.mb}_modelchunk_{self.model_chunk}"
+        return (
+            f"BackwardPreprocessTask_microbatch_{self.mb}_modelchunk_{self.model_chunk}_graphbreak_{self.graph_break}"
+        )
 
 
 class BackwardPostprocessTask(PipelineTask):
     def __repr__(self):
-        return f"BackwardPostprocessTask_microbatch_{self.mb}_modelchunk_{self.model_chunk}"
+        return (
+            f"BackwardPostprocessTask_microbatch_{self.mb}_modelchunk_{self.model_chunk}_graphbreak_{self.graph_break}"
+        )
 
 
 class PostProcessTask:
-    def __init__(self):
+    def __init__(self, graph_break=True):
         """
         PostProcessTask happens after pipeline execution
         """
         self.mb = -1
+        self.model_chunk = -1
+        self.graph_break = graph_break
 
 
 class ReduceGradsTask(PostProcessTask):
@@ -173,8 +187,10 @@ class Train1F1BSchedule(PipeSchedule):
         """
         Given a step id, return the corresponding microbatch id and whether current step is doing forward
         """
+        # Warmup phase
         if step_id < self.num_warmup_steps:
             return step_id, True
+        # Steady 1F1B phase
         elif step_id < self.num_warmup_steps + self.num_steady_state_microbatches * 2:
             current_1f1b_step = step_id - self.num_warmup_steps
             is_forward = current_1f1b_step % 2 == 0
@@ -183,6 +199,7 @@ class Train1F1BSchedule(PipeSchedule):
             else:
                 current_mb = current_1f1b_step // 2
             return current_mb, is_forward
+        # Cool down phase
         else:
             current_remaining_step = step_id - self.num_warmup_steps - self.num_steady_state_microbatches * 2
             current_mb = self.num_steady_state_microbatches + current_remaining_step
@@ -255,9 +272,25 @@ class TrainInterleavedSchedule(PipeSchedule):
             - Cool down phase: A step contains a single mb backward for a model chunk
     """
 
-    def __init__(self, num_microbatches, num_model_chunks, stages, stage_id):
+    def __init__(
+        self,
+        num_microbatches,
+        num_model_chunks,
+        stages,
+        stage_id,
+        fused_send_recv=False,
+        fused_fwd_bwd=False,
+        use_odd_even_scheduler=False,
+    ):
         super().__init__(num_microbatches, stages, stage_id)
+        # We do not need to fuse graph when there is no steady states
+        if num_microbatches <= stages:
+            fused_send_recv = False
+            fused_fwd_bwd = False
         self.num_model_chunks = num_model_chunks
+        self.fused_send_recv = fused_send_recv
+        self.fused_fwd_bwd = fused_fwd_bwd
+        self.use_odd_even_scheduler = use_odd_even_scheduler
         self.get_step_schedule()
 
     def get_step_schedule(self):
@@ -345,79 +378,115 @@ class TrainInterleavedSchedule(PipeSchedule):
         model_chunk = self.get_model_chunk_id(step_id, is_forward=is_forward)
         return not (self.stage_id == self.stages - 1 and model_chunk == self.num_model_chunks - 1)
 
-    def _get_forward_preprocess_task(self, step_id):
+    def _get_forward_preprocess_task(self, step_id, graph_break=True):
         """
         Recv forward, this is for next step
         """
         next_mb_fwd = self.get_microbatch_id(step_id + 1, is_forward=True)
         next_model_chunk_fwd = self.get_model_chunk_id(step_id + 1, is_forward=True)
-        return ForwardPreprocessTask(next_mb_fwd, model_chunk=next_model_chunk_fwd)
+        return ForwardPreprocessTask(next_mb_fwd, model_chunk=next_model_chunk_fwd, graph_break=graph_break)
 
-    def _get_forward_postprocess_task(self, step_id):
+    def _get_forward_postprocess_task(self, step_id, graph_break=True):
         """
         Send forward, this is for current step
         """
         current_mb_fwd = self.get_microbatch_id(step_id, is_forward=True)
         current_model_chunk_fwd = self.get_model_chunk_id(step_id, is_forward=True)
-        return ForwardPostprocessTask(current_mb_fwd, model_chunk=current_model_chunk_fwd)
+        return ForwardPostprocessTask(current_mb_fwd, model_chunk=current_model_chunk_fwd, graph_break=graph_break)
 
-    def _get_backward_preprocess_task(self, step_id):
+    def _get_backward_preprocess_task(self, step_id, graph_break=True):
         """
         Recv backward, this is for next step
         """
         next_mb_bwd = self.get_microbatch_id(step_id + 1, is_forward=False)
         next_model_chunk_bwd = self.get_model_chunk_id(step_id + 1, is_forward=False)
-        return BackwardPreprocessTask(next_mb_bwd, model_chunk=next_model_chunk_bwd)
+        return BackwardPreprocessTask(next_mb_bwd, model_chunk=next_model_chunk_bwd, graph_break=graph_break)
 
-    def _get_backward_postprocess_task(self, step_id):
+    def _get_backward_postprocess_task(self, step_id, graph_break=True):
         """
         Send backward, this is for current step
         """
         current_mb_bwd = self.get_microbatch_id(step_id, is_forward=False)
         current_model_chunk_bwd = self.get_model_chunk_id(step_id, is_forward=False)
-        return BackwardPostprocessTask(current_mb_bwd, model_chunk=current_model_chunk_bwd)
+        return BackwardPostprocessTask(current_mb_bwd, model_chunk=current_model_chunk_bwd, graph_break=graph_break)
 
-    def _get_forward_step_task(self, step_id):
+    def _get_forward_step_task(self, step_id, graph_break=True):
         current_mb_bwd = self.get_microbatch_id(step_id, is_forward=True)
         current_model_chunk_fwd = self.get_model_chunk_id(step_id, is_forward=True)
-        return ForwardStepTask(current_mb_bwd, model_chunk=current_model_chunk_fwd)
+        return ForwardStepTask(current_mb_bwd, model_chunk=current_model_chunk_fwd, graph_break=graph_break)
 
-    def _get_backward_step_task(self, step_id):
+    def _get_backward_step_task(self, step_id, graph_break=True):
         current_mb_bwd = self.get_microbatch_id(step_id, is_forward=False)
         current_model_chunk_bwd = self.get_model_chunk_id(step_id, is_forward=False)
-        return BackwardStepTask(current_mb_bwd, model_chunk=current_model_chunk_bwd)
+        return BackwardStepTask(current_mb_bwd, model_chunk=current_model_chunk_bwd, graph_break=graph_break)
 
     def _add_pre_post_processing_tasks(self, step_id, cmds, fwd_pre=True, fwd_post=True, bwd_pre=True, bwd_post=True):
         """
         send_fwd, recv_fwd, send_bwd, recv_bwd
         Specialy handling for last stage to send first before recv to remove deadlocks
         """
-        if not self.stage_id == self.num_stages - 1:
-            # recv fwd
-            if fwd_pre:
-                cmds.append(self._get_forward_preprocess_task(step_id))
-            # send fwd
-            if fwd_post:
-                cmds.append(self._get_forward_postprocess_task(step_id))
-            # recv bwd
-            if bwd_pre:
-                cmds.append(self._get_backward_preprocess_task(step_id))
-            # send bwd
-            if bwd_post:
-                cmds.append(self._get_backward_postprocess_task(step_id))
+        if not self.use_odd_even_scheduler:
+            if not self.stage_id == self.num_stages - 1:
+                # recv fwd
+                if fwd_pre:
+                    cmds.append(
+                        self._get_forward_preprocess_task(step_id, graph_break=not self.fused_send_recv or not bwd_post)
+                    )
+                # send bwd
+                if bwd_post:
+                    cmds.append(self._get_backward_postprocess_task(step_id))
+                # send fwd
+                if fwd_post:
+                    cmds.append(
+                        self._get_forward_postprocess_task(step_id, graph_break=not self.fused_send_recv or not bwd_pre)
+                    )
+                # recv bwd
+                if bwd_pre:
+                    cmds.append(self._get_backward_preprocess_task(step_id))
+            else:
+                # send_fwd
+                if fwd_post:
+                    cmds.append(
+                        self._get_forward_postprocess_task(step_id, graph_break=not self.fused_send_recv or not bwd_pre)
+                    )
+                # recv_bwd
+                if bwd_pre:
+                    cmds.append(self._get_backward_preprocess_task(step_id))
+                # recv_fwd
+                if fwd_pre:
+                    cmds.append(
+                        self._get_forward_preprocess_task(step_id, graph_break=not self.fused_send_recv or not bwd_post)
+                    )
+                # send_bwd
+                if bwd_post:
+                    cmds.append(self._get_backward_postprocess_task(step_id))
         else:
-            # send_fwd
-            if fwd_post:
-                cmds.append(self._get_forward_postprocess_task(step_id))
-            # recv_fwd
-            if fwd_pre:
-                cmds.append(self._get_forward_preprocess_task(step_id))
-            # send_bwd
-            if bwd_post:
-                cmds.append(self._get_backward_postprocess_task(step_id))
-            # recv_bwd
-            if bwd_pre:
-                cmds.append(self._get_backward_preprocess_task(step_id))
+            if self.stage_id % 2 == 0:  # Schedule for Even stages
+                # recv fwd
+                if fwd_pre:
+                    cmds.append(self._get_forward_preprocess_task(step_id))
+                # send fwd
+                if fwd_post:
+                    cmds.append(self._get_forward_postprocess_task(step_id))
+                # send bwd
+                if bwd_post:
+                    cmds.append(self._get_backward_postprocess_task(step_id))
+                # recv bwd
+                if bwd_pre:
+                    cmds.append(self._get_backward_preprocess_task(step_id))
+            else:  # Schedule for Odd stages
+                # send_fwd
+                if fwd_post:
+                    cmds.append(self._get_forward_postprocess_task(step_id))
+                # recv_fwd
+                if fwd_pre:
+                    cmds.append(self._get_forward_preprocess_task(step_id))
+                # recv_bwd
+                if bwd_pre:
+                    cmds.append(self._get_backward_preprocess_task(step_id))
+                # send_bwd
+                if bwd_post:
+                    cmds.append(self._get_backward_postprocess_task(step_id))
 
     def steps(self):
         total_steps = self.num_warmup_steps + self.num_steady_state_steps + self.num_remaining_steps + 1
@@ -447,7 +516,7 @@ class TrainInterleavedSchedule(PipeSchedule):
                 )
             # Steady state
             elif step_id < self.num_warmup_steps + self.num_steady_state_steps:
-                cmds.append(self._get_forward_step_task(step_id))
+                cmds.append(self._get_forward_step_task(step_id, graph_break=not self.fused_fwd_bwd))
                 cmds.append(self._get_backward_step_task(step_id))
                 # If this is the last step for steady state, do not recv fwd
                 # since there is no further forward steps

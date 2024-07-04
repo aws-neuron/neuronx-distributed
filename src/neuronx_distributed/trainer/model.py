@@ -1,3 +1,5 @@
+from typing import Any
+
 import torch
 
 
@@ -15,10 +17,10 @@ class NxDModel(torch.nn.Module):
     def __repr__(self):
         return "NxDModel({})".format(self.module.__repr__())
 
-    def local_module(self):
+    def local_modules(self):
         if self.pp_enabled:
-            return self.module.local_module
-        return self.module
+            return self.module.local_stage_modules
+        return [self.module]
 
     def original_module(self):
         if self.pp_enabled:
@@ -81,7 +83,17 @@ class NxDModel(torch.nn.Module):
         return self.module.state_dict(*args, **kwargs)
 
     def load_state_dict(self, state_dict, strict=True):
-        self.module.load_state_dict(state_dict, strict=strict)
+        return self.module.load_state_dict(state_dict, strict=strict)
+
+    def __getattr__(self, name: str) -> Any:
+        r"""
+        When attributes or methods are not defined in NxDModel() but defined in the wrapped module,
+        this method can forward them to the wrapped module.
+        """
+        try:
+            return super().__getattr__(name)  # defer to nn.Module's logic
+        except AttributeError:
+            return getattr(self.module, name)
 
     """
     common transformers.PreTrainedModel APIs

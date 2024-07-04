@@ -83,10 +83,11 @@ def get_grad_norm(parameters, norm_type=2, zero1_optimizer=False, zero1_optimize
                     pin_layout=True,
                 )
 
-    device = xm.xla_device()
-
     if isinstance(parameters, torch.Tensor):
         parameters = [parameters]
+
+    device = xm.xla_device()
+    dtype = parameters[0].dtype
 
     grads = []
     grads_for_norm = []
@@ -110,14 +111,14 @@ def get_grad_norm(parameters, norm_type=2, zero1_optimizer=False, zero1_optimize
 
     # Norm parameters.
     norm_type = float(norm_type)
-    total_norm = torch.FloatTensor([float(0.0)]).to(device)
+    total_norm = torch.tensor([float(0.0)], dtype=dtype, device=device)
 
     # Calculate norm.
     if torch.isinf(torch.tensor(norm_type)):
         total_norm_tp_duplicated = max(grad.abs().max() for grad in grads_for_norm_tp_duplicated)
         total_norm = max(grad.abs().max() for grad in grads_for_norm)
         total_norm = max(total_norm_tp_duplicated, total_norm)
-        total_norm = torch.FloatTensor([float(total_norm)]).to(device)
+        total_norm = torch.tensor([float(total_norm)], dtype=dtype, device=device)
         _allreduce_norm_across_parallel_groups(total_norm, torch.distributed.ReduceOp.MAX)
         total_norm = total_norm[0].item()
     else:
@@ -186,14 +187,20 @@ def clip_grad_norm(
 
     clip_coeff = max_norm / (total_norm + 1.0e-6)
     for g in grads:
-        g.data.mul_(torch.where(clip_coeff < 1, clip_coeff, torch.tensor(1.0, device=device)))
+        g.data.mul_(
+            torch.where(
+                clip_coeff < 1,
+                clip_coeff.to(dtype=total_norm.dtype),
+                torch.tensor(1.0, dtype=total_norm.dtype, device=device),
+            )
+        )
     return total_norm
 
 
 def bucket_allreduce_gradients(grads_list):
     """
     All reduce bucket gradients for data parallelism.
-    Referred from https://code.amazon.com/packages/Neuron-Nemo-Megatron/blobs/899fc918ffa82e4bea46750ff6dfe5b909d144a9/--/nemo/nemo/collections/nlp/models/language_modeling/megatron_base_model.py#L57 # noqa: E501
+    Referred from https://github.com/aws-neuron/neuronx-nemo-megatron/blob/main/nemo/nemo/collections/nlp/models/language_modeling/megatron_base_model.py#L58 # noqa: E501
     """
     bucket_cap = int(os.getenv("ALLREDUCE_BUCKET_CAP_MB", _ALLREDUCE_BUCKET_CAP_MB)) * 1024 * 1024
 
@@ -256,9 +263,10 @@ def allreduce_sequence_parallel_gradients(optimizer):
         for group, params in param_group.items():
             if group == "params":
                 for p in params:
-                    if isinstance(p, torch.Tensor) and p.grad is not None:
-                        sequence_parallel_param = getattr(p, "sequence_parallel_enabled", False)
-                        if sequence_parallel_param:
+                    if isinstance(p, torch.Tensor) and getattr(p, "sequence_parallel_enabled", False):
+                        if p.grad is not None:
                             grads.append(p.grad.data)
+                        elif hasattr(p, "main_grad"):
+                            grads.append(p.main_grad.data)
     for grad in grads:
         reduce_from_tensor_model_parallel_region(grad)

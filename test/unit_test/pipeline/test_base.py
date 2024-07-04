@@ -1,5 +1,6 @@
 from transformers import AutoModelForCausalLM, GPT2Config
 from transformers.models.gpt2.modeling_gpt2 import GPT2Block
+
 from neuronx_distributed.pipeline.model import NxDPPModel
 
 
@@ -30,9 +31,16 @@ def get_traced_model_gpt():
     )
     module = AutoModelForCausalLM.from_config(model_config)
     model = NxDPPModel(module=module, transformer_layer_cls=GPT2Block, tracer_cls="hf")
-    model.trace(input_names=["input_ids", "attention_mask", "labels"], leaf_modules=['GPT2Block'])
-    cut_points = ["transformer.h.1", "transformer.h.2", "transformer.h.3", "transformer.h.4", "transformer.h.5",
-                  "transformer.h.6", "transformer.h.7"]
+    model.trace(input_names=["input_ids", "attention_mask", "labels"], leaf_modules=["GPT2Block"])
+    cut_points = [
+        "transformer.h.1",
+        "transformer.h.2",
+        "transformer.h.3",
+        "transformer.h.4",
+        "transformer.h.5",
+        "transformer.h.6",
+        "transformer.h.7",
+    ]
     for cut in cut_points:
         model.cut_pipeline_stage(cut)
     return model.traced_model

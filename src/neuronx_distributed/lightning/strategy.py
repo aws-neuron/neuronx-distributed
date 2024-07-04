@@ -85,9 +85,8 @@ class NeuronXLAStrategy(XLAStrategy):
             import torch_xla.core.xla_model as xm
 
             global_rank = xm.get_ordinal()
-        if (torch.__version__.startswith('2.0')):
-            pass
-            import torch_xla.experimental.pjrt_backend
+        if torch.__version__.startswith("2.0"):
+            import torch_xla.experimental.pjrt_backend  # noqa
 
             dist.init_process_group("xla", init_method="pjrt://", rank=global_rank)
         else:

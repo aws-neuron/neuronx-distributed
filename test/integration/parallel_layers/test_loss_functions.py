@@ -143,7 +143,8 @@ def on_exit():
 
 if __name__ == "__main__":
     if requires_init_pg_override():
-        import torch_xla.experimental.pjrt_backend
+        import torch_xla.experimental.pjrt_backend  # noqa
+
         torch.distributed.init_process_group("xla", init_method="pjrt://")
     else:
         torch.distributed.init_process_group("xla")

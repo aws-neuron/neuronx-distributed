@@ -1,4 +1,2 @@
-transformers==4.35.2
-torch==1.13
+transformers==4.36.2
 sentencepiece
-protobuf

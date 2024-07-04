@@ -39,12 +39,17 @@ setup(
         'Topic :: Software Development :: Libraries',
         'Topic :: Software Development :: Libraries :: Python Modules',
     ],
-    keywords='aws neuron',
-    packages=PEP420PackageFinder.find(where='src'),
-    package_dir={'': 'src'},
-    package_data={'': [
-        'LICENSE.txt',
-    ]},
+    keywords="aws neuron",
+    packages=PEP420PackageFinder.find(where="src"),
+    package_dir={"": "src"},
+    package_data={
+        "": [
+            "LICENSE.txt",
+        ]
+    },
+    entry_points={
+        "console_scripts": ["nxd_convert_zero_checkpoints=neuronx_distributed.optimizer.convert_zero_checkpoints:main"],
+    },
     install_requires=[
         'torch-neuronx',
         'torch-xla',

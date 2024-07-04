@@ -1,40 +1,54 @@
 """ NxD GPTNeoX model """
 
-from packaging import version
+from functools import partial
 from typing import Optional, Tuple, Union
 
 import torch
 import torch.utils.checkpoint
-from torch import nn
-
-from transformers.activations import ACT2FN
-from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
-from transformers.utils import logging
-
-from neuronx_distributed.parallel_layers.layers import ParallelEmbedding, ColumnParallelLinear, RowParallelLinear
-from neuronx_distributed.parallel_layers.loss_functions import parallel_cross_entropy
-from neuronx_distributed.parallel_layers.parallel_state import get_tensor_model_parallel_size
-import neuronx_distributed.parallel_layers.utils as neuronx_dist_utils
-from neuronx_distributed.parallel_layers import move_model_to_device, mappings, layer_norm
 import torch_xla.core.xla_model as xm
-
+from packaging import version
+from torch import nn
+from transformers.activations import ACT2FN
+from transformers.modeling_outputs import (
+    BaseModelOutputWithPast,
+    CausalLMOutputWithPast,
+)
 from transformers.models.gpt_neox.modeling_gpt_neox import (
     GPTNeoXAttention,
-    GPTNeoXMLP,
+    GPTNeoXForCausalLM,
     GPTNeoXLayer,
+    GPTNeoXMLP,
     GPTNeoXModel,
     GPTNeoXPreTrainedModel,
-    GPTNeoXForCausalLM,
     RotaryEmbedding,
     apply_rotary_pos_emb,
 )
+from transformers.utils import logging
 
-from functools import partial
+import neuronx_distributed.parallel_layers.utils as neuronx_dist_utils
+from neuronx_distributed.parallel_layers import (
+    layer_norm,
+    mappings,
+    move_model_to_device,
+)
+from neuronx_distributed.parallel_layers.layers import (
+    ColumnParallelLinear,
+    ParallelEmbedding,
+    RowParallelLinear,
+)
+from neuronx_distributed.parallel_layers.loss_functions import parallel_cross_entropy
+from neuronx_distributed.parallel_layers.parallel_state import (
+    get_tensor_model_parallel_size,
+)
+
+
 def _init_normal(std, w):
     return nn.init.normal_(w, mean=0.0, std=std)
 
+
 if version.parse(torch.__version__) >= version.parse("2.1"):
     from torch_xla.utils.checkpoint import checkpoint
+
     checkpoint_method = checkpoint
 else:
     checkpoint_method = torch.utils.checkpoint.checkpoint
@@ -64,7 +78,9 @@ class GPTNeoXAttentionNxD(GPTNeoXAttention):
 
         # NxD code change: Replace the Linear with ColumnParallelLinear and RowParallelLinear
         self.config = config
-        self.num_attention_heads = neuronx_dist_utils.divide(config.num_attention_heads, get_tensor_model_parallel_size())
+        self.num_attention_heads = neuronx_dist_utils.divide(
+            config.num_attention_heads, get_tensor_model_parallel_size()
+        )
         init_method = partial(_init_normal, config.initializer_range)
         self.query_key_value = ColumnParallelLinear(
             config.hidden_size,
@@ -146,8 +162,7 @@ class GPTNeoXAttentionNxD(GPTNeoXAttention):
 
         # Mason: selective checkpoint
         if self.config.selective_checkpoint_enabled:
-            attn_output, attn_weights = \
-                checkpoint_method(self._attn, query, key, value, attention_mask, head_mask)
+            attn_output, attn_weights = checkpoint_method(self._attn, query, key, value, attention_mask, head_mask)
         else:
             # Compute attention
             attn_output, attn_weights = self._attn(query, key, value, attention_mask, head_mask)
@@ -164,7 +179,9 @@ class GPTNeoXAttentionNxD(GPTNeoXAttention):
             attn_output = attn_output.permute(0, 2, 1, 3).contiguous()
             # -> [bs, seq_len, num_attention_heads, attn_head_size]
             # -> [bs, seq_len, hidden_size]
-        attn_output = attn_output.view(attn_output.size(0), attn_output.size(1), self.num_attention_heads * self.head_size)
+        attn_output = attn_output.view(
+            attn_output.size(0), attn_output.size(1), self.num_attention_heads * self.head_size
+        )
 
         attn_output = self.dense(attn_output)
 
@@ -199,7 +216,7 @@ class GPTNeoXAttentionNxD(GPTNeoXAttention):
         attn_scores = attn_scores.view(batch_size, num_attention_heads, query_length, key_length)
 
         # NxD code change: creating causal_mask on-the-fly to trigger the Neuron compiler optimization
-        causal_mask = torch.triu(torch.ones((1, 1, query_length, key_length), device='xla'), diagonal=1).bool()
+        causal_mask = torch.triu(torch.ones((1, 1, query_length, key_length), device="xla"), diagonal=1).bool()
         attn_scores = attn_scores.masked_fill_(causal_mask, -10000.0)
 
         attn_weights = nn.functional.softmax(attn_scores, dim=-1)
@@ -247,10 +264,14 @@ class GPTNeoXLayerNxD(GPTNeoXLayer):
         self.use_parallel_residual = config.use_parallel_residual
 
         # NxD code change: Replace the nn LayerNorm with nxd LayerNorm to use sequence parallel
-        self.input_layernorm = layer_norm.LayerNorm(config.hidden_size, eps=config.layer_norm_eps, sequence_parallel_enabled=config.sequence_parallel_enabled)
+        self.input_layernorm = layer_norm.LayerNorm(
+            config.hidden_size, eps=config.layer_norm_eps, sequence_parallel_enabled=config.sequence_parallel_enabled
+        )
         self.input_layernorm.bias.data.zero_()
         self.input_layernorm.weight.data.fill_(1.0)
-        self.post_attention_layernorm = layer_norm.LayerNorm(config.hidden_size, eps=config.layer_norm_eps, sequence_parallel_enabled=config.sequence_parallel_enabled)
+        self.post_attention_layernorm = layer_norm.LayerNorm(
+            config.hidden_size, eps=config.layer_norm_eps, sequence_parallel_enabled=config.sequence_parallel_enabled
+        )
         self.post_attention_layernorm.bias.data.zero_()
         self.post_attention_layernorm.weight.data.fill_(1.0)
 
@@ -266,15 +287,17 @@ class GPTNeoXModelNxD(GPTNeoXModel):
         # NxD code change: Replace the Embedding with ParallelEmbedding
         init_method = partial(_init_normal, config.initializer_range)
         self.embed_in = ParallelEmbedding(
-                config.vocab_size,
-                config.hidden_size,
-                init_method=init_method,
+            config.vocab_size,
+            config.hidden_size,
+            init_method=init_method,
         )
 
         self.layers = nn.ModuleList([GPTNeoXLayerNxD(config) for _ in range(config.num_hidden_layers)])
 
         # Replace the nn LayerNorm with nxd LayerNorm to use sequence parallel
-        self.final_layer_norm = layer_norm.LayerNorm(config.hidden_size, eps=config.layer_norm_eps, sequence_parallel_enabled=config.sequence_parallel_enabled)
+        self.final_layer_norm = layer_norm.LayerNorm(
+            config.hidden_size, eps=config.layer_norm_eps, sequence_parallel_enabled=config.sequence_parallel_enabled
+        )
         self.final_layer_norm.bias.data.zero_()
         self.final_layer_norm.weight.data.fill_(1.0)
 
@@ -370,7 +393,6 @@ class GPTNeoXModelNxD(GPTNeoXModel):
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
             if self.gradient_checkpointing and self.training:
-
                 if use_cache:
                     logger.warning(
                         "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
@@ -428,7 +450,6 @@ class GPTNeoXModelNxD(GPTNeoXModel):
 
 
 class GPTNeoXForCausalLMNxD(GPTNeoXForCausalLM):
-
     def __init__(self, config):
         GPTNeoXPreTrainedModel.__init__(self, config)
 
