@@ -73,7 +73,6 @@ export NEURON_RT_NUM_CORES=32
 export NEURON_NUM_DEVICES=$NEURON_RT_NUM_CORES
 export TPU_NUM_DEVICES=$NEURON_RT_NUM_CORES
 export TPU_CHIPS_PER_HOST_BOUNDS=$NEURON_RT_NUM_CORES
-export NEURON_RT_ROOT_COMM_ID=localhost:48620
 
 #############################################
 
