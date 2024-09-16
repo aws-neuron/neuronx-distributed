@@ -6,6 +6,7 @@ sudo sysctl -w net.ipv4.ip_local_reserved_ports=44000
 
 MODEL_SIZE="70B"
 LLAMA_VERSION='3'
+: ${LLAMA_CONFIG_VERISON:=3}
 
 export FI_EFA_USE_DEVICE_RDMA=1
 export FI_PROVIDER=efa
@@ -87,7 +88,7 @@ torchrun $DISTRIBUTED_ARGS run_llama_nxd.py \
     --train_batch_size $BS \
     --use_meta_device_init 1 \
     --training_dir $DATA_PATH \
-    --training_config $SCRIPT_DIR/${MODEL_SIZE}_config_llama${LLAMA_VERSION} \
+    --training_config $SCRIPT_DIR/${MODEL_SIZE}_config_llama${LLAMA_CONFIG_VERISON} \
     --max_steps $max_steps \
     --seq_len $SEQ_LEN \
     --pipeline_parallel_size $PP_DEGREE \
@@ -113,4 +114,3 @@ torchrun $DISTRIBUTED_ARGS run_llama_nxd.py \
     --loading_step -1 \
     --tb_dir $tb_dir |& tee $LOG_PATH/log
 exit ${PIPESTATUS[0]}
-

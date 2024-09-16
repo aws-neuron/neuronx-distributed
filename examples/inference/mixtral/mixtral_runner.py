@@ -1,5 +1,3 @@
-import os
-
 import torch
 from mixtral.neuron_modeling_mixtral import (
     NeuronMixtralConfig,
@@ -17,10 +15,17 @@ class MixtralRunner(InferenceRunner):
     def load_hf_model(self):
         return NeuronMixtralForCausalLM.load_hf_model(self.model_path)
 
-    def load_neuron_model_on_cpu(self, max_context_length, max_new_tokens, batch_size, **kwargs):
+    def load_neuron_model_on_cpu(self, max_prompt_length, sequence_length, batch_size, **kwargs):
         # On CPU we can only run tensor parallelism with degree 1
-        config = self.get_config_for_nxd(batch_size, 1, max_context_length, max_new_tokens, **kwargs)
+        config = self.get_config_for_nxd(
+            batch_size,
+            1,
+            max_prompt_length=max_prompt_length,
+            sequence_length=sequence_length,
+            enable_bucketing=False,
+            **kwargs)
         config.torch_dtype = torch.float32
+        config.on_cpu = True  # to avoid running custom RMSNorm on cpu
 
         self.init_ditributed_env()
         neuron_model = NeuronMixtralModel(config)
@@ -45,7 +50,7 @@ class MixtralRunner(InferenceRunner):
 
         model.load(traced_model_path)
         if config.torch_dtype == torch.bfloat16:
-            os.environ["XLA_DOWNCAST_BF16"] = "1"
+            model.bfloat16()
 
         return model
 
@@ -63,6 +68,12 @@ class MixtralRunner(InferenceRunner):
 
     def get_padding_side(self):
         return "right"
+
+    def get_default_hf_generation_config_kwargs(self):
+        config = super().get_default_hf_generation_config_kwargs()
+        config['pad_token_id'] = 0
+
+        return config
 
 
 if __name__ == "__main__":

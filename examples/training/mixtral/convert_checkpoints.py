@@ -1,13 +1,10 @@
-import argparse
 import json
+
 import torch
-
-from checkpoint_converter import CheckpointConverterBase
-
+from neuronx_distributed.scripts.checkpoint_converter import CheckpointConverterBase
 
 
 class CheckpointConverterMixtral(CheckpointConverterBase):
-
     # ExpertFusedColumnParallelLinear
     gate_up_proj_partition_dim = 2
     # ExpertFusedRowParallelLinear
@@ -34,9 +31,9 @@ class CheckpointConverterMixtral(CheckpointConverterBase):
             down_proj = torch.stack(down_proj_per_expert)
 
             state_dict[f"model.layers.{i}.mlp.router.linear_router.weight"] = router_weight
-            state_dict[f"model.layers.{i}.mlp.expert_mlps.gate_proj.weight"] = gate_proj
-            state_dict[f"model.layers.{i}.mlp.expert_mlps.up_proj.weight"] = up_proj
-            state_dict[f"model.layers.{i}.mlp.expert_mlps.down_proj.weight"] = down_proj
+            state_dict[f"model.layers.{i}.mlp.expert_mlps.mlp_op.gate_proj.weight"] = gate_proj
+            state_dict[f"model.layers.{i}.mlp.expert_mlps.mlp_op.up_proj.weight"] = up_proj
+            state_dict[f"model.layers.{i}.mlp.expert_mlps.mlp_op.down_proj.weight"] = down_proj
 
         return state_dict
 
@@ -48,9 +45,9 @@ class CheckpointConverterMixtral(CheckpointConverterBase):
 
         for i in range(config["num_hidden_layers"]):
             router_weight = state_dict.pop(f"model.layers.{i}.mlp.router.linear_router.weight")
-            gate_proj = state_dict.pop(f"model.layers.{i}.mlp.expert_mlps.gate_proj.weight")
-            up_proj = state_dict.pop(f"model.layers.{i}.mlp.expert_mlps.up_proj.weight")
-            down_proj = state_dict.pop(f"model.layers.{i}.mlp.expert_mlps.down_proj.weight")
+            gate_proj = state_dict.pop(f"model.layers.{i}.mlp.expert_mlps.mlp_op.gate_proj.weight")
+            up_proj = state_dict.pop(f"model.layers.{i}.mlp.expert_mlps.mlp_op.up_proj.weight")
+            down_proj = state_dict.pop(f"model.layers.{i}.mlp.expert_mlps.mlp_op.down_proj.weight")
 
             gate_proj_per_expert = torch.unbind(gate_proj)
             up_proj_per_expert = torch.unbind(up_proj)

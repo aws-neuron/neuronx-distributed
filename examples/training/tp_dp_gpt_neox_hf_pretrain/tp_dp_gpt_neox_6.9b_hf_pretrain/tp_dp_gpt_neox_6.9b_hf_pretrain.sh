@@ -38,7 +38,7 @@ if [ ! -z "$SLURM_NTASKS" ]; then
     MASTER_ADDRESS=(`scontrol show hostnames $SLURM_JOB_NODELIST`)
     DISTRIBUTED_ARGS="--nproc_per_node $NUM_NEURONCORES --nnodes $WORLD_SIZE --node_rank $NODE_ID --master_addr $MASTER_ADDRESS --master_port 44000"
     if [ $NODE_ID -eq 0 ]; then
-        echo "WORLD_SIZE=$WORLD_SIZE"
+        echo "WORLD_SLURM_NTASKS=$WORLD_SIZE"
         echo "NODE_ID=$NODE_ID"
         echo "MASTER_ADDRESS=$MASTER_ADDRESS"
         echo "DISTRIBUTED_ARGS=$DISTRIBUTED_ARGS"

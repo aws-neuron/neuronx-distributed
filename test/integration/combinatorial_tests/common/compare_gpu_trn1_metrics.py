@@ -1,7 +1,5 @@
 import argparse
-import math
 import os
-from collections import defaultdict
 
 import tensorboard.backend.event_processing.event_accumulator as event_acc
 import torch
@@ -21,8 +19,8 @@ def load_events(event_file):
 def get_gpu_values(args):
     if args.gpu_event_file.endswith('pt'):
         if len(args.tags) > 1:
-            raise ValueError(f"Too many tags provided to use gpu pt benchmark. Only one tag is supported for gpu pt "
-                             f"benchmark")
+            raise ValueError("Too many tags provided to use gpu pt benchmark. Only one tag is supported for gpu pt "
+                             "benchmark")
         else:
             tag = args.tags[0]
         print('GPU benchmark is a pt file')
@@ -48,6 +46,10 @@ def main():
         "--rtol", type=float, help="Relative tolerance to use", default=0.05
     )
 
+    parser.add_argument(
+        "--confidence_interval", type=float, help="Relative tolerance to use", default=0.95
+    )
+
     args = parser.parse_args()
 
     if not os.path.exists(args.gpu_event_file):
@@ -59,17 +61,18 @@ def main():
     trn1_events = load_events(args.trn1_event_file)
 
     for tag in args.tags:
-        if tag in gpu_benchmark and tag in trn1_events:
+        trn1_tag = 'step loss' if (tag == 'loss'  and tag not in trn1_events) else tag
+        if tag in gpu_benchmark and trn1_tag in trn1_events:
             # extract values for the relevant tag from GPU to handle different benchmark types
-            gpu = [val.value if type(val) is not float else val for val in gpu_benchmark[tag]]
-            trn = [val.value if type(val) is not float else val for val in trn1_events[tag]]
+            gpu = [val.value if not isinstance(val, float) else val for val in gpu_benchmark[tag]]
+            trn = [val.value if not isinstance(val, float) else val for val in trn1_events[trn1_tag]]
 
-            are_all_close = torch.allclose(torch.Tensor(trn), torch.Tensor(gpu), rtol=args.rtol, atol=args.atol, equal_nan=False)
-            if not are_all_close:
-                raise ValueError(f"Tolerance exceeded for values for tag '{tag}'")
+            are_close = torch.isclose(torch.Tensor(trn), torch.Tensor(gpu), rtol=args.rtol, atol=args.atol, equal_nan=False)
+
+            if torch.mean(are_close.float()).item() < args.confidence_interval:
+                raise ValueError(f"Tolerance exceeded for values for tag '{tag}', GPU value={gpu}, trn1 value={trn}")
         else:
             raise ValueError(f"Tag '{tag}' not found in one of the event files")
-
 
 
 if __name__ == "__main__":

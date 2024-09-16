@@ -138,7 +138,7 @@ def exercise_single_module_fwd_bwd(module: torch.nn.Module, input_tensors: Tuple
                 grads_on_device.append(child.weight.grad.data)
             if hasattr(child, "bias") and child.bias is not None:
                 grads_on_device.append(child.bias.grad.data)
-    
+
     torch.distributed.barrier()
     xm.mark_step()
 
@@ -148,7 +148,7 @@ def exercise_single_module_fwd_bwd(module: torch.nn.Module, input_tensors: Tuple
     del(device)
 
     return (output_on_cpu, grads_on_cpu)
-    
+
 
 # assert_close_on_output_tensor allows the user to choose if the output tensors should be compared with
 #     torch.testing.assert_close (compares both relative diff and absolute diff, preferred) or using a simple absolute
@@ -193,12 +193,12 @@ def test_modules(test_module: torch.nn.Module, control_module: torch.nn.Module, 
     xm.rendezvous("start_test_modules")
     test_output, test_grads = exercise_single_module_fwd_bwd(test_module, input_tensors, mark_step_between_fwd_bwd)
     del(test_module)
-    xm.master_print(f"done exercising test module")
+    xm.master_print("done exercising test module")
 
     xm.rendezvous("start_testing_control_module")
     control_output, control_grads = exercise_single_module_fwd_bwd(control_module, input_tensors, mark_step_between_fwd_bwd)
     del(control_module)
-    xm.master_print(f"done exercising control module")
+    xm.master_print("done exercising control module")
 
     xm.rendezvous("check_outputs")
 
@@ -210,7 +210,7 @@ def test_modules(test_module: torch.nn.Module, control_module: torch.nn.Module, 
             # TODO: this is only toggle-able because some testcases fail assert_close on their output
             #       e.g. V1305356298
             if assert_close_on_output_tensor:
-                torch.testing.assert_close(test_output, control_output, atol=1e-5, rtol=0.01), f"Control and test outputs from fwd pass did not match!"
+                torch.testing.assert_close(test_output, control_output, atol=1e-5, rtol=0.01), "Control and test outputs from fwd pass did not match!"
             else:
                 error = test_output.sub(control_output).abs().max()
                 limit = 1e-3
@@ -230,6 +230,6 @@ def test_modules(test_module: torch.nn.Module, control_module: torch.nn.Module, 
         except Exception as e:
             xm.master_print(e)
             grads_pass = False
-    
+
     # If we got here compilation passed
     return (True, output_pass, grads_pass)

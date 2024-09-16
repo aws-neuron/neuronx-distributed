@@ -7,6 +7,7 @@ import numpy as np
 from datasets import load_dataset
 from transformers import AutoTokenizer
 
+
 def get_args():
     parser = argparse.ArgumentParser()
     group = parser.add_argument_group(title='input data')
@@ -30,6 +31,7 @@ def get_args():
     args = parser.parse_args()
     return args
 
+
 def sample_num_spans(rng, max_num_spans=16, num_samples=1):
     # Choose at leat 1 span
     num_spans = rng.poisson(1.0, size=(num_samples)) + 1
@@ -39,10 +41,10 @@ def sample_num_spans(rng, max_num_spans=16, num_samples=1):
 
 def format_to_infill(tokens, num_spans, tokenizer, rng):
     # Choose at leat 1 span
-    #num_spans = rng.poisson(1.0) + 1
-    #num_spans = np.min([num_spans, max_num_spans])
+    # num_spans = rng.poisson(1.0) + 1
+    # num_spans = np.min([num_spans, max_num_spans])
 
-    # Based on the number of spans, a span can 
+    # Based on the number of spans, a span can
     # have a size of maximum (len(text) - num_spans) // num_spans
     # This assumes we want at least one letter between two spans.
     max_len = (len(tokens) - num_spans) // num_spans
@@ -52,7 +54,7 @@ def format_to_infill(tokens, num_spans, tokenizer, rng):
         return None
 
     # Set first start and end index based `max_len`
-    max_start_idx = 1 # Very first letter will be skipped
+    max_start_idx = 1  # Very first letter will be skipped
     max_end_idx = max_len
 
     prefix_tokens = []
@@ -60,12 +62,7 @@ def format_to_infill(tokens, num_spans, tokenizer, rng):
 
     for span_idx in range(num_spans):
         # Randomly sample the length of the span
-        try:
-            sampled_length = rng.integers(1, max_len + 1)
-        except:
-            print("Error")
-            print(len(tokens), num_spans, max_len)
-            import pdb; pdb.set_trace()
+        sampled_length = rng.integers(1, max_len + 1)
 
         # Define low and high to sample a start position.
         # The first `+ 1` is due to `.integers` expecting a value
@@ -83,7 +80,7 @@ def format_to_infill(tokens, num_spans, tokenizer, rng):
         suffix_tokens += tokenizer.encode(f'<mask_{span_idx + 1}>') + span + tokenizer.encode('<eom>')
 
         # Update start and end indices
-        max_start_idx = chosen_start + sampled_length  + 1
+        max_start_idx = chosen_start + sampled_length + 1
         max_end_idx = chosen_start + sampled_length + max_len
 
         # Append leftover to prefix string
@@ -91,6 +88,7 @@ def format_to_infill(tokens, num_spans, tokenizer, rng):
             prefix_tokens += tokens[chosen_start + sampled_length:]
 
     return prefix_tokens + tokenizer.encode('<|endoftext|><sep>') + suffix_tokens
+
 
 def main(args):
     block_size = args.block_size
@@ -192,6 +190,7 @@ def main(args):
     train_dataset.save_to_disk(train_save_path)
     test_dataset.save_to_disk(test_save_path)
     valid_dataset.save_to_disk(valid_save_path)
+
 
 if __name__ == '__main__':
     args = get_args()

@@ -8,43 +8,12 @@ LICENSE_TXT_PATH=${BUILD_PATH}/private/LICENSE.txt
 BUILD_PATH_NEURONX_DISTRIBUTED=${BUILD_PATH}/public/NeuronxDistributed
 mkdir -p ${BUILD_PATH_NEURONX_DISTRIBUTED}
 
-# check against flake8 linter
-# Options used:
-#   --max-line-length=120 is used since a lot of docstrings
-#   contain lines longer than 120 that wouldn't make sense
-#   to split (ex. code snippets)
-#
-#   Warnings that are ignored
-#   F401: unused import
-#     - Reason to ignore: Side effects might occur on import.
-#       Also, neuronx-cc check would trip this.
-#   W503/504: newline before/after binary operator.
-#     - Reason to Ignore: conditionals are often split into
-#       multiple lines for readability).
-#
-#   More info in the following links:
-#   1) https://flake8.pycqa.org/en/latest/user/error-codes.html
-#   2) https://pycodestyle.pycqa.org/en/latest/intro.html#error-codes
-
-FLAKE8_MSG=$(flake8 --max-line-length=120 --ignore=F401,W503,W504,E203 ${SRC_PATH}/src/neuronx_distributed || true)
-
-python3.8 -m pip install flake8==3.7
-if [[ ! -z $FLAKE8_MSG ]]
-then
-  echo "FLAKE8 LINTING HAS DETECTED FORMATTING AND POTENTIALLY SOME SYNTAX ERRORS, PLEASE CHECK ABOVE OUTPUT!"
-  exit 1
-fi
-
-if [[ "$1" == "flake8" ]]
-then
-  exit 0
-fi
-
-# # Copy Python source files
+# Copy Python source files
 cp setup.py ${BUILD_PATH_NEURONX_DISTRIBUTED}/
 cp -r src ${BUILD_PATH_NEURONX_DISTRIBUTED}/
 cp $LICENSE_TXT_PATH ${BUILD_PATH_NEURONX_DISTRIBUTED}/
 
-## Build wheel
-DIST_DIR=${BUILD_PATH}/pip/public/neuronx-distributed
-python3.8 setup.py bdist_wheel --dist-dir ${DIST_DIR}
+
+export DIST_DIR=${BUILD_PATH}/pip/public/neuronx-distributed
+
+bash build.sh

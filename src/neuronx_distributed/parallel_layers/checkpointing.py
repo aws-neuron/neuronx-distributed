@@ -1,6 +1,6 @@
 import gc
 import os
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Dict
 
 import torch
 import torch_xla.core.xla_model as xm
@@ -32,8 +32,8 @@ def ensure_directory_exists(filename: str) -> None:
 PreShardHookFn = Callable[[torch.nn.Module, dict, str], bool]
 
 
-def _invoke_preshard_hook(module: torch.nn.Module, model_state_dict: dict, prefix: str = "") -> dict:
-    if module == None:
+def _invoke_preshard_hook(module: torch.nn.Module, model_state_dict: Dict[str, Any], prefix: str = "") -> None:
+    if module is None:
         return
 
     # This is temporary until we formailze the preshard_hook in src
@@ -45,7 +45,7 @@ def _invoke_preshard_hook(module: torch.nn.Module, model_state_dict: dict, prefi
         _invoke_preshard_hook(child, model_state_dict, prefix + name + ".")
 
 
-def get_sharded_model_dict(model: torch.nn.Module, model_state_dict: dict) -> dict:
+def get_sharded_model_dict(model: torch.nn.Module, model_state_dict: Dict[str, Any]) -> Dict[str, Any]:
     from ..pipeline.model import NxDPPModel
 
     tp_size = get_tensor_model_parallel_size()
@@ -89,18 +89,11 @@ def save(
         - checkpoint.pt
 
     """
-    if torch.distributed.is_initialized():
-        rank = torch.distributed.get_rank()
-        if rank == 0:
-            logger.info("saving checkpoint to {}".format(output_dir))
-    else:
-        logger.info("saving checkpoint to {}".format(output_dir))
-        rank = 0
-
-    chkpt_path = output_dir
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    logger.info("saving checkpoint to %s", output_dir)
 
     chkpt_path = os.path.join(
-        chkpt_path,
+        output_dir,
         "tp_rank_{:02d}_pp_rank_{:02d}".format(get_tensor_model_parallel_rank(), get_pipeline_model_parallel_rank()),
     )
     if not master_dp_only:
@@ -151,13 +144,14 @@ def save(
 
 def load(
     chkpt_path: str,
-    model: torch.nn.Module = None,
+    model: Optional[torch.nn.Module] = None,
     model_or_optimizer: Any = None,
     model_key: Optional[str] = "model",
     load_xser: bool = False,
     sharded: bool = True,
     strict: bool = True,
     master_dp_only: bool = True,
+    weights_only: bool = False,
 ) -> dict:
     """Load a checkpoint (model or optimizer) and return. In case the model/optimizer object is
     provided, it will load the model weights/optimizer stats. For large models/optimizers, to avoid
@@ -175,13 +169,7 @@ def load(
             model_or_optimizer is not None
         ), "When checkpoint is not shareded, kwarg `model_or_optimizer` needs to be passed"  # noqa: E501
 
-    if torch.distributed.is_initialized():
-        rank = torch.distributed.get_rank()
-        if rank == 0:
-            logger.info("loading checkpoint from {}".format(chkpt_path))
-    else:
-        logger.info("loading checkpoint from {}".format(chkpt_path))
-        rank = 0
+    logger.info("loading checkpoint from %s", chkpt_path)
 
     skip_rendezvous = os.environ.get(NXD_SKIP_RENDEZVOUS, None) == "1"
 
@@ -190,7 +178,7 @@ def load(
 
         if isinstance(model_or_optimizer, NxDPPModel) and not load_xser:
             logger.warning(
-                f"[Warning] It's recommended to use save_xser \
+                "[Warning] It's recommended to use save_xser \
                     to save NxDPPModel to reduce saving time and redundant graphss"
             )
 
@@ -203,7 +191,7 @@ def load(
 
         if isinstance(model_or_optimizer, torch.nn.Module) and not model_moved_to_device and load_xser:
             logger.warning(
-                f"[Warning] For save_xser case it is recommended to call load \
+                "[Warning] For save_xser case it is recommended to call load \
                     after moving model to device to reduce redundant graphs."
             )
 
@@ -222,8 +210,7 @@ def load(
     else:
         checkpoint_name = chkpt_path
 
-    if rank == 0:
-        logger.debug(f" loading checkpoint from {chkpt_path}")
+    logger.debug(" loading checkpoint from %s", chkpt_path)
 
     tp_size = get_tensor_model_parallel_size()
     tp_rank = get_tensor_model_parallel_rank()
@@ -232,9 +219,9 @@ def load(
         if tp_rank == worker_start:
             logger.debug(f"Worker {tp_rank} resuming from checkpoint {checkpoint_name}")
             if load_xser:
-                check_point = _xser_load(checkpoint_name)
+                check_point = _xser_load(checkpoint_name, weights_only=weights_only)
             else:
-                check_point = torch.load(checkpoint_name, map_location="cpu")
+                check_point = torch.load(checkpoint_name, weights_only=weights_only, map_location="cpu")
             if model_or_optimizer:
                 if model_key is not None:
                     model_state_dict = check_point[model_key]
@@ -262,22 +249,21 @@ def load(
     return check_point
 
 
-def _xser_load(path):
+def _xser_load(path: torch.serialization.FILE_LIKE, weights_only: bool = False) -> Any:
     """
     Modify from xla serialization load https://github.com/pytorch/xla/blob/master/torch_xla/utils/serialization.py#L79-L100,
     with casting tensors to xla device to prevent OOM
     """
-    ref_data = torch.load(path)
+    ref_data = torch.load(path, weights_only=weights_only)
 
     def convert_fn(tensors):
         rewritten_tensors = []
         for t in tensors:
-            rewritten_tensors.append(
-                torch.load(os.path.join(path + ".tensors", "tensor_{}.pt".format(t.tid))).to(device=xm.xla_device())
-            )
+            tensor_path = os.path.join(path + ".tensors", "tensor_{}.pt".format(t.tid))
+            rewritten_tensors.append(torch.load(tensor_path, weights_only=weights_only).to(device=xm.xla_device()))
         return rewritten_tensors
 
     def select_fn(v):
-        return type(v) == xser.TensorReference
+        return isinstance(v, xser.TensorReference)
 
     return xm.ToXlaTensorArena(convert_fn, select_fn).transform(ref_data)

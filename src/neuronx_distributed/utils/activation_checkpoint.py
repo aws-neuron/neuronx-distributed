@@ -64,7 +64,9 @@ def apply_activation_checkpointing(
             rmsg("Using NxDPPModel as input, `check_fn` will be ignored. Only transformer layer will be wrapped.")
         )
         activation_checkpoint_module = model.transformer_layer_cls
-        check_fn = lambda m: isinstance(m, activation_checkpoint_module)
+
+        def check_fn(m):
+            return isinstance(m, activation_checkpoint_module)
         models = model.local_stage_modules
     elif isinstance(model, NxDModel):
         models = model.local_modules()

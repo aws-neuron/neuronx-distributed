@@ -1,5 +1,5 @@
 import os
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional, Union, TYPE_CHECKING
 
 import torch
 from lightning_fabric.plugins.environments import (
@@ -7,6 +7,7 @@ from lightning_fabric.plugins.environments import (
     XLAEnvironment,
 )
 from lightning_fabric.utilities.types import _PATH, ReduceOp
+from lightning_fabric.utilities import move_data_to_device
 from pytorch_lightning.strategies import XLAStrategy
 from torch import Tensor
 
@@ -23,16 +24,20 @@ from .accelerator import NeuronXLAAccelerator
 from .checkpoint_io import NeuronCheckpointIO
 from .launcher import _NeuronXLALauncher
 
+if TYPE_CHECKING:
+    from pytorch_lightning.strategies.strategy import TBroadcast
+
 
 class NeuronXLAStrategy(XLAStrategy):
     def __init__(
         self,
-        nxd_config: Dict = None,
+        nxd_config: Optional[Dict[str, Any]] = None,
         tensor_parallel_size: int = 1,
         pipeline_parallel_size: int = 1,
+        expert_parallel_size: int = 1,
         debug: bool = False,
         sync_module_states: bool = False,
-        checkpoint_io: bool = None,
+        checkpoint_io: Optional[NeuronCheckpointIO] = None,
         save_load_xser: bool = True,
     ):
         if os.environ.get("TORCHELASTIC_RUN_ID") is not None:
@@ -51,7 +56,7 @@ class NeuronXLAStrategy(XLAStrategy):
         elif isinstance(checkpoint_io, NeuronCheckpointIO):
             self.checkpoint_io = checkpoint_io
         else:
-            raise NotImplementedError(f"NeuronXLAStrategy only supports NeuronCheckpointIO")
+            raise NotImplementedError("NeuronXLAStrategy only supports NeuronCheckpointIO")
 
         self.debug = debug
         self._launched = False
@@ -62,14 +67,16 @@ class NeuronXLAStrategy(XLAStrategy):
         if self.nxd_config is not None:
             self.tensor_parallel_size = self.nxd_config["tensor_parallel_size"]
             self.pipeline_parallel_size = self.nxd_config["pipeline_parallel_size"]
+            self.expert_parallel_size = self.nxd_config["expert_parallel_size"]
         else:
             self.tensor_parallel_size = tensor_parallel_size
             self.pipeline_parallel_size = pipeline_parallel_size
+            self.expert_parallel_size = expert_parallel_size
 
     def _configure_launcher(self) -> None:
         self._launcher = _NeuronXLALauncher(self)
 
-    def broadcast(self, obj, src: int = 0):
+    def broadcast(self, obj: "TBroadcast", src: int = 0) -> "TBroadcast":
         return obj
 
     @property
@@ -80,7 +87,7 @@ class NeuronXLAStrategy(XLAStrategy):
         import torch.distributed as dist
 
         if self.cluster_environment.creates_processes_externally:
-            global_rank = int(os.environ.get("RANK"))
+            global_rank = int(os.environ["RANK"])
         else:
             import torch_xla.core.xla_model as xm
 
@@ -98,6 +105,7 @@ class NeuronXLAStrategy(XLAStrategy):
             initialize_model_parallel(
                 tensor_model_parallel_size=self.tensor_parallel_size,
                 pipeline_model_parallel_size=self.pipeline_parallel_size,
+                expert_model_parallel_size=self.expert_parallel_size,
             )
 
         self.data_parallel_rank = get_data_parallel_rank()
@@ -105,7 +113,7 @@ class NeuronXLAStrategy(XLAStrategy):
         self.tensor_parallel_rank = get_tensor_model_parallel_rank()
         self.pipeline_parallel_rank = get_pipeline_model_parallel_rank()
 
-    def teardown(self):
+    def teardown(self) -> None:
         assert self.cluster_environment is not None
         self.cluster_environment.teardown()
         self.precision_plugin.teardown()
@@ -167,13 +175,13 @@ class NeuronXLAStrategy(XLAStrategy):
         xm.mark_step()
         return output.cpu()
 
-    def process_dataloader(self, dataloader: object):
+    def process_dataloader(self, dataloader: object) -> object:
         from torch_xla.distributed.parallel_loader import MpDeviceLoader
 
         # PP requires input data on CPU
         if self.pipeline_parallel_size > 1:
             if isinstance(dataloader, MpDeviceLoader):
-                print(f"convertine dataloader {dataloader} to {dataloader._loader}")
+                print(f"converting dataloader {dataloader} to {dataloader._loader}")
                 return dataloader._loader
             return dataloader
 

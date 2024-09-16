@@ -5,7 +5,8 @@ SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 
 # Neuron Compiler Flags
 # TODO: temporarily disable "--distribution-strategy=llm-training" because of a compiler bug. Ideally we should enable it for modular flow
-export NEURON_CC_FLAGS="--model-type=transformer --retry_failed_compilation"
+# --enable-saturate-infinity: convert inf to max_float to avoid nan (e.g. in transpose)
+export NEURON_CC_FLAGS="--model-type=transformer --retry_failed_compilation --enable-saturate-infinity"
 export NEURON_FUSE_SOFTMAX=1
 
 # Async Runtime
@@ -14,10 +15,12 @@ export NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS=7
 # HOST OOM
 export MALLOC_ARENA_MAX=64
 
-# TP degree
-TP_DEGREE=32
+# Tensor parallel degree
+: ${TP_DEGREE:=32}
 # Pipeline parallel degree
-PP_DEGREE=4
+: ${PP_DEGREE:=4}
+# Expert parallel degree
+: ${EP_DEGREE:=1}
 # SP
 SEQUENCE_PARALLEL_ENABLED=1
 # 0: bf16; 1: mixed precision
@@ -25,9 +28,11 @@ USE_MIX_PRECISION=1
 # 0: use pure DP; 1: use ZeRO-1
 USE_ZERO_1=1
 # global batch size
-GBS=32
+: ${GBS:=32}
 # micro batch size
 MBS=8
+# Enable selective checkpointing in integration tests.
+: ${SELECTIVE_CHECKPOINT_ENABLED:=1}
 # number of steps to run
 : ${TOTAL_STEPS:=22500}
 # warmup steps
@@ -39,15 +44,11 @@ MIN_LR=3.0e-5
 # model path
 MODEL_PATH=$SCRIPT_DIR/configs/8x7b_config.json
 # data path
-DATA_PATH="$HOME/examples_datasets/wikicorpus_llama2_7B_tokenized_4k"
+DATA_PATH="$HOME/examples_datasets/wikicorpus_llama2_tokenized_4k"
 # sequence length
 SEQ_LEN=4096
 # capacity factor
 CAPACITY_FACTOR=2.0
-# MoE sequence parallel mode
-MOE_SEQUENCE_PARALLEL_MODE="OPTIMIZED_SP_MATMUL"
-# ExpertMLPs permute strategy ("matmul" or "index")
-EXPERT_MLPS_PERMUTE_STRATEGY="matmul"
 # Use meta init
 META_DEVICE_INIT=1
 #############################################
@@ -96,6 +97,9 @@ fi
 if [ $SEQUENCE_PARALLEL_ENABLED -eq 1 ]; then
     EXTRA_ARGS+=" --sequence_parallel_enabled"
 fi
+if [ $SELECTIVE_CHECKPOINT_ENABLED -eq 1 ]; then
+    EXTRA_ARGS+=" --selective_checkpoint_enabled"
+fi
 
 if [ $PP_DEGREE -gt 1 ]; then
     # Data paralell size
@@ -124,6 +128,7 @@ else
 fi
 
 echo TP_DEGREE=$TP_DEGREE
+echo EP_DEGREE=$EP_DEGREE
 echo SEQUENCE_PARALLEL_ENABLED=$SEQUENCE_PARALLEL_ENABLED
 echo PP_DEGREE=$PP_DEGREE
 echo USE_MIX_PRECISION=$USE_MIX_PRECISION
@@ -138,8 +143,6 @@ echo MODEL_PATH=$MODEL_PATH
 echo DATA_PATH=$DATA_PATH
 echo SEQ_LEN=$SEQ_LEN
 echo CAPACITY_FACTOR=$CAPACITY_FACTOR
-echo MOE_SEQUENCE_PARALLEL_MODE=$MOE_SEQUENCE_PARALLEL_MODE
-echo EXPERT_MLPS_PERMUTE_STRATEGY=$EXPERT_MLPS_PERMUTE_STRATEGY
 echo EXTRA_ARGS=$EXTRA_ARGS
 echo DP=$DP
 echo STEPS_THIS_RUN=$STEPS_THIS_RUN
@@ -151,6 +154,7 @@ torchrun $DISTRIBUTED_ARGS \
     --data_dir $DATA_PATH \
     --tensor_parallel_size $TP_DEGREE \
     --pipeline_parallel_size $PP_DEGREE \
+    --expert_parallel_size $EP_DEGREE \
     --batch_size $MBS \
     --steps_this_run $STEPS_THIS_RUN\
     --max_steps $TOTAL_STEPS \
@@ -159,6 +163,4 @@ torchrun $DISTRIBUTED_ARGS \
     --min_lr $MIN_LR \
     --seq_len $SEQ_LEN \
     --capacity_factor $CAPACITY_FACTOR \
-    --moe_sequence_parallel_mode $MOE_SEQUENCE_PARALLEL_MODE \
-    --expert_mlps_permute_strategy $EXPERT_MLPS_PERMUTE_STRATEGY \
     $EXTRA_ARGS |& tee $OUTPUT_LOG

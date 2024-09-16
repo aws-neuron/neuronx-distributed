@@ -1,1 +1,1 @@
-from .zero_redundancy_optimizer import NeuronZero1Optimizer
+from .zero_redundancy_optimizer import NeuronZero1Optimizer, NeuronEPZero1Optimizer

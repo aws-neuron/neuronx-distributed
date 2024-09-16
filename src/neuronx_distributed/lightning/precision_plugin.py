@@ -1,8 +1,11 @@
-from typing import Any, Callable
+from typing import Any, Callable, TYPE_CHECKING
 
 from lightning_fabric.accelerators.xla import _XLA_AVAILABLE
 from lightning_fabric.utilities.types import Optimizable
 from pytorch_lightning.plugins.precision import XLAPrecisionPlugin
+
+if TYPE_CHECKING:
+    import pytorch_lightning as pl
 
 
 class NeuronXLAPrecisionPlugin(XLAPrecisionPlugin):
@@ -19,7 +22,5 @@ class NeuronXLAPrecisionPlugin(XLAPrecisionPlugin):
         closure: Callable[[], Any],
         **kwargs: Any,
     ) -> Any:
-        pass
-
         # TODO: currently using manual optimization, need further modification here for auto optimization
         optimizer.step()

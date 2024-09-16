@@ -194,7 +194,7 @@ class Logger:
                 headers={"X-aws-ec2-metadata-token": token.text},
             )
             return data.text
-        except:
+        except Exception:
             return os.environ.get("HOSTNAME", "unknown")
 
     def log(self, epoch, step, step_loss, learning_rate, throughput, grad_norm=None):
@@ -202,7 +202,7 @@ class Logger:
         grad_norm_msg = f"grad-norm : {grad_norm}" if grad_norm else ""
         print(
             f"LOG {time_now} - ({epoch}, {step}) step_loss : {step_loss:.4f} "
-            f"learning_rate : {learning_rate:.2e} throughput : {throughput:.2f} "
+            f"learning_rate : {learning_rate:.2e} throughput : {throughput:.2f} seq/s "
             f"{grad_norm_msg}",
             flush=True,
         )
@@ -361,8 +361,6 @@ def train_gpt_neox(flags):
         )
 
     def train_loop_fn(model, optimizer, train_loader, epoch, global_step, training_ustep, running_loss):
-        max_grad_norm = 1.0
-
         for _, data in enumerate(train_loader):
             training_ustep += 1
             input_ids = data["input_ids"]
@@ -536,7 +534,7 @@ def train_gpt_neox(flags):
                     ),
                 ]
                 metric_writer.store_metrics(metric_data)
-            if not os.environ.get("NEURON_EXTRACT_GRAPHS_ONLY", None): # Do not save checkpoint during pre-compile
+            if not os.environ.get("NEURON_EXTRACT_GRAPHS_ONLY", None):  # Do not save checkpoint during pre-compile
                 state_dict = {
                     "model": model.state_dict(),
                     "global_step": global_step,

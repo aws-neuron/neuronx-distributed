@@ -93,7 +93,7 @@ def apply_checkpoint(dist_model, layers_to_checkpoint=None):
         # checkpoint layers that are provided in input
         # if layers not provide in input, then checkpoint if it is transformer layer
         if (layers_to_checkpoint and name in layers_to_checkpoint) or (
-            not layers_to_checkpoint and type(module) == dist_model.transformer_layer_cls
+            not layers_to_checkpoint and type(module) is dist_model.transformer_layer_cls
         ):
             # add_module replaces old module with our own custom module.
             # https://pytorch.org/docs/stable/_modules/torch/nn/modules/module.html#Module.add_module
@@ -104,6 +104,8 @@ def apply_checkpoint(dist_model, layers_to_checkpoint=None):
     elif layers_to_checkpoint is None and not checkpoint_wrapper_added:
         logger.warning(
             rmsg(
-                f"During applying activation checkpointing, transformer_layer_cls {dist_model.transformer_layer_cls.__name__} can not be found in stage {dist_model.pipeline_parallel_rank}, skipping..."
+                f"During applying activation checkpointing, transformer_layer_cls "
+                f"{dist_model.transformer_layer_cls.__name__} cannot be found in stage "
+                f"{dist_model.pipeline_parallel_rank}, skipping ..."
             )
         )

@@ -45,8 +45,11 @@ class LoraLayer(torch.nn.Module, ABC):
             # QuantLinear
             in_features, out_features = base_layer.infeatures, base_layer.outfeatures
         elif hasattr(base_layer, "input_size") and hasattr(base_layer, "output_size"):
-            # Megatron ColumnParallelLinear,RowParallelLinear
+            # ColumnParallelLinear, RowParallelLinear
             in_features, out_features = base_layer.input_size, base_layer.output_size
+        elif hasattr(base_layer, "input_size") and hasattr(base_layer, "output_sizes"):
+            # GQAQKVColumnParallelLinear
+            in_features, out_features = base_layer.input_size, base_layer.output_sizes
         else:
             if is_hf_transformers_available():
                 from transformers.pytorch_utils import Conv1D
@@ -63,6 +66,10 @@ class LoraLayer(torch.nn.Module, ABC):
         self.in_features = in_features
         self.out_features = out_features
         self.merged = False
+        if lora_config.use_rslora:
+            self.scaling = self.lora_alpha / math.sqrt(self.lora_rank)
+        else:
+            self.scaling = self.lora_alpha / self.lora_rank
 
     def get_base_layer(self) -> torch.nn.Module:
         r"""
@@ -94,7 +101,7 @@ class LoraLayer(torch.nn.Module, ABC):
             orig_weights += self.get_delta_weight()
 
             if not torch.isfinite(orig_weights).all():
-                raise ValueError(f"NaNs detected in the merged weights. The adapter seems to be broken")
+                raise ValueError("NaNs detected in the merged weights. The adapter seems to be broken")
             base_layer.weight.data = orig_weights
         else:
             base_layer.weight.data += self.get_delta_weight()
@@ -132,12 +139,12 @@ class LoraLayer(torch.nn.Module, ABC):
                 # https://github.com/microsoft/LoRA/blob/a0a92e0f26c067cf94747bdbf1ce73793fa44d19/loralib/layers.py#L124
                 nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
             elif init_lora_weights == "gaussian":
-                nn.init.normal_(self.lora_A.weight, std=1 / self.r)
+                nn.init.normal_(self.lora_A.weight, std=1 / self.lora_rank)
             else:
                 raise ValueError(f"Unknown LoRA parameters initialization with {init_lora_weights}")
             nn.init.zeros_(self.lora_B.weight)
 
-        if self.lora_embedding_A:
+        if self.lora_embedding_A is not None:
             # initialize a the same way as the default for nn.linear and b to zero
             nn.init.zeros_(self.lora_embedding_A)
             nn.init.normal_(self.lora_embedding_B)
@@ -177,10 +184,6 @@ class LoraLinear(LoraLayer):
         # Actual trainable parameters
         self.lora_A = nn.Linear(self.in_features, self.lora_rank, bias=False)
         self.lora_B = nn.Linear(self.lora_rank, self.out_features, bias=False)
-        if lora_config.use_rslora:
-            self.scaling = self.lora_alpha / math.sqrt(self.lora_rank)
-        else:
-            self.scaling = self.lora_alpha / self.lora_rank
 
         self.init_lora_parameters(lora_config.init_lora_weights)
         base_layer = self.get_base_layer()
@@ -257,10 +260,6 @@ class LoraEmbedding(LoraLayer):
         weight_B = torch.randn(self.out_features, self.lora_rank)
         self.lora_embedding_A = nn.Parameter(weight_A)
         self.lora_embedding_B = nn.Parameter(weight_B)
-        if lora_config.use_rslora:
-            self.scaling = self.lora_alpha / math.sqrt(self.lora_rank)
-        else:
-            self.scaling = self.lora_alpha / self.lora_rank
 
         self.init_lora_parameters(lora_config.init_lora_weights)
         base_layer = self.get_base_layer()
@@ -352,10 +351,6 @@ class LoraConv2d(LoraLayer):
         padding = base_layer.padding
         self.lora_A = nn.Conv2d(self.in_features, self.lora_rank, kernel_size, stride, padding, bias=False)
         self.lora_B = nn.Conv2d(self.lora_rank, self.out_features, (1, 1), (1, 1), bias=False)
-        if lora_config.use_rslora:
-            self.scaling = self.lora_alpha / math.sqrt(self.lora_rank)
-        else:
-            self.scaling = self.lora_alpha / self.lora_rank
 
         self.init_lora_parameters(lora_config.init_lora_weights)
         weight = getattr(base_layer, "weight", None)

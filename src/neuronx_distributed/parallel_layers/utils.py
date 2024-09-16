@@ -1,6 +1,6 @@
 import collections
 import os
-from typing import List, Sequence
+from typing import List, Sequence, Any
 
 import numpy as np
 import torch
@@ -75,19 +75,44 @@ def copy_tensor_model_parallel_attributes(destination_tensor: torch.Tensor, sour
         maybe_copy(attribute)
 
 
-def ensure_divisibility(numerator, denominator):
+def ensure_divisibility(numerator: int, denominator: int) -> int:
     """Ensure that numerator is divisible by the denominator."""
     assert numerator % denominator == 0, "{} is not divisible by {}".format(numerator, denominator)
 
 
-def divide(numerator, denominator):
+def divide(numerator: int, denominator: int) -> int:
     """Ensure that numerator is divisible by the denominator and return
     the division value."""
     ensure_divisibility(numerator, denominator)
     return numerator // denominator
 
 
-def get_padding_length(numerator, denominator):
+def split_tensor_along_dim(
+    tensor: torch.Tensor,
+    dim: int,
+    num_partitions: int,
+    contiguous_split_chunks: bool = False,
+) -> List[torch.Tensor]:
+    """Split a tensor along the dimension 'dim'.
+    Arguments:
+        tensor: input tensor.
+        dim: the dimension to split over.
+        num_partitions: number of partitions to split the tensor
+        contiguous_split_chunks: If True, make each chunk contiguous
+                                 in memory.
+    """
+    # Get the size and dimension.
+    dim_size = divide(tensor.size()[dim], num_partitions)
+    # Split.
+    tensor_list = torch.split(tensor, dim_size, dim=dim)
+    # Note: torch.split does not create contiguous tensors by default.
+    if contiguous_split_chunks:
+        return tuple(chunk.contiguous() for chunk in tensor_list)
+
+    return tensor_list
+
+
+def get_padding_length(numerator: int, denominator: int) -> int:
     """Value to pad numerator with to make it evenly divisible by the denominator"""
     if numerator % denominator != 0:
         mod = numerator % denominator
@@ -108,17 +133,7 @@ def split_tensor_along_last_dim(
         contiguous_split_chunks: If True, make each chunk contiguous
                                  in memory.
     """
-    # Get the size and dimension.
-    last_dim = tensor.dim() - 1
-    last_dim_size = divide(tensor.size()[last_dim], num_partitions)
-    # Split.
-    tensor_list = torch.split(tensor, last_dim_size, dim=last_dim)
-    # Note: torch.split does not create contiguous tensors by default.
-    if contiguous_split_chunks:
-        return tuple(chunk.contiguous() for chunk in tensor_list)
-
-    return tensor_list
-
+    return split_tensor_along_dim(tensor, tensor.dim() - 1, num_partitions, contiguous_split_chunks)
 
 def split_tensor_along_second_dim(
     tensor: torch.Tensor,
@@ -132,34 +147,25 @@ def split_tensor_along_second_dim(
         contiguous_split_chunks: If True, make each chunk contiguous
                                  in memory.
     """
-    # Get the size and dimension.
-    last_dim_size = divide(tensor.size()[1], num_partitions)
-    # Split.
-    tensor_list = torch.split(tensor, last_dim_size, dim=1)
-    # Note: torch.split does not create contiguous tensors by default.
-    if contiguous_split_chunks:
-        return tuple(chunk.contiguous() for chunk in tensor_list)
+    return split_tensor_along_dim(tensor, 1, num_partitions, contiguous_split_chunks)
 
-    return tensor_list
-
-
-def is_torch_version_greater_than_2():
+def is_torch_version_greater_than_2() -> bool:
     return torch.__version__.startswith("2")
 
 
-def is_pjrt_device():
+def is_pjrt_device() -> bool:
     return os.environ.get("PJRT_DEVICE", None) == "NEURON"
 
 
-def requires_init_pg_override():
+def requires_init_pg_override() -> bool:
     return torch.__version__.startswith("2.0")
 
 
-def cast_tensor(tensor, from_dtype=torch.float32, to_dtype=torch.bfloat16):
+def cast_tensor(tensor: torch.Tensor, from_dtype: torch.dtype = torch.float32, to_dtype: torch.dtype = torch.bfloat16) -> Any:
     return tensor.to(dtype=to_dtype) if tensor.dtype == from_dtype else tensor
 
 
-def cast_all(state, from_dtype=torch.float32, to_dtype=torch.bfloat16):
+def cast_all(state: Any, from_dtype: torch.dtype = torch.float32, to_dtype: torch.dtype = torch.bfloat16) -> Any:
     if isinstance(state, torch.Tensor):
         return cast_tensor(state, from_dtype=from_dtype, to_dtype=to_dtype)
     else:
@@ -176,7 +182,7 @@ def cast_all(state, from_dtype=torch.float32, to_dtype=torch.bfloat16):
 
 
 # Refering to https://github.com/NVIDIA/apex/blob/master/apex/_autocast_utils.py#L22
-def cast_if_autocast_enabled(*args):
+def cast_if_autocast_enabled(*args: Any) -> Any:
     if not torch.is_autocast_enabled():
         return args
     else:
@@ -184,7 +190,7 @@ def cast_if_autocast_enabled(*args):
 
 
 # Modifying from https://github.com/pytorch/pytorch/blob/main/torch/cuda/amp/autocast_mode.py#L57, removed check for cuda device
-def _cast(value, dtype):
+def _cast(value: Any, dtype: Any) -> Any:
     if isinstance(value, torch.Tensor):
         is_eligible = value.is_floating_point() and (value.dtype is not torch.float64)
         return value.to(dtype) if is_eligible else value
@@ -204,7 +210,7 @@ def _cast(value, dtype):
         return value
 
 
-def move_all_tensor_to_cpu(data, convert=True):
+def move_all_tensor_to_cpu(data: Any, convert: bool = True) -> Any:
     def is_xla_tensor(tensor):
         return tensor.device.type == "xla"
 
@@ -215,12 +221,12 @@ def move_all_tensor_to_cpu(data, convert=True):
         return [tensor.to("cpu") for tensor in tensors]
 
     def select_fn(v):
-        return type(v) == torch.Tensor and is_xla_tensor(v)
+        return isinstance(v, torch.Tensor) and is_xla_tensor(v)
 
     return xm.ToXlaTensorArena(convert_fn, select_fn).transform(data)
 
 
-def get_local_world_size():
+def get_local_world_size() -> int:
     if is_torch_version_greater_than_2():
         # With pjrt this only works after init_process_group()
         import torch_xla.experimental.pjrt as pjrt
@@ -240,7 +246,7 @@ def move_model_to_device(model: torch.nn.Module, device: torch.device) -> None:
     model_utils.move_model_to_device(model, device)
 
 
-def verify_casted_dtype(value):
+def verify_casted_dtype(value: Any) -> None:
     """Veryfy whether the input values have been casted correctly"""
     if not torch.is_autocast_enabled():
         return

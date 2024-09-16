@@ -9,8 +9,6 @@ from transformers.models.gpt2.modeling_gpt2 import GPT2Block
 
 import neuronx_distributed as nxd
 
-from .. import update_result
-
 
 def get_model():
     seq_len = 512
@@ -64,52 +62,47 @@ class TestModelWrapper(unittest.TestCase):
     @patch("neuronx_distributed.utils.model_utils.get_local_world_size", MagicMock(return_value=32))
     @patch("torch.distributed.get_rank")
     def test_model_wrapper(self, rank_mock):
-        try:
-            pipeline_cuts = [
-                "transformer.h.1",
-                "transformer.h.2",
-                "transformer.h.3",
-                "transformer.h.4",
-                "transformer.h.5",
-                "transformer.h.6",
-                "transformer.h.7",
-            ]
-            nxd_config = nxd.neuronx_distributed_config(
-                tensor_parallel_size=8,
-                pipeline_parallel_size=8,
-                pipeline_config={
-                    "transformer_layer_cls": GPT2Block,
-                    "tracer_cls": "hf",
-                    "num_microbatches": 1,
-                    "output_loss_value_spec": True,
-                    "input_names": ["input_ids", "attention_mask", "labels"],
-                    "pipeline_cuts": pipeline_cuts,
-                    "param_init_fn": None,
-                    "leaf_module_cls": ["GPT2Block"],
-                    "use_zero1_optimizer": True,
-                    "use_optimizer_wrapper": True,
-                },
-                optimizer_config={
-                    "zero_one_enabled": True,
-                    "grad_clipping": True,
-                    "max_grad_norm": 1.0,
-                },
-                sequence_parallel=True,
-                activation_checkpoint_config="full",
-            )
-            model = nxd.initialize_parallel_model(nxd_config, get_model)
+        pipeline_cuts = [
+            "transformer.h.1",
+            "transformer.h.2",
+            "transformer.h.3",
+            "transformer.h.4",
+            "transformer.h.5",
+            "transformer.h.6",
+            "transformer.h.7",
+        ]
+        nxd_config = nxd.neuronx_distributed_config(
+            tensor_parallel_size=8,
+            pipeline_parallel_size=8,
+            pipeline_config={
+                "transformer_layer_cls": GPT2Block,
+                "tracer_cls": "hf",
+                "num_microbatches": 1,
+                "output_loss_value_spec": True,
+                "input_names": ["input_ids", "attention_mask", "labels"],
+                "pipeline_cuts": pipeline_cuts,
+                "param_init_fn": None,
+                "leaf_module_cls": ["GPT2Block"],
+                "use_zero1_optimizer": True,
+                "use_optimizer_wrapper": True,
+            },
+            optimizer_config={
+                "zero_one_enabled": True,
+                "grad_clipping": True,
+                "max_grad_norm": 1.0,
+            },
+            sequence_parallel=True,
+            activation_checkpoint_config="full",
+        )
+        model = nxd.initialize_parallel_model(nxd_config, get_model)
 
-            assert isinstance(model, nxd.trainer.model.NxDModel)
-            assert model.nxd_config == nxd_config
-            assert model.pp_enabled
-            assert model.dtype == torch.float32
-            model_str = str(model)
-            assert "NxDPPModel" in model_str
-            assert "NxDCheckpointWrapper" in model_str
-
-        except:
-            update_result({"inference_success": 0})
-            raise
+        assert isinstance(model, nxd.trainer.model.NxDModel)
+        assert model.nxd_config == nxd_config
+        assert model.pp_enabled
+        assert model.dtype == torch.float32
+        model_str = str(model)
+        assert "NxDPPModel" in model_str
+        assert "NxDCheckpointWrapper" in model_str
 
     @patch("neuronx_distributed.parallel_layers.parallel_state.initialize_model_parallel", MagicMock(return_value=None))
     @patch(
@@ -118,30 +111,25 @@ class TestModelWrapper(unittest.TestCase):
     @patch("neuronx_distributed.utils.model_utils.get_local_world_size", MagicMock(return_value=32))
     @patch("torch.distributed.get_rank")
     def test_model_wrapper_no_pp(self, rank_mock):
-        try:
-            nxd_config = nxd.neuronx_distributed_config(
-                tensor_parallel_size=8,
-                optimizer_config={
-                    "zero_one_enabled": True,
-                    "grad_clipping": True,
-                    "max_grad_norm": 1.0,
-                },
-                sequence_parallel=True,
-                activation_checkpoint_config="full",
-            )
-            model = nxd.initialize_parallel_model(nxd_config, get_model)
+        nxd_config = nxd.neuronx_distributed_config(
+            tensor_parallel_size=8,
+            optimizer_config={
+                "zero_one_enabled": True,
+                "grad_clipping": True,
+                "max_grad_norm": 1.0,
+            },
+            sequence_parallel=True,
+            activation_checkpoint_config="full",
+        )
+        model = nxd.initialize_parallel_model(nxd_config, get_model)
 
-            assert isinstance(model, nxd.trainer.model.NxDModel)
-            assert model.nxd_config == nxd_config
-            assert not model.pp_enabled
-            assert model.dtype == torch.float32
-            model_str = str(model)
-            assert "NxDPPModel" not in model_str
-            assert "NxDCheckpointWrapper" in model_str
-
-        except:
-            update_result({"inference_success": 0})
-            raise
+        assert isinstance(model, nxd.trainer.model.NxDModel)
+        assert model.nxd_config == nxd_config
+        assert not model.pp_enabled
+        assert model.dtype == torch.float32
+        model_str = str(model)
+        assert "NxDPPModel" not in model_str
+        assert "NxDCheckpointWrapper" in model_str
 
     @patch("neuronx_distributed.parallel_layers.parallel_state.initialize_model_parallel", MagicMock(return_value=None))
     @patch(
@@ -150,26 +138,22 @@ class TestModelWrapper(unittest.TestCase):
     @patch("neuronx_distributed.utils.model_utils.get_local_world_size", MagicMock(return_value=32))
     @patch("torch.distributed.get_rank")
     def test_model_wrapper_no_pp_load_state_dict_returns_load_result(self, rank_mock):
-        try:
-            nxd_config = nxd.neuronx_distributed_config(
-                tensor_parallel_size=8,
-                optimizer_config={
-                    "zero_one_enabled": True,
-                    "grad_clipping": True,
-                    "max_grad_norm": 1.0,
-                },
-                sequence_parallel=True,
-                activation_checkpoint_config="full",
-            )
-            model = nxd.initialize_parallel_model(nxd_config, get_model)
-            state_dict = model.state_dict()
-            load_result = model.load_state_dict(state_dict)
-            assert load_result is not None
-            assert len(load_result.missing_keys) == 0
-            assert len(load_result.unexpected_keys) == 0
-        except:
-            update_result({"inference_success": 0})
-            raise
+        nxd_config = nxd.neuronx_distributed_config(
+            tensor_parallel_size=8,
+            optimizer_config={
+                "zero_one_enabled": True,
+                "grad_clipping": True,
+                "max_grad_norm": 1.0,
+            },
+            sequence_parallel=True,
+            activation_checkpoint_config="full",
+        )
+        model = nxd.initialize_parallel_model(nxd_config, get_model)
+        state_dict = model.state_dict()
+        load_result = model.load_state_dict(state_dict)
+        assert load_result is not None
+        assert len(load_result.missing_keys) == 0
+        assert len(load_result.unexpected_keys) == 0
 
     @patch("neuronx_distributed.pipeline.model.parallel_state.initialize_model_parallel", MagicMock(return_value=None))
     @patch(
@@ -193,50 +177,45 @@ class TestModelWrapper(unittest.TestCase):
     @patch("neuronx_distributed.utils.model_utils.get_local_world_size", MagicMock(return_value=32))
     @patch("torch.distributed.get_rank")
     def test_model_wrapper_pp_load_state_dict_returns_load_result(self, rank_mock):
-        try:
-            pipeline_cuts = [
-                "transformer.h.1",
-                "transformer.h.2",
-                "transformer.h.3",
-                "transformer.h.4",
-                "transformer.h.5",
-                "transformer.h.6",
-                "transformer.h.7",
-            ]
-            nxd_config = nxd.neuronx_distributed_config(
-                tensor_parallel_size=8,
-                pipeline_parallel_size=8,
-                pipeline_config={
-                    "transformer_layer_cls": GPT2Block,
-                    "tracer_cls": "hf",
-                    "num_microbatches": 1,
-                    "output_loss_value_spec": True,
-                    "input_names": ["input_ids", "attention_mask", "labels"],
-                    "pipeline_cuts": pipeline_cuts,
-                    "param_init_fn": None,
-                    "leaf_module_cls": ["GPT2Block"],
-                    "use_zero1_optimizer": True,
-                    "use_optimizer_wrapper": True,
-                },
-                optimizer_config={
-                    "zero_one_enabled": True,
-                    "grad_clipping": True,
-                    "max_grad_norm": 1.0,
-                },
-                sequence_parallel=True,
-                activation_checkpoint_config="full",
-            )
-            model = nxd.initialize_parallel_model(nxd_config, get_model)
+        pipeline_cuts = [
+            "transformer.h.1",
+            "transformer.h.2",
+            "transformer.h.3",
+            "transformer.h.4",
+            "transformer.h.5",
+            "transformer.h.6",
+            "transformer.h.7",
+        ]
+        nxd_config = nxd.neuronx_distributed_config(
+            tensor_parallel_size=8,
+            pipeline_parallel_size=8,
+            pipeline_config={
+                "transformer_layer_cls": GPT2Block,
+                "tracer_cls": "hf",
+                "num_microbatches": 1,
+                "output_loss_value_spec": True,
+                "input_names": ["input_ids", "attention_mask", "labels"],
+                "pipeline_cuts": pipeline_cuts,
+                "param_init_fn": None,
+                "leaf_module_cls": ["GPT2Block"],
+                "use_zero1_optimizer": True,
+                "use_optimizer_wrapper": True,
+            },
+            optimizer_config={
+                "zero_one_enabled": True,
+                "grad_clipping": True,
+                "max_grad_norm": 1.0,
+            },
+            sequence_parallel=True,
+            activation_checkpoint_config="full",
+        )
+        model = nxd.initialize_parallel_model(nxd_config, get_model)
 
-            state_dict = model.state_dict()
-            load_result = model.load_state_dict(state_dict)
-            assert load_result is not None
-            assert len(load_result.missing_keys) == 0
-            assert len(load_result.unexpected_keys) == 0
-
-        except:
-            update_result({"inference_success": 0})
-            raise
+        state_dict = model.state_dict()
+        load_result = model.load_state_dict(state_dict)
+        assert load_result is not None
+        assert len(load_result.missing_keys) == 0
+        assert len(load_result.unexpected_keys) == 0
 
     @patch("neuronx_distributed.pipeline.model.parallel_state.initialize_model_parallel", MagicMock(return_value=None))
     @patch(
@@ -260,49 +239,44 @@ class TestModelWrapper(unittest.TestCase):
     @patch("neuronx_distributed.utils.model_utils.get_local_world_size", MagicMock(return_value=32))
     @patch("torch.distributed.get_rank")
     def test_model_wrapper_return_state_dict_with_prefix(self, rank_mock):
-        try:
-            pipeline_cuts = [
-                "transformer.h.1",
-                "transformer.h.2",
-                "transformer.h.3",
-                "transformer.h.4",
-                "transformer.h.5",
-                "transformer.h.6",
-                "transformer.h.7",
-            ]
-            nxd_config = nxd.neuronx_distributed_config(
-                tensor_parallel_size=8,
-                pipeline_parallel_size=8,
-                pipeline_config={
-                    "transformer_layer_cls": GPT2Block,
-                    "tracer_cls": "hf",
-                    "num_microbatches": 1,
-                    "output_loss_value_spec": True,
-                    "input_names": ["input_ids", "attention_mask", "labels"],
-                    "pipeline_cuts": pipeline_cuts,
-                    "param_init_fn": None,
-                    "leaf_module_cls": ["GPT2Block"],
-                    "use_zero1_optimizer": True,
-                    "use_optimizer_wrapper": True,
-                },
-                optimizer_config={
-                    "zero_one_enabled": True,
-                    "grad_clipping": True,
-                    "max_grad_norm": 1.0,
-                },
-                sequence_parallel=True,
-                activation_checkpoint_config="full",
-            )
-            model = nxd.initialize_parallel_model(nxd_config, get_model)
+        pipeline_cuts = [
+            "transformer.h.1",
+            "transformer.h.2",
+            "transformer.h.3",
+            "transformer.h.4",
+            "transformer.h.5",
+            "transformer.h.6",
+            "transformer.h.7",
+        ]
+        nxd_config = nxd.neuronx_distributed_config(
+            tensor_parallel_size=8,
+            pipeline_parallel_size=8,
+            pipeline_config={
+                "transformer_layer_cls": GPT2Block,
+                "tracer_cls": "hf",
+                "num_microbatches": 1,
+                "output_loss_value_spec": True,
+                "input_names": ["input_ids", "attention_mask", "labels"],
+                "pipeline_cuts": pipeline_cuts,
+                "param_init_fn": None,
+                "leaf_module_cls": ["GPT2Block"],
+                "use_zero1_optimizer": True,
+                "use_optimizer_wrapper": True,
+            },
+            optimizer_config={
+                "zero_one_enabled": True,
+                "grad_clipping": True,
+                "max_grad_norm": 1.0,
+            },
+            sequence_parallel=True,
+            activation_checkpoint_config="full",
+        )
+        model = nxd.initialize_parallel_model(nxd_config, get_model)
 
-            prefix = 'model_prefix.'
-            state_dict = model.state_dict(prefix=prefix)
-            for key in state_dict:
-                assert key.startswith(prefix)
-
-        except Exception as e:
-            update_result({"inference_success": 0})
-            raise
+        prefix = 'model_prefix.'
+        state_dict = model.state_dict(prefix=prefix)
+        for key in state_dict:
+            assert key.startswith(prefix)
 
 
 if __name__ == "__main__":

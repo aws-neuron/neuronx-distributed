@@ -134,6 +134,7 @@ def train_llama(args):
             "use_zero1_optimizer": args.use_zero1_optimizer > 0,
             "use_optimizer_wrapper": True,
             "deallocate_pipeline_outputs": args.deallocate_pipeline_outputs > 0,
+            "fuse_microbatches": args.fuse_microbatches > 0,
         },
         optimizer_config={
             "zero_one_enabled": args.use_zero1_optimizer > 0,
@@ -167,8 +168,8 @@ def train_llama(args):
 
     # Create NxD model
     model = nxd.initialize_parallel_model(nxd_config, get_model, config)
+
     world_size = parallel_state.get_data_parallel_size()
-    # model_dtype = get_dtype(model)
 
     param_groups = get_param_groups_by_weight_decay(model)
 
@@ -283,11 +284,9 @@ def train_llama(args):
                     attention_mask=attention_mask,
                     labels=labels,
                 )
-            total_steps += 1
             optimizer.step()
             global_norm = optimizer.grad_norm  # Global norm before clipping
             optimizer.zero_grad()
-            lr_scheduler.step()
             if should_print:
                 if total_steps % args.logging_interval == 0:
                     xm.add_step_closure(
@@ -302,6 +301,8 @@ def train_llama(args):
                             start,
                         ),
                     )
+            total_steps += 1
+            lr_scheduler.step()
             xm.mark_step()
             # Saving checkpoints
             if (args.checkpoint_freq > 0) and (total_steps % args.checkpoint_freq == 0):
@@ -416,11 +417,17 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--use_gpu_compatible_precision",
-        default=0,
+        default=1,
         type=int,
         help="Use gpu compatible precision",
     )
     parser.add_argument("--metrics_file", type=str, default="results.json", help="training metrics results file")
+    parser.add_argument(
+        "--fuse_microbatches",
+        type=int,
+        default=0,
+        help="Fuse microbatches into a single graph"
+    )
     # optimization
     opt_grp = parser.add_argument_group(title="optimization", description="arguments for optimization")
     opt_grp.add_argument("--weight_decay", default=0.01, type=float, help="weight decay")

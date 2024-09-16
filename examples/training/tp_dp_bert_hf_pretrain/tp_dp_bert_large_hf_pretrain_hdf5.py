@@ -78,7 +78,7 @@ torch.cuda.is_bf16_supported = lambda: True
 
 # Workaround for NaNs seen with transformers version >= 4.21.0
 # https://github.com/aws-neuron/aws-neuron-sdk/issues/593
-import transformers.modeling_utils as modeling_utils
+import transformers.modeling_utils as modeling_utils  # noqa: E402
 
 if os.environ.get("XLA_USE_BF16") or os.environ.get("XLA_DOWNCAST_BF16"):
     modeling_utils.get_parameter_dtype = lambda x: torch.bfloat16
@@ -218,7 +218,7 @@ class Logger:
                 headers={"X-aws-ec2-metadata-token": token.text},
             )
             return data.text
-        except:
+        except Exception:
             return os.environ.get("HOSTNAME", "unknown")
 
     def log(self, epoch, step, step_loss, learning_rate, throughput, grad_norm=None):
@@ -226,7 +226,7 @@ class Logger:
         grad_norm_msg = f"grad-norm : {grad_norm}" if grad_norm else ""
         print(
             f"LOG {time_now} - ({epoch}, {step}) step_loss : {step_loss:.4f} "
-            f"learning_rate : {learning_rate:.2e} throughput : {throughput:.2f} "
+            f"learning_rate : {learning_rate:.2e} throughput : {throughput:.2f} seq/s "
             f"{grad_norm_msg}",
             flush=True,
         )
@@ -564,7 +564,6 @@ def train_bert_hdf5(flags):
     scheduler_state_dict = None
 
     if flags.resume_ckpt:
-        step = flags.resume_step
         state_dict = checkpointing.load(flags.output_dir, model)
         optimizer.load_state_dict(state_dict["optimizer"])
         global_step = state_dict["global_step"]

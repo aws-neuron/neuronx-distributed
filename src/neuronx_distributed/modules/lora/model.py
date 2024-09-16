@@ -3,12 +3,14 @@ from __future__ import annotations
 import json
 import os
 import re
+from typing import Optional, Dict, Mapping, Any, Tuple, TYPE_CHECKING
 from dataclasses import asdict
 
 import torch
 import torch_xla.core.xla_model as xm
 
 from neuronx_distributed.parallel_layers import ColumnParallelLinear, RowParallelLinear
+from neuronx_distributed.modules.qkv_linear import GQAQKVColumnParallelLinear
 from neuronx_distributed.parallel_layers.parallel_state import (
     model_parallel_is_initialized,
 )
@@ -19,7 +21,10 @@ from neuronx_distributed.utils.model_utils import is_hf_transformers_available
 
 from .config import LoraConfig
 from .layer import LoraConv2d, LoraEmbedding, LoraLayer, LoraLinear
-from .tp_layer import LoraParallelLinear
+from .tp_layer import LoraParallelLinear, LoraGQAQKVParallelLinear
+
+if TYPE_CHECKING:
+    import transformers
 
 # The mapping is based on https://github.com/huggingface/peft/blob/main/src/peft/utils/constants.py
 
@@ -103,7 +108,7 @@ class LoraModel(torch.nn.Module):
 
     prefix: str = "lora_"
 
-    def __init__(self, module, config: LoraConfig) -> None:
+    def __init__(self, module: "transformers.PreTrainedModel", config: LoraConfig) -> None:
         assert config is not None
         super().__init__()
 
@@ -114,6 +119,7 @@ class LoraModel(torch.nn.Module):
         self.is_verbose_enabled = config.lora_verbose
         self.modules_to_save = config.modules_to_save
         self.is_lora_enabled = False
+        self.is_optimum_enabled = False
         self.is_checkpoint_loaded = False
         self.lora_config = config
         self.is_base_model_loaded = False
@@ -150,7 +156,7 @@ class LoraModel(torch.nn.Module):
             **kwargs,
         )
 
-    def _set_optimum_generate(self):
+    def _set_optimum_generate(self) -> None:
         if not self.is_optimum_enabled:
             try:
                 from optimum.neuron.utils.training_utils import (
@@ -159,14 +165,14 @@ class LoraModel(torch.nn.Module):
 
                 patch_generation_mixin_to_general_neuron_generation_mixin(self.module)
                 self.is_optimum_enabled = True
-            except:
+            except Exception:
                 raise ImportError("Failed to import optimum-neuron, generation will not work on Neuron.")
 
     def generate(self, *args, **kwargs):
         self._set_optimum_generate()
         return self.module.generate(*args, **kwargs)
 
-    def inject_adapter(self):
+    def inject_adapter(self) -> None:
         r"""
         Creates adapter layers and replaces the target modules with the adapter layers.
         It involves the following four steps:
@@ -200,14 +206,14 @@ class LoraModel(torch.nn.Module):
         self._mark_only_adapters_as_trainable()
         self.is_lora_enabled = True
 
-    def _get_submodules(self, key):
+    def _get_submodules(self, key: str):
         module = self.module
         target_name = key.split(".")[-1]
         parent = module.get_submodule(".".join(key.split(".")[:-1]))
         target = module.get_submodule(key)
         return parent, target, target_name
 
-    def _set_target_modules(self):
+    def _set_target_modules(self) -> None:
         config = self.lora_config
         if config.target_modules is not None:
             return
@@ -224,7 +230,7 @@ class LoraModel(torch.nn.Module):
         else:
             self.lora_config.target_modules = MODELS_TO_LORA_TARGET_MODULES_MAPPING[model_type]
 
-    def _check_target_module_exists(self, key):
+    def _check_target_module_exists(self, key: str) -> bool:
         r"""A helper method to check if the passed module's key name matches any of the target modules.
 
         Args:
@@ -248,17 +254,17 @@ class LoraModel(torch.nn.Module):
     def _create_and_replace(
         self,
         target,
-        target_name,
+        target_name: str,
         parent,
         current_key,
-    ):
+    ) -> None:
         if current_key is None:
             raise ValueError("Current Key shouldn't be `None`")
 
         new_module = self._create_new_module(target)
         self._replace_module(parent, target_name, new_module, target)
 
-    def _replace_module(self, parent, child_name, new_module, child):
+    def _replace_module(self, parent, child_name: str, new_module, child) -> None:
         setattr(parent, child_name, new_module)
         # child layer wraps the original module, unpack it
         if hasattr(child, "base_layer"):
@@ -274,13 +280,12 @@ class LoraModel(torch.nn.Module):
                 new_module.base_layer.state = child.state
             else:
                 new_module.state = child.state
-            new_module.to(child.weight.device)
+            new_module.to("xla")
 
         # dispatch to correct device
         for name, module in new_module.named_modules():
             if self.prefix in name:
-                weight = child.weight
-                module.to(weight.device)
+                module.to("xla")
 
     def _mark_only_adapters_as_trainable(self) -> None:
         module = self.module
@@ -323,16 +328,16 @@ class LoraModel(torch.nn.Module):
             new_module = LoraConv2d(target, lora_config)
         elif isinstance(target, torch.nn.Linear):
             new_module = LoraLinear(target, lora_config)
+        elif isinstance(target, (ColumnParallelLinear, RowParallelLinear)):
+            # check NxD model
+            new_module = LoraParallelLinear(base_layer=target, lora_config=lora_config)
+        elif isinstance(target, GQAQKVColumnParallelLinear):
+            new_module = LoraGQAQKVParallelLinear(base_layer=target, lora_config=lora_config)
         elif is_hf_transformers_available():
             from transformers.pytorch_utils import Conv1D
 
             if isinstance(target, Conv1D):
                 new_module = LoraLinear(target, lora_config, is_conv_1d_layer=True)
-
-        # check NxD model
-        if model_parallel_is_initialized():
-            if isinstance(target, (ColumnParallelLinear, RowParallelLinear)):
-                new_module = LoraParallelLinear(base_layer=target, lora_config=lora_config)
 
         if new_module is None:
             # no module could be matched
@@ -344,18 +349,19 @@ class LoraModel(torch.nn.Module):
                     transformers.pytorch_utils.Conv1D,
                     nxd.parallel_layers.ColumnParallelLinear,
                     nxd.parallel_layers.RowParallelLinear,
+                    nxd.modules.qkv_linear.GQAQKVColumnParallelLinear,
                 """
             )
         return new_module
 
-    def merge_lora(self):
+    def merge_lora(self) -> None:
         if not self.is_lora_merged:
             for module in self.module.modules():
                 if isinstance(module, LoraLayer):
                     module.merge()
             self.is_lora_merged = True
 
-    def unmerge_lora(self):
+    def unmerge_lora(self) -> None:
         if self.is_lora_merged:
             for module in self.module.modules():
                 if isinstance(module, LoraLayer):
@@ -368,14 +374,14 @@ class LoraModel(torch.nn.Module):
         """
         return self.module
 
-    def _restore_module_name(self, key: str):
+    def _restore_module_name(self, key: str) -> str:
         key_word = ".base_layer"
         if key_word in key:
             return key.replace(key_word, "")
         else:
             return key
 
-    def _get_lora_adapter_state_dict(self, save_dir: str = None):
+    def _get_lora_adapter_state_dict(self, save_dir: Optional[str] = None) -> Dict[str, Any]:
         """
         Return the state dict of the LoRA model and the modules specified by modules_to_save.
         There are three cases:
@@ -449,7 +455,7 @@ class LoraModel(torch.nn.Module):
         with open(filename, "w") as writer:
             writer.write(json.dumps(output_dict, indent=2, sort_keys=True))
 
-    def save_config(self, save_dir: str = None):
+    def save_config(self, save_dir: Optional[str] = None) -> None:
         if save_dir is None:
             save_dir = self.lora_config.lora_save_dir
 
@@ -458,7 +464,7 @@ class LoraModel(torch.nn.Module):
         self._save_config_to_json(config_filename)
         self.is_config_saved = True
 
-    def save_lora(self, save_dir: str = None, adapter_tag: str = None) -> None:
+    def save_lora(self, save_dir: Optional[str] = None, adapter_tag: Optional[str] = None) -> None:
         r"""for single-device LoRA saving only."""
         if not model_parallel_is_initialized():
             self._save_single_device_lora(save_dir, adapter_tag)
@@ -467,8 +473,8 @@ class LoraModel(torch.nn.Module):
 
     def _save_single_device_lora(
         self,
-        save_dir: str = None,
-        adapter_tag: str = None,
+        save_dir: Optional[str] = None,
+        adapter_tag: Optional[str] = None,
     ) -> None:
         r"""
         Only the master device saves the checkpoint.
@@ -515,7 +521,7 @@ class LoraModel(torch.nn.Module):
             self.lora_ckpt = ckpt
         else:
             config_filename = os.path.join(save_dir, CONFIG_NAME)
-            logger.info(f"LoRA configuration is not save in the checkpoint. Try to load it from {config_filename}")
+            logger.info("LoRA configuration is not save in the checkpoint. Try to load it from %s", config_filename)
             if not os.path.isfile(config_filename):
                 raise FileNotFoundError(f"Please name the file for LoRA confiugration as {CONFIG_NAME}.")
             self.lora_config = self._load_config_from_json(lora_config, config_filename)
@@ -539,7 +545,7 @@ class LoraModel(torch.nn.Module):
             lora_config_dict[key] = loaded_attributes[key]
         return LoraConfig(**lora_config_dict)
 
-    def _load_config_from_ckpt(self, lora_config: LoraConfig, ckpt) -> LoraConfig:
+    def _load_config_from_ckpt(self, lora_config: LoraConfig, ckpt: Dict[str, Any]) -> LoraConfig:
         config = ckpt.get("lora_config", None)
         if config is None:
             logger.warn("No LoRA configuration is found in checkpoint.")
@@ -551,7 +557,7 @@ class LoraModel(torch.nn.Module):
             return LoraConfig(**lora_config_dict)
 
     def load_lora(
-        self, save_dir: str = None, adapter_tag: str = None, ckpt_path: str = None, adapter_only: bool = True
+        self, save_dir: Optional[str] = None, adapter_tag: Optional[str] = None, ckpt_path: Optional[str] = None, adapter_only: bool = True
     ) -> None:
         r"""
         for single-device LoRA load only.
@@ -563,7 +569,7 @@ class LoraModel(torch.nn.Module):
             raise RuntimeError("Please use nxd.load_checkpoint() to load LoRA adapter when the base model is NxDModel.")
 
     def _load_single_device_lora(
-        self, save_dir: str = None, adapter_tag: str = None, ckpt_path: str = None, adapter_only: bool = True
+        self, save_dir: Optional[str] = None, adapter_tag: Optional[str] = None, ckpt_path: Optional[str] = None, adapter_only: bool = True
     ):
         if not adapter_only:
             if ckpt_path is None:
@@ -596,7 +602,7 @@ class LoraModel(torch.nn.Module):
         self.print_model_info()
         return load_result
 
-    def update_state_dict_keys(self, state_dict):
+    def update_state_dict_keys(self, state_dict: Dict[str, Any]) -> Dict[str, Any]:
         modules_keys = self.module_state_dict().keys()
 
         key_word = ".base_layer"
@@ -614,13 +620,13 @@ class LoraModel(torch.nn.Module):
         for n, p in self.module.named_parameters(*args, **kwargs):
             yield n, p
 
-    def module_state_dict(self):
+    def module_state_dict(self) -> Dict[str, Any]:
         return self.module.state_dict()
 
     def state_dict(self, *args, **kwargs):
         return self._get_lora_adapter_state_dict()
 
-    def load_state_dict(self, state_dict=None, strict=True):
+    def load_state_dict(self, state_dict: Mapping[str, Any] = None, strict: bool = True, assign: bool = False):
         r"""
         There are two steps to load state dict for LoRA model.
         Step 1: load the state dict for the base model
@@ -634,8 +640,7 @@ class LoraModel(torch.nn.Module):
             load_result = self.module.load_state_dict(state_dict, strict=False)
             self.is_base_model_loaded = True
 
-        if lora_config.load_lora_from_ckpt:
-            load_result = self.load_lora_adapter()
+        load_result = self.load_lora_adapter() if lora_config.load_lora_from_ckpt else None
 
         return load_result
 
@@ -651,14 +656,14 @@ class LoraModel(torch.nn.Module):
     def config(self):
         return self.original_module().lora_config
 
-    def __getattr__(self, name: str):
+    def __getattr__(self, name: str) -> Any:
         """Forward missing attributes to the wrapped module."""
         try:
             return super().__getattr__(name)  # defer to nn.Module's logic
         except AttributeError:
             return getattr(self.module, name)
 
-    def get_nb_trainable_parameters(self) -> tuple[int, int]:
+    def get_nb_trainable_parameters(self) -> Tuple[int, int]:
         r"""
         Returns the number of trainable parameters and the number of all parameters in the model.
         """
@@ -684,6 +689,6 @@ class LoraModel(torch.nn.Module):
 
     def print_model_info(self) -> None:
         if self.is_verbose_enabled:
-            logger.info(f"LoRA model: {self.module}")
-            logger.info(f"LoRA configuration: {self.lora_config}")
+            logger.info("LoRA model: %s", self.module)
+            logger.info("LoRA configuration: %s", self.lora_config)
             self.print_trainable_parameters()

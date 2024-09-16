@@ -68,10 +68,10 @@ from transformers.utils import (
 )
 
 import neuronx_distributed.parallel_layers.utils as neuronx_dist_utils
-from neuronx_distributed.modules.moe.expert_mlps import ExpertMLPsCapacityFactor
+from neuronx_distributed.modules.moe.expert_mlps import ExpertMLPs
 from neuronx_distributed.modules.moe.loss_function import load_balancing_loss_func
-from neuronx_distributed.modules.moe.model import MoE, MoESequenceParallelMode
-from neuronx_distributed.modules.moe.moe_parallel_layers import InputParallelLinear
+from neuronx_distributed.modules.moe.model import MoE
+from neuronx_distributed.modules.moe.moe_parallel_layers import LinearRouter
 from neuronx_distributed.modules.moe.routing import RouterTopK
 from neuronx_distributed.modules.qkv_linear import GQAQKVColumnParallelLinear
 from neuronx_distributed.parallel_layers import mappings
@@ -348,42 +348,34 @@ class MixtralAttention(MixtralAttentionHF):
 
 
 def initialize_mixtral_moe_layer(config):
-    if config.sequence_parallel_enabled:
-        assert (
-            config.moe_sequence_parallel_mode != MoESequenceParallelMode.NO_SP
-        ), "sequence_parallel_enabled=true, but moe_sequence_parallel_mode set to NO_SP"
-        sequence_parallel_mode = MoESequenceParallelMode[config.moe_sequence_parallel_mode]
-    else:
-        sequence_parallel_mode = MoESequenceParallelMode.NO_SP
-
     # Default to RouterTopK (without Sinkhorn)
     router = RouterTopK(
         num_experts=config.num_local_experts,
         top_k=config.num_experts_per_tok,
         hidden_size=config.hidden_size,
-        sequence_parallel_mode=sequence_parallel_mode,
     )
 
     init_method = partial(_init_normal, config.initializer_range)
 
     # TODO: Potentially add activation checkpointing in the ExpertMLPs, depending on profile/performance needs
-    expert_mlps = ExpertMLPsCapacityFactor(
+    expert_mlps = ExpertMLPs(
         num_experts=config.num_local_experts,
+        top_k=config.num_experts_per_tok,
         hidden_size=config.hidden_size,
         intermediate_size=config.intermediate_size,
         hidden_act=config.hidden_act,
+        glu_mlp=True,
         capacity_factor=config.capacity_factor,
+        normalize_top_k_affinities=True,
         init_method=init_method,
         output_layer_init_method=init_method,
-        glu_mlp=True,
-        sequence_parallel_mode=sequence_parallel_mode,
-        permute_strategy=config.expert_mlps_permute_strategy,
-        top_k=config.num_experts_per_tok,
-        normalize_top_k_affinities=True,
     )
 
     moe_layer = MoE(
-        router=router, expert_mlps=expert_mlps, return_router_logits=True, sequence_parallel_mode=sequence_parallel_mode
+        router=router,
+        expert_mlps=expert_mlps,
+        return_router_logits=True,
+        sequence_parallel_enabled=config.sequence_parallel_enabled,
     )
 
     return moe_layer
@@ -525,14 +517,19 @@ class MixtralDecoderLayer(MixtralDecoderLayerHF):
         hidden_states = residual + hidden_states
 
         # Fully Connected
+        if type(self.mlp).__name__ == "NxDCheckpointWrapper":
+            mlp_class = type(self.mlp._checkpoint_wrapped_module).__name__
+        else:
+            mlp_class = type(self.mlp).__name__
+
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        if isinstance(self.mlp, LlamaMLP):
+        if mlp_class == "LlamaMLP":
             hidden_states = self.mlp(hidden_states)
-        elif isinstance(self.mlp, MoE):
+        elif mlp_class == "MoE":
             hidden_states, router_logits = self.mlp(hidden_states)
         else:
-            raise Exception(f"MLP Layer type must be either LlamaMLP or MoE, got {type(self.mlp).__name__}.")
+            raise TypeError(f"MLP Layer type must be either LlamaMLP or MoE, got {type(self.mlp).__name__}.")
         hidden_states = residual + hidden_states
 
         outputs = (hidden_states,)
@@ -546,10 +543,13 @@ class MixtralDecoderLayer(MixtralDecoderLayerHF):
         if output_router_logits:
             # Concatenate the router logits with previous router logits
             if past_router_logits is not None:
-                if isinstance(self.mlp, MoE):
+                if mlp_class == "LlamaMLP":
+                    router_logits = past_router_logits
+                elif mlp_class == "MoE":
                     router_logits = torch.cat((past_router_logits, router_logits), dim=0)
                 else:
-                    router_logits = past_router_logits
+                    raise TypeError(f"MLP Layer type must be either LlamaMLP or MoE, got {type(self.mlp).__name__}.")
+
             outputs += (router_logits,)
 
         # TODO: Return a tuple here to workaround a NxD PP issue, can revert once the issue is fixed.
@@ -881,7 +881,7 @@ def init_weights(module):
     """
     if isinstance(module, MixtralRMSNorm):
         module.weight.data.fill_(1.0)
-    elif isinstance(module, (ParallelEmbedding, RowParallelLinear, ColumnParallelLinear, InputParallelLinear)):
+    elif isinstance(module, (ParallelEmbedding, RowParallelLinear, ColumnParallelLinear, LinearRouter)):
         module.init_weight_cpu()
         if hasattr(module, "bias") and module.bias is not None:
             module.bias.data.zero_()

@@ -120,7 +120,7 @@ class NeuronMixtralLTModule(NeuronLTModule):
                 and self.trainer.strategy.pipeline_parallel_rank == self.print_pp_rank
             ):
                 print(
-                    f"step {self.global_step} loss is {self.loss.detach().cpu().item()}, lr is {self.lr}, input_ids {torch.sum(self.input_ids.detach().cpu()).item()}, norm {self.global_norm}, global rank {xm.get_ordinal()}"
+                    f"step {self.global_step} loss is {self.loss.detach().cpu().item()}, lr is {self.lr}, throughput {self.tps} seq/s, input_ids {torch.sum(self.input_ids.detach().cpu()).item()}, norm {self.global_norm}, global rank {xm.get_ordinal()}"
                 )
 
             # Logging, need to revisit when automatic_optimization enabled
@@ -159,7 +159,7 @@ class NeuronMixtralLTModule(NeuronLTModule):
             and self.trainer.strategy.tensor_parallel_rank == 0
             and self.trainer.strategy.pipeline_parallel_rank == self.print_pp_rank
         ):
-            print(f"Training started!")
+            print("Training started!")
             # record training start time
             self.start_time = time.time()
 
@@ -169,7 +169,7 @@ class NeuronMixtralLTModule(NeuronLTModule):
             and self.trainer.strategy.tensor_parallel_rank == 0
             and self.trainer.strategy.pipeline_parallel_rank == self.print_pp_rank
         ):
-            print(f"Training finished!")
+            print("Training finished!")
             extract_graphs_only = os.environ.get("NEURON_EXTRACT_GRAPHS_ONLY", None)
             if not extract_graphs_only:
                 # record aggregate & final statistics in the metrics file

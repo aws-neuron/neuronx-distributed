@@ -76,7 +76,7 @@ def get_learning_rate_scheduler(optimizer, args, last_epoch=-1):
 
 def get_param_groups_by_weight_decay(model):
     """Get param groups."""
-    if hasattr(model, "local_named_parameters"):
+    if hasattr(model, "local_named_parameters") and hasattr(model, "partitioned") and model.partitioned:
         # Zero1 use the first param in opt to decide the device
         param_optimizer = list(model.local_named_parameters())
     else:
@@ -177,7 +177,7 @@ def create_instruction_based_dataset(data_dir, mini_batch_size, dp_size, dp_rank
     def preprocess_test_dataset(sample):
         instruction = f"### Instruction\n{sample['instruction']}"
         context = f"### Context\n{sample['context']}" if len(sample["context"]) > 0 else None
-        response = f"### Answer\n"
+        response = "### Answer\n"
         # join all the parts together
         prompt = "\n".join([i for i in [instruction, context, response] if i is not None])
         model_input = tokenizer(prompt, add_special_tokens=False)

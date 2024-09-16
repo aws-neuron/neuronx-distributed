@@ -8,17 +8,15 @@ transformers_ver = transformers.__version__
 if version.parse(transformers_ver) < version.parse("4.36.0"):
     assert False, f"transformers library version is {transformers_ver}. Minimum required is 4.36.0"
 
-from transformers.models.mixtral.configuration_mixtral import MixtralConfig
-from transformers.models.mixtral.modeling_mixtral import MixtralSparseMoeBlock
+from transformers.models.mixtral.configuration_mixtral import MixtralConfig  # noqa: E402
+from transformers.models.mixtral.modeling_mixtral import MixtralSparseMoeBlock  # noqa: E402
 
-from . import utils_testing as ut
+from . import utils_testing as ut  # noqa: E402
 
 
 def initialize_mixtral_model(cfg, seed=5):
     assert cfg.implementation == "topk"
-    assert cfg.glu_mlp == True, f"Mixtral implementation available only for GLU MLP"
-
-    intermediate_size = int(8 / 3 * cfg.hidden_size)
+    assert cfg.glu_mlp is True, "Mixtral implementation available only for GLU MLP"
 
     mixtral_config = MixtralConfig()
     mixtral_config.hidden_size = cfg.hidden_size
@@ -41,7 +39,7 @@ def convert_mixtral_to_neuron_state_dict(mixtral_state_dict, cfg):
     This function implements workarounds for this.
     """
 
-    assert cfg.glu_mlp == True, f"Only GPU MLP is supported for Mixtral Top-K model"
+    assert cfg.glu_mlp is True, "Only GPU MLP is supported for Mixtral Top-K model"
 
     neuron_state_dict = {}
     # Copy router weights
@@ -62,7 +60,7 @@ def convert_mixtral_to_neuron_state_dict(mixtral_state_dict, cfg):
             gate_up_proj_slice = torch.narrow(gate_up_proj, 0, e, 1)
             gate_up_proj_weights = torch.cat([gate_proj_weights, up_proj_weights], dim=1)
             gate_up_proj_slice.copy_(gate_up_proj_weights)
-    neuron_state_dict["expert_mlps.gate_up_proj.weight"] = gate_up_proj
+    neuron_state_dict["expert_mlps.mlp_op.gate_up_proj.weight"] = gate_up_proj
 
     down_proj = torch.empty(cfg.num_experts, intermediate_size, hidden_size, device=device)
     for e in range(cfg.num_experts):
@@ -71,6 +69,6 @@ def convert_mixtral_to_neuron_state_dict(mixtral_state_dict, cfg):
         if down_proj_weights is not None:
             down_proj_slice = torch.narrow(down_proj, 0, e, 1)
             down_proj_slice.copy_(down_proj_weights)
-    neuron_state_dict["expert_mlps.down_proj.weight"] = down_proj
+    neuron_state_dict["expert_mlps.mlp_op.down_proj.weight"] = down_proj
 
     return neuron_state_dict

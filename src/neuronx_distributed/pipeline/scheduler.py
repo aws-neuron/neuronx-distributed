@@ -9,7 +9,7 @@ class PipelineTask:
 
     def __eq__(self, other) -> bool:
         return (
-            type(self) == type(other)
+            type(self) is type(other)
             and self.mb == other.mb
             and self.model_chunk == other.model_chunk
             and self.graph_break == other.graph_break
@@ -64,10 +64,10 @@ class PostProcessTask:
 
 class ReduceGradsTask(PostProcessTask):
     def __repr__(self):
-        return f"ReduceGradsTask"
+        return "ReduceGradsTask"
 
     def __eq__(self, other) -> bool:
-        return type(self) == type(other)
+        return type(self) is type(other)
 
 
 class PipeSchedule(ABC):

@@ -55,7 +55,9 @@ class NxDOptimizer(torch.optim.Optimizer):
         self.optimizer.add_param_group(param_group)
 
     def state_dict(self):
-        return self.optimizer.state_dict()
+        state_dict = self.optimizer.state_dict()
+        state_dict = self._mark_expert_parallel_states(state_dict)
+        return state_dict
 
     def load_state_dict(self, state_dict):
         self.optimizer.load_state_dict(state_dict)
@@ -69,6 +71,48 @@ class NxDOptimizer(torch.optim.Optimizer):
     def __setstate__(self, state):
         self.optimizer.__setstate__(state)
 
+
+    def _mark_expert_parallel_states(self, state_dict):
+        if state_dict is None:
+            return None
+
+        ep_ids = set()
+        idx = 0
+        param_set = set()
+        for param_group in self.__getstate__()["param_groups"]:
+            for group, params in param_group.items():
+                if group == "params":
+                    for p in params:
+                        if isinstance(p, torch.Tensor) and hasattr(p, "expert_model_parallel") and p.expert_model_parallel:
+                            if id(p) not in param_set:
+                                ep_ids.add(idx)
+                        idx += 1
+                        param_set.add(id(p))
+
+
+        for id_p, param_state_dict in state_dict["state"].items():
+            if id_p in ep_ids:
+                for state_key in param_state_dict:
+                    param_state_dict[state_key].expert_model_parallel = True
+
+        return state_dict
+
+
+    def _fetch_gradients(self):
+        gradients = []
+        ep_gradients = []
+        for param_group in self.optimizer.__getstate__()["param_groups"]:
+            for group, params in param_group.items():
+                if group == "params":
+                    for p in params:
+                        if isinstance(p, torch.Tensor) and p.grad is not None:
+                            if hasattr(p, "expert_model_parallel") and p.expert_model_parallel:
+                                ep_gradients.append(p.grad.data)
+                            else:
+                                gradients.append(p.grad.data)
+
+        return gradients, ep_gradients
+
     def step(self, closure=None):
         # sequence parallel all-reduce
         if self.nxd_config["sequence_parallel"]:
@@ -76,7 +120,16 @@ class NxDOptimizer(torch.optim.Optimizer):
 
         optimizer_config = self.nxd_config["optimizer_config"]
         if not optimizer_config["zero_one_enabled"]:
-            grads.bucket_allreduce_gradients(xm._fetch_gradients(self))
+            non_ep_gradients, ep_gradients = self._fetch_gradients()
+            grads.bucket_allreduce_gradients(non_ep_gradients + ep_gradients)
+            if len(ep_gradients) > 0:
+                # initial allreduce takes place over the expert data parallel group
+                # which coincides with data parallel group when ep is disabled. when ep
+                # is enabled, non-ep gradients would additionally need to be reduced
+                # over the expert model parallel groups (since ep happens over dp ranks).
+                # non-ep gradient reduction needs to take place separately over emp/edp
+                # groups (in two separate steps) to side-step the MPMD limitation in runtime.
+                grads.bucket_allreduce_gradients(non_ep_gradients, reduce_over_ep_group=True)
             if optimizer_config["grad_clipping"]:
                 self._grad_norm = grads.clip_grad_norm(self.params, optimizer_config["max_grad_norm"])
         ret = self.optimizer.step(closure=closure)

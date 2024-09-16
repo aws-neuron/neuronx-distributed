@@ -11,7 +11,11 @@ class Sampler:
 
     def __init__(self, config: PretrainedConfig):
         self.on_device_sampling = config.on_device_sampling
-        if config.do_sample == True and config.num_beams == 1:
+        if hasattr(config, "is_medusa"):
+            self.is_medusa = config.is_medusa
+        else:
+            self.is_medusa = False
+        if config.do_sample and config.num_beams == 1:
             self.top_k = config.top_k
             self.sampling_method = self.multinomial
         else:
@@ -68,4 +72,6 @@ class Sampler:
             # count negative values to find index of sampled value
             counts = count_nonzero((diffs < 0), dim=dim)
             # return token indeces
+            if self.is_medusa:
+                return top_k_logits_indices
             return gather(input=top_k_logits_indices, dim=dim, index=counts.unsqueeze(1)).flatten()

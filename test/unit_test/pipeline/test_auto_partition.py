@@ -13,8 +13,6 @@ from neuronx_distributed.parallel_layers.loss_functions import parallel_cross_en
 from neuronx_distributed.pipeline.model import NxDPPModel
 from neuronx_distributed.pipeline.partition import create_partitions
 
-from .. import update_result
-
 
 class NxDModule(torch.nn.Module):
     def __init__(self, num_layers):
@@ -52,23 +50,19 @@ class TestAutoPartition(unittest.TestCase):
     @patch("neuronx_distributed.pipeline.model.parallel_state")
     @patch("torch.distributed.get_rank")
     def test_model_autopartition(self, rank_mock, state_mock):
-        try:
-            num_layers = 40
-            model = get_model_nxd(num_layers)
-            transformer_layer_cls = torch.nn.Linear
+        num_layers = 40
+        model = get_model_nxd(num_layers)
+        transformer_layer_cls = torch.nn.Linear
 
-            pipeline_parallel_size = 4
-            model_layers = model.get_model_layers(model.original_torch_module, transformer_layer_cls)
-            partitions = create_partitions(pipeline_parallel_size, model_layers)
+        pipeline_parallel_size = 4
+        model_layers = model.get_model_layers(model.original_torch_module, transformer_layer_cls)
+        partitions = create_partitions(pipeline_parallel_size, model_layers)
 
-            expected_model_layers = [f"layers.{x}" for x in range(num_layers)]
-            expected_partitions = [f"layers.{x}" for x in range(9, num_layers, 10)]
-            expected_partitions = expected_partitions[:-1]
-            assert model_layers == expected_model_layers
-            assert partitions == expected_partitions
-        except:
-            update_result({"inference_success": 0})
-            raise
+        expected_model_layers = [f"layers.{x}" for x in range(num_layers)]
+        expected_partitions = [f"layers.{x}" for x in range(9, num_layers, 10)]
+        expected_partitions = expected_partitions[:-1]
+        assert model_layers == expected_model_layers
+        assert partitions == expected_partitions
 
     @patch("neuronx_distributed.parallel_layers.layers.get_tensor_model_parallel_size", MagicMock(return_value=1))
     @patch("neuronx_distributed.parallel_layers.layers.get_tensor_model_parallel_rank", MagicMock(return_value=1))
@@ -86,21 +80,17 @@ class TestAutoPartition(unittest.TestCase):
     @patch("neuronx_distributed.pipeline.model.parallel_state")
     @patch("torch.distributed.get_rank")
     def test_model_autopartition_unevenly_divisible_layers(self, rank_mock, state_mock):
-        try:
-            num_layers = 19
-            model = get_model_nxd(num_layers)
-            transformer_layer_cls = torch.nn.Linear
+        num_layers = 19
+        model = get_model_nxd(num_layers)
+        transformer_layer_cls = torch.nn.Linear
 
-            pipeline_parallel_size = 4
-            model_layers = model.get_model_layers(model.original_torch_module, transformer_layer_cls)
-            partitions = create_partitions(pipeline_parallel_size, model_layers)
-            expected_model_layers = [f"layers.{x}" for x in range(num_layers)]
-            expected_partitions = ["layers.3", "layers.8", "layers.13"]
-            assert model_layers == expected_model_layers
-            assert partitions == expected_partitions
-        except:
-            update_result({"inference_success": 0})
-            raise
+        pipeline_parallel_size = 4
+        model_layers = model.get_model_layers(model.original_torch_module, transformer_layer_cls)
+        partitions = create_partitions(pipeline_parallel_size, model_layers)
+        expected_model_layers = [f"layers.{x}" for x in range(num_layers)]
+        expected_partitions = ["layers.3", "layers.8", "layers.13"]
+        assert model_layers == expected_model_layers
+        assert partitions == expected_partitions
 
 
 if __name__ == "__main__":

@@ -30,7 +30,7 @@ def uncompress_from_string(serialized_data_string):
 
 
 def is_instance_namedtuple(iterable):
-    return isinstance(iterable, tuple) and iterable.__class__.__base__ == tuple and hasattr(iterable, "_fields")
+    return isinstance(iterable, tuple) and isinstance(iterable.__class__.__base__, tuple) and hasattr(iterable, "_fields")
 
 
 def find_loss_from_output_and_spec(output_val, spec_val):

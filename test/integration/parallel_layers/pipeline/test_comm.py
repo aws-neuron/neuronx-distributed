@@ -29,11 +29,6 @@ datetime_str = str(datetime.now())
 
 def parse_args():
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument(
-        "--test_json",
-        required=False,
-        help="input json listing the test spec for network to compile",
-    )
     parser.add_argument("--s3_dir", required=False, help="location to upload all test artifacts")
     parser.add_argument(
         "--s3_bucket",
@@ -41,12 +36,10 @@ def parse_args():
     )
     args, leftovers = parser.parse_known_args()
     S3_BUCKET_NAME = args.s3_bucket
-    with open(args.test_json, "r") as f:
-        test_dict = json.load(f)
-    return test_dict, S3_BUCKET_NAME, args
+    return S3_BUCKET_NAME, args
 
 
-test_config, S3_BUCKET_NAME, args = parse_args()
+S3_BUCKET_NAME, args = parse_args()
 results = {"inference_success": 1}
 
 
@@ -74,13 +67,13 @@ def test_send_and_recv():
         )
         if get_pipeline_model_parallel_rank() == 0:
             a = torch.rand(2, 3, device=xm.xla_device())
-            t = send(a)
+            t = send(a) #noqa
             xm.mark_step()
             torch.save(a.cpu(), "tensor.pt")
         elif get_pipeline_model_parallel_rank() < 7:
             recv_a = recv_from(tensor_meta)
             xm.mark_step()
-            t = send(recv_a)
+            t = send(recv_a) #noqa
             xm.mark_step()
             recv_a_cpu = recv_a.to(torch.device("cpu"))
             a = torch.load("tensor.pt", map_location=torch.device("cpu"))
@@ -95,7 +88,7 @@ def test_send_and_recv():
     global results
     try:
         _test_send_and_recv()
-    except:
+    except Exception:
         results["inference_success"] = 0
         print(traceback.format_exc())
         raise
@@ -120,7 +113,7 @@ def test_1f_1b_comm():
         # Testing 1F1B communication
         if get_pipeline_model_parallel_rank() == 0:
             forward = torch.rand(2, 3, device=xm.xla_device())
-            t = send(forward)
+            t = send(forward) #noqa
             xm.mark_step()
             torch.save(forward.cpu(), "forward.pt")
             recv_backward = recv_from(backward_tensor_meta, recv_prev=False)
@@ -131,11 +124,11 @@ def test_1f_1b_comm():
         elif get_pipeline_model_parallel_rank() < 7:
             recv_forward = recv_from(forward_tensor_meta)
             xm.mark_step()
-            t = send(recv_forward)
+            t = send(recv_forward) #noqa
             xm.mark_step()
             recv_backward = recv_from(backward_tensor_meta, recv_prev=False)
             xm.mark_step()
-            t = send(recv_backward, send_next=False)
+            t = send(recv_backward, send_next=False) #noqa
             xm.mark_step()
             recv_forward_cpu = recv_forward.to(torch.device("cpu"))
             forward = torch.load("forward.pt", map_location=torch.device("cpu"))
@@ -147,7 +140,7 @@ def test_1f_1b_comm():
             recv_forward = recv_from(forward_tensor_meta)
             xm.mark_step()
             backward = torch.rand(1, 2, device=xm.xla_device())
-            t = send(backward, send_next=False)
+            t = send(backward, send_next=False) #noqa
             xm.mark_step()
             torch.save(backward.cpu(), "backward.pt")
             recv_forward_cpu = recv_forward.to(torch.device("cpu"))
@@ -157,7 +150,7 @@ def test_1f_1b_comm():
     global results
     try:
         _test_1f_1b_comm()
-    except:
+    except Exception:
         results["inference_success"] = 0
         print(traceback.format_exc())
         raise
@@ -191,23 +184,14 @@ def test_send_and_recv_python_object():
     global results
     try:
         _test_send_and_recv_python_object()
-    except:
+    except Exception:
         results["inference_success"] = 0
         print(traceback.format_exc())
         raise
 
 
-def upload_to_s3():
-    os.system(f'aws s3 cp --no-progress "{datetime_str}" {S3_BUCKET_NAME}')
-    print(met.metrics_report())
-
-
 def on_exit():
-    upload_to_s3()
-    for k in test_config:
-        os.system(f"rm {args.test_json}")
-        with open(args.test_json, "w") as f:
-            json.dump({k: results}, f)
+    print(met.metrics_report())
 
 
 if __name__ == "__main__":

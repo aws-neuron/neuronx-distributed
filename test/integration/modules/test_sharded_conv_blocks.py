@@ -10,13 +10,13 @@ import copy
 from typing import Tuple
 
 import torch
-import torch.nn.init as init
+import torch.nn.init as init  # noqa: F401
 import torch_xla.core.xla_model as xm
 import torch_xla.debug.metrics as met
 
 from neuronx_distributed.parallel_layers import layers, parallel_state
-from neuronx_distributed.parallel_layers.pad import pad_model
-from neuronx_distributed.parallel_layers.random import model_parallel_xla_manual_seed
+from neuronx_distributed.parallel_layers.pad import pad_model  # noqa: F401
+from neuronx_distributed.parallel_layers.random import model_parallel_xla_manual_seed  # noqa: F401
 from neuronx_distributed.parallel_layers.utils import requires_init_pg_override
 
 import diffusers
@@ -33,10 +33,11 @@ parentdir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 sys.path.append(parentdir)
 
 # Import the module from the parent directory
-from common.integration_test_utils import test_init, test_cleanup, test_modules, print_separator, set_random_seed
+from common.integration_test_utils import test_init, test_cleanup, test_modules, print_separator, set_random_seed  # noqa: E402, F401
 
 UP_BLOCKS = (CrossAttnUpBlock2D, UpBlock2D)
 CROSS_ATTN_BLOCKS = (CrossAttnDownBlock2D, CrossAttnUpBlock2D, UNetMidBlock2DCrossAttn)
+
 
 def parse_args():
     parser = argparse.ArgumentParser(add_help=False)
@@ -61,29 +62,31 @@ DOWN_BLOCK = "down_blocks"
 MID_BLOCK = "mid_block"
 UP_BLOCK = "up_blocks"
 
+
 def get_sharded_data(data: torch.Tensor, dim: int) -> torch.Tensor:
     tp_rank = parallel_state.get_tensor_model_parallel_rank()
     per_partition_size = data.shape[dim] // parallel_state.get_tensor_model_parallel_size()
     if dim == 0:
         return data[
-            per_partition_size * tp_rank : per_partition_size * (tp_rank + 1)
+            per_partition_size * tp_rank: per_partition_size * (tp_rank + 1)
         ].clone()
     elif dim == 1:
         return data[
-            :, per_partition_size * tp_rank : per_partition_size * (tp_rank + 1)
+            :, per_partition_size * tp_rank: per_partition_size * (tp_rank + 1)
         ].clone()
     else:
         raise Exception(
             f"Partiton value of 0,1 are supported, found {dim}."
         )
 
+
 # Shard a given Conv2d to be an OutputChannelParallelConv2d or InputChannelParallelConv2d,
 # including copying the weight/bias data to the sharded conv from the original
 def shard_conv2d(conv: torch.nn.Module, layer_type: type, gather_output: bool = None, input_is_parallel: bool = None) -> torch.nn.Module:
     allowed_layer_types = [layers.InputChannelParallelConv2d, layers.OutputChannelParallelConv2d]
     assert layer_type in allowed_layer_types, f"Requested layer must be one of {allowed_layer_types} but got {layer_type}"
-    assert (layer_type == layers.InputChannelParallelConv2d and input_is_parallel is not None) or (layer_type == layers.OutputChannelParallelConv2d and gather_output is not None), f"Must specify gather_output for OutputChannelParallelConv2d or input_is_parallel for InputChannelParallelConv2d"
-    
+    assert (layer_type == layers.InputChannelParallelConv2d and input_is_parallel is not None) or (layer_type == layers.OutputChannelParallelConv2d and gather_output is not None), "Must specify gather_output for OutputChannelParallelConv2d or input_is_parallel for InputChannelParallelConv2d"
+
     orig_conv = conv
     partition_dim = 0 if layer_type == layers.OutputChannelParallelConv2d else 1
     kw = {'gather_output': gather_output} if layer_type == layers.OutputChannelParallelConv2d else {'input_is_parallel': input_is_parallel}
@@ -96,21 +99,23 @@ def shard_conv2d(conv: torch.nn.Module, layer_type: type, gather_output: bool = 
             # InputChannelParallel bias not sharded
             conv.bias.data.copy_(orig_conv.bias.data)
 
-    del(orig_conv)
+    del orig_conv
 
     return conv
+
 
 def shard_groupnorm(norm: torch.nn.Module) -> torch.nn.Module:
     tp_degree = parallel_state.get_tensor_model_parallel_size()
     if norm.num_channels % tp_degree != 0 or (norm.num_channels // tp_degree) % norm.num_groups != 0:
         raise NotImplementedError(f"Have not implemented padding for norms yet. Cannot shard {norm} to TP degree {tp_degree}")
-    
+
     orig_norm = norm
     norm = torch.nn.GroupNorm(orig_norm.num_groups, orig_norm.num_channels // tp_degree, orig_norm.eps, orig_norm.affine)
     norm.weight.data = get_sharded_data(orig_norm.weight.data, 0)
     norm.bias.data = get_sharded_data(orig_norm.bias.data, 0)
 
     return norm
+
 
 def shard_sd_resnet_block(block: torch.nn.Module) -> torch.nn.Module:
     assert hasattr(block, 'conv1') and hasattr(block, 'conv2'), f"Expected the module being tested has a conv1 and conv2 to shard but found it doesn't! Selected module: {block}"
@@ -138,8 +143,9 @@ def shard_sd_resnet_block(block: torch.nn.Module) -> torch.nn.Module:
 
     if hasattr(block, 'conv_shortcut') and block.conv_shortcut is not None:
         block.conv_shortcut = shard_conv2d(block.conv_shortcut, layers.OutputChannelParallelConv2d, gather_output=True)
-    
+
     return block
+
 
 # model: HuggingFace model ID, e.g. stabilityai/stable-diffusion-2-1-base
 # block_type: down block, mid block, or up block
@@ -170,7 +176,7 @@ def test_stable_diffusion_resnet_block(tensor_model_parallel_size: int, model_id
 
         control_module = copy.deepcopy(blocks[block_idx].resnets[resnet_idx])
         test_module = copy.deepcopy(blocks[block_idx].resnets[resnet_idx])
-        del(model)
+        del model
 
         # Build the input tuple
         input_channels = test_module.conv1.in_channels
@@ -190,17 +196,17 @@ def test_stable_diffusion_resnet_block(tensor_model_parallel_size: int, model_id
         # See V1310769999
         pass_fail = test_modules(test_module, control_module, input_tuple, check_output_tensor=False)
         test_cleanup()
-        
+
         return pass_fail
 
     global results
     try:
         ret = None
         ret = _test_stable_diffusion_resnet_block()
-        assert all(ret), f"Test failed!"
+        assert all(ret), "Test failed!"
         # If we reach this point, test has passed
         xm.master_print("test passed")
-    except:
+    except Exception:
         results["inference_success"] = 0
         print(traceback.format_exc())
         print(f"test_stable_diffusion_resnet_block FAILED for {model_id}.{block_type}[{block_idx}].resnets[{resnet_idx}], input size {input_size}")
@@ -209,7 +215,7 @@ def test_stable_diffusion_resnet_block(tensor_model_parallel_size: int, model_id
         if ret is None:
             # Compilation failed
             ret = (False, False, False)
-    
+
     gc.collect()
 
     return ret
@@ -241,7 +247,7 @@ def test_stable_diffusion_unet_block(tensor_model_parallel_size: int, model_id: 
 
         control_module = copy.deepcopy(blocks[block_idx])
         test_module = copy.deepcopy(blocks[block_idx])
-        del(model)
+        del model
 
         assert hasattr(control_module, 'resnets'), f"{control_module}\nExpected the module being tested (see above) has an attribute 'resnets' (a list of resnet blocks) but found it doesn't!"
 
@@ -256,7 +262,7 @@ def test_stable_diffusion_unet_block(tensor_model_parallel_size: int, model_id: 
 
         hidden_states_shape = (batch_size, input_channels, input_spatial_dim, input_spatial_dim)
         input_hidden_states = torch.randn(hidden_states_shape, requires_grad=True)
-        
+
         input_list.append(input_hidden_states)
 
         if isinstance(test_module, UP_BLOCKS):
@@ -266,10 +272,10 @@ def test_stable_diffusion_unet_block(tensor_model_parallel_size: int, model_id: 
             for i, resnet in enumerate(test_module.resnets):
                 # Cross attn upblocks vary their resnet sizes, so need to choose the right number of channels
                 if isinstance(test_module, CROSS_ATTN_BLOCKS) and i != 0:
-                    input_channels = resnet.conv1.in_channels - test_module.attentions[i-1].proj_out.out_features
+                    input_channels = resnet.conv1.in_channels - test_module.attentions[i - 1].proj_out.out_features
                 else:
                     input_channels = resnet.conv1.in_channels // 2
-                    
+
                 shape = (batch_size, input_channels, input_spatial_dim, input_spatial_dim)
                 xm.master_print(f"computed shape of {shape} for resnet {i}")
                 res_hidden_states.append(torch.randn(shape, requires_grad=True))
@@ -279,10 +285,9 @@ def test_stable_diffusion_unet_block(tensor_model_parallel_size: int, model_id: 
             res_hidden_states = tuple(res_hidden_states)
             input_list.append(res_hidden_states)
 
-            
         temb_shape = (batch_size, temb_in_features)
         input_temb = torch.randn(temb_shape, requires_grad=True)
-        
+
         input_list.append(input_temb)
 
         if isinstance(test_module, CROSS_ATTN_BLOCKS):
@@ -306,15 +311,13 @@ def test_stable_diffusion_unet_block(tensor_model_parallel_size: int, model_id: 
 
         return pass_fail
 
-
-
     global results
     try:
         ret = None
         ret = _test_stable_diffusion_unet_block()
-        assert all(ret), f"Test failed!"
+        assert all(ret), "Test failed!"
         xm.master_print("test passed")
-    except:
+    except Exception:
         results["inference_success"] = 0
         print(traceback.format_exc())
         print(f"test_stable_diffusion_unet_block FAILED for {model_id}.{block_type}[{block_idx}], input size {input_size}")
@@ -324,10 +327,10 @@ def test_stable_diffusion_unet_block(tensor_model_parallel_size: int, model_id: 
             # Compilation failed
             ret = (False, False, False)
 
-
     gc.collect()
 
     return ret
+
 
 def upload_to_s3():
     os.system(f'aws s3 cp --no-progress "{datetime_str}" {S3_BUCKET_NAME}')
@@ -364,7 +367,7 @@ if __name__ == "__main__":
         test_results_csv_file = open("sharded_conv_functional_block_test_results.csv", "w+")
         test_results_csv_file.write("module_id,batch_size,input_shape,compile_pass,output_pass,grads_pass,test_pass\n")
         test_results_csv_file.flush()
-    
+
     # TODO: test more models - at least SD 1.5 and SD 2.1 non-base
     model_id = "stabilityai/stable-diffusion-2-1-base"
 
@@ -377,7 +380,7 @@ if __name__ == "__main__":
     num_resnets_per_block[MID_BLOCK].append(len(unet.mid_block.resnets))
     for block in unet.up_blocks:
         num_resnets_per_block[UP_BLOCK].append(len(block.resnets))
-    del(unet)
+    del unet
     for block_type in [DOWN_BLOCK, MID_BLOCK, UP_BLOCK]:
         for block_idx, num_resnets in enumerate(num_resnets_per_block[block_type]):
             for resnet_idx in range(0, num_resnets):
@@ -390,7 +393,7 @@ if __name__ == "__main__":
                         test_results_csv_file.write(f"{block_identifier},{1},{input_size},{pass_fail[0]},{pass_fail[1]},{pass_fail[2]},{all(pass_fail)}\n")
                         test_results_csv_file.flush()
                     xm.mark_step()
-    
+
     # TODO: mid and up blocks fail for various issues, tracked in the following tickets
     #       V1317582055
     #       V1317572506
@@ -406,7 +409,7 @@ if __name__ == "__main__":
                     test_results_csv_file.write(f"{block_identifier},{1},{input_size},{pass_fail[0]},{pass_fail[1]},{pass_fail[2]},{all(pass_fail)}\n")
                     test_results_csv_file.flush()
                 xm.mark_step()
-    
+
     if xm.is_master_ordinal():
         test_results_csv_file.close()
     atexit.register(on_exit)

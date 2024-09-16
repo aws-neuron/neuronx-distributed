@@ -11,16 +11,22 @@ from neuronx_distributed.parallel_layers.checkpointing import load, save
 
 
 class NeuronCheckpointIO(XLACheckpointIO):
-    def __init__(self, save_load_xser: bool = True, *args: Any, **kwargs: Any) -> None:
+    def __init__(self, save_load_xser: bool = True, weights_only: bool = False, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.save_load_xser = save_load_xser
+        self.weights_only = weights_only
 
     def load_checkpoint(
         self,
         checkpoint_path: _PATH,
         master_dp_only: bool = True,
     ) -> Dict[str, Any]:
-        return load(chkpt_path=checkpoint_path, load_xser=self.save_load_xser, master_dp_only=master_dp_only)
+        return load(
+            chkpt_path=checkpoint_path,
+            load_xser=self.save_load_xser,
+            master_dp_only=master_dp_only,
+            weights_only=self.weights_only,
+        )
 
     def save_checkpoint(
         self,

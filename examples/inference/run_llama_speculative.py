@@ -13,8 +13,8 @@ def llama_sample():
 
     # Batch size must be 1 for speculative decoding
     batch_size = 1
-    max_context_length = 256
-    max_new_tokens = 256
+    max_prompt_length = 256
+    sequence_length = 512
 
     # Need to trace both target and draft models
     # We don't need to trace token generation model for target
@@ -23,8 +23,8 @@ def llama_sample():
         traced_model_path=traced_target_model_path,
         tp_degree=32,
         batch_size=batch_size,
-        context_lengths=max_context_length,
-        new_token_counts=max_new_tokens,
+        max_prompt_length=max_prompt_length,
+        sequence_length=sequence_length,
         speculation_length=5,
         trace_tokengen_model=False,
     )
@@ -32,8 +32,8 @@ def llama_sample():
         traced_model_path=traced_draft_model_path,
         tp_degree=32,
         batch_size=batch_size,
-        context_lengths=max_context_length,
-        new_token_counts=max_new_tokens,
+        max_prompt_length=max_prompt_length,
+        sequence_length=sequence_length,
     )
 
     target_model = target_runner.load_neuron_model(traced_target_model_path)
@@ -44,8 +44,7 @@ def llama_sample():
     target_runner.check_accuracy(
         target_model,
         batch_size,
-        max_context_length,
-        max_new_tokens,
+        sequence_length,
         traced_draft_model=draft_model,
         speculation_length=5,
     )

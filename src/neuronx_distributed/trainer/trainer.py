@@ -5,8 +5,8 @@ import torch
 import torch_xla.core.xla_model as xm
 from packaging import version
 
+from neuronx_distributed.optimizer import NeuronZero1Optimizer, NeuronEPZero1Optimizer
 from neuronx_distributed.modules.lora import LoraConfig, LoraModel
-from neuronx_distributed.optimizer import NeuronZero1Optimizer
 from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.parallel_layers.pad import pad_model
 from neuronx_distributed.pipeline import NxDPPModel
@@ -20,8 +20,11 @@ from neuronx_distributed.utils.model_utils import (
     get_model_sequential,
     init_on_device,
     is_hf_pretrained_model,
-    is_nxtt_pretrained_model,
+    is_nxdt_pretrained_model,
+    check_delay_tracing,
+    get_delay_tracing
 )
+
 
 logger = get_logger()
 
@@ -29,6 +32,7 @@ logger = get_logger()
 def neuronx_distributed_config(
     tensor_parallel_size=1,
     pipeline_parallel_size=1,
+    expert_parallel_size=1,
     pipeline_config=None,
     optimizer_config=None,
     activation_checkpoint_config=None,
@@ -110,6 +114,7 @@ def neuronx_distributed_config(
     config = {
         "tensor_parallel_size": tensor_parallel_size,
         "pipeline_parallel_size": pipeline_parallel_size,
+        "expert_parallel_size": expert_parallel_size,
         "pipeline_config": pipeline_config,
         "optimizer_config": optimizer_config,
         "activation_checkpoint_config": activation_checkpoint_config,
@@ -124,6 +129,7 @@ def neuronx_distributed_config(
         parallel_state.initialize_model_parallel(
             tensor_model_parallel_size=config["tensor_parallel_size"],
             pipeline_model_parallel_size=config["pipeline_parallel_size"],
+            expert_model_parallel_size=config["expert_parallel_size"],
         )
 
     if torch.distributed.is_initialized() and parallel_state.is_global_rank_zero():
@@ -136,6 +142,7 @@ def initialize_parallel_model(nxd_config, model_fn, *model_args, **model_kwargs)
         parallel_state.initialize_model_parallel(
             tensor_model_parallel_size=nxd_config["tensor_parallel_size"],
             pipeline_model_parallel_size=nxd_config["pipeline_parallel_size"],
+            expert_model_parallel_size=nxd_config["expert_parallel_size"],
         )
 
     # Phase 1: get the base model
@@ -157,7 +164,9 @@ def initialize_parallel_model(nxd_config, model_fn, *model_args, **model_kwargs)
     if pp_enabled:
         nxd_config["pipeline_config"].update({"param_init_fn": param_init_fn})
         nxd_config["pipeline_config"].update({"use_model_wrapper": True})
+        nxd_config["pipeline_config"]["_delay_tracing"] = check_delay_tracing(nxd_config)
         model = NxDPPModel(model, **nxd_config["pipeline_config"])
+
 
     # Phase 3: materialize model and move to device
     sequential_move_factor = nxd_config["model_init_config"]["sequential_move_factor"]
@@ -192,16 +201,16 @@ def initialize_parallel_model(nxd_config, model_fn, *model_args, **model_kwargs)
 
                 for name in base_model._no_split_modules:
                     activation_checkpoint_classes.append(get_module_class_from_name(nxd_model, name))
-            elif is_nxtt_pretrained_model(base_model):
-                # Toolkit transformer layer will always be this type
-                from neuronx_training_toolkit.models.megatron.transformer import (
+            elif is_nxdt_pretrained_model(base_model):
+                # NxDT transformer layer will always be this type
+                from neuronx_distributed_training.models.megatron.transformer import (
                     ParallelTransformerLayer,
                 )
 
                 activation_checkpoint_classes = [ParallelTransformerLayer]
             else:
                 raise RuntimeError(
-                    '`activation_checkpoint_config` "full" is only supported for huggingface transformers or nxtt models.'
+                    '`activation_checkpoint_config` "full" is only supported for huggingface transformers or nxdt models.'
                 )
 
         else:
@@ -220,6 +229,12 @@ def initialize_parallel_model(nxd_config, model_fn, *model_args, **model_kwargs)
 
 
 def initialize_parallel_optimizer(nxd_config, optimizer_class, parameters, **defaults):
+    optimizer = initialize_optimizer_from_class(nxd_config, optimizer_class, parameters, **defaults)
+    nxd_optim = NxDOptimizer(optimizer, nxd_config)
+    return nxd_optim
+
+
+def initialize_optimizer_from_class(nxd_config, optimizer_class, parameters, model=None, **defaults):
     optimizer_config = nxd_config["optimizer_config"]
     mixed_precision_config = nxd_config["mixed_precision_config"]
     if optimizer_config["zero_one_enabled"]:
@@ -233,13 +248,17 @@ def initialize_parallel_optimizer(nxd_config, optimizer_class, parameters, **def
             zero1_configs.update({"coalesce_cc": True})
         if mixed_precision_config["use_master_weights"]:
             if "XLA_DOWNCAST_BF16" in os.environ and os.environ["XLA_DOWNCAST_BF16"] == "1":
-                zero1_configs.update({"optimizer_dtype": torch.double})
+                defaults.update({"optimizer_dtype": torch.double})
         if mixed_precision_config["use_fp32_grad_acc"]:
             zero1_configs.update({"use_grad_acc_hook": True, "higher_cc_precision": True})
         zero1_configs.update(
             {"save_master_weights": True if mixed_precision_config["use_master_weights_in_ckpt"] else False}
         )
-        optimizer = NeuronZero1Optimizer(
+        if get_delay_tracing(nxd_config):
+            defaults["lazy_init"] = True
+        logger.info("printing defaults here %s", defaults)
+        logger.info("printing zero1 config here %s", zero1_configs)
+        optimizer = zero1_optimizer_cls(
             parameters,
             optimizer_class,
             **zero1_configs,
@@ -254,5 +273,28 @@ def initialize_parallel_optimizer(nxd_config, optimizer_class, parameters, **def
                 "Non Zero-1 optimizer does not support `use_fp32_grad_acc` of `use_master_weights_in_ckpt`."
             )
         optimizer = optimizer_class(parameters, **defaults)
+        if get_delay_tracing(nxd_config):
+            from neuronx_distributed.trainer import hooks
 
-    return NxDOptimizer(optimizer, nxd_config)
+            hooks.register_post_partition_hook(filter_to_local_parameter_group, [optimizer])
+    return optimizer
+
+
+"""
+During the delayed tracing and partition flow, the optimizer gets initialized with all parameters, as the model has not
+yet been moved to the device. When the model is moved to device on xla new tensors are created on device.
+We filter the parameters to those in model.local_parameters() once the model is moved onto device.
+"""
+
+
+def filter_to_local_parameter_group(optimizer, model):
+    parameters = optimizer.param_groups
+    for param_group in parameters:
+        filtered_param_list = []
+        for meta_param in param_group["params"]:
+            if meta_param in model.meta_device_parameter_map:
+                meta_or_xla_param = model.meta_device_parameter_map[meta_param]
+                if meta_or_xla_param.device.type == "xla":
+                    filtered_param_list.append(meta_or_xla_param)
+        param_group["params"] = filtered_param_list
+    return

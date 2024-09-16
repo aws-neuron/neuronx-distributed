@@ -23,8 +23,8 @@ class bdist_wheel_plat_only(bdist_wheel):
 
 exec(open('src/neuronx_distributed/_version.py').read())
 setup(
-    name='neuronx-distributed',
-    version=__version__,
+    name="neuronx-distributed",
+    version=__version__, #noqa
     classifiers=[
         'Development Status :: 3 - Alpha',
         'Intended Audience :: Developers',
@@ -51,8 +51,14 @@ setup(
         "console_scripts": ["nxd_convert_zero_checkpoints=neuronx_distributed.optimizer.convert_zero_checkpoints:main"],
     },
     install_requires=[
+<<<<<<< HEAD
         'torch-neuronx',
         'torch-xla',
+=======
+        "torch-neuronx",
+        "torch-xla",
+        "safetensors"
+>>>>>>> 5470500 (Neuron SDK Release 2.20.0 (#21))
     ],
     distclass=BinaryDistribution,
     cmdclass={

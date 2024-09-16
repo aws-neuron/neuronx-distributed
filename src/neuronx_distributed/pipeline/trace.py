@@ -74,8 +74,24 @@ class TorchTracerWrapper(NxDTracer, torch.fx.Tracer):
         self.name = "pytorch"
 
 
-def get_concrete_args(model: nn.Module, input_names: List[str]):
+def get_concrete_args(
+    model: nn.Module,
+    input_names: Optional[List[str]] = None,
+    args: Optional[List[Any]] = None,
+    kwargs: Optional[Dict[Any, Any]] = None
+):
     sig = inspect.signature(model.forward)
+    if input_names is None and (kwargs is not None or args is not None):
+        input_names = []
+        # Handle args given without keywords
+        for i in range(len(args)):
+            param_name = list(sig.parameters.keys())[i]
+            input_names.append(param_name)
+
+        if kwargs is not None:
+            for k, v in kwargs.items():
+                input_names.append(k)
+                # Get the names of all provided args from customer and pass those to input_names
 
     if not (set(input_names) <= set(sig.parameters.keys())):
         formatted_input_names = input_names[0] if len(input_names) == 1 else ", ".join(input_names)
@@ -134,6 +150,8 @@ def patch_obj_method(autowrap_obj_methods):
 
 def trace_model(
     model: nn.Module,
+    args: Optional[List[Any]] = None,
+    kwargs: Optional[Dict[Any, Any]] = None,
     input_names: Optional[List[str]] = None,
     tracer_cls: Union[Any, str] = None,
     leaf_modules: Optional[List[Any]] = None,
@@ -143,20 +161,12 @@ def trace_model(
 ):
     if _create_wrapped_func is None and autowrap_obj_methods is not None:
         logger.warning(
-            f"Can not import _create_wrapped_func from torch.fx.__symbolic_trace, autowrap_obj_method will be ignored"
+            "Can not import _create_wrapped_func from torch.fx.__symbolic_trace, autowrap_obj_method will be ignored"
         )
 
     tracer_cls = get_tracer_class(model, tracer_cls=tracer_cls)
 
-    if input_names is None:
-        logger.warning(f"Getting input_names None. It is recommending to set up input names for tracing.")
-        if is_hf_pretrained_model(model):
-            input_names = model.dummy_inputs.keys()
-        else:
-            input_names = []
-
-    input_names = list(input_names)
-    concrete_args = get_concrete_args(model, input_names)
+    concrete_args = get_concrete_args(model, input_names, args, kwargs)
 
     # User specified leaf modules to skip
     if leaf_modules is None:

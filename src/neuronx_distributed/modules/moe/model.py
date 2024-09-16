@@ -1,9 +1,7 @@
 import torch
-from typing import Union
 
 from neuronx_distributed.modules.moe import expert_mlps, routing
-from neuronx_distributed.modules.moe.model_utils import MoESequenceParallelMode
-from neuronx_distributed.parallel_layers import mappings
+from neuronx_distributed.parallel_layers import mappings, parallel_state
 
 
 class MoE(torch.nn.Module):
@@ -21,54 +19,46 @@ class MoE(torch.nn.Module):
         normalize_top_k_affinities = True
 
         # Other configurations
-        capacity_factor = 4.0   # Full capacity with no token dropping, set to num_experts/top_k
-        sequence_parallel_mode = MoESequenceParallelMode.EXIT_SP_ON_ENTRY
-        permute_strategy = "matmul"
+        capacity_factor = None   # Full capacity with no token dropping
         init_method = lambda weight: torch.nn.init.kaiming_uniform_(weight, a=math.sqrt(5))
         output_layer_init_method = lambda weight: torch.nn.init.kaiming_uniform_(weight, a=math.sqrt(5))
+        sequence_parallel_enabled = True
 
         # Initialize router
         router = routing.RouterTopK(
             num_experts=num_experts,
             top_k=top_k,
             hidden_size=hidden_size,
-            sequence_parallel_mode=sequence_parallel_mode,
         )
 
         # Initialize expert_mlps
-        expert_mlps_cf = expert_mlps.ExpertMLPsCapacityFactor(
+        expert_mlps = expert_mlps.ExpertMLPs(
             num_experts=num_experts,
             top_k=top_k,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             hidden_act=hidden_act,
+            glu_mlp=glu_mlp,
             capacity_factor=capacity_factor,
+            normalize_top_k_affinities=normalize_top_k_affinities,
             init_method=init_method,
             output_layer_init_method=init_method,
-            glu_mlp=glu_mlp,
-            sequence_parallel_mode=sequence_parallel_mode,
-            permute_strategy=permute_strategy,
-            normalize_top_k_affinities=normalize_top_k_affinities,
         )
 
         # Initial moe_layer
         moe_layer = MoE(
             router=router,
-            expert_mlps=expert_mlps_cf,
+            expert_mlps=expert_mlps,
             return_router_logits=True,  # Required downstream for the load balancing loss function
-            sequence_parallel_mode=sequence_parallel_mode,
+            sequence_parallel_enabled=sequence_parallel_enabled,
         )
     ```
-
-    Due to difference between training and inference on SP, SP is implementated differently for them in MoE.
-    Note that the NO_SP mode is equivalent to the EXIT_SP_ON_ENTRY mode under the inference assumptions. (There
-    are no additional collectives for EXIT_SP_ON_ENTRY).
 
     Arguments:
         router: Determines expert routing for input tokens
         expert_mlps: Obtains the output of the MoE layer by passing tokens through the chosen experts
+        sequence_parallel_enabled: Whether the model is running in sequence parallel or not
         return_router_logits: Whether to return the router logits in the forward pass
-        sequence_parallel_mode: SP mode being used for the MoE layer.
     """
 
     # Flag used in testing. Should not be used in production.
@@ -77,24 +67,21 @@ class MoE(torch.nn.Module):
     def __init__(
         self,
         router: routing.RouterBase,
-        expert_mlps: expert_mlps.ExpertMLPsBase,
-        sequence_parallel_mode: Union[str, MoESequenceParallelMode],
+        expert_mlps: expert_mlps.ExpertMLPs,
+        sequence_parallel_enabled: bool = False,
         return_router_logits: bool = False,
     ):
         super().__init__()
 
-        if sequence_parallel_mode not in MoESequenceParallelMode.__members__:
-            raise TypeError(f"Unknown sequence_parallel_mode: {sequence_parallel_mode}")
-        if len({sequence_parallel_mode, router.sequence_parallel_mode, expert_mlps.sequence_parallel_mode}) > 1:
-            raise ValueError("Inconsistent SP modes across router, expert_mlps and MoE modules")
         for attr in ["num_experts", "top_k", "hidden_size"]:
             if getattr(router, attr) != getattr(expert_mlps, attr):
                 raise ValueError("Inconsistent {attr} across the router and expert_mlps")
 
         self.router = router
         self.expert_mlps = expert_mlps
-        self.sequence_parallel_mode = MoESequenceParallelMode[sequence_parallel_mode]
+        self.sequence_parallel_enabled = sequence_parallel_enabled
         self.return_router_logits = return_router_logits
+        self.ep_enabled = parallel_state.get_expert_model_parallel_size() > 1
 
     def forward(self, hidden_states):
         """Forward pass of the MoE layer.
@@ -105,7 +92,7 @@ class MoE(torch.nn.Module):
             T: Tokens = S * B (token dimension obtained by flattening S and B)
 
         Arguments:
-            hidden_states: Input tensor of shape (S, B, H) or (S', B, H)
+            hidden_states: Input tensor of shape (S, B, H) or (S', B, H) in training, (B, S, H) in inference.
 
         Returns:
             output: Output tensor of the same shape as hidden_states, containing the output of the MoE layer.
@@ -116,13 +103,51 @@ class MoE(torch.nn.Module):
                                      Returned if self.is_test is True.
         """
 
-        # Sequence parallelism is supported for training, but not for inference, so we need different branches for them.
-        # However, we may still want to run the MoE module in a particular SP mode, which requires the collective
-        # operations to be adjusted (compared to the base class).
-        if self.training:
-            output, router_logits, expert_index = self.forward_for_training(hidden_states)
+        # hidden_states: (S, B, H) or (S', B, H) in training, (B, S, H) in inference
+
+        if not self.training:
+            # Sequence parallelism is only supported for training
+            assert self.sequence_parallel_enabled is False, "SP is not currently supported for inference"
+
+        if self.sequence_parallel_enabled:
+            # All-Gather the hidden_states to exit sequence parallel
+            # full_hidden_states: (S', B, H) -> (S, B, H)
+            full_hidden_states = mappings.gather_from_sequence_parallel_region(hidden_states, to_model_parallel=False)
         else:
-            output, router_logits, expert_index = self.forward_for_inference(hidden_states)
+            full_hidden_states = hidden_states
+
+        # full_hidden_states: (S, B, H) in training, (B, S, H) in inference
+        full_hidden_states_shape = full_hidden_states.shape
+        seq_len = full_hidden_states_shape[0] if self.training else full_hidden_states_shape[1]
+
+        # full_hidden_states: (T, H)
+        full_hidden_states = full_hidden_states.view(-1, full_hidden_states.shape[-1])
+
+        # Get the router_logits, expert_affinities and expert_index from the router
+        # router_logits: (T, E), expert_affinities: (T, E), expert_index: (T, top_k)
+        router_logits, expert_affinities, expert_index = self.router(full_hidden_states)
+
+        # Get the output from the ExpertMLPs: (T, H)
+        output = self.expert_mlps(
+            hidden_states=full_hidden_states,
+            expert_affinities=expert_affinities,
+            expert_index=expert_index,
+            seq_len=seq_len,
+        )
+
+        # output: (S, B, H) in training, (B, S, H) in inference
+        output = output.view(full_hidden_states_shape)
+
+        if self.sequence_parallel_enabled and self.ep_enabled:
+            # Reduction is done earlier in the case of EP
+            output = mappings.scatter_to_sequence_parallel_region(output)
+        elif self.sequence_parallel_enabled:
+            # Reduce-scatter back to sequence parallel (as the hidden_states were in sequence parallel)
+            # output: (S, B, H) -> (S', B, H)
+            output = mappings.reduce_scatter_to_sequence_parallel_region(output)
+        elif not self.ep_enabled:
+            # output: (S, B, H) in training, (B, S, H) in inference
+            output = mappings.reduce_from_tensor_model_parallel_region(output)
 
         return_op = (output,)
         if self.expert_mlps.return_bias:
@@ -133,74 +158,3 @@ class MoE(torch.nn.Module):
             return_op += (expert_index,)
 
         return return_op
-
-    def forward_for_training(self, hidden_states):
-        if self.sequence_parallel_mode in {
-            MoESequenceParallelMode.EXIT_SP_ON_ENTRY,
-            MoESequenceParallelMode.EXIT_SP_ON_ENTRY_DELAY_MLP_AR,
-        }:
-            # All-Gather the hidden_states to exit sequence parallel
-            # hidden_states: (S', B, H) -> (S, B, H)
-            hidden_states = mappings.gather_from_sequence_parallel_region(hidden_states, to_model_parallel=False)
-
-        # Get the router_logits, expert_affinities and expert_index from the router
-        # router_logits: (T, E), expert_affinities: (T, E), expert_index: (T, top_k)
-        router_logits, expert_affinities, expert_index = self.router(hidden_states)
-
-        # Get the output from the ExpertMLPs: (S, B, H)
-        output = self.expert_mlps(hidden_states, expert_affinities, expert_index)
-
-        if self.sequence_parallel_mode == MoESequenceParallelMode.EXIT_SP_ON_ENTRY:
-            # Scatter back to sequence parallel (as the hidden_states were in sequence parallel)
-            # output: (S, B, H) -> (S', B, H)
-            output = mappings.scatter_to_sequence_parallel_region(output)
-
-        if self.sequence_parallel_mode == MoESequenceParallelMode.EXIT_SP_ON_ENTRY_DELAY_MLP_AR:
-            # Reduce-scatter back to sequence parallel (as the hidden_states were in sequence parallel)
-            # output: (S, B, H) -> (S', B, H)
-            output = mappings.reduce_scatter_to_sequence_parallel_region(output)
-
-        return output, router_logits, expert_index
-
-    def forward_for_inference(self, hidden_states):
-        """
-        The collective ops for inference differ from training because the rest of the model does not support
-        sequence parallelism in inference. Moreover, the input in inference is (B, S, H) instead of (S, B, H), 
-        which leads to differences in scatter/gather operations for SP. 
-        The implementation differences are summarized as follows: 
-        1. EXIT_SP_ON_ENTRY is equivalent to NO_SP because there are no additional collectives (input is not in SP). 
-        2. The reduce-scatter used in training for EXIT_SP_ON_ENTRY_DELAY_MLP_AR is modified to an all-reduce. 
-        3. In OPTIMIZED_SP_MATMUL, 
-            a. We run the router on the entire sequence (avoiding the all-gather of router logits). 
-            b. We scatter/gather the sequence dimension to enter/exit SP before/after ExpertMLPs. 
-            c. Note that OPTIMIZED_SP_MATMUL is not an SPMD workload, and is therefore not supported currently for inference. 
-
-        We run in SP mode only for context encoding, and not for token generation (since sequence length is 1).
-        """
-
-        assert self.sequence_parallel_mode != MoESequenceParallelMode.OPTIMIZED_SP_MATMUL, "OPTIMIZED_SP_MATMUL is unsupported for inference" 
-
-        seq_len, _, _ = hidden_states.shape
-        is_context_encoding = seq_len > 1
-
-        # Get the router_logits, expert_affinities and expert_index from the router
-        # router_logits: (T, E), expert_affinities: (T, E), expert_index: (T, top_k)
-        router_logits, expert_affinities, expert_index = self.router(hidden_states)
-
-        if is_context_encoding and self.sequence_parallel_mode == MoESequenceParallelMode.OPTIMIZED_SP_MATMUL:
-            # Scatter the sequence dimension to enter SP
-            # hidden_states: (B, S, H) -> (B, S', H)
-            hidden_states = mappings.scatter_input_channels_to_tensor_model_parallel_region(hidden_states)
-
-        # Get the output from the ExpertMLPs: (B, S, H)
-        output = self.expert_mlps(hidden_states, expert_affinities, expert_index)
-
-        if self.sequence_parallel_mode == MoESequenceParallelMode.EXIT_SP_ON_ENTRY_DELAY_MLP_AR:
-            # Perform delayed all-reduce (required since the MLP is in TP)
-            output = mappings.reduce_from_tensor_model_parallel_region(output)
-
-        if is_context_encoding and self.sequence_parallel_mode == MoESequenceParallelMode.OPTIMIZED_SP_MATMUL:
-            # output: (B, S', H) -> (B, S', H)
-            output = mappings.gather_from_tensor_model_parallel_region_second_dim(output)
-
-        return output, router_logits, expert_index

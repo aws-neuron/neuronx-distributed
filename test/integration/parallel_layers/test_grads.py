@@ -22,21 +22,13 @@ datetime_str = str(datetime.now())
 
 def parse_args():
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument(
-        "--test_json",
-        required=False,
-        help="input json listing the test spec for network to compile",
-    )
     parser.add_argument("--s3_dir", required=False, help="location to upload all test artifacts")
     parser.add_argument("--s3_bucket", default="s3://ktf-test-runs/neuronx_distributed_parallel_layers/layers")
     args, leftovers = parser.parse_known_args()
     S3_BUCKET_NAME = args.s3_bucket
-    with open(args.test_json, "r") as f:
-        test_dict = json.load(f)
-    return test_dict, S3_BUCKET_NAME, args
+    return S3_BUCKET_NAME, args
 
-
-test_config, S3_BUCKET_NAME, args = parse_args()
+S3_BUCKET_NAME, args = parse_args()
 results = {"inference_success": 1}
 
 
@@ -112,7 +104,7 @@ def test_single_layer_output_module():
     global results
     try:
         _test_single_layer_output_module()
-    except:
+    except Exception:
         results["inference_success"] = 0
         print(traceback.format_exc())
         raise
@@ -218,22 +210,10 @@ def test_tp_zero1_pp_gradient_clipping(tensor_parallel_size, pipeline_parallel_s
     global results
     try:
         _test_tp_zero1_pp_gradient_clipping(tensor_parallel_size, pipeline_parallel_size)
-    except:
+    except Exception:
         results["inference_success"] = 0
         print(traceback.format_exc())
         raise
-
-
-def upload_to_s3():
-    os.system(f'aws s3 cp --no-progress "{datetime_str}" {S3_BUCKET_NAME}')
-
-
-def on_exit():
-    # upload_to_s3()
-    for k in test_config:
-        os.system(f"rm {args.test_json}")
-        with open(args.test_json, "w") as f:
-            json.dump({k: results}, f)
 
 
 if __name__ == "__main__":
@@ -249,4 +229,3 @@ if __name__ == "__main__":
     test_tp_zero1_pp_gradient_clipping(tensor_parallel_size=8, pipeline_parallel_size=1)
     test_tp_zero1_pp_gradient_clipping(tensor_parallel_size=2, pipeline_parallel_size=4)
     test_single_layer_output_module()
-    atexit.register(on_exit)

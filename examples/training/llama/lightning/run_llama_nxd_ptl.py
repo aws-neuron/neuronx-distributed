@@ -21,25 +21,12 @@ import sys
 
 import torch
 import torch_xla.core.xla_model as xm
-from data_module import NeuronLightningDataModule
-from modeling_llama_nxd import (
-    CoreAttention,
-    LlamaDecoderLayer,
-    LlamaForCausalLM,
-    LlamaRMSNorm,
-    init_weights,
-)
-from module_llama import NeuronLlamaLTModule
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint
-from training_utils import (
-    create_llama_pretraining_dataset,
-    get_learning_rate_scheduler,
-    get_mixed_precision_config,
-    get_param_groups_by_weight_decay,
-    get_sin_cos_matrix,
-)
 from transformers import LlamaConfig, set_seed
+# Workaround for NaNs seen with transformers version >= 4.21.0
+# https://github.com/aws-neuron/aws-neuron-sdk/issues/593
+import transformers.modeling_utils as modeling_utils
 from transformers.optimization import get_linear_schedule_with_warmup
 
 import neuronx_distributed as nxd
@@ -52,12 +39,25 @@ from neuronx_distributed.lightning import (
 from neuronx_distributed.parallel_layers import mappings
 from neuronx_distributed.utils.adamw_fp32_optim_params import AdamW_FP32OptimParams
 
+from data_module import NeuronLightningDataModule
+from modeling_llama_nxd import (
+    CoreAttention,
+    LlamaDecoderLayer,
+    LlamaForCausalLM,
+    LlamaRMSNorm,
+    init_weights,
+)
+from module_llama import NeuronLlamaLTModule
+from training_utils import (
+    create_llama_pretraining_dataset,
+    get_learning_rate_scheduler,
+    get_mixed_precision_config,
+    get_param_groups_by_weight_decay,
+    get_sin_cos_matrix,
+)
+
 # For PT autocast.
 torch.cuda.is_bf16_supported = lambda: True
-
-# Workaround for NaNs seen with transformers version >= 4.21.0
-# https://github.com/aws-neuron/aws-neuron-sdk/issues/593
-import transformers.modeling_utils as modeling_utils
 
 if os.environ.get("XLA_USE_BF16") or os.environ.get("XLA_DOWNCAST_BF16"):
     modeling_utils.get_parameter_dtype = lambda x: torch.bfloat16
@@ -103,6 +103,7 @@ def train_llama(args):
             "use_zero1_optimizer": args.use_zero1_optimizer > 0,
             "use_optimizer_wrapper": True,
             "broadcast_and_average_loss": args.log_rank0 > 0,
+            "fuse_microbatches": args.fuse_microbatches > 0,
         }
 
     # Create model with different options
@@ -223,7 +224,7 @@ def train_llama(args):
     else:
         trainer.fit(model=model, datamodule=dm)
 
-    print(f"Training finished!")
+    print("Training finished!")
 
 
 def _mp_fn(index, args):
@@ -376,9 +377,15 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--use_gpu_compatible_precision",
-        default=0,
+        default=1,
         type=int,
         help="Use gpu compatible precision",
+    )
+    parser.add_argument(
+        "--fuse_microbatches",
+        type=int,
+        default=0,
+        help="Fuse microbatches into a single graph"
     )
 
     args = parser.parse_args(sys.argv[1:])

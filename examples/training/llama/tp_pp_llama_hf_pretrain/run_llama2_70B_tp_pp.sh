@@ -66,7 +66,7 @@ echo $DISTRIBUTED_ARGS
 # Input sequence length
 SEQ_LEN=4096
 # Pipeline parallel degree
-PP_DEGREE=4
+: ${PP_DEGREE:=8}
 # Virtual pipeline degree
 : ${VPP_DEGREE:=1}
 # Tensor parallel degree
@@ -78,6 +78,10 @@ BS=$(($GBS / $DP))
 # Number microbatches for pipeline execution
 # Setting same as BS so each microbatch contains a single datasample
 NUM_MICROBATCHES=$BS
+
+# Turn on the GPU compatible precision by default
+: ${GPU_COMPATIBLE_PRECISION:=1}
+
 DATA_PATH="$HOME/examples_datasets/wikicorpus_llama${LLAMA_VERSION}_tokenized_4k"
 
 
@@ -117,5 +121,6 @@ torchrun $DISTRIBUTED_ARGS run_llama_nxd.py \
     --use_selective_checkpoint 1 \
     --qkv_linear 1 \
     --kv_replicator 4 \
+    --use_gpu_compatible_precision $GPU_COMPATIBLE_PRECISION \
     --tb_dir $tb_dir |& tee $LOG_PATH/log
 exit ${PIPESTATUS[0]}

@@ -20,21 +20,13 @@ datetime_str = str(datetime.now())
 
 def parse_args():
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument(
-        "--test_json",
-        required=False,
-        help="input json listing the test spec for network to compile",
-    )
     parser.add_argument("--s3_dir", required=False, help="location to upload all test artifacts")
     parser.add_argument("--s3_bucket", default="s3://ktf-test-runs/neuronx_distributed_parallel_layers/layers")
     args, leftovers = parser.parse_known_args()
     S3_BUCKET_NAME = args.s3_bucket
-    with open(args.test_json, "r") as f:
-        test_dict = json.load(f)
-    return test_dict, S3_BUCKET_NAME, args
+    return S3_BUCKET_NAME, args
 
-
-test_config, S3_BUCKET_NAME, args = parse_args()
+S3_BUCKET_NAME, args = parse_args()
 results = {"inference_success": 1}
 
 
@@ -45,7 +37,7 @@ def set_random_seed(seed):
     torch.manual_seed(seed)
 
 
-def test_qkv_linear_with_kv_multipler_1(tensor_model_parallel_size):
+def test_qkv_linear_with_kv_multipler_1(tensor_model_parallel_size, fuse_qkv=False):
     def _test_qkv_linear_with_kv_multipler_1():
         batch_size = 8
         seq_length = 128
@@ -69,6 +61,7 @@ def test_qkv_linear_with_kv_multipler_1(tensor_model_parallel_size):
             sequence_parallel_enabled=True,
             keep_master_weight=True,
             kv_size_multiplier=1,
+            fuse_qkv=fuse_qkv
         ).to(device)
 
         row_linear = layers.RowParallelLinear(
@@ -127,10 +120,18 @@ def test_qkv_linear_with_kv_multipler_1(tensor_model_parallel_size):
         with torch.no_grad():
             dldy = orig_loss_weight.clone()
             x = orig_input_tensor.clone()
-            ref_q_linear.weight.copy_(col_linear.master_weight_q)
-            ref_k_linear.weight.copy_(col_linear.master_weight_k)
-            ref_v_linear.weight.copy_(col_linear.master_weight_v)
-            ref_mlp_linear.weight.copy_(row_linear.master_weight)
+            if fuse_qkv:
+                sizes = [tensor_model_parallel_size * hidden_size, tensor_model_parallel_size * hidden_size, tensor_model_parallel_size * hidden_size]
+                master_weight_q, master_weight_k, master_weight_v = torch.split(col_linear.master_weight_qkv, sizes, dim=0)
+                ref_q_linear.weight.copy_(master_weight_q)
+                ref_k_linear.weight.copy_(master_weight_k)
+                ref_v_linear.weight.copy_(master_weight_v)
+                ref_mlp_linear.weight.copy_(row_linear.master_weight)
+            else:
+                ref_q_linear.weight.copy_(col_linear.master_weight_q)
+                ref_k_linear.weight.copy_(col_linear.master_weight_k)
+                ref_v_linear.weight.copy_(col_linear.master_weight_v)
+                ref_mlp_linear.weight.copy_(row_linear.master_weight)
         x.requires_grad_()
         expected_q, expected_k, expected_v = ref_q_linear(x), ref_k_linear(x), ref_v_linear(x)
         e_q, e_k, e_v = (
@@ -181,42 +182,48 @@ def test_qkv_linear_with_kv_multipler_1(tensor_model_parallel_size):
             atol=1e-2,
         ), "output_v doesn't match rank{}".format(xm.get_ordinal())
 
-        # if tensor_model_parallel_size_ == 1:
         expected_q_grad_chunk = ref_q_linear.weight.grad.chunk(
             chunks=tensor_model_parallel_size_,
             dim=0,
         )[parallel_state.get_tensor_model_parallel_rank()]
-
-        assert np.allclose(
-            col_linear.weight_q.grad.detach().cpu().numpy(),
-            expected_q_grad_chunk.detach().cpu().numpy(),
-            rtol=1e-2,
-            atol=1e-2,
-        ), "grad_q doesn't match rank{}".format(xm.get_ordinal())
-
         expected_k_grad_chunk = ref_k_linear.weight.grad.chunk(
             chunks=tensor_model_parallel_size_,
             dim=0,
         )[parallel_state.get_tensor_model_parallel_rank()]
-
-        assert np.allclose(
-            col_linear.weight_k.grad.detach().cpu().numpy(),
-            expected_k_grad_chunk.detach().cpu().numpy(),
-            rtol=1e-2,
-            atol=1e-2,
-        ), "grad_k doesn't match rank{}".format(xm.get_ordinal())
-
         expected_v_grad_chunk = ref_v_linear.weight.grad.chunk(
             chunks=tensor_model_parallel_size_,
             dim=0,
         )[parallel_state.get_tensor_model_parallel_rank()]
 
-        assert np.allclose(
-            col_linear.weight_v.grad.detach().cpu().numpy(),
-            expected_v_grad_chunk.detach().cpu().numpy(),
-            rtol=1e-2,
-            atol=1e-2,
-        ), "grad_v doesn't match rank{}".format(xm.get_ordinal())
+        if fuse_qkv:
+            expected_qkv_grad_chunk = torch.cat([expected_q_grad_chunk, expected_k_grad_chunk, expected_v_grad_chunk], dim=0)
+            assert np.allclose(
+                col_linear.weight_qkv.grad.detach().cpu().numpy(),
+                expected_qkv_grad_chunk.detach().cpu().numpy(),
+                rtol=5e-2,
+                atol=1e-2,
+            ), "grad_qkv doesn't match rank{}".format(xm.get_ordinal())
+        else:
+            assert np.allclose(
+                col_linear.weight_q.grad.detach().cpu().numpy(),
+                expected_q_grad_chunk.detach().cpu().numpy(),
+                rtol=1e-2,
+                atol=1e-2,
+            ), "grad_q doesn't match rank{}".format(xm.get_ordinal())
+
+            assert np.allclose(
+                col_linear.weight_k.grad.detach().cpu().numpy(),
+                expected_k_grad_chunk.detach().cpu().numpy(),
+                rtol=1e-2,
+                atol=1e-2,
+            ), "grad_k doesn't match rank{}".format(xm.get_ordinal())
+
+            assert np.allclose(
+                col_linear.weight_v.grad.detach().cpu().numpy(),
+                expected_v_grad_chunk.detach().cpu().numpy(),
+                rtol=1e-2,
+                atol=1e-2,
+            ), "grad_v doesn't match rank{}".format(xm.get_ordinal())
 
         # Reset groups
         parallel_state.destroy_model_parallel()
@@ -231,13 +238,13 @@ def test_qkv_linear_with_kv_multipler_1(tensor_model_parallel_size):
     global results
     try:
         _test_qkv_linear_with_kv_multipler_1()
-    except:
+    except Exception:
         results["inference_success"] = 0
         print(traceback.format_exc())
         raise
 
 
-def test_qkv_linear_with_kv_multipler_4(tensor_model_parallel_size):
+def test_qkv_linear_with_kv_multipler_4(tensor_model_parallel_size, fuse_qkv=False):
     def _test_qkv_linear_with_kv_multipler_4():
         batch_size = 8
         seq_length = 128
@@ -266,6 +273,7 @@ def test_qkv_linear_with_kv_multipler_4(tensor_model_parallel_size):
             sequence_parallel_enabled=True,
             keep_master_weight=True,
             kv_size_multiplier=kv_shared_group_size,
+            fuse_qkv=fuse_qkv
         ).to(device)
 
         row_linear = layers.RowParallelLinear(
@@ -324,10 +332,18 @@ def test_qkv_linear_with_kv_multipler_4(tensor_model_parallel_size):
         with torch.no_grad():
             dldy = orig_loss_weight.clone()
             x = orig_input_tensor.clone()
-            ref_q_linear.weight.copy_(col_linear.master_weight_q)
-            ref_k_linear.weight.copy_(col_linear.master_weight_k)
-            ref_v_linear.weight.copy_(col_linear.master_weight_v)
-            ref_mlp_linear.weight.copy_(row_linear.master_weight)
+            if fuse_qkv:
+                sizes = [tensor_model_parallel_size * hidden_size, tensor_model_parallel_size * hidden_size // kv_shared_group_size , tensor_model_parallel_size * hidden_size // kv_shared_group_size]
+                master_weight_q, master_weight_k, master_weight_v = torch.split(col_linear.master_weight_qkv, sizes, dim=0)
+                ref_q_linear.weight.copy_(master_weight_q)
+                ref_k_linear.weight.copy_(master_weight_k)
+                ref_v_linear.weight.copy_(master_weight_v)
+                ref_mlp_linear.weight.copy_(row_linear.master_weight)
+            else:
+                ref_q_linear.weight.copy_(col_linear.master_weight_q)
+                ref_k_linear.weight.copy_(col_linear.master_weight_k)
+                ref_v_linear.weight.copy_(col_linear.master_weight_v)
+                ref_mlp_linear.weight.copy_(row_linear.master_weight)
         x.requires_grad_()
         expected_q, expected_k, expected_v = ref_q_linear(x), ref_k_linear(x), ref_v_linear(x)
         e_q, e_k, e_v = (
@@ -355,32 +371,53 @@ def test_qkv_linear_with_kv_multipler_4(tensor_model_parallel_size):
             chunks=tensor_model_parallel_size_,
             dim=0,
         )[parallel_state.get_tensor_model_parallel_rank()]
-        assert np.allclose(
-            col_linear.weight_q.grad.detach().cpu().numpy(),
-            expected_q_grad_chunk.detach().cpu().numpy(),
-            rtol=1e-2,
-            atol=1e-2,
-        ), "grad_q doesn't match rank{}".format(xm.get_ordinal())
-
         expected_k_grad_chunk = ref_k_linear.weight.grad.chunk(
             chunks=tensor_model_parallel_size_ // kv_shared_group_size,
             dim=0,
         )[parallel_state.get_tensor_model_parallel_rank() % 8]
-        assert np.allclose(
-            col_linear.weight_k.grad.detach().cpu().numpy(), expected_k_grad_chunk.cpu().numpy(), rtol=1e-2, atol=1
-        ), "grad_k doesn't match rank{}".format(xm.get_ordinal())
 
         expected_v_grad_chunk = ref_v_linear.weight.grad.chunk(
             chunks=tensor_model_parallel_size_ // kv_shared_group_size,
             dim=0,
         )[parallel_state.get_tensor_model_parallel_rank() % 8]
+        if fuse_qkv:
+            grad_q_chunk, grad_k_chunk, grad_v_chunk = torch.split(col_linear.weight_qkv.grad.detach().cpu(), [hidden_size,hidden_size,hidden_size], dim=0)
+            assert np.allclose(
+                grad_q_chunk.numpy(),
+                expected_q_grad_chunk.detach().cpu().numpy(),
+                rtol=5e-2,
+                atol=1e-2,
+            ), "grad_q doesn't match rank{}".format(xm.get_ordinal())
+            assert np.allclose(
+                grad_k_chunk.numpy(),
+                expected_k_grad_chunk.detach().cpu().numpy(),
+                rtol=1e-2,
+                atol=1,
+            ), "grad_k doesn't match rank{}".format(xm.get_ordinal())
+            assert np.allclose(
+                grad_v_chunk.numpy(),
+                expected_v_grad_chunk.detach().cpu().numpy(),
+                rtol=5e-2,
+                atol=1e-1,
+            ), "grad_v doesn't match rank{}".format(xm.get_ordinal())
+        else:
+            assert np.allclose(
+                col_linear.weight_q.grad.detach().cpu().numpy(),
+                expected_q_grad_chunk.detach().cpu().numpy(),
+                rtol=1e-2,
+                atol=1e-2,
+            ), "grad_q doesn't match rank{}".format(xm.get_ordinal())
 
-        assert np.allclose(
-            col_linear.weight_v.grad.detach().cpu().numpy(),
-            expected_v_grad_chunk.detach().cpu().numpy(),
-            rtol=5e-2,
-            atol=1e-1,
-        ), "grad_v doesn't match rank{}".format(xm.get_ordinal())
+            assert np.allclose(
+                col_linear.weight_k.grad.detach().cpu().numpy(), expected_k_grad_chunk.cpu().numpy(), rtol=1e-2, atol=1
+            ), "grad_k doesn't match rank{}".format(xm.get_ordinal())
+
+            assert np.allclose(
+                col_linear.weight_v.grad.detach().cpu().numpy(),
+                expected_v_grad_chunk.detach().cpu().numpy(),
+                rtol=5e-2,
+                atol=1e-1,
+            ), "grad_v doesn't match rank{}".format(xm.get_ordinal())
 
         # Reset groups
         parallel_state.destroy_model_parallel()
@@ -395,18 +432,10 @@ def test_qkv_linear_with_kv_multipler_4(tensor_model_parallel_size):
     global results
     try:
         _test_qkv_linear_with_kv_multipler_4()
-    except:
+    except Exception:
         results["inference_success"] = 0
         print(traceback.format_exc())
         raise
-
-
-def on_exit():
-    if xm.get_ordinal() == 0:
-        for k in test_config:
-            os.system(f"rm {args.test_json}")
-            with open(args.test_json, "w") as f:
-                json.dump({k: results}, f)
 
 
 if __name__ == "__main__":
@@ -418,6 +447,9 @@ if __name__ == "__main__":
         torch.distributed.init_process_group("xla")
     world_size = xm.xrt_world_size()
     tensor_model_parallel_size = 32
+    # Set the XLA_DISABLE_FUNCTIONALIZATION flag to avoid accuracy issues with PT2.1 and fused_qkv
+    os.environ['XLA_DISABLE_FUNCTIONALIZATION'] = '0'
     test_qkv_linear_with_kv_multipler_1(tensor_model_parallel_size)
+    test_qkv_linear_with_kv_multipler_1(tensor_model_parallel_size, fuse_qkv=True)
     test_qkv_linear_with_kv_multipler_4(tensor_model_parallel_size)
-    atexit.register(on_exit)
+    test_qkv_linear_with_kv_multipler_4(tensor_model_parallel_size, fuse_qkv=True)

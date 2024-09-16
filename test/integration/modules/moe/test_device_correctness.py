@@ -1,23 +1,23 @@
 import argparse
-import atexit
-import json
 import os
 import time
-import torch
 import traceback
 
 import loss_fn_correctness_test_helper as lch
+import torch
 
 # Imports from MoE unit tests (for this import to succeed, test/unit_test/modules/moe must be added to PYTHONPATH)
 import utils_testing as ut
-from device_correctness_test_configs import get_device_correctness_test_configs
+from device_correctness_test_configs import (
+    get_device_correctness_test_configs,
+    get_neuron_cc_flags,
+)
 from device_correctness_test_runner import run_device_correctness_test
 
 from neuronx_distributed.modules.moe import (
     load_balancing_loss_func as neuron_load_balancing_loss_func,
 )
 from neuronx_distributed.parallel_layers.utils import is_pjrt_device
-
 
 SEPARATOR = "-" * 70
 
@@ -43,37 +43,23 @@ GRAD_TEST_TOLS_BF16 = {
 
 def parse_args():
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument(
-        "--test_json",
-        required=False,
-        help="input json listing the test spec for network to compile",
-    )
     parser.add_argument("--s3_dir", required=False, help="location to upload all test artifacts")
     parser.add_argument("--s3_bucket", default="s3://ktf-test-runs/neuronx_distributed_modules/moe")
     parser.add_argument("--test_dtype", required=True, choices=["fp32", "bf16"], help="Either fp32 or bf16")
     args, leftovers = parser.parse_known_args()
     S3_BUCKET_NAME = args.s3_bucket
-    with open(args.test_json, "r") as f:
-        test_dict = json.load(f)
     test_dtype = torch.float32 if args.test_dtype == "fp32" else torch.bfloat16
-    return test_dict, S3_BUCKET_NAME, args, test_dtype
+    return S3_BUCKET_NAME, args, test_dtype
 
 
-test_config, S3_BUCKET_NAME, args, TEST_DTYPE = parse_args()
+S3_BUCKET_NAME, args, TEST_DTYPE = parse_args()
 results = {"inference_success": 1}
 
-if "--model-type" not in os.environ.get("NEURON_CC_FLAGS", ""):
-    os.environ["NEURON_CC_FLAGS"] = os.environ.get("NEURON_CC_FLAGS", "") + " --model-type=transformer "
-else:
-    assert any(s in os.environ["NEURON_CC_FLAGS"] for s in ["--model-type transformer", "--model-type=transformer"])
+# Set compiler flags before TRN enablement
+os.environ["NEURON_CC_FLAGS"] = get_neuron_cc_flags(test_dtype=TEST_DTYPE)
 
-
-if TEST_DTYPE == torch.float32:
-    # Set compiler flag to disable auto-casting before TRN enablement
-    assert "--auto-cast" not in os.environ.get("NEURON_CC_FLAGS", "")
-    os.environ["NEURON_CC_FLAGS"] = os.environ.get("NEURON_CC_FLAGS", "") + " --auto-cast=none"
-
-import torch_xla.core.xla_model as xm  # TRN enablement
+# TRN enablement
+import torch_xla.core.xla_model as xm  # noqa: E402
 
 
 def summarize_test(start_time, num_tests, failed):
@@ -100,9 +86,9 @@ def test_moe_layer_device_correctness():
             print(f"Running test {i+1}/{len(test_configs)}: {str(cfg)}")
             try:
                 run_device_correctness_test(cfg, output_test_tols, grad_test_tols)
-                print(f"ok\n")
-            except Exception as e:
-                print(f"Failed test")
+                print("ok\n")
+            except Exception:
+                print("Failed test")
                 print(traceback.format_exc())
                 failed += 1
         summarize_test(start_time, len(test_configs), failed)
@@ -110,7 +96,7 @@ def test_moe_layer_device_correctness():
     global results
     try:
         _test_moe_layer_device_correctness()
-    except:
+    except Exception:
         results["inference_success"] = 0
         print(traceback.format_exc())
         raise
@@ -148,9 +134,9 @@ def test_loss_fn_device_correctness():
                         assert neuron_loss.dtype == cpu_loss.dtype
                         TEST_TOLS = lch.FP32_TEST_TOLS if cfg.dtype == torch.float32 else lch.BF16_TEST_TOLS
                         ut.check_tensors(neuron_loss.cpu(), cpu_loss, **TEST_TOLS, additional_msg=f"Iteration {it}")
-                print(f"ok\n")
-            except Exception as e:
-                print(f"Failed test")
+                print("ok\n")
+            except Exception:
+                print("Failed test")
                 print(traceback.format_exc())
                 failed += 1
         summarize_test(start_time, len(test_configs), failed)
@@ -158,18 +144,10 @@ def test_loss_fn_device_correctness():
     global results
     try:
         _test_loss_fn_device_correctness()
-    except:
+    except Exception:
         results["inference_success"] = 0
         print(traceback.format_exc())
         raise
-
-
-def on_exit():
-    if xm.get_ordinal() == 0:
-        for k in test_config:
-            os.system(f"rm {args.test_json}")
-            with open(args.test_json, "w") as f:
-                json.dump({k: results}, f)
 
 
 if __name__ == "__main__":
@@ -184,4 +162,3 @@ if __name__ == "__main__":
     test_moe_layer_device_correctness()
     print(f"Running loss fn device correctness test, test_dtype={str(TEST_DTYPE)}")
     test_loss_fn_device_correctness()
-    atexit.register(on_exit)

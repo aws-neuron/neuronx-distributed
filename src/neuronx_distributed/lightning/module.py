@@ -4,6 +4,7 @@ from typing import Any, Callable, Dict, Optional, Tuple, Union
 import torch
 import torch_xla.core.xla_model as xm
 from lightning_utilities.core.apply_func import apply_to_collection
+from lightning_utilities.core.rank_zero import rank_zero_warn
 from pytorch_lightning import LightningModule
 from pytorch_lightning.trainer.connectors.logger_connector.fx_validator import (
     _FxValidator,
@@ -32,7 +33,7 @@ class NeuronLTModule(LightningModule):
         opt_kwargs: Dict = {},
         scheduler_args: Tuple = (),
         scheduler_kwargs: Dict = {},
-        model_fn: Callable = None,
+        model_fn: Optional[Callable[..., Any]] = None,
         grad_accum_steps: int = 1,
         train_batch_size: int = 16,
         logging_interval: int = 1,
@@ -116,7 +117,7 @@ class NeuronLTModule(LightningModule):
 
     def get_param_groups_by_weight_decay(self):
         """Get param groups. Customers can override this to have their own way of weight_decay"""
-        if hasattr(self.model, "local_named_parameters"):
+        if hasattr(self.model, "local_named_parameters") and hasattr(self.model, "partitioned") and self.model.partitioned:
             # Zero1 use the first param in opt to decide the device
             param_optimizer = list(self.model.local_named_parameters())
         else:

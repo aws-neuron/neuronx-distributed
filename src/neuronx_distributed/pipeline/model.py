@@ -40,6 +40,7 @@ from neuronx_distributed.utils.model_utils import (
     maybe_materalize_model,
     move_model_to_device,
     reinit_model,
+    get_delay_tracing,
 )
 from neuronx_distributed.utils.serialization import (
     SerializationManager,
@@ -75,6 +76,8 @@ class NxDPPModel(nn.Module):
         return_loss_on_cpu: Optional[bool] = True,
         deallocate_pipeline_outputs: bool = False,
         auto_partition: Optional[bool] = False,
+        fuse_microbatches: Optional[bool] = False,
+        _delay_tracing: Optional[bool] = False,
         _turn_off_odd_even_scheduler: Optional[bool] = False,
         _all_reduce_send_recv: Optional[bool] = False,
         _fused_send_recv: Optional[bool] = False,
@@ -203,7 +206,8 @@ class NxDPPModel(nn.Module):
         super(NxDPPModel, self).__init__()
         if not parallel_state.model_parallel_is_initialized() and not _debug_mode:
             raise RuntimeError(
-                "Model parallelism needs to be initialzed before applying NxDPPModel wrapper. Please call neuronx_distributed.parallel_layers.initialize_model_parallel(pipeline_model_parallel_size, tensor_model_parallel_size)"  # noqa: E501
+                "Model parallelism needs to be initialzed before applying NxDPPModel wrapper. Please call neuronx_distributed.parallel_layers.initialize_model_parallel(pipeline_model_parallel_size, tensor_model_parallel_size)"
+                # noqa: E501
             )
         if transformer_layer_cls is None:
             raise ValueError("NxDPPModel requires transformer_layer_cls as input")
@@ -223,6 +227,11 @@ class NxDPPModel(nn.Module):
         self.virtual_pipeline_size = virtual_pipeline_size
         self.param_init_fn = param_init_fn
         self._all_reduce_send_recv = _all_reduce_send_recv
+        self.fuse_microbatches = fuse_microbatches
+        if self.fuse_microbatches:
+            if self.return_loss_on_cpu:
+                logger.warning("return_loss_on_cpu will be set to False when fuse_microbatches is set to True.")
+            self.return_loss_on_cpu = False
 
         # Non-public config
         self._mark_step_before_pp_runtime = _mark_step_before_pp_runtime
@@ -244,7 +253,7 @@ class NxDPPModel(nn.Module):
 
         self._metadata_comm_type = "gloo" if _use_gloo_for_metadata_comm else "tcp"
         if not parallel_state.is_tcp_store_available() and self._metadata_comm_type == "tcp":
-            logger.warning(f"Can not get default tcp_store, fall back to use gloo for metadata communication")
+            logger.warning("Can not get default tcp_store, fall back to use gloo for metadata communication")
             self._metadata_comm_type = "gloo"
 
         # Use Odd/Even schedule when num_microbatches==pipeline_parallel_size
@@ -278,6 +287,14 @@ class NxDPPModel(nn.Module):
         self.local_name_to_original_name = {}
         self.original_name_to_local_name = {}
         self.local_stage_modules = []
+        self._delay_tracing = _delay_tracing
+        self.meta_device_parameter_map = None
+        self.leaf_module_cls = leaf_module_cls
+        self.autowrap_functions = autowrap_functions
+        self.autowrap_modules = autowrap_modules
+        self.autowrap_obj_methods = autowrap_obj_methods
+        self.tracer_cls = tracer_cls
+        self.meta_named_parameters = {}
 
         self.clear_minibatch_state()
         if not _debug_mode:
@@ -295,16 +312,20 @@ class NxDPPModel(nn.Module):
             model_layers = self.get_model_layers(self.original_torch_module, self.transformer_layer_cls)
             if len(model_layers) == 0:
                 raise ValueError(f"No modules of type {self.transformer_layer_cls} found in the model.")
-            if torch.distributed.get_rank() == 0:
-                logger.info("Model transformer layers are: \n{}".format(model_layers))
+            logger.info("Model transformer layers are: \n%s", model_layers)
             num_partitions = self.pipeline_parallel_size * self.virtual_pipeline_size
             pipeline_cuts = create_partitions(num_partitions, model_layers)
-            if torch.distributed.get_rank() == 0:
-                logger.info("Pipeline cuts are: \n{}".format(pipeline_cuts))
+            logger.info("Pipeline cuts are: \n%s", pipeline_cuts)
 
-        # If pipeline cuts are set, directly run tracing and partition
-        if pipeline_cuts is not None and len(pipeline_cuts) > 0:
+        # If pipeline cuts are set and input names are provided, directly run tracing and partition
+        if pipeline_cuts is not None and len(pipeline_cuts) > 0 and not self._delay_tracing:
+            if input_names is None:
+                raise ValueError(
+                    "Input names are required for tracing when the NxD optimizer and model wrapper are not used"
+                )
             self.trace(
+                args=None,
+                kwargs=None,
                 input_names=input_names,
                 leaf_modules=leaf_module_cls,
                 autowrap_functions=autowrap_functions,
@@ -371,6 +392,8 @@ class NxDPPModel(nn.Module):
 
     def trace(
         self,
+        args: Optional[List[str]] = None,
+        kwargs: Optional[Dict[Any, Any]] = None,
         input_names: Optional[List[str]] = None,
         leaf_modules: Optional[List[Any]] = None,
         autowrap_functions: Optional[List[Callable]] = None,
@@ -406,6 +429,8 @@ class NxDPPModel(nn.Module):
         leaf_modules.append(self.transformer_layer_cls.__name__)
         self.traced_model = trace_model(
             self.original_torch_module,
+            args=args,
+            kwargs=kwargs,
             input_names=input_names,
             leaf_modules=leaf_modules,
             autowrap_functions=autowrap_functions,
@@ -432,7 +457,8 @@ class NxDPPModel(nn.Module):
 
         if (self.pipeline_parallel_size * self.virtual_pipeline_size) != num_stages:
             raise ValueError(
-                f"User cut stages {num_stages} mismatch the initialized pipeline parallel size {self.pipeline_parallel_size}"  # noqa: E501
+                f"User cut stages {num_stages} mismatch the initialized pipeline parallel size {self.pipeline_parallel_size}"
+                # noqa: E501
             )
         assert (
             self.traced_model is not None
@@ -471,6 +497,18 @@ class NxDPPModel(nn.Module):
             )
 
         self._post_partition(qualname_map)
+
+        # Execute steps to move model to device in case of delayed tracing flow
+        if get_delay_tracing(self):
+            self._create_meta_parameter_map()
+            self.maybe_materialize_local_module()
+            self.move_model_to_device()
+            self._get_meta_device_parameter_map()
+
+        # Execute post partition hooks
+        from neuronx_distributed.trainer import hooks
+
+        hooks.execute_all_hooks(self)
 
     def _post_partition(self, qualname_map):
         # Create name mapping between original parameter to partitioned parameter
@@ -602,6 +640,23 @@ class NxDPPModel(nn.Module):
                             torch.distributed.all_reduce(p.data, group=pg)
                         break
 
+    def _create_meta_parameter_map(self):
+        for n, p in self.named_parameters():
+            self.meta_named_parameters[n] = p
+        return self.meta_named_parameters
+
+    def _get_meta_device_parameter_map(self):
+        if self.meta_device_parameter_map is not None:
+            return self.meta_device_parameter_map
+        else:
+            self.meta_device_parameter_map = {}
+            for name, param in self.named_parameters():
+                if param.device.type == "xla":
+                    self.meta_device_parameter_map[self.meta_named_parameters[name]] = param
+                else:
+                    self.meta_device_parameter_map[self.meta_named_parameters[name]] = self.meta_named_parameters[name]
+            return self.meta_device_parameter_map
+
     def _mark_pipeline_cuts(self, cut_point):
         # Internal API to mark the cut in the graph
         for node in self.traced_model.graph.nodes:
@@ -632,7 +687,8 @@ class NxDPPModel(nn.Module):
         if self.input_names is not None:
             if set(kwargs.keys()) != set(self.input_names):
                 raise RuntimeError(
-                    f"train/eval inputs ({set(kwargs.keys())}) must be same as the tracing input names {set(self.input_names)}"  # noqa: E501
+                    f"train/eval inputs ({set(kwargs.keys())}) must be same as the tracing input names {set(self.input_names)}"
+                    # noqa: E501
                 )
 
     def _disable_grad_for_nonlocal(self):
@@ -679,23 +735,50 @@ class NxDPPModel(nn.Module):
                 self.should_graph_break = True
             self.shape_traced = True
             end = time.time()
-            logger.info(rmsg(f"Tensor shapes inference finished, total consumed time {end-start}s"))
+            logger.info(rmsg(f"Tensor shapes inference finished, total consumed time {end - start}s"))
             for i in range(self.virtual_pipeline_size):
                 stage_id = self.get_current_stage(i)
                 logger.debug(
                     rmsg(
-                        f"After tracing model chunk {i}'s stage_id_to_IO_input_names {self.stage_id_to_IO_input_names[stage_id]}"  # noqa: E501
+                        f"After tracing model chunk {i}'s stage_id_to_IO_input_names {self.stage_id_to_IO_input_names[stage_id]}"
+                        # noqa: E501
                     )
                 )
 
         # Need to create input iters again since the old one is garbage collected
         self._create_model_inputs_iter(kwargs)
 
-    def run_train(self, **kwargs):
+    def perform_delayed_tracing_and_partition(self, args, kwargs):
+        # Perform tracing
+        model_layers = self.get_model_layers(self.original_torch_module, self.transformer_layer_cls)
+        num_partitions = self.pipeline_parallel_size * self.virtual_pipeline_size
+        pipeline_cuts = create_partitions(num_partitions, model_layers)
+        if pipeline_cuts is not None and len(pipeline_cuts) > 0:
+            self.trace(
+                args=args,
+                kwargs=kwargs,
+                leaf_modules=self.leaf_module_cls,
+                autowrap_functions=self.autowrap_functions,
+                autowrap_modules=self.autowrap_modules,
+                autowrap_obj_methods=self.autowrap_obj_methods,
+                tracer_cls=self.tracer_cls,
+            )
+            for pp_cut in pipeline_cuts:
+                self.cut_pipeline_stage(pp_cut)
+
+        # Perform partition
+        if not self.partitioned:
+            self.partition()
+
+    def run_train(self, *args, **kwargs):
         if self._mark_step_before_pp_runtime:
             self._mark_step()
         self._autocast_enabled = torch.is_autocast_enabled()
         self._autocast_dtype = torch.get_autocast_gpu_dtype()
+
+        if not self.partitioned:
+            self.perform_delayed_tracing_and_partition(args, kwargs)
+
         with torch.cuda.amp.autocast(enabled=False):
             loss = self._run_train(**kwargs)
         self._autocast_enabled = False
@@ -709,6 +792,10 @@ class NxDPPModel(nn.Module):
             self._mark_step()
         self._autocast_enabled = torch.is_autocast_enabled()
         self._autocast_dtype = torch.get_autocast_gpu_dtype()
+
+        if not self.partitioned:
+            self.perform_delayed_tracing_and_partition({}, kwargs)
+
         with torch.cuda.amp.autocast(enabled=False):
             loss = self._run_eval(**kwargs)
         self._autocast_enabled = False
@@ -825,7 +912,8 @@ class NxDPPModel(nn.Module):
         else:
             if len(outputs) != self.stage_id_to_output_count[stage]:
                 raise RuntimeError(
-                    f"Stage {stage} number outputs ({len(outputs)}) mismatches with compiled result ({self.stage_id_to_output_count[stage]})"  # noqa: E501
+                    f"Stage {stage} number outputs ({len(outputs)}) mismatches with compiled result ({self.stage_id_to_output_count[stage]})"
+                    # noqa: E501
                 )
         return outputs
 
@@ -897,13 +985,15 @@ class NxDPPModel(nn.Module):
             if self.current_mb_stage_input[1] != self.current_mb:
                 raise RuntimeError(
                     rmsg(
-                        f"Running ForwardStepTask for mb {self.current_mb} but current_mb_stage_input contains mb {self.current_mb_stage_input[1]}"  # noqa: E501
+                        f"Running ForwardStepTask for mb {self.current_mb} but current_mb_stage_input contains mb {self.current_mb_stage_input[1]}"
+                        # noqa: E501
                     )
                 )
             if self.current_mb_stage_input[2] != self.current_model_chunk:
                 raise RuntimeError(
                     rmsg(
-                        f"Running ForwardStepTask for model chunk {self.current_model_chunk} but current_mb_stage_input contains model chunk {self.current_mb_stage_input[2]}"  # noqa: E501
+                        f"Running ForwardStepTask for model chunk {self.current_model_chunk} but current_mb_stage_input contains model chunk {self.current_mb_stage_input[2]}"
+                        # noqa: E501
                     )
                 )
             if self.current_mb_stage_output is not None:
@@ -959,11 +1049,13 @@ class NxDPPModel(nn.Module):
                         # [TODO] Add support, requires for cross attention
                         if pass_along_io and t.requires_grad:
                             raise RuntimeError(
-                                f"Does not support tensors that require grads to pass along! IO name {name} current stage {next_stage - 1}"  # noqa: E501
+                                f"Does not support tensors that require grads to pass along! IO name {name} current stage {next_stage - 1}"
+                                # noqa: E501
                             )
                         logger.debug(
                             rmsg(
-                                f"fwd mb {self.current_mb} model chunk {self.current_model_chunk} collect {name}'s {idx}th tensor meta {tensor_meta[idx]} for bwd"  # noqa: E501
+                                f"fwd mb {self.current_mb} model chunk {self.current_model_chunk} collect {name}'s {idx}th tensor meta {tensor_meta[idx]} for bwd"
+                                # noqa: E501
                             )
                         )
                         # Collect the outputs that require grad for bwd
@@ -995,11 +1087,13 @@ class NxDPPModel(nn.Module):
             raise RuntimeError("Running BackwardStepTask but current_mb_grads is None")
         if self.current_mb_grads[1] != self.current_mb:
             raise RuntimeError(
-                f"Running BackwardStepTask for mb {self.current_mb} but current_mb_grads contains mb {self.current_mb_grads[1]}"  # noqa: E501
+                f"Running BackwardStepTask for mb {self.current_mb} but current_mb_grads contains mb {self.current_mb_grads[1]}"
+                # noqa: E501
             )
         if self.current_mb_grads[2] != self.current_model_chunk:
             raise RuntimeError(
-                f"Running BackwardStepTask for model chunk {self.current_model_chunk} but current_mb_grads contains model chunk {self.current_mb_grads[2]}"  # noqa: E501
+                f"Running BackwardStepTask for model chunk {self.current_model_chunk} but current_mb_grads contains model chunk {self.current_mb_grads[2]}"
+                # noqa: E501
             )
         if len(self.mb_to_outputs_for_grads[self.current_model_chunk][self.current_mb]) == 0:
             raise RuntimeError(
@@ -1037,7 +1131,8 @@ class NxDPPModel(nn.Module):
             if len(self.mb_to_inputs_for_grads[self.current_model_chunk][self.current_mb]) != 0:
                 raise RuntimeError(
                     rmsg(
-                        "Running ForwardPreprocessTask but mb_to_inputs_for_grads already contains inputs for current mb"  # noqa: E501
+                        "Running ForwardPreprocessTask but mb_to_inputs_for_grads already contains inputs for current mb"
+                        # noqa: E501
                     )
                 )
 
@@ -1109,13 +1204,15 @@ class NxDPPModel(nn.Module):
             if self.current_mb_stage_output[1] != self.current_mb:
                 raise RuntimeError(
                     rmsg(
-                        f"Running ForwardPostprocessTask for mb {self.current_mb} but current_mb_stage_output contains mb {self.current_mb_stage_output[1]}"  # noqa: E501
+                        f"Running ForwardPostprocessTask for mb {self.current_mb} but current_mb_stage_output contains mb {self.current_mb_stage_output[1]}"
+                        # noqa: E501
                     )
                 )
             if self.current_mb_stage_output[2] != self.current_model_chunk:
                 raise RuntimeError(
                     rmsg(
-                        f"Running ForwardPostprocessTask for model chunk {self.current_model_chunk} but current_mb_stage_output contains model chunk {self.current_mb_stage_output[2]}"  # noqa: E501
+                        f"Running ForwardPostprocessTask for model chunk {self.current_model_chunk} but current_mb_stage_output contains model chunk {self.current_mb_stage_output[2]}"
+                        # noqa: E501
                     )
                 )
         outputs = self.current_mb_stage_output[0]
@@ -1132,7 +1229,8 @@ class NxDPPModel(nn.Module):
                 # Tensors that needs to pass along
                 if name not in self.mb_pass_along_io[self.current_mb]:
                     raise RuntimeError(
-                        f"Pass along io {name} is missing, current_mb_pass_along_io {self.mb_pass_along_io[self.current_mb].keys()}"  # noqa: E501
+                        f"Pass along io {name} is missing, current_mb_pass_along_io {self.mb_pass_along_io[self.current_mb].keys()}"
+                        # noqa: E501
                     )
                 current_output, model_chunk = self.mb_pass_along_io[self.current_mb].pop(name)
                 if model_chunk != self.current_model_chunk:
@@ -1292,7 +1390,7 @@ class NxDPPModel(nn.Module):
                 logger.debug(rmsg(f"Run task {task}"))
                 self.current_mb = task.mb
                 self.current_model_chunk = task.model_chunk
-                self.should_graph_break = task.graph_break
+                self.should_graph_break = task.graph_break and (not self.fuse_microbatches)
                 # Equivalent to: self._fwd_step_task()
                 self._exec_instr = MethodType(self._INSTRUCTION_MAP[type(task)], self)
                 self._exec_instr()
@@ -1490,7 +1588,7 @@ class NxDPPModel(nn.Module):
         return pg
 
     def _get_microbatch_dataloader(self, all_batches):
-        return MpDeviceLoader(all_batches, xm.xla_device(), batches_per_execution=self.num_microbatches)
+        return MpDeviceLoader(all_batches, xm.xla_device(), batches_per_execution=self.num_microbatches + 1)
 
     def maybe_materialize_local_module(self):
         """

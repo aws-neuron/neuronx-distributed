@@ -3,15 +3,7 @@ import os
 import numpy as np
 import torch
 from module_llama_orig import NeuronLlamaLTModule as NeuronLlamaLTModuleOrigin
-from pytorch_lightning.trainer.connectors.logger_connector.fx_validator import (
-    _FxValidator,
-)
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
-
-from neuronx_distributed.trainer import (
-    initialize_parallel_model,
-    initialize_parallel_optimizer,
-)
 
 
 def load_events(event_file):
@@ -53,7 +45,7 @@ class NeuronLlamaLTModule(NeuronLlamaLTModuleOrigin):
                 and self.trainer.strategy.pipeline_parallel_rank == self.trainer.strategy.pipeline_parallel_size - 1
             ):
                 print(
-                    f"step {self.global_step} loss is {self.loss.detach().cpu().item()}, lr is {self.lr}, input_ids {torch.sum(self.input_ids.detach().cpu()).item()}"
+                    f"step {self.global_step} loss is {self.loss.detach().cpu().item()}, lr is {self.lr}, throughput {self.tps} seq/s, input_ids {torch.sum(self.input_ids.detach().cpu()).item()}"
                 )
 
                 step_now = self.global_step - 1
