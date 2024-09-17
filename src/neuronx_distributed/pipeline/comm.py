@@ -78,10 +78,8 @@ def recv_from(tensor_meta, recv_prev=True, tracing=False, all_reduce_send_recv=F
         # Use all_gather instead of all_reduce for send/recv
         rank = xm.get_ordinal()
         split_index = 0
-        gr = []
         for group in groups:
             if rank in group:
-                gr = group
                 split_index = sorted(group).index(rank)
                 break
         split_index = 1 - split_index
@@ -167,7 +165,7 @@ def _recv_with_gloo_group(src_rank):
     data = tensor.cpu().numpy().tobytes()
     # get original length
     length = int.from_bytes(data[:4], "big")
-    data = data[4 : length + 4]
+    data = data[4: length + 4]
     return pickle.loads(data)
 
 
@@ -189,7 +187,7 @@ def _recv_with_tcp_store(src_rank):
             # Need to decode since tcp_store.get returns byte types
             obj_str = tcp_store.get(key).decode("utf-8")
             success = True
-        except:
+        except Exception:
             count += 1
     if not success:
         raise RuntimeError(rmsg(f"Failed to receive object with key {key}"))

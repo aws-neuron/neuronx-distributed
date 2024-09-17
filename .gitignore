@@ -134,6 +134,7 @@ dmypy.json
 
 build
 .vscode/
+*.iml
 .attach_pid*
 src/neuronx_distributed.egg-info/
 *.whl

@@ -17,8 +17,8 @@ echo "MBS: $MBS"
 echo "SEQUENCE_PARALLEL: $SEQUENCE_PARALLEL"
 echo "SEQ_LEN: $SEQ_LEN"
 echo "PIPELINE_PARALLEL: $PIPELINE_PARALLEL" # TODO - enable pp when running model
-echo "USE_ZERO_1= $USE_ZERO_1" # 0: use pure DP; 1: use ZeRO-1
-echo "USE_MIX_PRECISION=$USE_MIX_PRECISION" # 0: bf16; 1: mixed precision
+echo "USE_ZERO_1: $USE_ZERO_1" # 0: use pure DP; 1: use ZeRO-1
+echo "USE_MIX_PRECISION: $USE_MIX_PRECISION" # 0: bf16; 1: mixed precision
 echo "SELECTIVE_CHECKPOINT: $SELECTIVE_CHECKPOINT"
 
 #############################################

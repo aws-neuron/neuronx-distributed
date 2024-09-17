@@ -106,9 +106,7 @@ def convert_sbase_to_neuron_state_dict(sbase_state_dict, cfg):
 
     # copy the MLP parameters
     if cfg.glu_mlp:
-        gate_up_proj = torch.empty(
-            cfg.num_experts, hidden_size, 2 * intermediate_size, device=device, dtype=cfg.dtype
-        )
+        gate_up_proj = torch.empty(cfg.num_experts, hidden_size, 2 * intermediate_size, device=device, dtype=cfg.dtype)
         for e in range(cfg.num_experts):
             # Copy gate_proj and up_proj after concatenation
             gate_proj_weights = sbase_state_dict[f"experts.{e}.gate_proj.weight"].T
@@ -116,7 +114,7 @@ def convert_sbase_to_neuron_state_dict(sbase_state_dict, cfg):
             gate_up_proj_slice = torch.narrow(gate_up_proj, 0, e, 1)
             gate_up_proj_weights = torch.cat([gate_proj_weights, up_proj_weights], dim=1)
             gate_up_proj_slice.copy_(gate_up_proj_weights)
-        neuron_state_dict["expert_mlps.gate_up_proj.weight"] = gate_up_proj
+        neuron_state_dict["expert_mlps.mlp_op.gate_up_proj.weight"] = gate_up_proj
     else:
         up_proj = torch.empty(cfg.num_experts, hidden_size, intermediate_size, device=device, dtype=cfg.dtype)
         for e in range(cfg.num_experts):
@@ -124,7 +122,7 @@ def convert_sbase_to_neuron_state_dict(sbase_state_dict, cfg):
             up_proj_weights = sbase_state_dict[f"experts.{e}.up_proj.weight"].T
             up_proj_slice = torch.narrow(up_proj, 0, e, 1)
             up_proj_slice.copy_(up_proj_weights)
-        neuron_state_dict["expert_mlps.up_proj.weight"] = up_proj
+        neuron_state_dict["expert_mlps.mlp_op.up_proj.weight"] = up_proj
 
     down_proj = torch.empty(cfg.num_experts, intermediate_size, hidden_size, device=device, dtype=cfg.dtype)
     for e in range(cfg.num_experts):
@@ -132,6 +130,6 @@ def convert_sbase_to_neuron_state_dict(sbase_state_dict, cfg):
         down_proj_weights = sbase_state_dict[f"experts.{e}.down_proj.weight"].T
         down_proj_slice = torch.narrow(down_proj, 0, e, 1)
         down_proj_slice.copy_(down_proj_weights)
-    neuron_state_dict["expert_mlps.down_proj.weight"] = down_proj
+    neuron_state_dict["expert_mlps.mlp_op.down_proj.weight"] = down_proj
 
     return neuron_state_dict

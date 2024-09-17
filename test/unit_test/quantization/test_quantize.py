@@ -8,10 +8,7 @@ from neuronx_distributed.parallel_layers.layers import (
     RowParallelLinear,
 )
 from neuronx_distributed.quantization.quantization_layers import (
-    BaseQuantizeParallelLinear,
-    QuantizationType,
     QuantizedColumnParallel,
-    QuantizedDtype,
     QuantizedRowParallel,
 )
 from neuronx_distributed.quantization.quantize import convert
@@ -66,7 +63,7 @@ class TestConvert(unittest.TestCase):
 
         # With inplace
         model1 = Model()
-        model2 = convert(module=model1, q_config=None, inplace=True, mapping=None)
+        convert(module=model1, q_config=None, inplace=True, mapping=None)
 
         assert isinstance(model1.linear1.lay1, QuantizedColumnParallel)
         assert isinstance(model1.linear1.lay2, QuantizedRowParallel)

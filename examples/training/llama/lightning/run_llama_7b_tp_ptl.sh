@@ -106,7 +106,7 @@ torchrun $DISTRIBUTED_ARGS \
     --data_dir $DATA_PATH \
     --tensor_parallel_size $TP_DEGREE \
     --train_batch_size $MBS \
-    --steps_this_run $STEPS_THIS_RUN\
+    --steps_this_run $STEPS_THIS_RUN \
     --max_steps $TOTAL_STEPS \
     --warmup_steps $WARMUP_STEPS \
     --lr $LR \

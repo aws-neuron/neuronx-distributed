@@ -6,7 +6,9 @@ import os
 import pathlib
 import shutil
 from collections import defaultdict
-from typing import Any, Callable, List, Optional, Union
+from typing import Any, Callable, List, Optional, Union, Tuple
+from typing import cast
+
 
 import torch
 import torch_neuronx
@@ -95,7 +97,10 @@ class TensorParallelNeuronModel(ParallelModel):
         if not self.load:
             self._load()
         results = []
-        futures = [self.executor.submit(model, *tensors) for model in self.models]
+        if self.executor is not None:
+            futures = [self.executor.submit(model, *tensors) for model in self.models]
+        else:
+            raise RuntimeError("executor is None although it has to be properly initialized")
         for future in concurrent.futures.as_completed(futures):
             results.append(future.result())
         # Here we are making the assumption that we are operating in SPMD mode.
@@ -169,7 +174,7 @@ def _trace(
     inline_weights_to_neff: bool = True,
     bucket_config: Optional[BucketModelConfig] = None,
     tp_degree: int = 1,
-    max_parallel_compilations: int = None,
+    max_parallel_compilations: Optional[int] = None,
 ) -> None:
     os.environ["RANK"] = str(rank)
     if requires_init_pg_override():
@@ -189,7 +194,6 @@ def _trace(
         example_inputs = [example_inputs]
 
     for tp_rank in range(tp_degree):
-        artifacts_collection = []
         if rank == tp_rank:
             for bucket_rank in range(bucket_degree):
                 # Set flag to stop parallel_layes.load() from waiting on all
@@ -234,11 +238,11 @@ def parallel_model_trace(
     inline_weights_to_neff: bool = True,
     bucket_config: Optional[BucketModelConfig] = None,
     tp_degree: int = 1,
-    max_parallel_compilations: int = None,
+    max_parallel_compilations: Optional[int] = None,
     spmd_mode: bool = False,
     checkpoint_loader_callable: Optional[Callable] = None,
     force_custom_init_on_device: bool = False,
-    serialization_path: str = None,
+    serialization_path: Optional[str] = None,
 ) -> ParallelModel:
     """
     Trace a distributed module/function to produce a compiled Neuron ScriptModule.
@@ -267,13 +271,13 @@ def parallel_model_trace(
             the rank specific weights to generate the other ranks.
         checkpoint_loader_callable: A callable method to load the model's checkpoint.  When using
             spmd_mode, checkpoint_loader_callable is a required argument.
-        force_custom_init_on_device: Bool to indidcate whether to force use custom init_on_device functionality
+        force_custom_init_on_device: Bool to indicate whether to force use custom init_on_device functionality
             NOTE: If you are trying to use it for Quantized api, make sure this bool is set to True
         serialization_path: A path to store the serialized traced model if provided. Currently only works
             for SPMD mode.
     Returns:
         A wrapper Module which wraps individual HLO computation which is a
-        fused neuron::foward operation.
+        fused neuron::forward operation.
     """
 
     if bucket_config is not None and inline_weights_to_neff:
@@ -315,7 +319,7 @@ def parallel_model_trace(
         models = _spmd_trace(
             func,
             example_inputs,
-            checkpoint_loader_callable,
+            cast(Callable, checkpoint_loader_callable),
             tp_degree,
             states,
             compiler_workdir,
@@ -326,7 +330,7 @@ def parallel_model_trace(
         )
     else:
         logging.warn(
-            f"Using non SPMD mode. Set spmd_mode=True if the worlkload is SPMD for a faster trace. Tracing in non SPMD mode for large models can run into OOM errors as we compile all ranks"
+            "Using non SPMD mode. Set spmd_mode=True if the worlkload is SPMD for a faster trace. Tracing in non SPMD mode for large models can run into OOM errors as we compile all ranks"
         )
         xmp.spawn(
             _trace,
@@ -340,7 +344,7 @@ def parallel_model_trace(
                 inline_weights_to_neff,
                 bucket_config,
                 tp_degree,
-                max_parallel_compilations if max_parallel_compilations != None else tp_degree,
+                max_parallel_compilations if max_parallel_compilations is not None else tp_degree,
             ),
             start_method="spawn",
             nprocs=tp_degree,
@@ -367,13 +371,13 @@ def parallel_model_save(model: ParallelModel, save_dir: str) -> None:
 
 def find_unique_dtypes(model):
     state_dict = model.state_dict()
-    dtype_map = defaultdict(int)
+    dtype_map: defaultdict = defaultdict(int)
     for _, value in state_dict.items():
         dtype_map[value.dtype] += 1
     return dict(dtype_map)
 
 
-def _load_script_modules(model_dir: str) -> List[torch.ScriptModule]:
+def _load_script_modules(model_dir: str) -> Tuple[List[Any], List[str]]:
     models = []
     with torch_neuronx.contexts.disable_nrt_load():
         model_rank_files = sorted(
@@ -420,7 +424,7 @@ def _spmd_trace(
     compiler_args: Optional[Union[List[str], str]] = None,
     bucket_config: Optional[BucketModelConfig] = None,
     force_custom_init_on_device: bool = False,
-    serialization_path: str = None,
+    serialization_path: Optional[str] = None,
 ):
     """
     Xla trace a signle rank and compile it with neuronx-cc.
@@ -506,8 +510,12 @@ def _validate_traceable(func: Callable, tp_degree: int, force_custom_init_on_dev
     with init_on_device(torch.device("meta"), force_custom_init_on_device=force_custom_init_on_device):
         model, _ = func()
 
+    assert isinstance(
+        model, torch.nn.Module
+    ), "The first return value of func is expected to be of type torch.nn.Module"
+
     def _validate_children(module: torch.nn.Module):
-        if module == None:
+        if module is None:
             return
 
         # Sharding across vocab dimension requires rank level constants for intput masking.
@@ -598,6 +606,16 @@ def _load_weights(
     with init_on_device(torch.device("meta"), force_custom_init_on_device=force_custom_init_on_device):
         model, _ = func()
 
+    get_sharded_checkpoint(checkpoint, model, rank, tp_degree)
+
+    with torch_neuronx.contexts.disable_nrt_load():
+        rank_0_path = os.path.join(compiler_workdir, "tp_0.pt")
+        traced_model = torch.jit.load(rank_0_path)
+        replace_weights(traced_model, checkpoint)
+        return traced_model
+
+
+def get_sharded_checkpoint(checkpoint, model, rank, tp_degree):
     invoke_preshard_hook(model, checkpoint, "")
 
     dtype = None
@@ -607,12 +625,20 @@ def _load_weights(
     # Shards the checkpoint to the right weight for the rank
     shard_children(model, checkpoint, "", dtype, rank, tp_degree)
 
-    with torch_neuronx.contexts.disable_nrt_load():
-        rank_0_path = os.path.join(compiler_workdir, "tp_0.pt")
-        traced_model = torch.jit.load(rank_0_path)
-        replace_weights(traced_model, checkpoint)
-        return traced_model
 
+def create_local_weight_qkv(rank, world_size, full_weight, partition_dim, q_len, kv_len, out_weight=None):
+    # Shard q,k,v weights separately and then fuse them for each rank
+    q_weight, k_weight, v_weight = torch.split(full_weight, [q_len, kv_len, kv_len], dim=partition_dim)
+    q_weight_list = torch.split(q_weight, divide(q_len, world_size), dim=partition_dim)[rank::world_size]
+    k_weight_list = torch.split(k_weight, divide(kv_len, world_size), dim=partition_dim)[rank::world_size]
+    v_weight_list = torch.split(v_weight, divide(kv_len, world_size), dim=partition_dim)[rank::world_size]
+
+    with torch.no_grad():
+        return torch.cat((
+            torch.cat(q_weight_list, dim=partition_dim),
+            torch.cat(k_weight_list, dim=partition_dim),
+            torch.cat(v_weight_list, dim=partition_dim),
+        ), dim=partition_dim, out=out_weight)
 
 def create_local_weight(rank, world_size, full_weight, partition_dim, per_partition_size, stride, out_weight=None):
     per_partition_per_stride_size = divide(per_partition_size, stride)
@@ -635,11 +661,12 @@ def _mock_parallel_state(tp_degree: int, rank: int):
             self.world_size = world_size
 
         def size(self):
-            return tp_degree
+            return self.world_size
 
     parallel_state._TENSOR_MODEL_PARALLEL_GROUP = Mock(tp_degree)
     parallel_state._DATA_PARALLEL_GROUP = Mock(1)
     parallel_state._MPU_TENSOR_MODEL_PARALLEL_RANK = rank
+    parallel_state._EXPERT_MODEL_PARALLEL_GROUP = Mock(1)
 
 
 def invoke_preshard_hook(module, checkpoint, prefix):
@@ -647,7 +674,7 @@ def invoke_preshard_hook(module, checkpoint, prefix):
     Preshard hooks are hooks to manipulate checkpoints
     Checkpoint manipulation for GQA replication is one usecase.
     """
-    if module == None:
+    if module is None:
         return
 
     # This is temporary until we formailze the preshard_hook in src
@@ -665,7 +692,7 @@ def shard_children(module, checkpoint, prefix, dtype, rank, tp_degree):
     Checkpoint weights are sharded based on rank and tp_degree
     """
 
-    if module == None:
+    if module is None:
         return
 
     for name, child in module._modules.items():
@@ -675,7 +702,6 @@ def shard_children(module, checkpoint, prefix, dtype, rank, tp_degree):
     if not isinstance(module, __SUPPORTED_SHARDED_MODULES):
         return
 
-    module_parameter: torch.nn.Parameter = None
     for module_parameter_name, module_parameter in module.named_parameters():
         parameter_name = prefix + module_parameter_name
 
@@ -696,8 +722,15 @@ def shard_children(module, checkpoint, prefix, dtype, rank, tp_degree):
             stride = module_parameter.partition_stride
 
             per_partition_size = tensor.shape[partition_dim] // tp_degree
-            checkpoint[parameter_name] = create_local_weight(
-                rank, tp_degree, tensor, partition_dim, per_partition_size, stride
-            )
+            if hasattr(module_parameter, "fused_qkv"):
+                query_len = module_parameter.num_attention_heads * module_parameter.head_dim
+                kv_len = module_parameter.num_key_value_heads * module_parameter.head_dim
+                checkpoint[parameter_name] = create_local_weight_qkv(
+                    rank, tp_degree, tensor, partition_dim, query_len, kv_len
+                )
+            else:
+                checkpoint[parameter_name] = create_local_weight(
+                    rank, tp_degree, tensor, partition_dim, per_partition_size, stride
+                )
         else:
             checkpoint[parameter_name] = tensor

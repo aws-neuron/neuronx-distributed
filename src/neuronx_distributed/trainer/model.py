@@ -2,6 +2,8 @@ from typing import Any
 
 import torch
 
+from neuronx_distributed.utils.model_utils import get_delay_tracing
+
 
 class NxDModel(torch.nn.Module):
     def __init__(self, module, nxd_config):
@@ -12,7 +14,9 @@ class NxDModel(torch.nn.Module):
 
         self.pp_enabled = nxd_config["pipeline_parallel_size"] > 1
 
-        self.train()
+        if not self.pp_enabled:
+            # When pp is enabled run_train() will handle this, so self.train() can be skipped during init
+            self.train()
 
     def __repr__(self):
         return "NxDModel({})".format(self.module.__repr__())
@@ -46,7 +50,7 @@ class NxDModel(torch.nn.Module):
         return self.module(*args, **kwargs)
 
     def named_parameters(self, *args, **kwargs):
-        if self.pp_enabled:
+        if self.pp_enabled and not get_delay_tracing(self.nxd_config):
             for n, p in self.module.local_named_parameters(*args, **kwargs):
                 yield n, p
             return

@@ -31,7 +31,6 @@ class TestSampling(unittest.TestCase):
         config.top_k = 3
         config.num_beams = 1
         sampler = Sampler(config)
-        neg_inf = -float("inf")
         torch.random.manual_seed(5)
         x = torch.rand((2, 100))
         sampled = sampler.sample(x)

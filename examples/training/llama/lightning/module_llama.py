@@ -69,7 +69,7 @@ class NeuronLlamaLTModule(NeuronLTModule):
             print("Failed to import optimum-neuron dependency, generation will not work on Neuron.")
         # Load Pretrained checkpoint
         if hasattr(self.model_args[0], "pretrained_ckpt") and self.model_args[0].pretrained_ckpt:
-            user_content = nxd.load_checkpoint(
+            nxd.load_checkpoint(
                 self.model_args[0].pretrained_ckpt,
                 tag="pretrained_weight",
                 model=self.model,

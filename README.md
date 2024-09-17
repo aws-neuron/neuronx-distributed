@@ -9,10 +9,10 @@ To install the library, please follow the instructions mentioned here: https://a
 To build from source, run the following command:
 
 ```
-python3 setup.py bdist_wheel
+bash ./build.sh
 ```
-
-It should place the wheel at `dist/`
+ 
+It should place the wheel at `build/`
 
 ## API Reference Guide
 

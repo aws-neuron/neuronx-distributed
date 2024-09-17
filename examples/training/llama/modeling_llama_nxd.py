@@ -764,15 +764,7 @@ def init_weights(module):
     Re-init weights after partition
     Referred from HF transformers https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py#L690
     """
-    if isinstance(module, torch.nn.Linear):
-        module.weight.data.normal_(mean=0.0, std=config.initializer_range)
-        if module.bias is not None:
-            module.bias.data.zero_()
-    elif isinstance(module, torch.nn.Embedding):
-        module.weight.data.normal_(mean=0.0, std=config.initializer_range)
-        if module.padding_idx:
-            module.weight.data[module.padding_idx].zero_()
-    elif isinstance(module, LlamaRMSNorm):
+    if isinstance(module, LlamaRMSNorm):
         module.weight.data.fill_(1.0)
     elif isinstance(module, (ParallelEmbedding, RowParallelLinear, ColumnParallelLinear)):
         module.init_weight_cpu()

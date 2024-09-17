@@ -1,20 +1,24 @@
 import os
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional, TYPE_CHECKING
 
 from lightning_fabric.utilities.cloud_io import _is_dir
 from lightning_fabric.utilities.logger import _add_prefix
+import pytorch_lightning as pl
 from pytorch_lightning.core.saving import save_hparams_to_yaml
 from pytorch_lightning.loggers.tensorboard import TensorBoardLogger
+from pytorch_lightning.utilities.rank_zero import rank_zero_warn
 from torch import Tensor
 
 from neuronx_distributed.parallel_layers.parallel_state import (
     get_data_parallel_rank,
-    get_data_parallel_size,
     get_pipeline_model_parallel_rank,
     get_pipeline_model_parallel_size,
     get_tensor_model_parallel_rank,
     model_parallel_is_initialized,
 )
+
+if TYPE_CHECKING:
+    from torch.utils import tensorboard
 
 
 class NeuronTensorBoardLogger(TensorBoardLogger):
@@ -32,13 +36,11 @@ class NeuronTensorBoardLogger(TensorBoardLogger):
         self._print_step = value
 
     @property
-    def experiment(self) -> "SummaryWriter":
+    def experiment(self) -> "tensorboard.SummaryWriter":
         """Actual tensorboard object. To use TensorBoard features anywhere in your code, do the following.
 
         Example::
-
             logger.experiment.some_tensorboard_function()
-
         """
         """Neuron change, log on the last PP rank"""
         if not self.should_print():
@@ -96,7 +98,8 @@ class NeuronTensorBoardLogger(TensorBoardLogger):
                     ) from ex
 
     def log_graph(  # type: ignore[override]
-        self, model: "pl.LightningModule", input_array: Optional[Tensor] = None
+        self, model: "pl.LightningModule",
+        input_array: Optional[Tensor] = None
     ) -> None:
         """Neuron change, log on the last PP rank"""
         if not self.should_print():
@@ -125,15 +128,12 @@ class NeuronTensorBoardLogger(TensorBoardLogger):
             with pl.core.module._jit_is_scripting():
                 self.experiment.add_graph(model, input_array)
 
-    def should_print(self):
+    def should_print(self) -> bool:
         # For NxD we should log on the last PP
-        assert model_parallel_is_initialized(), f"NxD model parallel not initialized"
+        assert model_parallel_is_initialized(), "NxD model parallel not initialized"
         print_pp_rank = 0 if self.log_rank0 else get_pipeline_model_parallel_size() - 1
         return (
-            get_data_parallel_rank() == 0
-            and get_tensor_model_parallel_rank() == 0
-            and get_pipeline_model_parallel_rank() == print_pp_rank
-            and self.print_step >= 0
+            get_data_parallel_rank() == 0 and get_tensor_model_parallel_rank() == 0 and get_pipeline_model_parallel_rank() == print_pp_rank and self.print_step >= 0
         )
 
 
@@ -143,7 +143,7 @@ class _DummyExperiment:
     def nop(self, *args: Any, **kw: Any) -> None:
         pass
 
-    def __getattr__(self, _: Any) -> Callable:
+    def __getattr__(self, _: Any) -> Callable[..., Any]:
         return self.nop
 
     def __getitem__(self, idx: int) -> "_DummyExperiment":

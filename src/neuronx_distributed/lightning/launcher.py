@@ -65,7 +65,7 @@ class _NeuronXLALauncher(_XLALauncher):
             self._recover_results_in_main_process(worker_output, trainer)
             return worker_output.trainer_results
         else:  # Neuron change for launch with torchrun
-            process_idx = int(os.environ.get("LOCAL_RANK"))
+            process_idx = int(os.environ["LOCAL_RANK"])
             self._strategy._local_rank = process_idx
             results = function(*args, **kwargs)
             _rank_teardown(process_idx)
@@ -76,6 +76,7 @@ class _NeuronXLALauncher(_XLALauncher):
         # XLA's multiprocessing returns the global index, not the local index as torch's multiprocessing
         # https://github.com/pytorch/xla/blob/v1.13.0/torch_xla/distributed/xla_multiprocessing.py#L321
         process_idx: int,
+        trainer: Optional["pl.Trainer"],
         function: Callable,
         args: Any,
         kwargs: Any,

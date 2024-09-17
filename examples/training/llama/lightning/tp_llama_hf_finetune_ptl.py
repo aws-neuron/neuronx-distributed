@@ -21,11 +21,6 @@ import os
 import sys
 
 import numpy as np
-
-current = os.path.dirname(os.path.realpath(__file__))
-parent = os.path.dirname(current)
-sys.path.append(parent)
-
 import torch
 import torch_xla.core.xla_model as xm
 from data_module import NeuronLightningDataModule
@@ -35,9 +30,8 @@ from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint
 from torchmetrics.text.rouge import ROUGEScore
 from training_utils import create_instruction_based_dataset, get_mixed_precision_config
-from transformers import AdamW, LlamaConfig, LlamaTokenizer, set_seed
+from transformers import AdamW, LlamaConfig, LlamaTokenizer, set_seed, AutoTokenizer
 from transformers.optimization import get_linear_schedule_with_warmup
-
 import neuronx_distributed as nxd
 from neuronx_distributed.lightning import (
     NeuronTensorBoardLogger,
@@ -49,12 +43,12 @@ from neuronx_distributed.modules.lora import LoraConfig
 from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.utils.adamw_fp32_optim_params import AdamW_FP32OptimParams
 
-# For PT autocast.
-torch.cuda.is_bf16_supported = lambda: True
-
 # Workaround for NaNs seen with transformers version >= 4.21.0
 # https://github.com/aws-neuron/aws-neuron-sdk/issues/593
 import transformers.modeling_utils as modeling_utils
+
+# For PT autocast.
+torch.cuda.is_bf16_supported = lambda: True
 
 if os.environ.get("XLA_USE_BF16") or os.environ.get("XLA_DOWNCAST_BF16"):
     modeling_utils.get_parameter_dtype = lambda x: torch.bfloat16
@@ -64,6 +58,7 @@ def train_llama(flags):
     print(f"Namespace: {flags}")
     set_seed(flags.seed)
 
+    target_modules = ["q_proj", "v_proj", "k_proj"] if flags.qkv_linear == 0 else ["qkv_proj"]
     lora_config = LoraConfig(
         enable_lora=flags.enable_lora,
         lora_rank=16,
@@ -71,7 +66,7 @@ def train_llama(flags):
         lora_dropout=0.05,
         bias="none",
         lora_verbose=True,
-        target_modules=["q_proj", "v_proj", "k_proj"],
+        target_modules=target_modules,
     )
 
     mixed_precision_config = get_mixed_precision_config(flags.use_gpu_compatible_precision > 0)
@@ -89,8 +84,8 @@ def train_llama(flags):
     model_config.pretrained_ckpt = flags.pretrained_ckpt
     model_config.use_cache = False
     model_config.separate_qkv = flags.separate_qkv
-    model_config.kv_shared_group_size = args.kv_replicator
-    model_config.qkv_linear = args.qkv_linear
+    model_config.kv_shared_group_size = flags.kv_replicator
+    model_config.qkv_linear = flags.qkv_linear
     model_config.max_position_embeddings = max(model_config.max_position_embeddings, flags.seq_len)
     if flags.num_layers > 0:
         model_config.num_hidden_layers = flags.num_layers
@@ -113,9 +108,7 @@ def train_llama(flags):
             last_epoch=-1,
         )
 
-    BASE_MODEL = "NousResearch/Llama-2-7b-hf"
-    tokenizer = LlamaTokenizer.from_pretrained(BASE_MODEL)
-
+    tokenizer = AutoTokenizer.from_pretrained(flags.model_name, token=flags.hf_token)
     model = NeuronLlamaLTModule(
         tokenizer=tokenizer,
         model_fn=LlamaForCausalLM,
@@ -181,7 +174,7 @@ def train_llama(flags):
     else:
         trainer.fit(model=model, datamodule=dm)
 
-    xm.master_print(f"Training finished!")
+    xm.master_print("Training finished!")
 
     if flags.do_eval and not os.environ.get("NEURON_EXTRACT_GRAPHS_ONLY", None):
         evaluate(model, tokenizer, dm.test_dataloader(), args.golden_rouge_score_path)
@@ -215,7 +208,7 @@ def evaluate(model, tokenizer, test_loader, golden_rouge_score_path):
             label_text = tokenizer.decode(labels[0].cpu(), clean_up_tokenization_spaces=True)
             rouge.update(predicted_text, label_text)
             if parallel_state.get_tensor_model_parallel_rank() == 0:
-                print(f"=== PROMPT ===")
+                print("=== PROMPT ===")
                 print(prompt)
                 print("=== GENERATED SEQUENCE ===")
                 print(predicted_text)
@@ -253,6 +246,18 @@ if __name__ == "__main__":
         "--model_path",
         type=str,
         help="Model weight and config path.",
+    )
+    parser.add_argument(
+        "--model_name",
+        type=str,
+        default='meta-llama/Meta-Llama-3-8B',
+        help="Base model name.",
+    )
+    parser.add_argument(
+        "--hf_token",
+        type=str,
+        default=None,
+        help="Huggingface token to access base model and tokenizer.",
     )
     parser.add_argument(
         "--data_dir",
@@ -379,7 +384,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--use_gpu_compatible_precision",
-        default=0,
+        default=1,
         type=int,
         help="Use gpu compatible precision",
     )

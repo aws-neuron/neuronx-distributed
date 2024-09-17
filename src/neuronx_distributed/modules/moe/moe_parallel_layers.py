@@ -1,12 +1,13 @@
 import math
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Callable, Any
 
 import torch
+import torch.nn as nn
 import torch.distributed
 from torch import Tensor
 
-from neuronx_distributed.modules.moe.model_utils import MoESequenceParallelMode
 from neuronx_distributed.parallel_layers import layers, mappings, parallel_state, utils
+from neuronx_distributed.parallel_layers.parallel_state import get_expert_model_parallel_size
 
 
 class ExpertFusedLinearWithAsyncCommunication(torch.autograd.Function):
@@ -14,6 +15,23 @@ class ExpertFusedLinearWithAsyncCommunication(torch.autograd.Function):
     Mixture of Experts.
 
     The implementation largely mimics LinearWithAsyncCommunication, but is modified for the 3D weights.
+
+    notation used for shapes:
+    e: number of experts
+    h: input dim
+    i: output dim
+
+    shapes:
+    * input/input.grad (e, ..., h)
+    * output/output.grad (e, ..., i)
+    * weight (e, i, h)
+
+    NOTE: that we have inner dimensions denoted by '...', which can be an arbitrary
+    number of dimensions. In general, the product of inner dimensions can be
+    thought of as the number of tokens.
+    Sometimes with MoE workloads it is convenient to have tokens laid out in multiple
+    dimensions to facilitate tracking when they are partitioned using multiple
+    parallelism dimensions.
     """
 
     @staticmethod
@@ -24,47 +42,55 @@ class ExpertFusedLinearWithAsyncCommunication(torch.autograd.Function):
         bias: Optional[Tensor],
         async_grad_allreduce: bool,
         sequence_parallel_enabled: bool,
-        save_for_backwards: bool = True,
+        save_for_backward: bool = True,
     ):
         if bias is not None:
             raise NotImplementedError("Bias is not currently supported for MoE")
         if sequence_parallel_enabled:
-            raise NotImplementedError("Since ExpertMLPs is executed only in TP mode, SP is not implemented")
+            raise NotImplementedError(
+                "sequence parallelism (SP) is not currently supported for expert "
+                "fused linear layers. If SP is in use for the model, then we "
+                "currently expect SP to be exited before linear layers are applied."
+            )
+        if input.shape[0] != weight.shape[0] and input.shape[0] > 1:
+            raise RuntimeError(
+                f"input and weight disagree on number of experts (first dimension). "
+                f"input_shape={tuple(input.shape)}, weight_shape={tuple(weight.shape)}"
+            )
 
         ctx.async_grad_allreduce = async_grad_allreduce
-        ctx.sequence_parallel_enabled = sequence_parallel_enabled
         ctx.compute_weight_gradient = weight.requires_grad
 
-        # E: num_experts, C: expert_capacity, H: input_size, I: intermediate/output_size
-        # input: (E, C, H), weight: (E, H, I)
-
-        if save_for_backwards:
+        if save_for_backward:
             if ctx.compute_weight_gradient:
                 ctx.save_for_backward(input, weight)
             else:
                 ctx.save_for_backward(weight)
 
-        # output: (E, C, I)
-        output = torch.matmul(input, weight)
+        # E: num_experts, H: input_size, I: intermediate/output_size
+	    # ... might refer to 1 or more dimensions, including C dimension (expert capacity)
+        # input: (E, ..., H), weight: (E, H, I)
+        output = torch.einsum("e...h,ehi->e...i", input, weight)
+
+	    # output: (E, ..., I)
         return output
 
     @staticmethod
-    def backward(ctx, grad_output: Tensor):
-        # grad_output: (E, C, I)
-
-        # input: (E, C, H), weight: (E, H, I)
+    def backward(ctx, grad_output: Tensor) -> Tuple[Tensor]:
+        # grad_output: (E, ..., I)
+        # input: (E, ..., H), weight: (E, H, I)
         if ctx.compute_weight_gradient:
             input, weight = ctx.saved_tensors
         else:
             weight = ctx.saved_tensors[0]
             input = None
 
-        # grad_input: (E, C, H)
-        grad_input = grad_output.matmul(weight.transpose(-1, -2))
+        # grad_input: (E, ..., H)
+        grad_input = torch.einsum("e...i,ehi->e...h", grad_output, weight)
 
         if ctx.async_grad_allreduce:
             # Asynchronous all-reduce
-            handle = torch.distributed.all_reduce(
+            torch.distributed.all_reduce(
                 grad_input,
                 group=parallel_state.get_tensor_model_parallel_group(),
             )
@@ -74,16 +100,45 @@ class ExpertFusedLinearWithAsyncCommunication(torch.autograd.Function):
             return grad_input, None, None, None, None, None, None
 
         # grad_weight: (E, H, I)
-        grad_weight = torch.matmul(input.transpose(-1, -2), grad_output)
+        grad_weight = torch.einsum("e...h,e...i->ehi", input, grad_output)
 
         return grad_input, grad_weight, None, None, None, None, None
 
 
-class ExpertFusedColumnParallelLinear(layers.ColumnParallelLinear):
+class ExpertFusedLinear(nn.Module):
+    def _mark_expert_parallel_weights(self, iterable=None):
+        """ Register expert parallel parameters """
+
+        if get_expert_model_parallel_size() > 1:
+            if iterable is None:
+               iterable = self.parameters()
+
+            for p in iterable:
+                p.expert_model_parallel = True
+
+    def _apply(self, fn, *args, **kwargs):
+        """ Moving parameters from cpu to device creates new parameters. to() method
+        internally calls the _apply method for all the submodules, which we override
+        here to make sure ep parameters are marked on device as well """
+
+        out = super()._apply(fn, *args, **kwargs)
+        self._mark_expert_parallel_weights()
+        return out
+
+    def _save_to_state_dict(self, destination, *args, **kwargs):
+        initial_states = {id(v) for v in destination.values()}
+        out = super()._save_to_state_dict(destination, *args, **kwargs)
+        new_states = [v for v in destination.values() if id(v) not in initial_states]
+        self._mark_expert_parallel_weights(new_states)
+        return out
+
+
+class ExpertFusedColumnParallelLinear(layers.ColumnParallelLinear, ExpertFusedLinear):
     """Specialized linear layer for MoE, supporting column parallelism for all experts simultaneously.
 
     This class inherits from ColumnParallelLinear, and over-rides certain attributes and functions needed to enable
-    column-parallel linear layer computation for 3D weights.
+    column-parallel linear layer computation for 3D weights. The forward pass of the parent class is over-ridden
+    to to support selective computations on a subset of experts.
 
     Bias is not currently supported for MoE.
     Sequence parallelism is handled independently of MLP computations in MoE, and therefore defaults to False.
@@ -96,20 +151,20 @@ class ExpertFusedColumnParallelLinear(layers.ColumnParallelLinear):
         num_experts: int,
         input_size: int,
         output_size: int,
-        gather_output: bool = True,
         dtype: torch.dtype = torch.float32,
-        device: torch.device = None,
+        device: Optional[torch.device] = None,
         stride: int = 1,
-        init_method: torch.nn.init = None,
+        init_method: Optional[Callable[..., Any]] = None,
         keep_master_weight: bool = False,
-    ):
+    ) -> None:
         self.num_experts = num_experts
+        self._n_local_experts = utils.divide(num_experts, parallel_state.get_expert_model_parallel_size())
 
         super().__init__(
             input_size=input_size,
             output_size=output_size,
             bias=False,
-            gather_output=gather_output,
+            gather_output=False,
             dtype=dtype,
             device=device,
             stride=stride,
@@ -118,30 +173,59 @@ class ExpertFusedColumnParallelLinear(layers.ColumnParallelLinear):
             keep_master_weight=keep_master_weight,
             skip_bias_add=False,
         )
+        self._mark_expert_parallel_weights()
 
     def set_weight_and_bias_config(self):
         # Define 3D weight tensor, one linear layer per expert
-        self.weight_shape = (self.num_experts, self.input_size, self.output_size_per_partition)
+        self.weight_shape = (
+            self._n_local_experts,
+            self.input_size,
+            self.output_size_per_partition,
+        )
         # Column parallel partitioning for each expert
         self.weight_partition_dim = 2
         self.bias_shape = None
 
     def _init_weight(self, weight):
         # Initialize the linear layer of each expert separately
-        assert len(weight.shape) == 3 and weight.shape[0] == self.num_experts
+        assert len(weight.shape) == 3
         for e in range(weight.shape[0]):
             if self.arg_init_method is None:
                 torch.nn.init.kaiming_uniform_(weight[e], a=math.sqrt(5))
             else:
                 self.arg_init_method(weight[e])
 
+    def forward(
+        self, input_: torch.Tensor, expert_indices: torch.Tensor = None
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """If expert_indices is provided, then the computations are performed only on the specified experts.
+        Otherwise, the input is passed through all experts in the layer."""
 
-class ExpertFusedRowParallelLinear(layers.RowParallelLinear):
+        if self.async_tensor_model_parallel_allreduce or self.sequence_parallel_enabled:
+            input_parallel = input_
+        else:
+            input_parallel = mappings.copy_to_tensor_model_parallel_region(input_)
+
+        # Matrix multiply.
+        weight = self.weight[expert_indices, :, :] if expert_indices is not None else self.weight
+        output = self._forward_impl(
+            input=input_parallel,
+            weight=weight,
+            bias=None,
+            async_grad_allreduce=self.async_tensor_model_parallel_allreduce,
+            sequence_parallel_enabled=self.sequence_parallel_enabled,
+            autograd_func_class=self.autograd_func_class,
+        )
+        return output
+
+
+class ExpertFusedRowParallelLinear(layers.RowParallelLinear, ExpertFusedLinear):
     """Specialized linear layer for MoE, supporting row parallelism for all experts simultaneously.
 
     This class inherits from RowParallelLinear, and over-rides certain attributes and functions needed to enable
     row-parallel linear layer computation for 3D weights. The forward pass of the parent class is over-ridden
-    to avoid the output all-reduce depending on the sequence parallel mode.
+    to optionally avoid the output all-reduce depending on the sequence parallel mode, and to support selective
+    computations on a subset of experts.
 
     Bias is not currently supported for MoE.
     Sequence parallelism is handled independently of MLP computations in MoE, and therefore defaults to False.
@@ -154,24 +238,24 @@ class ExpertFusedRowParallelLinear(layers.RowParallelLinear):
         num_experts: int,
         input_size: int,
         output_size: int,
-        sequence_parallel_mode: MoESequenceParallelMode,
-        input_is_parallel: bool = False,
+        reduce_output: bool = True,
         dtype: torch.dtype = torch.float32,
-        device: torch.device = None,
+        device: Optional[torch.device] = None,
         stride: int = 1,
-        init_method: torch.nn.init = None,
+        init_method: Optional[Callable[..., Any]] = None,
         keep_master_weight: bool = False,
-    ):
+    ) -> None:
         self.num_experts = num_experts
-        if sequence_parallel_mode not in MoESequenceParallelMode:
-            raise TypeError(f"Unknown sequence_parallel_mode: {sequence_parallel_mode}")
-        self.sequence_parallel_mode = sequence_parallel_mode
+        self._n_local_experts = utils.divide(num_experts, parallel_state.get_expert_model_parallel_size())
+
+        # Whether to all-reduce the output across TP ranks or not
+        self.reduce_output = reduce_output
 
         super().__init__(
             input_size=input_size,
             output_size=output_size,
             bias=False,
-            input_is_parallel=input_is_parallel,
+            input_is_parallel=True,
             dtype=dtype,
             device=device,
             stride=stride,
@@ -180,89 +264,94 @@ class ExpertFusedRowParallelLinear(layers.RowParallelLinear):
             keep_master_weight=keep_master_weight,
             skip_bias_add=False,
         )
+        self._mark_expert_parallel_weights()
 
     def set_weight_and_bias_config(self):
         # Define 3D weight tensor, one linear layer per expert
-        self.weight_shape = (self.num_experts, self.input_size_per_partition, self.output_size)
+        self.weight_shape = (
+            self._n_local_experts,
+            self.input_size_per_partition,
+            self.output_size,
+        )
         # Row parallel partitioning for each expert
         self.weight_partition_dim = 1
         self.bias_shape = None
 
     def _init_weight(self, weight):
         # Initialize the linear layer of each expert separately
-        assert len(weight.shape) == 3 and weight.shape[0] == self.num_experts
+        assert len(weight.shape) == 3
         for e in range(weight.shape[0]):
             if self.arg_init_method is None:
                 torch.nn.init.kaiming_uniform_(weight[e], a=math.sqrt(5))
             else:
                 self.arg_init_method(weight[e])
 
-    def forward(self, input_: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        # Set up backprop all-reduce.
-        if self.input_is_parallel:
-            input_parallel = input_
-        else:
-            assert not self.sequence_parallel_enabled
-            input_parallel = mappings.scatter_to_tensor_model_parallel_region(input_)
+    def forward(
+        self, input_: torch.Tensor, expert_indices: torch.Tensor = None
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """If expert_indices is provided, then the computations are performed only on the specified experts.
+        Otherwise, the input is passed through all experts in the layer."""
 
         # Matrix multiply.
+        weight = self.weight[expert_indices, :, :] if expert_indices is not None else self.weight
         output_parallel = self._forward_impl(
-            input=input_parallel,
-            weight=self.weight,
+            input=input_,
+            weight=weight,
             bias=None,
             async_grad_allreduce=False,
             sequence_parallel_enabled=False,
             autograd_func_class=self.autograd_func_class,
         )
 
-        if self.sequence_parallel_mode == MoESequenceParallelMode.EXIT_SP_ON_ENTRY_DELAY_MLP_AR:
-            # Avoid the output all-reduce, in favor of a reduce-scatter at the end of the MoE layer instead
-            output = output_parallel
-        else:
-            # All-reduce across all the partitions.
+        if self.reduce_output:
             output = mappings.reduce_from_tensor_model_parallel_region(output_parallel)
+            return output
+        else:
+            # Return without output all-reduce, in favor of an all-reduce or reduce-scatter after the MoE output combine.
+            return output_parallel
 
-        return output
 
-
-class LinearWithParallelInput(torch.autograd.Function):
-    """Linear layer execution where the input is potentially parallel.
-    Implements an all-reduce of weight gradients in the backward pass if necessary.
+class LinearWithWeightGradAR(torch.autograd.Function):
+    """Linear layer which implements an all-reduce of weight gradients in the backward pass.
+    Used for the MoE router, see LinearRouter for more details.
     """
 
     @staticmethod
     def forward(ctx, input, weight, reduce_weight_grad):
-        # input: (S, B, H), weight: (E, H)
-        ctx.reduce_weight_grad = reduce_weight_grad
+        # input: (T, H), weight: (E, H)
         assert weight.requires_grad
+        ctx.reduce_weight_grad = reduce_weight_grad
         ctx.save_for_backward(input, weight)
-        # output: (S, B, E)
+        # output: (T, E)
         output = torch.matmul(input, weight.t())
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
-        # grad_output: (S, B, E)
+        # grad_output: (T, E)
         input, weight = ctx.saved_tensors
-        reduce_weight_grad = ctx.reduce_weight_grad
-        # grad_input: (S, B, H)
+        # grad_input: (T, H)
         grad_input = grad_output.matmul(weight)
         # grad_weight: (E, H)
-        grad_weight = torch.einsum("sbe,sbh->eh", grad_output, input)
-        if reduce_weight_grad and parallel_state.get_tensor_model_parallel_size() > 1:
+        grad_weight = torch.einsum("te,th->eh", grad_output, input)
+        if parallel_state.get_tensor_model_parallel_size() > 1 and ctx.reduce_weight_grad:
             # All-reduce the gradients of the weight
             torch.distributed.all_reduce(grad_weight, group=parallel_state.get_tensor_model_parallel_group())
         return grad_input, grad_weight, None
 
 
-class InputParallelLinear(torch.nn.Module):
-    """Linear layer where the input is potentially in parallel.
-    Used for defining the router in MoE when in certain SP modes. See routing.py for details.
+class LinearRouter(torch.nn.Module):
+    """Specialized torch module for MoE Router, which implements an all-reduce of the weight gradients in the backward pass.
+
+    Reason:
+    In the forward pass of ExpertMLPs, we avoid the all-reduce in the down projection step (see ExpertFusedRowParallelLinear).
+    Instead, we perform an all-reduce or reduce-scatter after combining outputs from different experts into the original SBH or BSH hidden_states.
+    Therefore, the router weight gradients (which flow backwards from the expert affinity scaling) are computed using only the partial output
+    at each rank. Therefore, we need to perform a small all-reduce collective (size HE) on the router gradients in the backward pass.
 
     Arguments:
         input_size: Dimensionality of the input to the linear layer.
         output_size: Dimensionality of the output of the linear layer.
-        reduce_weight_grad: Whether to all-reduce the gradients of the weights in the backward pass.
         dtype: Datatype for the layer weights.
         device: Device for the layer weights.
     """
@@ -271,7 +360,6 @@ class InputParallelLinear(torch.nn.Module):
         self,
         input_size: int,
         output_size: int,
-        reduce_weight_grad: bool,
         dtype: torch.dtype = torch.float32,
         device: torch.device = torch.device("cpu"),
     ):
@@ -287,14 +375,15 @@ class InputParallelLinear(torch.nn.Module):
         if self.weight.device != torch.device("meta"):
             self.init_weight_cpu()
 
-        self.reduce_weight_grad = reduce_weight_grad
+    def forward(self, input_):
+        """Lightweight wrapper around the LinearRouterWithWeightGradAR autograd function."""
 
-    def forward(self, input):
-        """Lightweight wrapper around the LinearWithParallelInput autograd function."""
-        args = utils.cast_if_autocast_enabled(input, self.weight, self.reduce_weight_grad)
+        # if ep is enabled do not reduce weight grad because we don't do delayed allreduce
+        reduce_weight_grad = get_expert_model_parallel_size() == 1
+        args = utils.cast_if_autocast_enabled(input_, self.weight, reduce_weight_grad)
         utils.verify_casted_dtype(args)
         with torch.cuda.amp.autocast(enabled=False):
-            return LinearWithParallelInput.apply(*args)
+            return LinearWithWeightGradAR.apply(*args)
 
     def init_weight_cpu(self):
         torch.nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))

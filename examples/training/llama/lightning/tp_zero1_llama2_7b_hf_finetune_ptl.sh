@@ -37,6 +37,8 @@ WARMUP_STEPS=20
 LR=5.0e-5
 # model path
 MODEL_PATH=$SCRIPT_DIR
+# base model name
+BASE_MODEL="NousResearch/Llama-2-7b-hf"
 # sequence length
 SEQ_LEN=4096
 # Path to dataset
@@ -116,8 +118,9 @@ echo STEPS_THIS_RUN=$STEPS_THIS_RUN
 echo OUTPUT_LOG=$OUTPUT_LOG
 
 torchrun $DISTRIBUTED_ARGS \
-    tp_zero1_llama2_7b_hf_finetune_ptl.py \
+    tp_llama_hf_finetune_ptl.py \
     --model_path $MODEL_PATH \
+    --model_name $BASE_MODEL \
     --data_dir $DATA_PATH \
     --task "open_qa" \
     --tensor_parallel_size $TP_DEGREE \

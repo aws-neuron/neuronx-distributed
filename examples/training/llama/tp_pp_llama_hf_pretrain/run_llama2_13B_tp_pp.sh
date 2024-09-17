@@ -59,7 +59,7 @@ echo $DISTRIBUTED_ARGS
 # Input sequence length
 SEQ_LEN=4096
 # Pipeline parallel degree
-PP_DEGREE=4
+: ${PP_DEGREE:=4}
 # Tensor parallel degree
 TP_DEGREE=8
 # : paralell size

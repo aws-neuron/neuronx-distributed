@@ -1,6 +1,5 @@
 import argparse
 import atexit
-import json
 import os
 import traceback
 from datetime import datetime
@@ -26,26 +25,19 @@ parentdir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 sys.path.append(parentdir)
 
 # Import the module from the parent directory
-from common.integration_test_utils import test_init, test_cleanup, test_modules
+from common.integration_test_utils import test_init, test_cleanup, test_modules  # noqa: E402
 
 
 def parse_args():
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument(
-        "--test_json",
-        required=False,
-        help="input json listing the test spec for network to compile",
-    )
     parser.add_argument("--s3_dir", required=False, help="location to upload all test artifacts")
     parser.add_argument("--s3_bucket", default="s3://ktf-test-runs/neuronx_distributed_parallel_layers/layers")
     args, leftovers = parser.parse_known_args()
     S3_BUCKET_NAME = args.s3_bucket
-    with open(args.test_json, "r") as f:
-        test_dict = json.load(f)
-    return test_dict, S3_BUCKET_NAME, args
+    return S3_BUCKET_NAME, args
 
 
-test_config, S3_BUCKET_NAME, args = parse_args()
+S3_BUCKET_NAME, args = parse_args()
 results = {"inference_success": 1}
 
 
@@ -103,7 +95,7 @@ def test_parallel_embedding(tensor_model_parallel_size):
     global results
     try:
         _test_parallel_embedding()
-    except:
+    except Exception:
         results["inference_success"] = 0
         print(traceback.format_exc())
         raise
@@ -173,7 +165,7 @@ def test_parallel_embedding_shard_over_embedding_dim(tensor_model_parallel_size)
     global results
     try:
         _test_parallel_embedding()
-    except:
+    except Exception:
         results["inference_success"] = 0
         print(traceback.format_exc())
         raise
@@ -247,7 +239,7 @@ def test_initialize_parameter_cpu(tensor_model_parallel_size):
     global results
     try:
         _test_initialize_parameter_cpu()
-    except:
+    except Exception:
         results["inference_success"] = 0
         print(traceback.format_exc())
         raise
@@ -342,7 +334,7 @@ def test_row_parallel_linear_seq_parallel(tensor_model_parallel_size):
     global results
     try:
         _test_row_parallel_linear_seq_parallel()
-    except:
+    except Exception:
         results["inference_success"] = 0
         print(traceback.format_exc())
         raise
@@ -436,7 +428,7 @@ def test_column_parallel_linear_seq_parallel(tensor_model_parallel_size):
     global results
     try:
         _test_column_parallel_linear_seq_parallel()
-    except:
+    except Exception:
         results["inference_success"] = 0
         print(traceback.format_exc())
         raise
@@ -553,11 +545,10 @@ def test_padding_attention_heads(tensor_model_parallel_size):
     global results
     try:
         _test_padding_attention_heads()
-    except:
+    except Exception:
         results["inference_success"] = 0
         print(traceback.format_exc())
         raise
-
 
 
 def test_output_channel_parallel_conv(tensor_model_parallel_size):
@@ -612,10 +603,11 @@ def test_output_channel_parallel_conv(tensor_model_parallel_size):
     try:
         _test_output_channel_parallel_conv()
         xm.master_print("test passed")
-    except:
+    except Exception:
         results["inference_success"] = 0
         print(traceback.format_exc())
         raise
+
 
 def test_input_channel_parallel_conv(tensor_model_parallel_size):
     def _test_input_channel_parallel_conv():
@@ -668,10 +660,11 @@ def test_input_channel_parallel_conv(tensor_model_parallel_size):
     try:
         _test_input_channel_parallel_conv()
         xm.master_print("test passed")
-    except:
+    except Exception:
         results["inference_success"] = 0
         print(traceback.format_exc())
         raise
+
 
 class BackToBackConvs(torch.nn.Module):
     def __init__(self, conv1_args, conv2_args, parallel: bool = False):
@@ -734,22 +727,14 @@ def test_back_to_back_parallel_convs(tensor_model_parallel_size):
     try:
         _test_back_to_back_parallel_convs()
         xm.master_print("test passed")
-    except:
+    except Exception:
         results["inference_success"] = 0
         print(traceback.format_exc())
         raise
 
-def upload_to_s3():
-    os.system(f'aws s3 cp --no-progress "{datetime_str}" {S3_BUCKET_NAME}')
-    print(met.metrics_report())
-
 
 def on_exit():
-    upload_to_s3()
-    for k in test_config:
-        os.system(f"rm {args.test_json}")
-        with open(args.test_json, "w") as f:
-            json.dump({k: results}, f)
+    print(met.metrics_report())
 
 
 if __name__ == "__main__":

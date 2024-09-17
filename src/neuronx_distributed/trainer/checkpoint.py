@@ -2,8 +2,10 @@ import concurrent.futures
 import gc
 import math
 import os
+import re
 from datetime import datetime
-from typing import List, Tuple
+from packaging import version
+from typing import List, Tuple, Optional, Any, Dict
 
 import torch
 import torch_xla
@@ -11,11 +13,26 @@ import torch_xla.core.xla_model as xm
 import torch_xla.utils.serialization as xser
 
 from neuronx_distributed.optimizer import NeuronZero1Optimizer
+
+if version.parse(torch.__version__) >= version.parse("2.1"):
+    HAVE_DCP_SUPPORT = True
+    import neuronx_distributed.optimizer.zero_dcp_utils as dcp_utils
+else:
+    HAVE_DCP_SUPPORT = False
+    dcp_utils = None
+
 from neuronx_distributed.parallel_layers.parallel_state import (
     get_data_parallel_group,
     get_data_parallel_rank,
+    get_expert_data_parallel_rank,
+    get_expert_model_parallel_rank,
+    get_expert_data_parallel_size,
+    get_expert_model_parallel_size,
+    get_expert_data_parallel_group,
+    get_expert_model_parallel_group,
     get_pipeline_model_parallel_rank,
     get_tensor_model_parallel_rank,
+    model_parallel_is_initialized,
 )
 from neuronx_distributed.parallel_layers.utils import (
     get_local_world_size,
@@ -30,18 +47,19 @@ from .checkpoint_storage import BaseCheckpointStorage, create_checkpoint_storage
 logger = get_logger()
 
 
-def _get_path(prefix, tp=True, pp=True, dp=False):
+def _get_path(prefix: str, tp: bool = True, pp: bool = True, dp: bool = False, ep: bool = False) -> str:
     path = ""
     path += "_dp_rank_{:02d}".format(get_data_parallel_rank() if dp else 0)
+    path += "_ep_rank_{:02d}".format(get_expert_model_parallel_rank()) if ep else ""
     path += "_tp_rank_{:02d}".format(get_tensor_model_parallel_rank() if tp else 0)
     path += "_pp_rank_{:02d}".format(get_pipeline_model_parallel_rank() if pp else 0)
     if path != "":
         path = path[1:]
     path += ".pt"
-    return "{}/{}".format(prefix, path)
+    return f"{prefix}/{path}"
 
 
-def _determine_remove_tags(checkpoint_dir: BaseCheckpointStorage, num_kept: int):
+def _determine_remove_tags(checkpoint_dir: BaseCheckpointStorage, num_kept: int) -> List[str]:
     """
     deteremine checkpoint tags to be removed to satisfy num_kept
     return value: a list of tags
@@ -70,8 +88,10 @@ def _determine_remove_tags(checkpoint_dir: BaseCheckpointStorage, num_kept: int)
 
     return remove_tags
 
+# Global ThreadPoolExecutor to avoid reinitialization
+_executor = None
 
-def _bulk_save(checkpoint_dir: BaseCheckpointStorage, save_items: List[Tuple[object, str]]):
+def _bulk_save(checkpoint_dir: BaseCheckpointStorage, save_items: List[Tuple[object, str]]) -> None:
     for obj, filename in save_items:
         checkpoint_dir.save_object(obj, filename)
 
@@ -91,28 +111,33 @@ class CheckpointIOState:
 
         if self._async_save:
             self._checkpoint_dir = None
-            self._executor = concurrent.futures.ProcessPoolExecutor(max_workers=1)
-            self._save_items: list[(torch.Tensor, src)] = list()
-            self._save_task: concurrent.futurex = None
-            self._remove_tags: list[str] = None
-            self._remove_task: concurrent.future = None
+            global _executor
+            _executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            self._save_items: List[Tuple[torch.Tensor, str]] = []
+            self._save_task: Optional[concurrent.futures.Future] = None
+            self._dcp_save_items: List[Tuple[Any]] = []
+            self._dcp_save_task: Optional[concurrent.futures.Future] = None
+            self._remove_tags: Optional[List[str]] = None
+            self._remove_task: Optional[concurrent.futures.Future] = None
+            self._num_kept: Optional[int]
 
-    def begin(self, checkpoint_dir: BaseCheckpointStorage, tag: str):
+    def begin(self, checkpoint_dir: BaseCheckpointStorage, tag: str) -> None:
         self._checkpoint_dir = checkpoint_dir
 
         if self._async_save and self._current_tag is not None:
             self.wait_save(async_remove=True)
 
         self._current_tag = tag
+        xm.rendezvous("create ckpt dir after every neuron-core has filepath")
         if torch.distributed.get_rank() == 0:
             method = "async" if self._async_save else "synced"
-            logger.info(f"{method} saving of checkpoint {tag} began")
+            logger.info("%s saving of checkpoint %s began", method, tag)
             self._checkpoint_dir.create_dir(self._current_tag)
             # create a "checkpoint" tag to mark the directory as checkpoint directory
             # this is to distinguish checkpoint from users' own data directory under output directory
             self._checkpoint_dir.save_text("1", os.path.join(self._current_tag, "checkpoint"))
 
-    def add_save_task(self, obj: object, filename: str):
+    def add_save_task(self, obj: Any, filename: str) -> None:
         assert filename.startswith(self._current_tag + "/")
         relative_filename = filename[len(self._current_tag) + 1 :]
         self._relative_filenames.add(relative_filename)
@@ -122,60 +147,88 @@ class CheckpointIOState:
             assert self._checkpoint_dir
             self._checkpoint_dir.save_object(obj, filename)
 
-    def end(self, num_kept: int):
+    def add_dcp_save_task(self, checkpoint_dir: BaseCheckpointStorage, state_dict: dict, optimizer, model, ckpt_path):
+        path = os.path.join(checkpoint_dir.dirname(), ckpt_path, "optim")
+        aux_infos = dcp_utils.get_dcp_aux_infos(model, optimizer)
+        state_dict_cpu = move_all_tensor_to_cpu(state_dict)
+        if self._async_save:
+            self._dcp_save_items.append((path, state_dict_cpu, aux_infos))
+        else:
+            dcp_utils.save_optim_state_dict(path, state_dict_cpu, aux_infos)
+
+    def _dealloc_tensor_host_memory_callback(self, future):
+        """Future callback to asynchronous deallocate the tensor host memory
+        """
+        self._save_items = []
+        gc.collect()
+
+    def end(self, num_kept: int) -> None:
         if self._async_save:
             self._num_kept = num_kept
             if len(self._save_items) > 0:
-                self._save_task = self._executor.submit(_bulk_save, self._checkpoint_dir, self._save_items)
-            if torch.distributed.get_rank() == 0:
-                logger.info(f"async saving of checkpoint {self._current_tag} requested")
+                self._save_task = _executor.submit(_bulk_save, self._checkpoint_dir, self._save_items)
+                # After save async thread is finished, use callback to async dealloc the tensor host memory
+                self._save_task.add_done_callback(self._dealloc_tensor_host_memory_callback)
+            if len(self._dcp_save_items) > 0:
+                self._dcp_save_task = _executor.submit(dcp_utils.save_optim_state_dict, *(self._dcp_save_items[0]))
+                # After save async thread is finished, use callback to async dealloc the tensor host memory
+                self._dcp_save_task.add_done_callback(self._dealloc_tensor_host_memory_callback)
+            logger.info("async saving of checkpoint %s requested", self._current_tag)
         else:
             xm.rendezvous("saving checkpoint done")
             if torch.distributed.get_rank() == 0:
-                logger.info(f"synced saving of checkpoint {self._current_tag} completed")
+                logger.info("synced saving of checkpoint %s completed", self._current_tag)
                 self._checkpoint_dir.save_text("1", os.path.join(self._current_tag, "done"))
             xm.rendezvous("mark checkpoint as done")
             self.submit_remove(num_kept, async_remove=False)
 
-    def wait_save(self, async_remove):
+    def wait_save(self, async_remove: bool) -> None:
         if not self._async_save:
             return
 
         # first wait for save to finish
-        tasks = []
         if self._save_task:
             done, _ = concurrent.futures.wait([self._save_task])
             for f in done:
                 if f.exception():
                     raise f.exception()
+        if self._dcp_save_task:
+            done, _ = concurrent.futures.wait([self._dcp_save_task])
+            for f in done:
+                if f.exception():
+                    raise f.exception()
 
-        xm.rendezvous(f"async saving checkpoint done")
+        xm.rendezvous("async saving checkpoint done")
 
         if self._save_task:
             self._save_task = None
+            # This is already asynchronously invoked in _dealloc_tensor_host_memory_callback
+            # However, this needs to be kept for the sync checkpointing case
             self._save_items = []
-            if torch.distributed.get_rank() == 0:
-                self._checkpoint_dir.save_text("1", os.path.join(self._current_tag, "done"))
-
-        xm.rendezvous(f"mark checkpoint as done")
-
+        if self._dcp_save_task:
+            self._dcp_save_task = None
+            self._dcp_save_items = []
         if torch.distributed.get_rank() == 0:
-            logger.info(f"async saving of checkpoint {self._current_tag} completed")
+            self._checkpoint_dir.save_text("1", os.path.join(self._current_tag, "done"))
+
+        xm.rendezvous("mark checkpoint as done")
+
+        logger.info("async saving of checkpoint %s completed", self._current_tag)
 
         # remove checkpoint if necessary.
         self.wait_remove()
         self.submit_remove(self._num_kept, async_remove=async_remove)
 
-    def submit_remove(self, num_kept: int, async_remove: bool, remove_tags: List[str] = []):
+    def submit_remove(self, num_kept: int, async_remove: bool, remove_tags: Optional[List[str]] = None) -> None:
+        remove_tags = remove_tags or []
         remove_tags = remove_tags if len(remove_tags) else _determine_remove_tags(self._checkpoint_dir, num_kept)
         xm.rendezvous("determine remove tags done")
         if len(remove_tags) == 0:
-            if torch.distributed.get_rank() == 0:
-                logger.info(f"no checkpoints to remove.")
+            logger.info("no checkpoints to remove.")
             return
 
         if torch.distributed.get_rank() == 0:
-            logger.info(f"removing previous checkpoint in {remove_tags}")
+            logger.info("removing previous checkpoint in %s", remove_tags)
             # remove the done file first to avoid the situation
             # the deletion was interrupted by faults, leaving
             # a corrupted checkpoint_dir with the "done" tag.
@@ -186,7 +239,7 @@ class CheckpointIOState:
                     completed_tags.append(remove_tag)
                     self._checkpoint_dir.remove_file(done_file)
 
-            logger.info(f"done tags in {completed_tags} cleared")
+            logger.info("done tags in %s cleared", completed_tags)
 
         remove_filenames = []
         for remove_tag in remove_tags:
@@ -195,18 +248,17 @@ class CheckpointIOState:
 
         if async_remove:
             self._remove_tags = remove_tags
-            self._remove_task = self._executor.submit(self._checkpoint_dir.remove_files, remove_filenames)
-            if torch.distributed.get_rank() == 0:
-                logger.info(f"async removal of {self._remove_tags} requested.")
+            self._remove_task = _executor.submit(self._checkpoint_dir.remove_files, remove_filenames)
+            logger.info("async removal of %s requested.", self._remove_tags)
         else:
             self._checkpoint_dir.remove_files(remove_filenames)
             xm.rendezvous("remove files done")
             # wait until everyone deleted the files they wrote, then rank 0 delete what were left
             if torch.distributed.get_rank() == 0:
                 self._checkpoint_dir.remove_dirs(remove_tags)
-                logger.info(f"previous checkpoint in {remove_tags} successfully removed")
+                logger.info("previous checkpoint in %s successfully removed", remove_tags)
 
-    def wait_remove(self):
+    def wait_remove(self) -> None:
         if self._remove_task:
             done, _ = concurrent.futures.wait([self._remove_task])
             for f in done:
@@ -216,24 +268,24 @@ class CheckpointIOState:
             xm.rendezvous("remove files done")
             if torch.distributed.get_rank() == 0:
                 self._checkpoint_dir.remove_dirs(self._remove_tags)
-                logger.info(f"async removal of {self._remove_tags} completed")
+                logger.info("async removal of %s completed", self._remove_tags)
             self._remove_tags = None
             self._remove_task = None
         # This rendevous is necessary, since it avoids the race condition that
         # can occur when each worker is trying to find the next set of files to
         # delete. Its a corner case, where worker 0 is still deleting, and worker
-        # 1 has moved on to the submit_remove task. It tries to find_files, and 
+        # 1 has moved on to the submit_remove task. It tries to find_files, and
         # in the process runs into a race condition, resulting in file not found
         # error.
         xm.rendezvous("Wait for all workers to come from deletion")
 
-    def wait_all(self):
-        # when this function is called, ProcessPool may have been shutdown.
+    def wait_all(self) -> None:
+        # when this function is called, ThreadPool may have been shutdown.
         # there fore we must use synced remove
         self.wait_save(async_remove=False)
 
 
-def _get_my_group_info(groups: List[List[int]]):
+def _get_my_group_info(groups: List[List[int]]) -> Tuple[int, int]:
     global_rank = torch.distributed.get_rank()
     for group in groups:
         if global_rank in group:
@@ -242,7 +294,18 @@ def _get_my_group_info(groups: List[List[int]]):
     raise RuntimeError(f"Error: global rank {global_rank} is not in groups")
 
 
-def _xser_load_data(checkpoint_dir: BaseCheckpointStorage, path: str, groups: List[List[int]] = None):
+def _get_ep_group_info() -> Tuple[int, int, int, int, int, int]:
+    emp_rank = get_expert_model_parallel_rank()
+    edp_rank = get_expert_data_parallel_rank()
+    emp_size = get_expert_model_parallel_size()
+    edp_size = get_expert_data_parallel_size()
+    emp_group = get_expert_model_parallel_group(as_list=True)
+    edp_group = get_expert_data_parallel_group(as_list=True)
+
+    return emp_rank, edp_rank, emp_size, edp_size, emp_group, edp_group
+
+
+def _xser_load_data(checkpoint_dir: BaseCheckpointStorage, path: str, groups: Optional[List[List[int]]] = None, ep_only: bool = False):
     """
     load tensors saved in path into a state_dict.
     Parameters:
@@ -254,56 +317,80 @@ def _xser_load_data(checkpoint_dir: BaseCheckpointStorage, path: str, groups: Li
     # checkpoint generated using older version still need to be supported.
     ref_info = checkpoint_dir.load_object(path + ".info.pt") if checkpoint_dir.file_exists(path + ".info.pt") else None
 
-    tensor_folder = path + ".tensors"
+    ep_tensor_folder = path + ".tensors"
 
     if groups is not None:
         my_rank_in_group, my_group_size = _get_my_group_info(groups)
+        # for non-ep tensors all ranks load from ep_rank_00 folder, round-robin
+        non_ep_tensor_folder = re.sub("ep_rank_\d{2}", "ep_rank_00", path) + ".tensors"
+
+    if model_parallel_is_initialized():
+        emp_rank, edp_rank, emp_size, edp_size, emp_group, edp_group = _get_ep_group_info()
 
     def convert_fn(tensors):
-        rewritten_tensors = []
+        rewritten_tensors = [None for t in tensors]
 
-        for t in tensors:
-            tensor_file = os.path.join(tensor_folder, "tensor_{}.pt".format(t.tid))
-            if (ref_info is not None) and (groups is not None):
-                # When there is redundency (groups is not None) and we know the tensor's shape and dtype (ref_info is not None)
-                # we use the following optimization:
-                #    among workers that has same tensor (in same group), only 1 worker read tensor from disk
-                #    other workers will get the tensor from network broadcasting
-                #
-                # we used round robin to select which worker will read from disk to evenly
-                # distribute the load tasks.
-                if (t.tid % my_group_size) == my_rank_in_group:
-                    loaded = checkpoint_dir.load_object(tensor_file).to(xm.xla_device())
+        def _is_ep(dct):
+            return "expert_model_parallel" in dct and dct["expert_model_parallel"]
+
+        ep_tensors = [(i, t) for i, t in enumerate(tensors) if _is_ep(ref_info[t.tid])]
+        non_ep_tensors = [(i, t) for i, t in enumerate(tensors) if not _is_ep(ref_info[t.tid])]
+
+        def _load_tensors(tensor_list, _group, _rank, _group_size, _tensor_folder):
+            for idx, (original_idx, t) in enumerate(tensor_list):
+                tensor_file = os.path.join(_tensor_folder, "tensor_{}.pt".format(t.tid))
+
+                if (ref_info is not None) and (groups is not None):
+                    # When there is redundency (groups is not None) and we know the tensor's shape and dtype (ref_info is not None)
+                    # we use the following optimization:
+                    #    among workers that has same tensor (in same group), only 1 worker read tensor from disk
+                    #    other workers will get the tensor from network broadcasting
+                    #
+                    # we used round robin to select which worker will read from disk to evenly
+                    # distribute the load tasks.
+
+                    if (idx % _group_size) == _rank:
+                        loaded = checkpoint_dir.load_object(tensor_file).to(xm.xla_device())
+                    else:
+                        dtype = ref_info[t.tid]["dtype"]
+                        shape = ref_info[t.tid]["shape"]
+                        loaded = torch.zeros(shape, dtype=dtype, device=xm.xla_device())
+
+                    # we use all_reduce to implement broadcast because xla does not have native broadcast support.
+                    xm.all_reduce(xm.REDUCE_SUM, [loaded], groups=_group)
                 else:
-                    dtype = ref_info[t.tid]["dtype"]
-                    shape = ref_info[t.tid]["shape"]
-                    loaded = torch.zeros(shape, dtype=dtype, device=xm.xla_device())
-                # we use all_reduce to implement broadcast because xla does not have native broadcast support.
-                xm.all_reduce(xm.REDUCE_SUM, [loaded], groups=groups)
-            else:
-                # when dtype and shape are not available or there is no redundency, all workers load tensor from disk
-                loaded = checkpoint_dir.load_object(tensor_file).to(xm.xla_device())
+                    # when dtype and shape are not available or there is no redundency, all workers load tensor from disk
+                    loaded = checkpoint_dir.load_object(tensor_file).to(xm.xla_device())
 
-            rewritten_tensors.append(loaded)
+                rewritten_tensors[original_idx] = loaded
+
+        if groups is not None:
+            _load_tensors(ep_tensors, edp_group, edp_rank, edp_size, ep_tensor_folder)
+            _load_tensors(non_ep_tensors, groups, my_rank_in_group, my_group_size, non_ep_tensor_folder)
+        elif ep_only:
+            _load_tensors(ep_tensors, None, None, None, ep_tensor_folder)
+        else:
+            _load_tensors(ep_tensors + non_ep_tensors, None, None, None, ep_tensor_folder)
 
         if groups is not None:
             xm.mark_step()
         return rewritten_tensors
 
     def select_fn(v):
-        return type(v) == xser.TensorReference
+        return isinstance(v, xser.TensorReference)
 
     return xm.ToXlaTensorArena(convert_fn, select_fn).transform(ref_data)
 
 
 class _InternalTensorReference:
-    def __init__(self, tid, shape, dtype):
+    def __init__(self, tid, shape, dtype, expert_model_parallel):
         self.tid = tid
         self.shape = shape
         self.dtype = dtype
+        self.expert_model_parallel = expert_model_parallel
 
 
-def _assign_tensors_to_bins(tensors, bin_count) -> List[List[int]]:
+def _assign_tensors_to_bins(tensors: List[torch.Tensor], bin_count: int) -> List[List[int]]:
     """
     assign a list of tensors into multiple bins, such that each bin's
     total tensor size are similar.
@@ -337,8 +424,8 @@ def _assign_tensors_to_bins(tensors, bin_count) -> List[List[int]]:
 
 
 def _xser_save_data(
-    checkpoint_dir: BaseCheckpointStorage, path: str, state_dict, iostate, groups: List[List[int]] = None
-):
+    checkpoint_dir: BaseCheckpointStorage, path: str, state_dict, iostate: CheckpointIOState, groups: Optional[List[List[int]]] = None
+) -> Any:
     """
     This function save the tensors in a state_dict into a directory.
     Each tensor will be saved as a separate file.
@@ -352,56 +439,61 @@ def _xser_save_data(
     if groups is not None:
         my_rank_in_group, my_group_size = _get_my_group_info(groups)
 
-    def convert_fn(tensors):
+    emp_rank, edp_rank, emp_size, edp_size, emp_group, edp_group = _get_ep_group_info()
+
+    def convert_fn(tensors: List[torch.Tensor]) -> List[torch.Tensor]:
         torch_xla._XLAC._xla_sync_multi(tensors, devices=[], wait=True, sync_xla_data=True)
 
         if groups is None:
             my_tensors = None
         else:
-            my_tensors = _assign_tensors_to_bins(tensors, my_group_size)[my_rank_in_group]
+            my_tensors = _assign_tensors_to_bins(tensors, edp_size)[edp_rank]
 
         rewritten_tensors = []
         for i, t in enumerate(tensors):
+            is_expert_parallel = hasattr(t, "expert_model_parallel") and t.expert_model_parallel
             if (my_tensors is None) or (i in my_tensors):
                 t0 = datetime.now()
                 cpu_data = t.cpu()
                 t1 = datetime.now()
-                iostate.add_save_task(cpu_data, xser._get_tensor_file(path, i))
-                if torch.distributed.get_rank() == 0:
-                    logger.debug(f"    transfer tensor {i} to cpu elapsed: {(t1 - t0).total_seconds()} seconds")
-            rewritten_tensors.append(_InternalTensorReference(i, t.shape, t.dtype))
+                # if the below condition is not satisfied, someone else will store the same data
+                if my_tensors is None or (is_expert_parallel or emp_rank == 0):
+                    iostate.add_save_task(cpu_data, xser._get_tensor_file(path, i))
+                logger.debug("    transfer tensor %d to cpu elapsed: %d seconds", i, (t1 - t0).total_seconds())
+            rewritten_tensors.append(_InternalTensorReference(i, t.shape, t.dtype, is_expert_parallel))
         return rewritten_tensors
 
     def select_fn(v):
-        return type(v) == torch.Tensor and xm.is_xla_tensor(v)
+        return isinstance(v, torch.Tensor)  # and xm.is_xla_tensor(v)
 
     checkpoint_dir.create_shared_dir(path)
     return xm.ToXlaTensorArena(convert_fn, select_fn).transform(state_dict)
 
 
-def _extract_tensor_info_and_update_state_dict(state_dict: dict, tensor_info: dict):
+def _extract_tensor_info_and_update_state_dict(state_dict: Dict[str, Any], tensor_info: Dict[int, Dict[str, Any]]) -> None:
     """
     for a given state_dict, replace _InternalTensorReference with XserTensorReference,
     and put the dtype and shape in a separate accout.
     """
     for k, v in state_dict.items():
-        if type(v) == _InternalTensorReference:
-            tensor_info[v.tid] = {"dtype": v.dtype, "shape": v.shape}
+        if isinstance(v, _InternalTensorReference):
+            tensor_info[v.tid] = {"dtype": v.dtype, "shape": v.shape, "expert_model_parallel": v.expert_model_parallel}
             state_dict[k] = xser.TensorReference(v.tid)
-        if type(v) == dict:
+        if isinstance(v, dict):
             _extract_tensor_info_and_update_state_dict(v, tensor_info)
 
 
 def _save(
-    ckpt, checkpoint_dir: BaseCheckpointStorage, path: str, groups=None, num_workers=8, use_xser=False, iostate=None
-):
+    ckpt: Any, checkpoint_dir: BaseCheckpointStorage, path: str, groups: Optional[List[List[int]]] = None, num_workers: int = 8, use_xser: bool = False, iostate: Optional[CheckpointIOState] = None, optimizer: bool = False
+) -> None:
     if groups is not None:
         my_rank_in_group, my_group_size = _get_my_group_info(groups)
+    emp_rank, edp_rank, emp_size, edp_size, emp_group, edp_group = _get_ep_group_info()
 
     # quick path when use xser
     if use_xser:
         state_dict = _xser_save_data(checkpoint_dir, xser._get_tensors_folder(path), ckpt, iostate, groups)
-        if (groups is None) or (my_rank_in_group == 0):
+        if (groups is None) or (edp_rank == 0):
             tensor_info = {}
             # to make sure path can be loaded using xser.load(), we must update
             # state_dict such that it does not have _InternalTensorReference
@@ -420,7 +512,7 @@ def _save(
                 iostate.add_save_task(cpu_data, path)
 
 
-def _load_obj_from_state_dict(obj, state_dict, strict):
+def _load_obj_from_state_dict(obj: Any, state_dict: Dict[str, Any], strict: bool) -> None:
     if isinstance(obj, torch.nn.Module):
         obj.load_state_dict(state_dict, strict=strict)
     elif isinstance(obj, dict):
@@ -433,14 +525,14 @@ def _load_obj_from_state_dict(obj, state_dict, strict):
 
 
 def _load(
-    obj,
+    obj: Any,
     checkpoint_dir: BaseCheckpointStorage,
     path: str,
-    groups: List[List[int]] = None,
+    groups: Optional[List[List[int]]] = None,
     num_workers: int = 8,
     strict: bool = True,
     use_xser: bool = False,
-):
+) -> None:
     """
     Load object the save as path.
 
@@ -454,6 +546,7 @@ def _load(
     # quick path when use xser
     if use_xser:
         ckpt = _xser_load_data(checkpoint_dir, path, groups)
+        ckpt = _move_step_to_cpu(ckpt)
         _load_obj_from_state_dict(obj, ckpt, strict)
         return
 
@@ -467,7 +560,7 @@ def _load(
     xm.rendezvous("load checkpoint done")
 
 
-def has_checkpoint(checkpoint_dir_str: str):
+def has_checkpoint(checkpoint_dir_str: str) -> bool:
     checkpoint_dir = create_checkpoint_storage(checkpoint_dir_str)
     return len(checkpoint_dir.list_completed_checkpoint_tags()) > 0
 
@@ -476,10 +569,10 @@ g_iostate = None
 
 
 def save_checkpoint(
-    checkpoint_dir_str,
-    tag,
-    model=None,
-    optimizer=None,
+    checkpoint_dir_str: str,
+    tag: str,
+    model: Any = None,
+    optimizer: Any = None,
     scheduler=None,
     user_content=None,
     num_workers=8,
@@ -487,7 +580,8 @@ def save_checkpoint(
     num_kept_ckpts=None,
     async_save=False,
     zero1_optimizer=False,
-):
+    use_zero1_dcp=False,
+) -> None:
     """
     Method to save checkpoint, return ``None``.
 
@@ -512,18 +606,18 @@ def save_checkpoint(
       - newest
 
     Parameters:
-        path (str):
+        checkpoint_dir_str (str):
             path to save the checkpoints.
         tag (str):
             tag to save the checkpoints.
         model (torch.nn.Module or dict):
-            model to save, optinal.
+            model to save, optional.
         optimizer (torch.optim.Optimizer or dict):
-            optimizer to save, optinal.
+            optimizer to save, optional.
         scheduler:
-            scheduler to save, optinal.
+            scheduler to save, optional.
         user_content:
-            user contents to save, optinal.
+            user contents to save, optional.
         num_workers (int):
             num of workers to save the checkpoints on the same time, range: 1-32.
         use_xser (bool):
@@ -532,9 +626,11 @@ def save_checkpoint(
         num_kept_ckpts (int):
             number of checkpoints to keep on disk, optional. Default: ``None``.
         async_save (bool):
-            whether to use asynchronous saving method
+            whether to use asynchronous saving method.
         zero1_optimizer (bool):
-            whether the optimizer state is from a zero1 optimizer, used when optimizer is a dict
+            whether the optimizer state is from a zero1 optimizer, used when optimizer is a dict.
+        use_zero1_dcp (bool):
+            whether to use Distributed Checkpoint for ZeRO-1 optimizer.
     """
     # TODO: Use distributed checkpoint
     assert torch.distributed.is_initialized(), "Only support distributed training mode."
@@ -553,18 +649,22 @@ def save_checkpoint(
     g_iostate.begin(checkpoint_dir, tag)
     ckpt_path = str(tag)
 
+    ep_enabled = get_expert_model_parallel_size() > 1
+
     # save model
     if model is not None:
         if torch.distributed.get_rank() == 0:
             checkpoint_dir.create_dir(os.path.join(ckpt_path, "model"), exist_ok=True)
-        model_path = os.path.join(ckpt_path, _get_path("model"))
+        model_path = os.path.join(ckpt_path, _get_path("model", ep=ep_enabled))
+
         if isinstance(model, NxDPPModel):
             ckpt = model.local_state_dict()
         elif isinstance(model, dict):
             ckpt = model
         else:
             ckpt = model.state_dict()
-        groups = get_data_parallel_group(as_list=True)
+
+        groups = get_expert_data_parallel_group(as_list=True)
         _save(
             ckpt,
             checkpoint_dir,
@@ -589,17 +689,29 @@ def save_checkpoint(
             zero1_enabled = isinstance(optimizer, NeuronZero1Optimizer)
             optimizer_state_dict = optimizer.state_dict()
 
-        optimizer_path = os.path.join(ckpt_path, _get_path("optim", dp=zero1_enabled))
+        if zero1_enabled:
+            par_args = {"dp": True}
+        elif ep_enabled:
+            par_args = {"ep": True}
+        else:
+            par_args = {}
+
+        optimizer_path = os.path.join(ckpt_path, _get_path("optim", **par_args))
         groups = None if zero1_enabled else get_data_parallel_group(as_list=True)
-        _save(
-            optimizer_state_dict,
-            checkpoint_dir,
-            optimizer_path,
-            groups=groups,
-            num_workers=num_workers,
-            use_xser=use_xser,
-            iostate=g_iostate,
-        )
+        if zero1_enabled and use_zero1_dcp and HAVE_DCP_SUPPORT:
+            assert async_save, "Now we only use DCP for async checkpoint saving."
+            g_iostate.add_dcp_save_task(checkpoint_dir, optimizer_state_dict, optimizer, model, ckpt_path)
+        else:
+            _save(
+                optimizer_state_dict,
+                checkpoint_dir,
+                optimizer_path,
+                groups=groups,
+                num_workers=num_workers,
+                use_xser=use_xser,
+                iostate=g_iostate,
+                optimizer=True,
+            )
 
     # save scheduler
     if scheduler is not None:
@@ -614,15 +726,26 @@ def save_checkpoint(
     g_iostate.end(num_kept_ckpts)
 
 
+def _move_step_to_cpu(ckpt: Any, key: Optional[str] = None) -> Any:
+    if key == "step":
+        return ckpt.cpu()
+
+    if isinstance(ckpt, dict):
+        return {k: _move_step_to_cpu(v, k) for k, v in ckpt.items()}
+
+    return ckpt
+
+
 def load_checkpoint(
-    path,
-    tag=None,
-    model=None,
-    optimizer=None,
-    scheduler=None,
-    num_workers=8,
-    strict=True,
-):
+    path: str,
+    tag: Optional[str] = None,
+    model: Optional[torch.nn.Module] = None,
+    optimizer: Optional[torch.optim.Optimizer] = None,
+    scheduler: Any = None,
+    num_workers: int = 8,
+    strict: bool = True,
+    use_zero1_dcp: bool = False,
+) -> Any:
     """
     Method to load checkpoint, return user contents if exists otherwise ``None``.
     If ``tag`` not provided, will try to use the newest tag tracked by ``save_checkpoint``.
@@ -631,21 +754,27 @@ def load_checkpoint(
         path (str):
             path to load the checkpoints.
         tag (str):
-            tag to load the checkpoints.
+            tag to load the checkpoints, optional.
         model (torch.nn.Module):
-            model to load, optinal.
+            model to load, optional.
         optimizer (torch.optim.Optimizer):
-            optimizer to load, optinal.
+            optimizer to load, optional.
         scheduler:
-            scheduler to load, optinal.
+            scheduler to load, optional.
         num_workers (int):
             num of workers to load the checkpoints on the same time, range: 1-32.
         strict (bool):
             whether to use strict mode when loading model checkpoint. Default: ``True``.
+        use_zero1_dcp (bool):
+            whether to use Distributed Checkpoint for ZeRO-1 optimizer.
     """
     assert torch.distributed.is_initialized(), "Only support distributed training mode."
 
     checkpoint_dir = create_checkpoint_storage(path)
+    ep_enabled = get_expert_model_parallel_size() > 1
+
+    if ep_enabled and strict:
+        print("Strict checkpoint loading is not supported with expert parallelism.")
 
     if tag is None:
         tags = checkpoint_dir.list_completed_checkpoint_tags()
@@ -657,12 +786,11 @@ def load_checkpoint(
 
     use_xser = checkpoint_dir.is_checkpoint_xser(tag)
 
-    if torch.distributed.get_rank() == 0:
-        logger.info("loading checkpoint from {}".format(ckpt_path))
+    logger.info("loading checkpoint from %s", ckpt_path)
 
     # load model
     if model is not None:
-        model_path = os.path.join(ckpt_path, _get_path("model"))
+        model_path = os.path.join(ckpt_path, _get_path("model", ep=ep_enabled))
         groups = get_data_parallel_group(as_list=True)
         _load(
             model, checkpoint_dir, model_path, groups=groups, num_workers=num_workers, strict=strict, use_xser=use_xser
@@ -680,11 +808,28 @@ def load_checkpoint(
         elif isinstance(optimizer, NeuronZero1Optimizer):
             zero1_enabled = True
         else:
-            raise RuntimeError(f"Error: invalid type for the argument optimizer for load_checkpoint, expecting a dict or NxDOptimizer, or NeuronZero1Optimizer, got {type(optimizer)}")
+            raise RuntimeError(
+                f"Error: invalid type for the argument optimizer for load_checkpoint, expecting a dict or NxDOptimizer, or NeuronZero1Optimizer, got {type(optimizer)}"
+            )
 
-        groups = None if zero1_enabled else get_data_parallel_group(as_list=True)
-        optimizer_path = os.path.join(ckpt_path, _get_path("optim", dp=zero1_enabled))
-        _load(optimizer, checkpoint_dir, optimizer_path, groups=groups, num_workers=num_workers, use_xser=use_xser)
+        ep_enabled = get_expert_model_parallel_size() > 1
+
+        if zero1_enabled:
+            par_args = {"dp": True}
+            groups = None
+        elif ep_enabled:
+            par_args = {"ep": True}
+            groups = get_expert_data_parallel_group(as_list=True)
+        else:
+            par_args = {}
+            groups = get_data_parallel_group(as_list=True)
+
+        if zero1_enabled and use_zero1_dcp and HAVE_DCP_SUPPORT:
+            aux_infos = dcp_utils.get_dcp_aux_infos(model, optimizer)
+            dcp_utils.load_optim_state_dict(os.path.join(checkpoint_dir.dirname(), ckpt_path, "optim"), optimizer, aux_infos)
+        else:
+            optimizer_path = os.path.join(ckpt_path, _get_path("optim", **par_args))
+            _load(optimizer, checkpoint_dir, optimizer_path, groups=groups, num_workers=num_workers, use_xser=use_xser)
 
     # load scheduler
     if scheduler is not None:
@@ -697,13 +842,12 @@ def load_checkpoint(
     if checkpoint_dir.file_exists(user_content_path):
         user_content = checkpoint_dir.load_object(user_content_path, map_location="cpu")
 
-    if torch.distributed.get_rank() == 0:
-        logger.info("loading checkpoint done")
+    logger.info("loading checkpoint done")
 
     xm.rendezvous("load all checkpoints done")
     return user_content
 
 
-def finalize_checkpoint():
+def finalize_checkpoint() -> None:
     if g_iostate:
         g_iostate.wait_all()

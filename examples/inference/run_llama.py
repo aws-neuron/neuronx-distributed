@@ -1,8 +1,12 @@
+import torch
 from llama2.llama2_runner import LlamaRunner
 from transformers import GenerationConfig
 
-model_path = "/home/ubuntu/model_hf/Llama-2-7b-hf/"
-traced_model_path = "/home/ubuntu/traced_model/Llama-2-7b-hf/"
+model_path = "/home/ubuntu/model_hf/Llama-2-7b/"
+traced_model_path = "/home/ubuntu/traced_model/Llama-2-7b/"
+
+torch.manual_seed(0)
+
 
 def llama_sample():
     # Compile the model for a specific configuration
@@ -13,17 +17,18 @@ def llama_sample():
     runner = LlamaRunner(model_path=model_path, tokenizer_path=model_path, generation_config=generation_config)
 
     batch_size = 2
-    max_context_length = 1024
-    max_new_tokens = 1024
+    max_prompt_length = 1024
+    sequence_length = 2048
 
     runner.trace(
         traced_model_path=traced_model_path,
         tp_degree=32,
         batch_size=batch_size,
-        context_lengths=max_context_length,
-        new_token_counts=max_new_tokens,
+        max_prompt_length=max_prompt_length,
+        sequence_length=sequence_length,
         on_device_sampling=True,
     )
+
     # Load model weights into Neuron device
     # We will use the returned model to run accuracy and perf tests
     print("\nLoading model to Neuron device ..")
@@ -31,8 +36,8 @@ def llama_sample():
 
     # Confirm the traced model matches the huggingface model run on cpu
     print("\nChecking accuracy ..")
-    runner.check_accuracy(neuron_model, batch_size, max_context_length, max_new_tokens)
- 
+    runner.check_accuracy(neuron_model, batch_size, sequence_length)
+
     # Perform inference
     prompt = ["I believe the meaning of life is", "The color of the sky is"]
     print("\nGenerating ..")

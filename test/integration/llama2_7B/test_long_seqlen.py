@@ -1,12 +1,8 @@
-import argparse
-import atexit
-import json
 import os
 import re
 import signal
 import subprocess
 import sys
-import traceback
 
 SUCCEEDED = "succeeded"
 ERRORS = "errors"
@@ -14,29 +10,11 @@ MEMORY_DEGRADATION = "memory degradation"
 PERFORMANCE_DEGADATION = "performance degradation"
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument(
-        "--test_json",
-        required=False,
-        help="input json listing the test spec for network to compile",
-    )
-    parser.add_argument("--s3_dir", required=False, help="location to upload all test artifacts")
-    parser.add_argument("--s3_bucket", default="s3://ktf-test-runs/neuronx_distributed_parallel_layers/layers")
-    args, leftovers = parser.parse_known_args()
-    S3_BUCKET_NAME = args.s3_bucket
-    with open(args.test_json, "r") as f:
-        test_dict = json.load(f)
-    return test_dict, S3_BUCKET_NAME, args
-
-
-test_config, S3_BUCKET_NAME, args = parse_args()
-results = {"inference_success": 1}
-
-
 def run_job(seq_len=32768, mem_threshold=0, throughputs_threshold=99999):
     p1 = subprocess.run(
-        [f"{seq_len}", "neuron_parallel_compile", "./run_llama_7b_tp_ptl.sh", f"{seq_len}"],
+        [f"export SEQ_LEN={seq_len}; neuron_parallel_compile ./run_llama_7b_tp_ptl.sh"],
+        shell=True,
+        text=True,
         stderr=sys.stderr,
         stdout=sys.stdout,
     )
@@ -53,7 +31,9 @@ def run_job(seq_len=32768, mem_threshold=0, throughputs_threshold=99999):
     )
 
     p2 = subprocess.run(
-        [f"{seq_len}", "./run_llama_7b_tp_ptl.sh", f"{seq_len}"],
+        [f"export SEQ_LEN={seq_len}; ./run_llama_7b_tp_ptl.sh"],
+        shell=True,
+        text=True,
         stderr=sys.stderr,
         stdout=sys.stdout,
     )
@@ -99,21 +79,14 @@ def extract_throughput(seq_len=32768):
     return throughputs
 
 
-def on_exit():
-    for k in test_config:
-        os.system(f"rm {args.test_json}")
-        with open(args.test_json, "w") as f:
-            json.dump({k: results}, f)
-
-
 if __name__ == "__main__":
     succeeded = []
     failed = []
     for seq_len, mem_thershold, perf_threshold in [
         # Threshold with 5%-8% tolarance
-        [8192, 88590512128, 9.15],
-        [16384, 109604828160, 3.10],
-        [32768, 124354230272, 1.20],
+        [8192, 88590512128, 6.60],
+        [16384, 109604828160, 2.60],
+        [32768, 124354230272, 1.00],
     ]:
         return_status = run_job(seq_len, mem_thershold, perf_threshold)
         if return_status == SUCCEEDED:
@@ -121,11 +94,5 @@ if __name__ == "__main__":
         else:
             failed.append(seq_len)
     print(f"Succeeded: seq len {succeeded}, Failed: seq len {failed}")
-    try:
-        assert not failed, "Job failed"
-    except:
-        results["inference_success"] = 0
-        print(traceback.format_exc())
-        raise
-    print(f"Tests finished successfully!")
-    atexit.register(on_exit)
+    assert not failed, "Job failed"
+    print("Tests finished successfully!")

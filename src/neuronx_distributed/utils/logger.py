@@ -2,42 +2,41 @@
 import logging
 import os
 import sys
+from functools import lru_cache, wraps
+from typing import Any, Optional, Callable, TypeVar
+from typing_extensions import ParamSpec
 
-_logger_initialized = False
-_log_level = None
+# Third Party
+import torch
+
+T = TypeVar("T")
+P = ParamSpec("P")
 
 
-def get_log_level():
-    global _log_level
-    if _log_level is None:
-        default = "info"
-        log_level = os.environ.get("NXD_LOG_LEVEL", default=default)
-        log_level = log_level.lower()
-
-        # allowed_levels = ["info", "trace", "debug", "warning", "error", "fatal", "off"]
-        if log_level == "off":
-            level = logging.FATAL + 1
-        elif log_level == "fatal":
-            # fatal added so that log level can take same values for cpp and py
-            # fatal in cpp exceptions kills the process
-            # so use fatal for that only
-            level = logging.FATAL
-        elif log_level == "error":
-            level = logging.ERROR
-        elif log_level == "warning":
-            level = logging.WARNING
-        elif log_level == "info":
-            level = logging.INFO
-        elif log_level in ["debug", "trace"]:
-            level = logging.DEBUG
-        else:
-            level = logging.INFO
-        _log_level = level
-    return _log_level
+@lru_cache
+def get_log_level() -> int:
+    """Get the log level as configured or the default"""
+    log_level = os.environ.get("NXD_LOG_LEVEL", default="info").lower()
+    if log_level == "off":
+        return logging.FATAL + 1
+    if log_level == "fatal":
+        # fatal added so that log level can take same values for cpp and py
+        # fatal in cpp exceptions kills the process
+        # so use fatal for that only
+        return logging.FATAL
+    if log_level == "error":
+        return logging.ERROR
+    if log_level == "warning":
+        return logging.WARNING
+    if log_level == "info":
+        return logging.INFO
+    if log_level in ["debug", "trace"]:
+        return logging.DEBUG
+    raise ValueError(f"Allowed NXD_LOG_LEVELS are: info, trace, debug, warning, error, fatal, off. Got: {log_level}")
 
 
 class PackagePathFilter(logging.Filter):
-    def filter(self, record):
+    def filter(self, record: Any) -> bool:
         pathname = record.pathname
         record.relativepath = None
         abs_sys_paths = map(os.path.abspath, sys.path)
@@ -50,33 +49,64 @@ class PackagePathFilter(logging.Filter):
         return True
 
 
-def get_logger(name="neuronx_distributed"):
-    global _logger_initialized
-    if not _logger_initialized:
-        level = get_log_level()
-        logger = logging.getLogger(name)
-        hide_time = os.getenv("NXD_LOG_HIDE_TIME", "False")
+def get_logger(name: str = "neuronx_distributed", rank0_only: bool = True) -> logging.Logger:
+    logger = logging.getLogger(name + ("[0]" if rank0_only else "[]"))
+    if getattr(logger, "initialized", False):
+        return logger  # already configured
 
-        fmt = "["
-        if hide_time.lower() in ["true", "1"]:
-            hide_time = True
-        else:
-            hide_time = False
-            fmt += "%(asctime)s.%(msecs)03d: "
-        logger.handlers = []
-        log_formatter = logging.Formatter(
-            fmt=fmt + "%(levelname).1s %(relativepath)s:%(lineno)d] %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-        )
-        stdout_handler = logging.StreamHandler(sys.stdout)
-        stdout_handler.setFormatter(log_formatter)
-        stdout_handler.addFilter(PackagePathFilter())
-        logger.addHandler(stdout_handler)
+    hide_time = os.getenv("NXD_LOG_HIDE_TIME", "false").lower()
+    time = "" if hide_time in ["true", "1"] else "%(asctime)s.%(msecs)03d: "
+    log_formatter = logging.Formatter(
+        fmt=f"[{time}%(levelname).1s %(relativepath)s:%(lineno)d] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    stdout_handler = logging.StreamHandler(sys.stdout)
+    stdout_handler.setFormatter(log_formatter)
+    stdout_handler.addFilter(PackagePathFilter())
+    logger.handlers = [stdout_handler]  # overwrite
 
-        if level:
-            logger.setLevel(level)
-        else:
-            logger.disabled = True
-        _logger_initialized = True
-        logger.propagate = False
-    return logging.getLogger(name)
+    level = get_log_level()
+    if level <= logging.FATAL:
+        logger.setLevel(level)
+        if rank0_only:
+            # this ensures all logging levels get marked with the rank zero decorator
+            # otherwise logs would get multiplied for each GPU process in multi-GPU setup
+            for level in (
+                "debug",
+                "info",
+                "warning",
+                "error",
+                "exception",
+                "fatal",
+                "critical",
+            ):
+                setattr(logger, level, _rank0_only(getattr(logger, level)))
+    else:
+        logger.disabled = True
+    logger.propagate = False
+    logger.initialized = True
+    return logger
+
+
+def _rank0_only(fn: Callable[P, T], default: Optional[T] = None, **extra_kwargs: P.kwargs) -> Callable[P, Optional[T]]:
+    """Wrap a logging.Logger function to call internal function only in rank zero.
+    Function that can be used as a decorator to enable a function/method being called only on global rank 0.
+
+    Arguments:
+       fn: function to decorate
+       default: value to return when the global rank is not 0
+    Returns:
+       Decorated function
+    """
+
+    @wraps(fn)
+    def wrapped_fn(*args: P.args, **kwargs: P.kwargs) -> Optional[T]:
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else int(os.environ.get("RANK", "0"))
+        if rank == 0:
+            # excluding the wrapper from calling stack for logger to use
+            # see https://docs.python.org/3/library/logging.html#logging.Logger.findCaller
+            kwargs["stacklevel"] = kwargs.get("stacklevel", 1) + 1
+            return fn(*args, **kwargs)
+        return default
+
+    return wrapped_fn

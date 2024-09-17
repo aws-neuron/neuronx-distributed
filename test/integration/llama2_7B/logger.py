@@ -66,7 +66,7 @@ class Logger:
                 headers={"X-aws-ec2-metadata-token": token.text},
             )
             return data.text
-        except:
+        except Exception:
             return os.environ.get("HOSTNAME", "unknown")
 
     def log(self, epoch, step, step_loss, learning_rate, throughput, grad_norm=None):
@@ -74,7 +74,7 @@ class Logger:
         grad_norm_msg = f"grad-norm : {grad_norm}" if grad_norm else ""
         print(
             f"LOG {time_now} - ({epoch}, {step}) step_loss : {step_loss:.4f} "
-            f"learning_rate : {learning_rate:.2e} throughput : {throughput:.2f} "
+            f"learning_rate : {learning_rate:.2e} throughput : {throughput:.2f} seq/s "
             f"{grad_norm_msg}",
             flush=True,
         )

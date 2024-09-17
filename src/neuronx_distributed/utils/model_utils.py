@@ -34,11 +34,11 @@ try:
 except ImportError:
     _TORCHDISTX_AVAIL = False
 
-_NXTT_AVAIL = True
+_NXDT_AVAIL = True
 try:
-    from neuronx_training_toolkit.models.megatron.module import MegatronModule
+    from neuronx_distributed_training.models.megatron.module import MegatronModule
 except ImportError:
-    _NXTT_AVAIL = False
+    _NXDT_AVAIL = False
 
 
 def analyze_shared_parameters(module, shared_parameters=None, prefix=""):
@@ -99,11 +99,39 @@ def is_hf_transformers_available():
 def is_hf_accelerate_available():
     return _Accelerate_AVAIL
 
-def is_nxtt_pretrained_model(model):
-    return _NXTT_AVAIL and isinstance(model, MegatronModule)
+def is_nxdt_pretrained_model(model):
+    return _NXDT_AVAIL and isinstance(model, MegatronModule)
 
-def is_nxtt_available():
-    return _NXTT_AVAIL
+def is_nxdt_available():
+    return _NXDT_AVAIL
+
+def recursive_filter(item, predicate):
+    """ Filter a structure containing tensors based on the given predicate """
+
+    def _is_tensor_or_parameter(obj):
+        return isinstance(obj, (torch.Tensor, nn.Parameter))
+
+    def _augmented_predicate(obj):
+        return predicate(obj) if _is_tensor_or_parameter(obj) else True
+
+    if isinstance(item, dict):
+        out = {}
+        for k, v in item.items():
+            if _augmented_predicate(v):
+                out[k] = recursive_filter(v, predicate)
+    elif isinstance(item, (list, tuple, set)):
+        out = []
+        for x in item:
+            if _augmented_predicate(x):
+                out.append(recursive_filter(x, predicate))
+        out = type(item)(out)
+    else:
+        # under normal circumstances this should not return None, unless
+        # there is an unexpected data structure involved
+        out = item if _augmented_predicate(item) else None
+
+    return out
+
 
 
 @contextmanager
@@ -128,10 +156,12 @@ def preserve_parallel_attributes(model: torch.nn.Module) -> None:
     """
     Preserve the following 3 attributes for the model parameters
         - tensor_model_parallel
+        - expert_model_parallel
         - sequence_parallel_enabled
         - shared
     """
     tp_params = {}
+    ep_params = {}
     seq_parallel_params = {}
     shared_parameters = {}
     for name, param in model.named_parameters():
@@ -141,6 +171,8 @@ def preserve_parallel_attributes(model: torch.nn.Module) -> None:
                 "partition_dim": param.partition_dim,
                 "stride": param.partition_stride,
             }
+        if hasattr(param, "expert_model_parallel"):
+            ep_params[name] = param.expert_model_parallel
         if hasattr(param, "sequence_parallel_enabled"):
             seq_parallel_params[name] = param.sequence_parallel_enabled
         if hasattr(param, "shared"):
@@ -151,6 +183,8 @@ def preserve_parallel_attributes(model: torch.nn.Module) -> None:
         for name, param in model.named_parameters():
             if name in tp_params and not hasattr(param, "tensor_model_parallel"):
                 set_tensor_model_parallel_attributes(param, *tp_params[name].values())
+            if name in ep_params and not hasattr(param, "expert_model_parallel"):
+                setattr(param, "expert_model_parallel", ep_params[name])
             if name in seq_parallel_params and not hasattr(param, "sequence_parallel_enabled"):
                 setattr(param, "sequence_parallel_enabled", seq_parallel_params[name])
             if name in shared_parameters and not hasattr(param, "shared"):
@@ -300,3 +334,15 @@ def get_model_sequential(model, device, sequential_move_factor=11, param_init_fn
                 move_model_to_device(model, device)
         xm.rendezvous("get_model_sequential" + str(worker))
     return model
+
+
+def check_delay_tracing(nxd_config):
+    # Temporarily disabling delayed tracing while we investigate some issues
+    # TODO re-enable once the issues with delayed tracing are resolved
+    return False
+
+
+def get_delay_tracing(arg):
+    # Temporarily disabling delayed tracing while we investigate some issues
+    # TODO re-enable once the issues with delayed tracing are resolved
+    return False

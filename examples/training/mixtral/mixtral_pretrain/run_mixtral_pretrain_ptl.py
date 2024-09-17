@@ -23,43 +23,43 @@ current = os.path.dirname(os.path.realpath(__file__))
 parent = os.path.dirname(current)
 sys.path.append(parent)
 
-import torch
-import torch_xla.core.xla_model as xm
-from data_module import NeuronLightningDataModule
-from modeling_mixtral_moe_nxd import (
-    CoreAttention,
-    MixtralDecoderLayer,
-    MixtralForCausalLM,
-    MixtralRMSNorm,
-    init_weights,
-)
-from module_mixtral import NeuronMixtralLTModule, NeuronMixtralPPLTModule
-from pytorch_lightning import Trainer
-from pytorch_lightning.callbacks import ModelCheckpoint, ModelSummary
-from training_utils import (
-    create_mixtral_pretraining_dataset,
-    get_learning_rate_scheduler,
-    get_mixed_precision_config,
-)
-from transformers import AdamW, MixtralConfig, set_seed
-
-import neuronx_distributed as nxd
-from neuronx_distributed.lightning import (
-    NeuronTensorBoardLogger,
-    NeuronTQDMProgressBar,
-    NeuronXLAPrecisionPlugin,
-    NeuronXLAStrategy,
-)
-from neuronx_distributed.modules.moe.loss_function import load_balancing_loss_func
-from neuronx_distributed.parallel_layers import mappings
-from neuronx_distributed.utils.adamw_fp32_optim_params import AdamW_FP32OptimParams
+import torch  # noqa: E402
+import torch_xla.core.xla_model as xm  # noqa: E402
+from data_module import NeuronLightningDataModule  # noqa: E402
+from modeling_mixtral_moe_nxd import (  # noqa: E402
+    CoreAttention,  # noqa: E402
+    MixtralDecoderLayer,  # noqa: E402
+    MixtralForCausalLM,  # noqa: E402
+    MixtralRMSNorm,  # noqa: E402
+    init_weights,  # noqa: E402
+)  # noqa: E402
+from module_mixtral import NeuronMixtralLTModule, NeuronMixtralPPLTModule  # noqa: E402
+from pytorch_lightning import Trainer  # noqa: E402
+from pytorch_lightning.callbacks import ModelCheckpoint, ModelSummary  # noqa: E402
+from training_utils import (  # noqa: E402
+    create_mixtral_pretraining_dataset,  # noqa: E402
+    get_learning_rate_scheduler,  # noqa: E402
+    get_mixed_precision_config,  # noqa: E402
+)  # noqa: E402
+from transformers import AdamW, MixtralConfig, set_seed  # noqa: E402
+import neuronx_distributed as nxd  # noqa: E402
+from neuronx_distributed.modules.moe.model import MoE  # noqa: E402
+from neuronx_distributed.lightning import (  # noqa: E402
+    NeuronTensorBoardLogger,  # noqa: E402
+    NeuronTQDMProgressBar,  # noqa: E402
+    NeuronXLAPrecisionPlugin,  # noqa: E402
+    NeuronXLAStrategy,  # noqa: E402
+)  # noqa: E402
+from neuronx_distributed.modules.moe.loss_function import load_balancing_loss_func  # noqa: E402
+from neuronx_distributed.parallel_layers import mappings  # noqa: E402
+from neuronx_distributed.utils.adamw_fp32_optim_params import AdamW_FP32OptimParams  # noqa: E402
 
 # For PT autocast.
 torch.cuda.is_bf16_supported = lambda: True
 
 # Workaround for NaNs seen with transformers version >= 4.21.0
 # https://github.com/aws-neuron/aws-neuron-sdk/issues/593
-import transformers.modeling_utils as modeling_utils
+import transformers.modeling_utils as modeling_utils  # noqa: E402
 
 if os.environ.get("XLA_USE_BF16") or os.environ.get("XLA_DOWNCAST_BF16"):
     modeling_utils.get_parameter_dtype = lambda x: torch.bfloat16
@@ -127,10 +127,9 @@ def train_mixtral(flags):
 
 def _setup_model_config(flags):
     model_config = MixtralConfig.from_pretrained(flags.model_path)
-    model_config.capacity_factor = flags.capacity_factor
+    # capacity_factor = None corresponds to full capacity (no token dropping)
+    model_config.capacity_factor = float(flags.capacity_factor) if flags.capacity_factor is not None else None
     model_config.sequence_parallel_enabled = flags.sequence_parallel_enabled > 0
-    model_config.moe_sequence_parallel_mode = flags.moe_sequence_parallel_mode
-    model_config.expert_mlps_permute_strategy = flags.expert_mlps_permute_strategy
     model_config.qkv_linear = flags.qkv_linear > 0
     model_config.selective_checkpoint_enabled = flags.selective_checkpoint_enabled > 0
     model_config.kv_shared_group_size = flags.kv_replicator
@@ -147,6 +146,7 @@ def _setup_nxd_config(flags):
         else {
             "meta_device_init": True,
             "param_init_fn": init_weights,
+            "sequential_move_factor": 11,
         }
     )
 
@@ -175,10 +175,11 @@ def _setup_nxd_config(flags):
     return nxd.neuronx_distributed_config(
         tensor_parallel_size=flags.tensor_parallel_size,
         pipeline_parallel_size=flags.pipeline_parallel_size,
+        expert_parallel_size=flags.expert_parallel_size,
         pipeline_config=pipeline_config,
         optimizer_config={"zero_one_enabled": flags.use_zero_1, "grad_clipping": True, "max_grad_norm": 1.0},
         sequence_parallel=flags.sequence_parallel_enabled,
-        activation_checkpoint_config=CoreAttention if flags.selective_checkpoint_enabled else "full",
+        activation_checkpoint_config=(CoreAttention, MoE) if flags.selective_checkpoint_enabled else "full",
         model_init_config=model_init_config,
         mixed_precision_config=mixed_precision_config,
     )
@@ -289,6 +290,7 @@ if __name__ == "__main__":
 
     parser.add_argument("--tensor_parallel_size", default=2, type=int, help="Tensor parallel size")
     parser.add_argument("--pipeline_parallel_size", type=int, default=1, help="PP size")
+    parser.add_argument("--expert_parallel_size", type=int, default=1, help="EP size")
     parser.add_argument("--num_microbatches", type=int, default=8, help="num_microbatches used for PP")
     parser.add_argument("--seq_len", default=2048, type=int, help="Sequence length")
     parser.add_argument("--use_mix_precision", action="store_true", help="Use mix precision.")
@@ -310,18 +312,6 @@ if __name__ == "__main__":
         help="Enable sequence parallel",
     )
     parser.add_argument(
-        "--moe_sequence_parallel_mode",
-        default="EXIT_SP_ON_ENTRY",
-        type=str,
-        help="MoE layer sequence parallel mode",
-    )
-    parser.add_argument(
-        "--expert_mlps_permute_strategy",
-        default="matmul",
-        type=str,
-        help="ExpertMLPs permute strategy (either 'matmul' or 'index')",
-    )
-    parser.add_argument(
         "--selective_checkpoint_enabled",
         default=False,
         action="store_true",
@@ -341,8 +331,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--capacity_factor",
-        default=4.0,
-        type=float,
+        default=None,
         help="MoE capacity factor",
     )
     parser.add_argument(
@@ -350,7 +339,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--use_gpu_compatible_precision",
-        default=0,
+        default=1,
         type=int,
         help="Use gpu compatible precision",
     )

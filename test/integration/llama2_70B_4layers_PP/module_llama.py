@@ -30,7 +30,7 @@ class NeuronLlamaLTModule(NeuronLlamaLTModuleOrigin):
             and self.trainer.strategy.pipeline_parallel_rank == self.trainer.strategy.pipeline_parallel_size - 1
         ):
             print(
-                f"step {self.global_step} loss is {self.loss.detach().cpu().item()}, lr is {self.lr}, input_ids {torch.sum(self.input_ids.detach().cpu()).item()}"
+                f"step {self.global_step} loss is {self.loss.detach().cpu().item()}, lr is {self.lr}, throughput {self.tps} seq/s, input_ids {torch.sum(self.input_ids.detach().cpu()).item()}"
             )
 
             step_now = self.global_step - 1

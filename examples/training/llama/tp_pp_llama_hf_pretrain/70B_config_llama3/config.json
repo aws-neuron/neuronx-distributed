@@ -28,4 +28,3 @@
   "selective_checkpoint_enabled": false,
   "move_model_to_device":false
 }
-  

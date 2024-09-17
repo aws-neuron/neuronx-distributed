@@ -24,11 +24,6 @@ datetime_str = str(datetime.now())
 
 def parse_args():
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument(
-        "--test_json",
-        required=False,
-        help="input json listing the test spec for network to compile",
-    )
     parser.add_argument("--s3_dir", required=False, help="location to upload all test artifacts")
     parser.add_argument(
         "--s3_bucket",
@@ -36,12 +31,9 @@ def parse_args():
     )
     args, leftovers = parser.parse_known_args()
     S3_BUCKET_NAME = args.s3_bucket
-    with open(args.test_json, "r") as f:
-        test_dict = json.load(f)
-    return test_dict, S3_BUCKET_NAME, args
+    return S3_BUCKET_NAME, args
 
-
-test_config, S3_BUCKET_NAME, args = parse_args()
+S3_BUCKET_NAME, args = parse_args()
 results = {"inference_success": 1}
 
 
@@ -122,23 +114,14 @@ def test_parallel_cross_entropy(tensor_model_parallel_size):
     global results
     try:
         _test_parallel_cross_entropy()
-    except:
+    except Exception:
         results["inference_success"] = 0
         print(traceback.format_exc())
         raise
 
 
-def upload_to_s3():
-    os.system(f'aws s3 cp --no-progress "{datetime_str}" {S3_BUCKET_NAME}')
-    print(met.metrics_report())
-
-
 def on_exit():
-    upload_to_s3()
-    for k in test_config:
-        os.system(f"rm {args.test_json}")
-        with open(args.test_json, "w") as f:
-            json.dump({k: results}, f)
+    print(met.metrics_report())
 
 
 if __name__ == "__main__":

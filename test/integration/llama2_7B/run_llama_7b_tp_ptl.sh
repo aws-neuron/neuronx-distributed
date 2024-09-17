@@ -3,7 +3,7 @@
 #############################################
 # User defined parameters and env vars
 
-if [ -z "$SEQ_LEN" ];
+if [ -z "$SEQ_LEN" ] || [ "$SEQ_LEN" -eq 4096 ];
 then
     DATA_PATH="$HOME/wikicorpus_datasets/wikicorpus_llama_v2_tokenized_4k"
     SEQ_LEN=4096
@@ -46,7 +46,7 @@ fi
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 
-export NEURON_CC_FLAGS="--model-type transformer --distribution-strategy=llm-training --cache_dir=$HOME/neuron_compile_cache$SEQ_LEN/ --retry_failed_compilation"
+export NEURON_CC_FLAGS="--model-type transformer --distribution-strategy=llm-training --cache_dir=$HOME/neuron_compile_cache$SEQ_LEN/ --retry_failed_compilation --enable-saturate-infinity"
 export NEURON_FUSE_SOFTMAX=1
 
 # Async Runtime
@@ -150,7 +150,7 @@ torchrun $DISTRIBUTED_ARGS \
     --data_dir $DATA_PATH \
     --tensor_parallel_size $TP_DEGREE \
     --train_batch_size $MBS \
-    --steps_this_run $STEPS_THIS_RUN\
+    --steps_this_run $STEPS_THIS_RUN \
     --max_steps $TOTAL_STEPS \
     --warmup_steps $WARMUP_STEPS \
     --lr $LR \

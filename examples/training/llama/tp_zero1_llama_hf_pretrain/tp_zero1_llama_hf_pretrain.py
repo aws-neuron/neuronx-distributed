@@ -31,27 +31,22 @@ import torch_xla.core.xla_model as xm
 import torch_xla.distributed.parallel_loader as pl
 import torch_xla.distributed.xla_multiprocessing as xmp
 from logger import Logger
-from modeling_llama_nxd import CoreAttention, LlamaForCausalLM
-from training_utils import Throughput, create_llama_pretraining_dataset, get_mixed_precision_config
+from modeling_llama_nxd import CoreAttention, LlamaForCausalLM, init_weights
+from training_utils import Throughput, create_llama_pretraining_dataset, get_mixed_precision_config, get_sin_cos_matrix
 from transformers import AdamW, LlamaConfig, set_seed
 from transformers.optimization import get_linear_schedule_with_warmup
 
 import neuronx_distributed as nxd
-from neuronx_distributed.parallel_layers import (
-    checkpointing,
-    grads,
-    layers,
-    parallel_state,
-)
+from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.parallel_layers.utils import requires_init_pg_override
 from neuronx_distributed.utils.adamw_fp32_optim_params import AdamW_FP32OptimParams
-
-# For PT autocast.
-torch.cuda.is_bf16_supported = lambda: True
 
 # Workaround for NaNs seen with transformers version >= 4.21.0
 # https://github.com/aws-neuron/aws-neuron-sdk/issues/593
 import transformers.modeling_utils as modeling_utils
+
+# For PT autocast.
+torch.cuda.is_bf16_supported = lambda: True
 
 if os.environ.get("XLA_USE_BF16") or os.environ.get("XLA_DOWNCAST_BF16"):
     modeling_utils.get_parameter_dtype = lambda x: torch.bfloat16
@@ -152,16 +147,6 @@ def get_model(flags):
         config.hidden_size = args.hidden_size
     xm.master_print(config)
     model = LlamaForCausalLM(config)
-
-    def get_sin_cos_matrix(config):
-        head_dim = config.hidden_size // config.num_attention_heads
-        base = 10000
-        inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
-        t = torch.arange(config.max_position_embeddings, dtype=inv_freq.dtype)
-        freqs = torch.einsum("i,j->ij", t, inv_freq)
-        # Different from paper, but it uses a different permutation in order to obtain the same calculation
-        emb = torch.cat((freqs, freqs), dim=-1)
-        return emb.cos()[None, None, :, :].to(torch.float32), emb.sin()[None, None, :, :].to(torch.float32)
 
     # Here we make sure we use the same sine and cosine matrices for all layers.
     # Making use of same tensors would make the CSE algorithm eliminate the lookup call
@@ -642,7 +627,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--use_gpu_compatible_precision",
-        default=0,
+        default=1,
         type=int,
         help="Use gpu compatible precision",
     )

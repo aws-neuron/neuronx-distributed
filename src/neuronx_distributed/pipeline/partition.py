@@ -285,6 +285,8 @@ def create_partitions(pipeline_parallel_size, model_layer_names):
     """
     num_hidden_layers = len(model_layer_names)
     num_layer_per_partition = num_hidden_layers // pipeline_parallel_size
+    assert num_layer_per_partition >= 1, f"The partition cannot be created; num_hidden_layers should be atleast equal to \
+        pipeline_parallel_size, but found num_hidden_layers = {num_hidden_layers} and pipeline_parallel_size = {pipeline_parallel_size}"
     layers_per_partition = [num_layer_per_partition for x in range(pipeline_parallel_size)]
     remainder = num_hidden_layers % pipeline_parallel_size
     if remainder > 0:

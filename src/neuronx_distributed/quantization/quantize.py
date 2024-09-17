@@ -1,33 +1,17 @@
 import copy
-from typing import Any, Callable, Dict, TypedDict
+from typing import Any, Callable, Dict
 
-from neuronx_distributed.quantization.quantization_layers import (
-    QuantizationType,
-    QuantizedDtype,
+from neuronx_distributed.quantization.quantization_config import (
+    BASE_QCONFIG_DICT_TYPE,
+    get_default_custom_qconfig_dict,
 )
 from neuronx_distributed.quantization.quantization_mappings import (
     get_default_quant_module_mappings,
 )
 
 
-class CONFIG_DICT_TYPE(TypedDict):
-    quantization_type: QuantizationType
-    quantized_dtype: QuantizedDtype
-
-
-_DEFAULT_CUSTOM_CONFIG_DICT: CONFIG_DICT_TYPE = {
-    "quantization_type": QuantizationType.SCALAR,
-    "quantized_dtype": QuantizedDtype.INT8,
-}
-
-
-def get_default_custom_config_dict() -> CONFIG_DICT_TYPE:
-    r"""Defines the default custom config dict."""
-    return _DEFAULT_CUSTOM_CONFIG_DICT
-
-
 def convert(
-    module: Any, q_config: CONFIG_DICT_TYPE = None, inplace: bool = False, mapping: Dict[Callable, Any] = None
+    module: Any, q_config: BASE_QCONFIG_DICT_TYPE = None, inplace: bool = False, mapping: Dict[Callable, Any] = None
 ) -> Any:
     """Funtion to convert a Non quantized module to its quantized version based on the q_config
 
@@ -43,7 +27,7 @@ def convert(
     if not inplace:
         module = copy.deepcopy(module)
     if q_config is None:
-        q_config = get_default_custom_config_dict()
+        q_config = get_default_custom_qconfig_dict()
     if mapping is None:
         mapping = get_default_quant_module_mappings()
 
@@ -60,14 +44,13 @@ def _convert_initialized_float_to_initialized_quantized(module, q_config, mappin
     reassign = {}
 
     for name, mod in module.named_children():
-        if not type(mod) in mapping:
+        if type(mod) not in mapping:
             _convert_initialized_float_to_initialized_quantized(module=mod, q_config=q_config, mapping=mapping)
         if type(mod) in mapping:
             quantized_class = mapping[type(mod)]
             reassign[name] = quantized_class.from_float(
                 mod=mod,
-                quantization_type=q_config.get("quantization_type"),
-                quantized_dtype=q_config.get("quantized_dtype"),
+                q_config=q_config,
             )
         # Currently there is a bug in quantize.convert function where even though
         # Parallel embedding has set for tensor_model_parallel attribute, it does not show

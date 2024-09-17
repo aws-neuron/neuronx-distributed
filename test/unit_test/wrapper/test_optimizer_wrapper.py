@@ -9,9 +9,6 @@ from transformers.models.gpt2.modeling_gpt2 import GPT2Block
 
 import neuronx_distributed as nxd
 
-from .. import update_result
-
-
 def get_model():
     seq_len = 512
     model_config = GPT2Config(
@@ -92,56 +89,51 @@ class TestOptimizerWrapper(unittest.TestCase):
     @patch("neuronx_distributed.utils.model_utils.get_local_world_size", MagicMock(return_value=32))
     @patch("torch.distributed.get_rank")
     def test_optimizer_wrapper(self, rank_mock):
-        try:
-            pipeline_cuts = [
-                "transformer.h.1",
-                "transformer.h.2",
-                "transformer.h.3",
-                "transformer.h.4",
-                "transformer.h.5",
-                "transformer.h.6",
-                "transformer.h.7",
-            ]
-            nxd_config = nxd.neuronx_distributed_config(
-                tensor_parallel_size=8,
-                pipeline_parallel_size=8,
-                pipeline_config={
-                    "transformer_layer_cls": GPT2Block,
-                    "tracer_cls": "hf",
-                    "num_microbatches": 1,
-                    "output_loss_value_spec": True,
-                    "input_names": ["input_ids", "attention_mask", "labels"],
-                    "pipeline_cuts": pipeline_cuts,
-                    "param_init_fn": None,
-                    "leaf_module_cls": ["GPT2Block"],
-                    "use_zero1_optimizer": True,
-                    "use_optimizer_wrapper": True,
-                },
-                optimizer_config={
-                    "zero_one_enabled": True,
-                    "grad_clipping": True,
-                    "max_grad_norm": 1.0,
-                },
-                sequence_parallel=True,
-                activation_checkpoint_config="full",
-            )
-            model = nxd.initialize_parallel_model(nxd_config, get_model)
-            optimizer = nxd.initialize_parallel_optimizer(nxd_config, torch.optim.AdamW, model.parameters(), lr=1e-3)
+        pipeline_cuts = [
+            "transformer.h.1",
+            "transformer.h.2",
+            "transformer.h.3",
+            "transformer.h.4",
+            "transformer.h.5",
+            "transformer.h.6",
+            "transformer.h.7",
+        ]
+        nxd_config = nxd.neuronx_distributed_config(
+            tensor_parallel_size=8,
+            pipeline_parallel_size=8,
+            pipeline_config={
+                "transformer_layer_cls": GPT2Block,
+                "tracer_cls": "hf",
+                "num_microbatches": 1,
+                "output_loss_value_spec": True,
+                "input_names": ["input_ids", "attention_mask", "labels"],
+                "pipeline_cuts": pipeline_cuts,
+                "param_init_fn": None,
+                "leaf_module_cls": ["GPT2Block"],
+                "use_zero1_optimizer": True,
+                "use_optimizer_wrapper": True,
+            },
+            optimizer_config={
+                "zero_one_enabled": True,
+                "grad_clipping": True,
+                "max_grad_norm": 1.0,
+            },
+            sequence_parallel=True,
+            activation_checkpoint_config="full",
+        )
+        model = nxd.initialize_parallel_model(nxd_config, get_model)
+        optimizer = nxd.initialize_parallel_optimizer(nxd_config, torch.optim.AdamW, model.parameters(), lr=1e-3)
 
-            assert optimizer.nxd_config == nxd_config
-            assert isinstance(optimizer, nxd.trainer.optimizer.NxDOptimizer)
-            assert isinstance(optimizer.optimizer, nxd.optimizer.NeuronZero1Optimizer)
-            assert isinstance(optimizer.optimizer.base_optimizer, torch.optim.AdamW)
-            assert len(list(model.parameters())) == len(optimizer.params)
-            assert optimizer.grad_norm is None
+        assert optimizer.nxd_config == nxd_config
+        assert isinstance(optimizer, nxd.trainer.optimizer.NxDOptimizer)
+        assert isinstance(optimizer.optimizer, nxd.optimizer.NeuronZero1Optimizer)
+        assert isinstance(optimizer.optimizer.base_optimizer, torch.optim.AdamW)
+        assert len(list(model.parameters())) == len(optimizer.params)
+        assert optimizer.grad_norm is None
 
-            for method in ["step", "zero_grad", "state_dict"]:
-                getattr(optimizer, method)()
-                assert getattr(nxd.optimizer.zero_redundancy_optimizer.NeuronZero1Optimizer, method).called
-
-        except:
-            update_result({"inference_success": 0})
-            raise
+        for method in ["step", "zero_grad", "state_dict"]:
+            getattr(optimizer, method)()
+            assert getattr(nxd.optimizer.zero_redundancy_optimizer.NeuronZero1Optimizer, method).called
 
     @patch("torch.optim.AdamW.step", MagicMock(return_value=None))
     @patch("torch.optim.AdamW.zero_grad", MagicMock(return_value=None))
@@ -177,55 +169,50 @@ class TestOptimizerWrapper(unittest.TestCase):
     @patch("neuronx_distributed.trainer.optimizer.grads.clip_grad_norm", MagicMock(return_value=None))
     @patch("torch.distributed.get_rank")
     def test_optimizer_wrapper_no_zero1(self, rank_mock):
-        try:
-            pipeline_cuts = [
-                "transformer.h.1",
-                "transformer.h.2",
-                "transformer.h.3",
-                "transformer.h.4",
-                "transformer.h.5",
-                "transformer.h.6",
-                "transformer.h.7",
-            ]
-            nxd_config = nxd.neuronx_distributed_config(
-                tensor_parallel_size=8,
-                pipeline_parallel_size=8,
-                pipeline_config={
-                    "transformer_layer_cls": GPT2Block,
-                    "tracer_cls": "hf",
-                    "num_microbatches": 1,
-                    "output_loss_value_spec": True,
-                    "input_names": ["input_ids", "attention_mask", "labels"],
-                    "pipeline_cuts": pipeline_cuts,
-                    "param_init_fn": None,
-                    "leaf_module_cls": ["GPT2Block"],
-                    "use_zero1_optimizer": True,
-                    "use_optimizer_wrapper": True,
-                },
-                optimizer_config={
-                    "zero_one_enabled": False,
-                    "grad_clipping": True,
-                    "max_grad_norm": 1.0,
-                },
-                sequence_parallel=True,
-                activation_checkpoint_config="full",
-            )
-            model = nxd.initialize_parallel_model(nxd_config, get_model)
-            optimizer = nxd.initialize_parallel_optimizer(nxd_config, torch.optim.AdamW, model.parameters(), lr=1e-3)
+        pipeline_cuts = [
+            "transformer.h.1",
+            "transformer.h.2",
+            "transformer.h.3",
+            "transformer.h.4",
+            "transformer.h.5",
+            "transformer.h.6",
+            "transformer.h.7",
+        ]
+        nxd_config = nxd.neuronx_distributed_config(
+            tensor_parallel_size=8,
+            pipeline_parallel_size=8,
+            pipeline_config={
+                "transformer_layer_cls": GPT2Block,
+                "tracer_cls": "hf",
+                "num_microbatches": 1,
+                "output_loss_value_spec": True,
+                "input_names": ["input_ids", "attention_mask", "labels"],
+                "pipeline_cuts": pipeline_cuts,
+                "param_init_fn": None,
+                "leaf_module_cls": ["GPT2Block"],
+                "use_zero1_optimizer": True,
+                "use_optimizer_wrapper": True,
+            },
+            optimizer_config={
+                "zero_one_enabled": False,
+                "grad_clipping": True,
+                "max_grad_norm": 1.0,
+            },
+            sequence_parallel=True,
+            activation_checkpoint_config="full",
+        )
+        model = nxd.initialize_parallel_model(nxd_config, get_model)
+        optimizer = nxd.initialize_parallel_optimizer(nxd_config, torch.optim.AdamW, model.parameters(), lr=1e-3)
 
-            assert optimizer.nxd_config == nxd_config
-            assert isinstance(optimizer, nxd.trainer.optimizer.NxDOptimizer)
-            assert isinstance(optimizer.optimizer, torch.optim.AdamW)
-            assert len(list(model.parameters())) == len(optimizer.params)
-            assert optimizer.grad_norm is None
+        assert optimizer.nxd_config == nxd_config
+        assert isinstance(optimizer, nxd.trainer.optimizer.NxDOptimizer)
+        assert isinstance(optimizer.optimizer, torch.optim.AdamW)
+        assert len(list(model.parameters())) == len(optimizer.params)
+        assert optimizer.grad_norm is None
 
-            for method in ["step", "zero_grad", "state_dict"]:
-                getattr(optimizer, method)()
-                assert getattr(torch.optim.AdamW, method).called, method
-
-        except:
-            update_result({"inference_success": 0})
-            raise
+        for method in ["step", "zero_grad", "state_dict"]:
+            getattr(optimizer, method)()
+            assert getattr(torch.optim.AdamW, method).called, method
 
 
 if __name__ == "__main__":

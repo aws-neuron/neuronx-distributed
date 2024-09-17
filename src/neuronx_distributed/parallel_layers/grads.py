@@ -9,6 +9,10 @@ from .mappings import reduce_from_tensor_model_parallel_region
 from .parallel_state import (
     get_data_parallel_group,
     get_data_parallel_size,
+    get_expert_data_parallel_group,
+    get_expert_data_parallel_size,
+    get_expert_model_parallel_group,
+    get_expert_model_parallel_size,
     get_pipeline_model_parallel_group,
     get_pipeline_model_parallel_size,
     get_tensor_model_parallel_group,
@@ -52,17 +56,33 @@ def get_grad_norm(parameters, norm_type=2, zero1_optimizer=False, zero1_optimize
 
     if not zero1_optimizer and zero1_optimizer_groups is not None:
         raise ValueError(
-            f"Getting zero1_optimizer_groups while zero1_optimizer is False. When using zero-1 optimizer grad clipping is handled by optimizer."
+            "Getting zero1_optimizer_groups while zero1_optimizer is False. When using zero-1 optimizer grad clipping is handled by optimizer."
         )  # noqa
 
-    def _allreduce_norm_across_parallel_groups(total_norm, reduce_op):
+    def _allreduce_norm_across_parallel_groups(total_norm, ep_total_norm, reduce_op):
         """
         - zero1 without groups: allreduce across world groups
         - otherwise allreduce across each parallel group
         """
         if zero1_optimizer and zero1_optimizer_groups is None:
-            torch.distributed.all_reduce(total_norm, op=reduce_op)
+            torch.distributed.all_reduce(total_norm, op=reduce_op, group=get_expert_data_parallel_group())
+            if get_expert_model_parallel_size() > 1:
+                torch.distributed.all_reduce(total_norm, op=reduce_op, group=get_expert_model_parallel_group())
+                torch.distributed.all_reduce(ep_total_norm, op=reduce_op, group=get_expert_data_parallel_group())
+                total_norm += ep_total_norm
+
         else:
+            if get_expert_model_parallel_size() > 1:
+                torch.distributed.all_reduce(
+                    ep_total_norm,
+                    op=reduce_op,
+                    group=get_expert_model_parallel_group(),
+                )
+            if reduce_op == torch.distributed.ReduceOp.MAX:
+                total_norm = max(total_norm, ep_total_norm)
+            else:
+                # reduce_op will be SUM for Lp-norms
+                total_norm += ep_total_norm
             if get_tensor_model_parallel_size() > 1:
                 torch.distributed.all_reduce(
                     total_norm,
@@ -82,11 +102,12 @@ def get_grad_norm(parameters, norm_type=2, zero1_optimizer=False, zero1_optimize
                     groups=zero1_optimizer_groups,
                     pin_layout=True,
                 )
+        return total_norm
 
     if isinstance(parameters, torch.Tensor):
         parameters = [parameters]
 
-    device = xm.xla_device()
+    device = parameters[0].device
     dtype = parameters[0].dtype
 
     grads = []
@@ -97,10 +118,13 @@ def get_grad_norm(parameters, norm_type=2, zero1_optimizer=False, zero1_optimize
         is_not_shared = param_is_not_shared(param)
         is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(param)
         is_tp_param = hasattr(param, "tensor_model_parallel") and param.tensor_model_parallel
+        is_ep_param = _is_ep_param(param)
         if grad_not_none:
             grad = param.grad.detach()
             grads.append(grad)
         if grad_not_none and is_not_shared:
+            if is_ep_param:
+                grad.expert_model_parallel = True
             if is_tp_param or (is_not_tp_duplicate and not force_spmd):
                 # TP parallelized parameters
                 # (not force_spmd) only tp rank 0 will add non-tp paramaters
@@ -126,14 +150,21 @@ def get_grad_norm(parameters, norm_type=2, zero1_optimizer=False, zero1_optimize
             # sum the non-tp grad norm and scale by the tp_size
             for grad in grads_for_norm_tp_duplicated:
                 grad_norm = torch.norm(grad, norm_type)
-                total_norm += grad_norm**norm_type
+                if _is_ep_grad(grad):
+                    ep_total_norm += grad_norm**norm_type
+                else:
+                    total_norm += grad_norm**norm_type
             total_norm /= get_tensor_model_parallel_size()
+            ep_total_norm /= get_tensor_model_parallel_size()
 
         for grad in grads_for_norm:
             grad_norm = torch.norm(grad, norm_type)
-            total_norm += grad_norm**norm_type
+            if _is_ep_grad(grad):
+                ep_total_norm += grad_norm**norm_type
+            else:
+                total_norm += grad_norm**norm_type
 
-        _allreduce_norm_across_parallel_groups(total_norm, torch.distributed.ReduceOp.SUM)
+        total_norm = _allreduce_norm_across_parallel_groups(total_norm, ep_total_norm, torch.distributed.ReduceOp.SUM)
         total_norm = torch.pow(total_norm, 1.0 / norm_type)
 
     return total_norm
@@ -177,8 +208,13 @@ def clip_grad_norm(
         force_spmd=force_spmd,
     )
 
-    # Scale.
-    device = xm.xla_device()
+    clip_grads_with_norm(parameters, total_norm, max_norm)
+    return total_norm
+
+
+def clip_grads_with_norm(parameters, total_norm, max_norm):
+    assert len(parameters) > 0, "Parameters should be a non-empty list for gradient clipping"
+    device = parameters[0].device
     grads = []
     for param in parameters:
         if param.grad is not None:
@@ -197,7 +233,7 @@ def clip_grad_norm(
     return total_norm
 
 
-def bucket_allreduce_gradients(grads_list):
+def bucket_allreduce_gradients(grads_list, reduce_over_ep_group=False):
     """
     All reduce bucket gradients for data parallelism.
     Referred from https://github.com/aws-neuron/neuronx-nemo-megatron/blob/main/nemo/nemo/collections/nlp/models/language_modeling/megatron_base_model.py#L58 # noqa: E501
@@ -221,10 +257,24 @@ def bucket_allreduce_gradients(grads_list):
         gradients = reversed(grads)
         total = 0
         tensor_bucket = []
-        groups = get_data_parallel_group(as_list=True)
+
+        # if reduce_over_ep_group == False, the assumption is that we are allreducing
+        # all gradients over the expert-data-parallel group. if there is no ep, this
+        # is the only allreduce that we do, since data-parallel-group == expert-data-parallel-group.
+        # otherwise, non-expert-parallel gradients will go through an additional allreduce
+        # with reduce_over_ep_group == True, so that they are reduced over the full dp group.
+        if reduce_over_ep_group:
+            groups = get_expert_model_parallel_group(as_list=True)
+        else:
+            groups = get_expert_data_parallel_group(as_list=True)
+
+        # the assumption is that if we are reducing over ep group, then we
+        # will also separately reduce over expert data parallel group, and the
+        # normalization has already happened.
+        size = get_data_parallel_size() if not reduce_over_ep_group else 1.0
 
         for grad in gradients:
-            grad.data /= get_data_parallel_size()
+            grad.data /= size
             grad_bytes = grad.numel() * grad.element_size()
 
             # Gradient is larger than bucket_cap, don't bucketize

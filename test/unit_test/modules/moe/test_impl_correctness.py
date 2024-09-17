@@ -9,17 +9,15 @@ import torch
 from parameterized import parameterized
 
 from neuronx_distributed import parallel_layers
-from neuronx_distributed.modules.moe import ACT2FN
 from neuronx_distributed.modules.moe import (
     load_balancing_loss_func as neuron_load_balancing_loss_func,
 )
 
-from ... import update_result
 from . import loss_fn_correctness_test_helper as lch
 from . import mixtral_model as m_mixtral
 from . import sbase_model as m_sbase
 from . import utils_testing as ut
-from .utils_testing import ExptCfgCorrectness
+from .utils_testing import ExptCfg
 
 if not torch.distributed.is_initialized():
     # Simulate torchrun (required because MoE uses parallel layers for TP)
@@ -47,12 +45,14 @@ TEST_TOLS = {
 }
 
 
-def get_impl_correctness_test_configs(test_type):
-    assert test_type in {"fwd", "bwd"}
+def get_impl_correctness_test_configs(test_modes):
+    test_modes = set(test_modes)
+    assert (
+        len(test_modes) > 0 and len(test_modes - {"training", "inference"}) == 0
+    ), f"Unknown test modes: {str(test_modes)}"
 
     GLU_MLP_ARGS = [True, False]
     DTYPE_ARGS = [torch.float32, torch.bfloat16]
-    PERMUTE_STRATEGY_ARGS = ["matmul", "index"]
 
     test_configs = []
 
@@ -65,53 +65,40 @@ def get_impl_correctness_test_configs(test_type):
             "implementation": "sbase",
         }
 
-        # Test forward_full_capacity
-        test_cfg["expert_mlps_permute_strategy"] = "index"
+        # Training tests
+        test_cfg["test_mode"] = "training"
         sbase_test_configs.extend(
             [
-                ExptCfgCorrectness(
-                    seq_len=128, batch_size=1, hidden_size=384, num_experts=2, capacity_factor=2.0, **test_cfg
-                ),
-                ExptCfgCorrectness(
-                    seq_len=128, batch_size=4, hidden_size=384, num_experts=8, capacity_factor=8.0, **test_cfg
-                ),
+                # Test forward_all_experts (full capacity)
+                ExptCfg(seq_len=128, batch_size=1, hidden_size=384, num_experts=2, capacity_factor=None, **test_cfg),
+                ExptCfg(seq_len=128, batch_size=4, hidden_size=384, num_experts=8, capacity_factor=None, **test_cfg),
+                # Test forward_capacity_factor
+                ExptCfg(seq_len=128, batch_size=1, hidden_size=384, num_experts=4, capacity_factor=2.0, **test_cfg),
+                ExptCfg(seq_len=128, batch_size=4, hidden_size=384, num_experts=8, capacity_factor=1.0, **test_cfg),
             ]
         )
 
-        # Test cases for inference (therefore we return them only for the fwd correctness)
-        if test_type == "fwd":
-            # Tests for token-gen
-            sbase_test_configs.extend(
-                [
-                    ExptCfgCorrectness(
-                        seq_len=1, batch_size=1, hidden_size=384, num_experts=4, capacity_factor=1.0, **test_cfg
-                    ),
-                    ExptCfgCorrectness(
-                        seq_len=1, batch_size=4, hidden_size=960, num_experts=4, capacity_factor=1.0, **test_cfg
-                    ),
-                ]
-            )
-
-        # capacity_factor such that some tokens may be dropped
-        for permute_strategy in PERMUTE_STRATEGY_ARGS:
-            test_cfg["expert_mlps_permute_strategy"] = permute_strategy
-            sbase_test_configs.extend(
-                [
-                    # capacity_factor such that some tokens may be dropped
-                    ExptCfgCorrectness(
-                        seq_len=128, batch_size=1, hidden_size=384, num_experts=4, capacity_factor=2.0, **test_cfg
-                    ),
-                    ExptCfgCorrectness(
-                        seq_len=128, batch_size=4, hidden_size=384, num_experts=8, capacity_factor=1.0, **test_cfg
-                    ),
-                ]
-            )
+        # Inference tests
+        test_cfg["test_mode"] = "inference"
+        sbase_test_configs.extend(
+            [
+                # Test context encoding
+                ExptCfg(seq_len=128, batch_size=1, hidden_size=384, num_experts=2, capacity_factor=None, **test_cfg),
+                ExptCfg(seq_len=128, batch_size=4, hidden_size=384, num_experts=8, capacity_factor=None, **test_cfg),
+                ExptCfg(seq_len=128, batch_size=1, hidden_size=384, num_experts=4, capacity_factor=2.0, **test_cfg),
+                ExptCfg(seq_len=128, batch_size=4, hidden_size=384, num_experts=8, capacity_factor=1.0, **test_cfg),
+                # Test token generation
+                ExptCfg(seq_len=1, batch_size=1, hidden_size=384, num_experts=4, capacity_factor=None, **test_cfg),
+                ExptCfg(seq_len=1, batch_size=2, hidden_size=384, num_experts=4, capacity_factor=None, **test_cfg),
+                ExptCfg(seq_len=1, batch_size=8, hidden_size=960, num_experts=4, capacity_factor=None, **test_cfg),
+            ]
+        )
 
     # Test each configuration on 2 random activation functions
     for test_no, cfg in enumerate(sbase_test_configs):
         for hidden_act in ut.get_random_activations(num=2, seed=test_no):
             test_configs.append(dataclasses.replace(cfg, hidden_act=hidden_act))
-    
+
     # Mixtral test cases
     # Only fp32 testing with full capacity is supported for mixtral because we havent hacked the golden implementation
     test_cfg = {
@@ -119,63 +106,119 @@ def get_impl_correctness_test_configs(test_type):
         "glu_mlp": True,
         "hidden_act": "silu",
         "implementation": "topk",
-        "expert_mlps_permute_strategy": "index",
+        "capacity_factor": None,
     }
 
-    # Test forward_full_capacity
+    # Training tests
+    test_cfg["test_mode"] = "training"
     test_configs.extend(
         [
-            ExptCfgCorrectness(
-                seq_len=128, batch_size=1, hidden_size=384, num_experts=2, capacity_factor=2.0, top_k=1, **test_cfg,
+            ExptCfg(
+                seq_len=128,
+                batch_size=1,
+                hidden_size=384,
+                num_experts=2,
+                top_k=1,
+                **test_cfg,
             ),
-            ExptCfgCorrectness(
-                seq_len=128, batch_size=2, hidden_size=384, num_experts=4, capacity_factor=2.0, top_k=2, **test_cfg,
+            ExptCfg(
+                seq_len=128,
+                batch_size=2,
+                hidden_size=384,
+                num_experts=4,
+                top_k=2,
+                **test_cfg,
             ),
-            ExptCfgCorrectness(
-                seq_len=128, batch_size=4, hidden_size=384, num_experts=4, capacity_factor=1.0, top_k=4, **test_cfg,
+            ExptCfg(
+                seq_len=128,
+                batch_size=4,
+                hidden_size=384,
+                num_experts=4,
+                top_k=4,
+                **test_cfg,
             ),
         ]
     )
 
-    # Test cases for inference (therefore we return them only for the fwd correctness)
-    if test_type == "fwd":
-        # Tests for token-gen
-        test_configs.extend(
-            [
-                ExptCfgCorrectness(
-                    seq_len=1, batch_size=1, hidden_size=384, num_experts=4, capacity_factor=1.0, top_k=2, **test_cfg,
-                ),
-                ExptCfgCorrectness(
-                    seq_len=1, batch_size=2, hidden_size=384, num_experts=4, capacity_factor=1.0, top_k=4, **test_cfg,
-                ),
-                ExptCfgCorrectness(
-                    seq_len=1, batch_size=4, hidden_size=384, num_experts=8, capacity_factor=1.0, top_k=4, **test_cfg,
-                ),
-            ]
-        )
+    # Inference tests
+    test_cfg["test_mode"] = "inference"
+    test_configs.extend(
+        [
+            # Test context encoding
+            ExptCfg(
+                seq_len=128,
+                batch_size=1,
+                hidden_size=384,
+                num_experts=2,
+                top_k=1,
+                **test_cfg,
+            ),
+            ExptCfg(
+                seq_len=128,
+                batch_size=2,
+                hidden_size=384,
+                num_experts=4,
+                top_k=2,
+                **test_cfg,
+            ),
+            ExptCfg(
+                seq_len=128,
+                batch_size=4,
+                hidden_size=384,
+                num_experts=4,
+                top_k=4,
+                **test_cfg,
+            ),
+            # Test token generation
+            ExptCfg(
+                seq_len=1,
+                batch_size=1,
+                hidden_size=384,
+                num_experts=4,
+                top_k=2,
+                **test_cfg,
+            ),
+            ExptCfg(
+                seq_len=1,
+                batch_size=2,
+                hidden_size=384,
+                num_experts=4,
+                top_k=4,
+                **test_cfg,
+            ),
+            ExptCfg(
+                seq_len=1,
+                batch_size=4,
+                hidden_size=384,
+                num_experts=8,
+                top_k=4,
+                **test_cfg,
+            ),
+        ]
+    )
 
-    # Add full capacity tests for matmul and index
-    full_capacity_permute_test_configs = []
+    # Add full capacity tests for forward_capacity_factor
+    forward_capacity_factor_full_capacity_test_configs = []
     eps = 10**-6
     for cfg in test_configs:
         if cfg.seq_len == 1:
-            # Skip for token-gen
+            # Skip for token generation configs
             continue
-        
-        if cfg.capacity_factor >= cfg.num_experts / cfg.top_k:
+
+        if cfg.capacity_factor is None:
             # Set capacity_factor = full_capacity_factor - eps
             full_cf_eps = float(cfg.num_experts / cfg.top_k) - eps
-            for permute_strategy in PERMUTE_STRATEGY_ARGS:
-                full_cf_eps_cfg = dataclasses.replace(
-                    cfg, 
-                    capacity_factor=full_cf_eps, 
-                    expert_mlps_permute_strategy=permute_strategy
-                )
-                full_capacity_permute_test_configs.append(full_cf_eps_cfg)
+            full_cf_eps_cfg = dataclasses.replace(
+                cfg,
+                capacity_factor=full_cf_eps,
+            )
+            forward_capacity_factor_full_capacity_test_configs.append(full_cf_eps_cfg)
 
-    test_configs.extend(full_capacity_permute_test_configs)
-    
-    return test_configs
+    test_configs.extend(forward_capacity_factor_full_capacity_test_configs)
+
+    test_mode_configs = [cfg for cfg in test_configs if cfg.test_mode in test_modes]
+
+    return test_mode_configs
 
 
 def initialize_neuron_and_golden_models(cfg):
@@ -228,188 +271,181 @@ def get_expected_dropped_token_indices(expert_ind, cfg):
 
 
 class TestImplCorrectness(unittest.TestCase):
-    @parameterized.expand(get_impl_correctness_test_configs("fwd"), name_func=ut.custom_name_func)
+    @parameterized.expand(
+        get_impl_correctness_test_configs(test_modes=["training", "inference"]), name_func=ut.custom_name_func
+    )
     def test_fwd_correctness(self, cfg):
-        try:
-            is_token_gen = cfg.seq_len == 1
-            model_neuron, model_golden = initialize_neuron_and_golden_models(cfg)
+        model_neuron, model_golden = initialize_neuron_and_golden_models(cfg)
 
-            # Set is_test=True
-            model_neuron.is_test = True
-            if cfg.implementation == "sbase":
-                model_golden.is_test = True
+        # Set is_test=True
+        model_neuron.is_test = True
+        if cfg.implementation == "sbase":
+            model_golden.is_test = True
 
-            if is_token_gen:
-                model_neuron.eval()
-                model_golden.eval()
-            else:
-                model_neuron.train()
-                model_golden.train()
-
-            with torch.no_grad():
-                for it in range(cfg.num_iters):
-                    if is_token_gen:
-                        # Token gen: input should be BSH
-                        ip = torch.randn(cfg.batch_size, cfg.seq_len, cfg.hidden_size, dtype=cfg.dtype, device=cfg.device)
-                    else:
-                        # For training, input is SBH
-                        # For context encoding, the ordering of S and B does not matter for cpu testing
-                        ip = torch.randn(cfg.seq_len, cfg.batch_size, cfg.hidden_size, dtype=cfg.dtype, device=cfg.device)
-
-                    if cfg.implementation == "topk":
-                        # Run fwd on both the Neuron and Mixtral HF model
-                        op_neuron, router_logits_neuron, exp_ind_neuron = model_neuron(ip)
-                        op_mixtral, router_logits_mixtral = model_golden(ip)
-
-                        # check that router logits and outputs match
-                        ut.check_tensors(
-                            router_logits_neuron, router_logits_mixtral, **TEST_TOLS, additional_msg=f"Iteration {it}"
-                        )
-                        ut.check_tensors(op_neuron, op_mixtral, **TEST_TOLS, additional_msg=f"Iteration {it}")
-
-                    elif cfg.implementation == "sbase":
-                        # Run fwd on both the Neuron and S-BASE model
-                        op_neuron, _, exp_ind_neuron = model_neuron(ip)
-                        op_sbase, _, exp_ind_sbase = model_golden(ip)
-
-                        if cfg.dtype == torch.bfloat16:
-                            # Skip this check for token-gen (because perc_discrepancy may be large since S*B is small)
-                            if not is_token_gen:
-                                # Permit minor discrepancies for bf16
-                                perc_discrepancy = 1 - torch.mean(
-                                    torch.isclose(exp_ind_neuron, exp_ind_sbase, **TEST_TOLS).to(torch.float32)
-                                )
-                                assert (
-                                    perc_discrepancy.item() < BF16_EXPERT_ASSIGNMENT_DIFF_TOL
-                                ), f" diff is {perc_discrepancy}"
-                        else:
-                            # Check that the initial expert assignments were identical for fp32
-                            ut.check_tensors(
-                                exp_ind_neuron, exp_ind_sbase, **TEST_TOLS, additional_msg=f"Iteration {it}"
-                            )
-
-                        # Token-gen is dropless
-                        if not is_token_gen:
-                            # Get the indices of the tokens which should have been dropped by the model_neuron
-                            expected_dropped_token_indices = get_expected_dropped_token_indices(exp_ind_neuron, cfg)
-
-                            # Manually simulate the dropping of tokens in op_sbase
-                            op_sbase = ut.drop_tokens_in_tensor(op_sbase, expected_dropped_token_indices)
-
-                        if cfg.dtype == torch.bfloat16:
-                            # Simulate dropping of tokens in op_neuron and op_sbase where the expert assignments are not matching with neuron
-                            expert_mismatch_indices = torch.where(exp_ind_neuron != exp_ind_sbase)[0].tolist()
-                            op_sbase = ut.drop_tokens_in_tensor(op_sbase, expert_mismatch_indices)
-                            op_neuron = ut.drop_tokens_in_tensor(op_neuron, expert_mismatch_indices)
-
-                        # Check that op_neuron matches the op_sbase with the dropped tokens
-                        ut.check_tensors(op_neuron, op_sbase, **TEST_TOLS, additional_msg=f"Iteration {it}")
-
-                    else:
-                        raise ValueError(f"Unknown implementation: {cfg.implementation}")
-        except:
-            update_result({"inference_success": 0})
-            raise
-
-    @parameterized.expand(get_impl_correctness_test_configs("bwd"), name_func=ut.custom_name_func)
-    def test_bwd_correctness(self, cfg):
-        try:
-            model_neuron, model_golden = initialize_neuron_and_golden_models(cfg)
-
-            # Set is_test=True
-            model_neuron.is_test = True
-            if cfg.implementation == "sbase":
-                model_golden.is_test = True
-
-            # Set models to train mode
+        is_token_gen = cfg.seq_len == 1
+        if cfg.test_mode == "inference":
+            model_neuron.eval()
+            model_golden.eval()
+        else:
             model_neuron.train()
             model_golden.train()
 
-            optimizer_neuron = torch.optim.Adadelta(model_neuron.parameters())
-            optimizer_golden = torch.optim.Adadelta(model_golden.parameters())
-            mse_loss = torch.nn.MSELoss()
-
+        with torch.no_grad():
             for it in range(cfg.num_iters):
-                # Generate random input tensor
-                ip = torch.randn(cfg.seq_len, cfg.batch_size, cfg.hidden_size, dtype=cfg.dtype, device=cfg.device)
+                if cfg.test_mode == "inference":
+                    # Inference: input is BSH
+                    ip = torch.randn(
+                        cfg.batch_size, cfg.seq_len, cfg.hidden_size, dtype=cfg.dtype, device=cfg.device
+                    )
+                else:
+                    # Training: input is SBH
+                    ip = torch.randn(
+                        cfg.seq_len, cfg.batch_size, cfg.hidden_size, dtype=cfg.dtype, device=cfg.device
+                    )
 
-                if cfg.dtype == torch.bfloat16:
-                    # Simulate dropping of tokens in input where the expert assignments are not matching with neuron
-                    assert cfg.implementation == "sbase"
-                    with torch.no_grad():
-                        op_neuron, _, exp_ind_neuron = model_neuron(ip)
-                        op_sbase, _, exp_ind_sbase = model_golden(ip)
+                if cfg.implementation == "topk":
+                    # Run fwd on both the Neuron and Mixtral HF model
+                    op_neuron, router_logits_neuron, exp_ind_neuron = model_neuron(ip)
+                    op_mixtral, router_logits_mixtral = model_golden(ip)
+
+                    # Check that router logits and outputs match
+                    ut.check_tensors(
+                        router_logits_neuron, router_logits_mixtral, **TEST_TOLS, additional_msg=f"Iteration {it}"
+                    )
+                    ut.check_tensors(op_neuron, op_mixtral, **TEST_TOLS, additional_msg=f"Iteration {it}")
+
+                elif cfg.implementation == "sbase":
+                    # Run fwd on both the Neuron and S-BASE model
+                    op_neuron, _, exp_ind_neuron = model_neuron(ip)
+                    op_sbase, _, exp_ind_sbase = model_golden(ip)
+
+                    if cfg.dtype == torch.bfloat16:
+                        # Skip this check for token-gen (because perc_discrepancy may be large since S*B is small)
+                        if not is_token_gen:
+                            # Permit minor discrepancies for bf16
+                            perc_discrepancy = 1 - torch.mean(
+                                torch.isclose(exp_ind_neuron, exp_ind_sbase, **TEST_TOLS).to(torch.float32)
+                            )
+                            assert (
+                                perc_discrepancy.item() < BF16_EXPERT_ASSIGNMENT_DIFF_TOL
+                            ), f" diff is {perc_discrepancy}"
+                    else:
+                        # Check that the initial expert assignments were identical for fp32
+                        ut.check_tensors(
+                            exp_ind_neuron, exp_ind_sbase, **TEST_TOLS, additional_msg=f"Iteration {it}"
+                        )
+
+                    # Token-gen is dropless
+                    if not is_token_gen:
+                        # Get the indices of the tokens which should have been dropped by the model_neuron
+                        expected_dropped_token_indices = get_expected_dropped_token_indices(exp_ind_neuron, cfg)
+
+                        # Manually simulate the dropping of tokens in op_sbase
+                        op_sbase = ut.drop_tokens_in_tensor(op_sbase, expected_dropped_token_indices)
+
+                    if cfg.dtype == torch.bfloat16:
+                        # Simulate dropping of tokens in op_neuron and op_sbase where the expert assignments are not matching with neuron
                         expert_mismatch_indices = torch.where(exp_ind_neuron != exp_ind_sbase)[0].tolist()
-                        ip = ut.drop_tokens_in_tensor(ip, expert_mismatch_indices)
+                        op_sbase = ut.drop_tokens_in_tensor(op_sbase, expert_mismatch_indices)
+                        op_neuron = ut.drop_tokens_in_tensor(op_neuron, expert_mismatch_indices)
 
-                # Run forward pass on model_neuron
-                op_neuron, _, exp_ind_neuron = model_neuron(ip)
+                    # Check that op_neuron matches the op_sbase with the dropped tokens
+                    ut.check_tensors(op_neuron, op_sbase, **TEST_TOLS, additional_msg=f"Iteration {it}")
 
-                if cfg.implementation == "sbase":
-                    # Get the indices of the tokens which should have been dropped by the model_neuron
-                    expected_dropped_token_indices = get_expected_dropped_token_indices(exp_ind_neuron, cfg)
-                    # Manually simulate the dropping of tokens in the input passed
-                    ip = ut.drop_tokens_in_tensor(ip.clone().detach(), expected_dropped_token_indices)
-
-                # Run forward pass on model_golden
-                if cfg.implementation == "sbase":
-                    op_golden, _, _ = model_golden(ip)
-                elif cfg.implementation == "topk":
-                    op_golden, _ = model_golden(ip)
                 else:
                     raise ValueError(f"Unknown implementation: {cfg.implementation}")
 
-                # Compute MSE loss wrt which we get the gradients
-                targets = torch.zeros_like(ip, device=cfg.device, dtype=torch.float32)
-                loss_neuron = mse_loss(op_neuron.to(torch.float32), targets)
-                loss_golden = mse_loss(op_golden.to(torch.float32), targets)
-                ut.check_tensors(loss_neuron, loss_golden, **TEST_TOLS, additional_msg=f"Iteration {it}")
+    @parameterized.expand(get_impl_correctness_test_configs(test_modes=["training"]), name_func=ut.custom_name_func)
+    def test_bwd_correctness(self, cfg):
+        model_neuron, model_golden = initialize_neuron_and_golden_models(cfg)
 
-                # Run backward pass to compute gradients
-                loss_neuron.backward()
-                loss_golden.backward()
+        # Set is_test=True
+        model_neuron.is_test = True
+        if cfg.implementation == "sbase":
+            model_golden.is_test = True
 
-                # Compare gradients
-                grads_neuron = ut.get_model_grads_dict(model_neuron)
-                grads_golden = convert_golden_to_neuron_state_dict(ut.get_model_grads_dict(model_golden), cfg=cfg)
-                assert set(grads_neuron.keys()) == set(grads_golden.keys())
-                for key in grads_neuron:
-                    ut.check_tensors(
-                        grads_neuron[key], grads_golden[key], **TEST_TOLS, additional_msg=f"Iteration: {it}, key: {key}"
-                    )
+        # Set models to train mode
+        model_neuron.train()
+        model_golden.train()
 
-                # Zero out gradients before next iteration
-                optimizer_neuron.zero_grad()
-                optimizer_golden.zero_grad()
-        except:
-            update_result({"inference_success": 0})
-            raise
+        optimizer_neuron = torch.optim.Adadelta(model_neuron.parameters())
+        optimizer_golden = torch.optim.Adadelta(model_golden.parameters())
+        mse_loss = torch.nn.MSELoss()
+
+        for it in range(cfg.num_iters):
+            # Generate random input tensor
+            ip = torch.randn(cfg.seq_len, cfg.batch_size, cfg.hidden_size, dtype=cfg.dtype, device=cfg.device)
+
+            if cfg.dtype == torch.bfloat16:
+                # Simulate dropping of tokens in input where the expert assignments are not matching with neuron
+                assert cfg.implementation == "sbase"
+                with torch.no_grad():
+                    op_neuron, _, exp_ind_neuron = model_neuron(ip)
+                    op_sbase, _, exp_ind_sbase = model_golden(ip)
+                    expert_mismatch_indices = torch.where(exp_ind_neuron != exp_ind_sbase)[0].tolist()
+                    ip = ut.drop_tokens_in_tensor(ip, expert_mismatch_indices)
+
+            # Run forward pass on model_neuron
+            op_neuron, _, exp_ind_neuron = model_neuron(ip)
+
+            if cfg.implementation == "sbase":
+                # Get the indices of the tokens which should have been dropped by the model_neuron
+                expected_dropped_token_indices = get_expected_dropped_token_indices(exp_ind_neuron, cfg)
+                # Manually simulate the dropping of tokens in the input passed
+                ip = ut.drop_tokens_in_tensor(ip.clone().detach(), expected_dropped_token_indices)
+
+            # Run forward pass on model_golden
+            if cfg.implementation == "sbase":
+                op_golden, _, _ = model_golden(ip)
+            elif cfg.implementation == "topk":
+                op_golden, _ = model_golden(ip)
+            else:
+                raise ValueError(f"Unknown implementation: {cfg.implementation}")
+
+            # Compute MSE loss wrt which we get the gradients
+            targets = torch.zeros_like(ip, device=cfg.device, dtype=torch.float32)
+            loss_neuron = mse_loss(op_neuron.to(torch.float32), targets)
+            loss_golden = mse_loss(op_golden.to(torch.float32), targets)
+            ut.check_tensors(loss_neuron, loss_golden, **TEST_TOLS, additional_msg=f"Iteration {it}")
+
+            # Run backward pass to compute gradients
+            loss_neuron.backward()
+            loss_golden.backward()
+
+            # Compare gradients
+            grads_neuron = ut.get_model_grads_dict(model_neuron)
+            grads_golden = convert_golden_to_neuron_state_dict(ut.get_model_grads_dict(model_golden), cfg=cfg)
+            assert set(grads_neuron.keys()) == set(grads_golden.keys())
+            for key in grads_neuron:
+                ut.check_tensors(
+                    grads_neuron[key], grads_golden[key], **TEST_TOLS, additional_msg=f"Iteration: {it}, key: {key}"
+                )
+
+            # Zero out gradients before next iteration
+            optimizer_neuron.zero_grad()
+            optimizer_golden.zero_grad()
 
     @parameterized.expand(
         lch.get_loss_fn_correctness_test_configs(dtypes=[torch.bfloat16, torch.float32]), name_func=ut.custom_name_func
     )
     def test_loss_fn_correctness(self, cfg):
-        try:
-            # Set random seed for reproducibility
-            torch.manual_seed(cfg.num_experts)
-            with torch.no_grad():
-                for it in range(cfg.num_iters):
-                    test_gate_logits = [
-                        torch.randn(cfg.batch_size * cfg.seq_len, cfg.num_experts, device=cfg.device, dtype=cfg.dtype)
-                        for _ in range(cfg.num_layers)
-                    ]
-                    test_gate_logits = tuple(test_gate_logits)
-                    hf_loss = lch.hf_load_balancing_loss_func(test_gate_logits, cfg.num_experts, cfg.top_k)
-                    concatenated_test_gate_logits = torch.cat([layer_gate for layer_gate in test_gate_logits], dim=0)
-                    neuron_loss = neuron_load_balancing_loss_func(
-                        concatenated_test_gate_logits, cfg.num_experts, cfg.top_k
-                    )
-                    assert neuron_loss.dtype == hf_loss.dtype
-                    test_tols = lch.FP32_TEST_TOLS if cfg.dtype == torch.float32 else lch.BF16_TEST_TOLS
-                    ut.check_tensors(neuron_loss, hf_loss, **test_tols, additional_msg=f"Iteration {it}")
-        except:
-            update_result({"inference_success": 0})
-            raise
+        # Set random seed for reproducibility
+        torch.manual_seed(cfg.num_experts)
+        with torch.no_grad():
+            for it in range(cfg.num_iters):
+                test_gate_logits = [
+                    torch.randn(cfg.batch_size * cfg.seq_len, cfg.num_experts, device=cfg.device, dtype=cfg.dtype)
+                    for _ in range(cfg.num_layers)
+                ]
+                test_gate_logits = tuple(test_gate_logits)
+                hf_loss = lch.hf_load_balancing_loss_func(test_gate_logits, cfg.num_experts, cfg.top_k)
+                concatenated_test_gate_logits = torch.cat([layer_gate for layer_gate in test_gate_logits], dim=0)
+                neuron_loss = neuron_load_balancing_loss_func(
+                    concatenated_test_gate_logits, cfg.num_experts, cfg.top_k
+                )
+                assert neuron_loss.dtype == hf_loss.dtype
+                test_tols = lch.FP32_TEST_TOLS if cfg.dtype == torch.float32 else lch.BF16_TEST_TOLS
+                ut.check_tensors(neuron_loss, hf_loss, **test_tols, additional_msg=f"Iteration {it}")
 
 
 if __name__ == "__main__":
