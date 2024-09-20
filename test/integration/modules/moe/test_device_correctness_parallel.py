@@ -56,10 +56,10 @@ def parse_args():
     args, leftovers = parser.parse_known_args()
     S3_BUCKET_NAME = args.s3_bucket
     test_dtype = torch.float32 if args.test_dtype == "fp32" else torch.bfloat16
-    return S3_BUCKET_NAME, args, test_dtype, args.test_mode, args.test_tp_degree
+    return S3_BUCKET_NAME, args, test_dtype, args.test_mode, args.test_tp_degree, args.test_ep_degree, args.zero1
 
 
-S3_BUCKET_NAME, args, TEST_DTYPE, TEST_MODE, TEST_TP_DEGREE = parse_args()
+S3_BUCKET_NAME, args, TEST_DTYPE, TEST_MODE, TEST_TP_DEGREE, TEST_EP_DEGREE, ZERO1 = parse_args()
 results = {"inference_success": 1}
 
 # Set compiler flags before TRN enablement

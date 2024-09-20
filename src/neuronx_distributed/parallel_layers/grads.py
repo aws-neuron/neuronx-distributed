@@ -104,6 +104,12 @@ def get_grad_norm(parameters, norm_type=2, zero1_optimizer=False, zero1_optimize
                 )
         return total_norm
 
+    def _is_ep_param(obj):
+        return hasattr(obj, "expert_model_parallel") and obj.expert_model_parallel
+
+    def _is_ep_grad(obj):
+        return hasattr(obj, "expert_model_parallel") and obj.expert_model_parallel
+
     if isinstance(parameters, torch.Tensor):
         parameters = [parameters]
 
@@ -136,6 +142,7 @@ def get_grad_norm(parameters, norm_type=2, zero1_optimizer=False, zero1_optimize
     # Norm parameters.
     norm_type = float(norm_type)
     total_norm = torch.tensor([float(0.0)], dtype=dtype, device=device)
+    ep_total_norm = torch.tensor([float(0.0)], dtype=dtype, device=device)
 
     # Calculate norm.
     if torch.isinf(torch.tensor(norm_type)):
@@ -143,7 +150,7 @@ def get_grad_norm(parameters, norm_type=2, zero1_optimizer=False, zero1_optimize
         total_norm = max(grad.abs().max() for grad in grads_for_norm)
         total_norm = max(total_norm_tp_duplicated, total_norm)
         total_norm = torch.tensor([float(total_norm)], dtype=dtype, device=device)
-        _allreduce_norm_across_parallel_groups(total_norm, torch.distributed.ReduceOp.MAX)
+        _allreduce_norm_across_parallel_groups(total_norm, total_norm, torch.distributed.ReduceOp.MAX)
         total_norm = total_norm[0].item()
     else:
         if force_spmd:

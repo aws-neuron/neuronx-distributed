@@ -9,6 +9,7 @@ from neuronx_distributed.optimizer import NeuronZero1Optimizer, NeuronEPZero1Opt
 from neuronx_distributed.modules.lora import LoraConfig, LoraModel
 from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.parallel_layers.pad import pad_model
+from neuronx_distributed.parallel_layers.parallel_state import rmsg, get_expert_model_parallel_size
 from neuronx_distributed.pipeline import NxDPPModel
 from neuronx_distributed.trainer.model import NxDModel
 from neuronx_distributed.trainer.optimizer import NxDOptimizer
@@ -238,6 +239,8 @@ def initialize_optimizer_from_class(nxd_config, optimizer_class, parameters, mod
     optimizer_config = nxd_config["optimizer_config"]
     mixed_precision_config = nxd_config["mixed_precision_config"]
     if optimizer_config["zero_one_enabled"]:
+        ep_enabled = get_expert_model_parallel_size() > 1
+        zero1_optimizer_cls = NeuronEPZero1Optimizer if ep_enabled else NeuronZero1Optimizer
         zero1_configs = {
             "grad_clipping": optimizer_config["grad_clipping"],
             "pin_layout": False,

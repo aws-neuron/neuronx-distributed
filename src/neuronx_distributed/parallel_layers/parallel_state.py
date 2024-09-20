@@ -57,7 +57,11 @@ _MPU_EXPERT_MODEL_PARALLEL_RANK: Optional[int] = None
 PP_GROUP_PG_GLOO: Optional[ProcessGroup] = None
 
 
-def initialize_model_parallel(tensor_model_parallel_size: int = 1, pipeline_model_parallel_size: int = 1) -> None:
+def initialize_model_parallel(
+    tensor_model_parallel_size: int = 1,
+    pipeline_model_parallel_size: int = 1,
+    expert_model_parallel_size: int = 1,
+) -> None:
     """
     Initialize model data parallel groups.
 
@@ -182,15 +186,20 @@ def initialize_model_parallel(tensor_model_parallel_size: int = 1, pipeline_mode
     # Get world size and rank. Ensure some consistencies.
     assert torch.distributed.is_initialized()
 
+    rank = torch.distributed.get_rank()
     world_size: int = torch.distributed.get_world_size()
     tensor_model_parallel_size: int = min(tensor_model_parallel_size, world_size)
     pipeline_model_parallel_size: int = min(pipeline_model_parallel_size, world_size)
+    expert_model_parallel_size: int = min(expert_model_parallel_size, world_size)
+
+    # compute implied data parallel degrees for both expert and non-expert regions,
+    # in both cases making sure implied data parallel size is an integer.
     if world_size % (tensor_model_parallel_size * pipeline_model_parallel_size) != 0:
         raise RuntimeError(
-            (
-                f"`world_size` ({world_size}) is not divisible by tensor_model_parallel_size"
-                f" ({tensor_model_parallel_size}) x pipeline_model_parallel_size ({pipeline_model_parallel_size})"
-            )
+            f"invalid implied data parallel degree: "
+            f"`world_size` ({world_size}) is not divisible by "
+            f"tensor_model_parallel_size ({tensor_model_parallel_size}) x "
+            f"pipeline_model_parallel_size ({pipeline_model_parallel_size})"
         )
     data_parallel_size: int = world_size // (tensor_model_parallel_size * pipeline_model_parallel_size)
 
@@ -617,8 +626,16 @@ def destroy_model_parallel() -> None:
     """Set the groups to none."""
     global _TENSOR_MODEL_PARALLEL_GROUP
     _TENSOR_MODEL_PARALLEL_GROUP = None
+    global _EXPERT_MODEL_PARALLEL_GROUP
+    _EXPERT_MODEL_PARALLEL_GROUP = None
+    global _EXPERT_MODEL_PARALLEL_GROUP_SPMD
+    _EXPERT_MODEL_PARALLEL_GROUP_SPMD = None
     global _DATA_PARALLEL_GROUP
     _DATA_PARALLEL_GROUP = None
+    global _EXP_DATA_PARALLEL_GROUP
+    _EXP_DATA_PARALLEL_GROUP = None
+    global _EXP_DATA_PARALLEL_GROUP_SPMD
+    _EXP_DATA_PARALLEL_GROUP_SPMD = None
     global _PIPELINE_MODEL_PARALLEL_GROUP
     _PIPELINE_MODEL_PARALLEL_GROUP = None
     global _PIPELINE_GLOBAL_RANKS
