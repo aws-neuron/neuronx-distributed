@@ -84,7 +84,8 @@ class ExpertMLPs(torch.nn.Module):
             activation_fn=self.act_fn,
             dtype=dtype,
             device=device,
-            init_method=output_layer_init_method,
+            input_layer_init_method=init_method,
+            output_layer_init_method=output_layer_init_method,
         )
 
         self.dtype = dtype

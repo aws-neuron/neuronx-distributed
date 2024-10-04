@@ -1,7 +1,14 @@
+import functools
+from typing import Callable, Tuple
+
 import torch
+from torch import Tensor
+from torch.autograd import Function
+import torch.distributed
 import torch_xla.core.xla_model as xm
 
 from .parallel_state import (
+    get_expert_model_parallel_group,
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_size,
@@ -96,6 +103,8 @@ def _gather_along_dim(x: Tensor, partition_dim: int) -> Tensor:
 
     return output.contiguous()
 
+def _gather_along_first_dim(x: Tensor) -> Tensor:
+    return _gather_along_dim(x, partition_dim=0)
 
 def _gather_along_last_dim(x: Tensor) -> Tensor:
     return _gather_along_dim(x, partition_dim=len(x.shape)-1)
@@ -111,13 +120,18 @@ def _reduce_scatter_along_dim(x: Tensor, partition_dim: int) -> Tensor:
     """Reduce-scatter the input tensor across model parallel group."""
     tp_group = get_tensor_model_parallel_group()
 
-    world_size = get_tensor_model_parallel_size()
-    # Bypass the function if we are using only 1 device.
-    if world_size == 1:
-        return input_
+    # bypass the function if we only have 1 TP/SP rank
+    if tp_group.size() == 1:
+        return x
 
-    # Size and dimension.
-    rank = get_tensor_model_parallel_rank()
+    shape = list(x.shape)
+    if shape[partition_dim] % tp_group.size() != 0:
+        raise RuntimeError(
+            f"unable to create {tp_group.size()} partitions along dim {partition_dim} "
+            f"of tensor of shape {tuple(x.shape)} due to not being evenly divisible."
+        )
+    shape[partition_dim] //= tp_group.size()
+    output = torch.empty(shape, dtype=x.dtype, device=x.device)
 
     xm.reduce_scatter(
         xm.REDUCE_SUM,
@@ -130,56 +144,13 @@ def _reduce_scatter_along_dim(x: Tensor, partition_dim: int) -> Tensor:
         pin_layout=False,
     )
 
-    # Note: torch.cat already creates a contiguous tensor.
-    output = torch.cat(tensor_list, dim=1).contiguous()
-
     return output
 
+def _all_to_all_in_expert_parallel_region(x: Tensor, split_dim: int, concat_dim: int) -> Tensor:
+    ep_group = get_expert_model_parallel_group()
 
-def _split_along_first_dim(input_: torch.Tensor) -> torch.Tensor:
-    """Split the tensor along its first dimension and keep the corresponding slice."""
-    world_size = get_tensor_model_parallel_size()
-    # Bypass the function if we are using only 1 GPU for tensor model parallel.
-    if world_size == 1:
-        return input_
-
-    # Split along first dimension.
-    dim_size = input_.size(0)
-    assert dim_size % world_size == 0
-    local_dim_size = dim_size // world_size
-    dim_offset = get_tensor_model_parallel_rank() * local_dim_size
-    output = input_[dim_offset : dim_offset + local_dim_size].contiguous()
-    return output
-
-
-def _gather_along_last_dim(input_: torch.Tensor) -> torch.Tensor:
-    """Gather tensors and concatenate along the last dimension."""
-
-    world_size = get_tensor_model_parallel_size()
-    # Bypass the function if we are using only 1 device.
-    if world_size == 1:
-        return input_
-
-    # Size and dimension.
-    last_dim = input_.dim() - 1
-
-    tensor_list = [torch.empty_like(input_) for _ in range(world_size)]
-    torch.distributed.all_gather(tensor_list, input_, group=get_tensor_model_parallel_group())
-
-    # Note: torch.cat already creates a contiguous tensor.
-    output = torch.cat(tensor_list, dim=last_dim).contiguous()
-
-    return output
-
-
-def _gather_along_first_dim(input_: torch.Tensor) -> torch.Tensor:
-    """Gather tensors and concatenate along the first dimension."""
-    world_size = get_tensor_model_parallel_size()
-    # Bypass the function if we are using only 1 GPU.
-    if world_size == 1:
-        return input_
-
-    output = xm.all_gather(input_, groups=get_tensor_model_parallel_group(as_list=True), pin_layout=False)
+    if ep_group.size() == 1:  # bypass if there's no EP.
+        return x
 
     return xm.all_to_all(
         x,
@@ -189,8 +160,6 @@ def _gather_along_first_dim(input_: torch.Tensor) -> torch.Tensor:
         groups=get_expert_model_parallel_group(as_list=True),
         pin_layout=False,
     )
-
-    return output
 
 
 class _CopyToModelParallelRegion(torch.autograd.Function):
@@ -290,54 +259,34 @@ class _GatherFromSequenceParallelRegion(torch.autograd.Function):
     # FIXME(mkozuki): Definition of static symbolic methods don't look correct according to
     # https://pytorch.org/docs/stable/onnx.html#static-symbolic-method
     @staticmethod
-    def symbolic(graph, input_):
-        return _gather_along_second_dim(input_)
+    def symbolic(
+        graph,
+        input_: Tensor,
+        partition_dim: int,
+        to_model_parallel: bool = True,
+    ) -> Tensor:
+        return _gather_along_dim(input_, partition_dim=partition_dim)
 
     @staticmethod
-    def forward(ctx, input_):
-        return _gather_along_second_dim(input_)
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        return _split_along_second_dim(grad_output)
-
-
-class _ScatterToSequenceParallelRegion(torch.autograd.Function):
-    """Split the input and keep only the corresponding chunk to the rank."""
-
-    @staticmethod
-    def symbolic(graph, input_):
-        return _split_along_first_dim(input_)
-
-    @staticmethod
-    def forward(ctx, input_):
-        return _split_along_first_dim(input_)
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        return _gather_along_first_dim(grad_output)
-
-
-class _GatherFromSequenceParallelRegion(torch.autograd.Function):
-    """Gather the input from sequence parallel region and concatenate."""
-
-    # FIXME(mkozuki): Definition of static symbolic methods don't look correct according to
-    # https://pytorch.org/docs/stable/onnx.html#static-symbolic-method
-    @staticmethod
-    def symbolic(graph, input_, to_model_parallel: bool = True):
-        return _gather_along_first_dim(input_)
-
-    @staticmethod
-    def forward(ctx, input_, to_model_parallel: bool = True):
+    def forward(
+        ctx,
+        input_: Tensor,
+        partition_dim: int,
+        to_model_parallel: bool = True,
+    ) -> Tensor:
+        ctx.partition_dim = partition_dim
         ctx.to_model_parallel = to_model_parallel
-        return _gather_along_first_dim(input_)
+        return _gather_along_dim(input_, partition_dim=partition_dim)
 
     @staticmethod
-    def backward(ctx, grad_output):
-        if ctx.to_model_parallel:
-            return _reduce_scatter_along_first_dim(grad_output), None
-        else:
-            return _split_along_first_dim(grad_output), None
+    def backward(ctx, grad_output: Tensor) -> Tuple[Tensor, None, None]:
+        partition_dim: int = ctx.partition_dim
+        grad_input = (
+            _reduce_scatter_along_dim(grad_output, partition_dim=partition_dim)
+            if ctx.to_model_parallel
+            else _split_along_dim(grad_output, partition_dim=partition_dim)
+        )
+        return grad_input, None, None
 
 
 class _ReduceScatterToSequenceParallelRegion(torch.autograd.Function):
@@ -346,32 +295,47 @@ class _ReduceScatterToSequenceParallelRegion(torch.autograd.Function):
     # FIXME(mkozuki): Definition of static symbolic methods don't look correct according to
     # https://pytorch.org/docs/stable/onnx.html#static-symbolic-method
     @staticmethod
-    def symbolic(graph, input_):
-        return _reduce_scatter_along_first_dim(input_)
+    def symbolic(graph, input_: Tensor, partition_dim: int) -> Tensor:
+        return _reduce_scatter_along_dim(input_, partition_dim=partition_dim)
 
     @staticmethod
-    def forward(ctx, input_):
-        return _reduce_scatter_along_first_dim(input_)
+    def forward(ctx, input_: Tensor, partition_dim: int) -> Tensor:
+        ctx.partition_dim = partition_dim
+        return _reduce_scatter_along_dim(input_, partition_dim=partition_dim)
 
     @staticmethod
-    def backward(ctx, grad_output):
-        return _gather_along_first_dim(grad_output)
+    def backward(ctx, grad_output: Tensor) -> Tuple[Tensor, None]:
+        return _gather_along_dim(grad_output, partition_dim=ctx.partition_dim), None
 
 
-class _ScatterInputChannelsToModelParallelRegion(torch.autograd.Function):
-    """Split the input and keep only the corresponding chuck to the rank."""
+class _AllToAllInExpertParallelRegion(Function):
+    @staticmethod
+    def symbolic(graph, input_: Tensor, split_dim: int, concat_dim: int) -> Tensor:
+        return _all_to_all_in_expert_parallel_region(
+            input_,
+            split_dim=split_dim,
+            concat_dim=concat_dim,
+        )
 
     @staticmethod
-    def symbolic(graph, input_):
-        return _split_along_second_dim(input_)
+    def forward(ctx, input_: Tensor, split_dim: int, concat_dim: int) -> Tensor:
+        ctx.split_dim = split_dim
+        ctx.concat_dim = concat_dim
+        return _all_to_all_in_expert_parallel_region(
+            input_,
+            split_dim=split_dim,
+            concat_dim=concat_dim,
+        )
 
     @staticmethod
-    def forward(ctx, input_):
-        return _split_along_second_dim(input_)
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        return _gather_along_second_dim(grad_output)
+    def backward(ctx, grad_output: Tensor) -> Tuple[Tensor, None, None]:
+        # all2all as before but with concat/split dims inverted.
+        grad_input = _all_to_all_in_expert_parallel_region(
+            grad_output,
+            split_dim=ctx.concat_dim,
+            concat_dim=ctx.split_dim,
+        )
+        return grad_input, None, None
 
 
 class _ScatterInputChannelsToModelParallelRegion(torch.autograd.Function):
@@ -416,11 +380,11 @@ def gather_from_tensor_model_parallel_region(input_):
 
 
 def scatter_to_sequence_parallel_region(input_: torch.Tensor) -> torch.Tensor:
-    return _ScatterToSequenceParallelRegion.apply(input_)
+    return _ScatterToSequenceParallelRegion.apply(input_, 0)
 
 
-def gather_from_sequence_parallel_region(input_, to_model_parallel=True):
-    return _GatherFromSequenceParallelRegion.apply(input_, to_model_parallel)
+def gather_from_sequence_parallel_region(input_, to_model_parallel=True) -> Tensor:
+    return _GatherFromSequenceParallelRegion.apply(input_, 0, to_model_parallel)
 
 
 def reduce_scatter_to_sequence_parallel_region(input_: Tensor) -> Tensor:

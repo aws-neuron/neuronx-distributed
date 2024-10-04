@@ -16,6 +16,7 @@ export MALLOC_ARENA_MAX=64
 
 MODEL_SIZE="8B"
 LLAMA_VERSION='3'
+: ${LLAMA_CONFIG_VERSION:=3}
 
 # TP degree
 TP_DEGREE=32
@@ -34,7 +35,7 @@ WARMUP_STEPS=100
 # learning rate
 LR=1.5e-4
 # model path
-MODEL_PATH=$SCRIPT_DIR/${MODEL_SIZE}_config_llama${LLAMA_VERSION}
+MODEL_PATH=$SCRIPT_DIR/${MODEL_SIZE}_config_llama${LLAMA_CONFIG_VERSION}
 # data path
 DATA_PATH="$HOME/examples_datasets/wikicorpus_llama3_tokenized_8k"
 # sequence length

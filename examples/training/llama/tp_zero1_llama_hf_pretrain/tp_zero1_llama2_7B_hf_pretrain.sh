@@ -32,7 +32,7 @@ TOTAL_STEPS=10000
 # warmup steps
 WARMUP_STEPS=100
 # learning rate
-LR=1.5e-4
+LR=3.0e-4
 # model path
 MODEL_PATH=$SCRIPT_DIR/${MODEL_SIZE}_config_llama${LLAMA_VERSION}
 # data path
@@ -130,6 +130,5 @@ torchrun $DISTRIBUTED_ARGS \
     --sequence_parallel_enabled \
     --selective_checkpoint_enabled \
     --logging_interval 10 \
-    --qkv_linear \
     $EXTRA_ARGS |& tee $OUTPUT_LOG
 exit ${PIPESTATUS[0]}

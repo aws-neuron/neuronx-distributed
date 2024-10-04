@@ -448,42 +448,7 @@ class NeuronBaseModel(PreTrainedModel):
             # perform sampling on Neuron to get tokens
             res = self.sampler.sample(logits[:, -1, :])
 
-
-
-        # NeuronLlamaModel class manages the KV cache. So the attention_mask will be generated and passed
-        # through to LlamaModel. We override the HF's code that generates attention mask because HF does
-        # not support left aligned RHS padding. This enables Neuron to achieve higher performance and
-        # extensibility.
-        #
-        # 4d mask is passed through the layers
-        # attention_mask = _prepare_4d_causal_attention_mask(
-        #     attention_mask, (batch_size, seq_length), inputs_embeds, past_key_values_length
-        # )
-
-        # embed positions
-        hidden_states = inputs_embeds
-
-        # decoder layers
-        next_decoder_cache = ()
-
-        for idx, decoder_layer in enumerate(self.layers):
-            past_key_value = past_key_values[idx] if past_key_values is not None else None
-
-            layer_outputs = decoder_layer(
-                hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_value=past_key_value,
-                active_mask=active_mask,
-            )
-
-            hidden_states = layer_outputs[0]
-
-            next_decoder_cache += (layer_outputs[1],)
-
-        hidden_states = self.norm(hidden_states)
-
-        return (hidden_states, next_decoder_cache)
+        return [res] + updated_kv_cache
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -931,13 +896,18 @@ class NeuronBaseForCausalLM(NeuronSpeculation):
         else:
             next_tokens = logits_or_next_tokens
 
-    def _construct_output(self, logits_or_next_tokens):
         OutputParams = CausalLMOutputWithPast(
             logits=None if self.config.on_device_sampling else logits_or_next_tokens,
             hidden_states=logits_or_next_tokens,
             attentions=None,
         )
-        OutputParams.tokens = logits_or_next_tokens
+
+        if self.config.is_medusa:
+            OutputParams.tokens = next_tokens[:1, :, :]
+            OutputParams.medusa_tokens = next_tokens[1:, :, :]
+        else:
+            OutputParams.tokens = next_tokens
+
         return OutputParams
 
     # We override this function because we want to change the way attention_mask

@@ -11,8 +11,13 @@ from neuronx_distributed.parallel_layers.parallel_state import get_expert_model_
 
 
 class ExpertFusedLinearWithAsyncCommunication(torch.autograd.Function):
-    """Linear layer execution with asynchronous communication, which handles the 3D weight tensor required for
-    Mixture of Experts.
+    """Linear layer execution with asynchronous communication, specialized for
+    cases where there are multiple linears that are applied to multiple inputs
+    (i.e. Mixture of Experts, where there are multiple inputs, with each assigned
+    to a single expert).
+    In particular, this function supports parallel execution of linear layers across
+    all experts, where matmuls/collectives for all experts are launched in a
+    single operation (we call this "Expert Fusion").
 
     The implementation largely mimics LinearWithAsyncCommunication, but is modified for the 3D weights.
 

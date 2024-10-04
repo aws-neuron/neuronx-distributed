@@ -280,21 +280,24 @@ class NeuronLlamaDecoderLayer(nn.Module):
         return outputs
 
 
-class NeuronLlamaModel(NeuronBaseModel, LlamaPreTrainedModel):
+class ResBlock(nn.Module):
     """
-    The neuron version of the LlamaModel
-    """
-    def setup_attr_for_model(self, config: NeuronLlamaConfig):
-        # Needed for init_inference_optimization()
-        self.on_device_sampling = config.on_device_sampling
-        self.tp_degree = config.tp_degree
-        self.hidden_size = config.hidden_size
-        self.num_attention_heads = config.num_attention_heads
-        self.num_key_value_heads = config.num_key_value_heads
-        self.max_batch_size = config.max_batch_size
-        self.buckets = config.buckets
+    A Residual Block module.
 
-    def init_model(self, config: NeuronLlamaConfig):
+    This module performs a linear transformation followed by a SiLU activation,
+    and then adds the result to the original input, creating a residual connection.
+
+    Args:
+        hidden_size (int): The size of the hidden layers in the block.
+    """
+
+    def __init__(self, hidden_size):
+        super().__init__()
+        self.linear = nn.Linear(hidden_size, hidden_size)
+        # Initialize as an identity mapping
+        torch.nn.init.zeros_(self.linear.weight)
+        # Use SiLU activation to keep consistent with the Llama model
+        self.act = nn.SiLU()
 
     def forward(self, x):
         """

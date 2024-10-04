@@ -237,10 +237,6 @@ def run_device_correctness_test(cfg, output_tols, grad_tols):
             ut.nxd_init(tp_degree=tp_degree, ep_degree=ep_degree, seed=it)
 
             # Get sharded input for rank (for sequence parallel)
-            tp_size = parallel_state.get_tensor_model_parallel_size()
-            tp_rank = parallel_state.get_tensor_model_parallel_rank()
-
-            ip_trn_full = ip_cpu.detach().to(device)
             if sequence_parallel_enabled:
                 ip_trn = mappings.scatter_to_sequence_parallel_region(ip_trn_full)
             else:
