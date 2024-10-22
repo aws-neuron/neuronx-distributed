@@ -50,6 +50,7 @@ class InferenceRunner:
         self._is_torch_profile_enabled = False
 
         if generation_config is None:
+            print('no generation config input')
             generation_config = GenerationConfig.from_pretrained(model_path)
             generation_config.top_k = 1
             generation_config.do_sample = True
@@ -155,7 +156,7 @@ class InferenceRunner:
         merged_kwargs = self.get_default_hf_generation_config_kwargs()
         if kwargs is not None:
             merged_kwargs.update(kwargs)
-        config = config_cls.from_pretrained(self.model_path, **merged_kwargs)
+        config = config_cls.from_pretrained(self.model_path)
 
         config.tp_degree = tp_degree
 
@@ -164,7 +165,9 @@ class InferenceRunner:
         if config.max_new_tokens == 0:
             config.max_new_tokens = None
         max_length = sequence_length
-        config.max_length = max_length
+        config.generation_config = merged_kwargs
+        config.generation_config["max_length"] = max_length
+        # config.generation_config["max_length"] = max_length
         config.n_positions = max_length
         config.n_active_tokens = max_length
 
@@ -185,6 +188,8 @@ class InferenceRunner:
 
         config.padding_side = self.get_padding_side()
         config.on_device_sampling = kwargs.get("on_device_sampling", False)
+        #config.on_device_sampling = True
+
 
         config.spec_batch_size = batch_size
         config.speculation_length = kwargs.get("speculation_length", 0)
@@ -198,7 +203,7 @@ class InferenceRunner:
         config.is_medusa = kwargs.get("is_medusa", False)
         config.medusa_speculation_length = kwargs.get("medusa_speculation_length", 0)
         config.num_medusa_heads = kwargs.get("num_medusa_heads", 0)
-        config.pad_token_id = kwargs.get("pad_token_id", None)
+        #config.pad_token_id = kwargs.get("pad_token_id", None)
 
         return config
 
@@ -222,9 +227,9 @@ class InferenceRunner:
         if len(prompts) != model.config.max_batch_size:
             raise ValueError(f"Number of prompts should match batch size {model.config.max_batch_size}")
 
-        max_length = kwargs.pop("max_length", model.config.max_length)
-        if (max_length > model.config.max_length):
-            ValueError(f"Found user supplied {max_length=} exceeds the compiled model sequence_length={model.config.max_length}")
+        max_length = kwargs.pop("max_length", model.config.generation_config["max_length"])
+        if (max_length > model.config.generation_config["max_length"]):
+            ValueError(f"Found user supplied {max_length=} exceeds the compiled model sequence_length={model.config.generation_config['max_length']}")
 
         with self.torch_profile(chrome_trace_path="generate-on-neuron.torch-trace.json"):
             outputs, output_tokens = self.generate(
@@ -436,6 +441,7 @@ class InferenceRunner:
             raise ValueError(
                 f"Type {config.torch_dtype} is not supported for this model at this time. Please choose float32 or bfloat16."
             )
+        
         # We have the config in the trace_model_path
         config.save_pretrained(traced_model_path)
 
@@ -529,7 +535,7 @@ class InferenceRunner:
         return report
 
     def get_sample_inputs(self, model_type, config, tokenizer=None):
-        max_length = config.max_length
+        max_length = config.generation_config["max_length"]
         batch_size = config.batch_size
         num_medusa_heads = config.num_medusa_heads if config.num_medusa_heads else 4
         medusa_speculation_length = config.medusa_speculation_length if config.medusa_speculation_length else 64

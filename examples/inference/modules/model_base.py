@@ -66,7 +66,7 @@ class NeuronBaseModel(PreTrainedModel):
         self.vocab_size = config.vocab_size
         self.speculation_length = config.speculation_length
         self.padding_side = config.padding_side
-        self.max_length = config.max_length
+        self.max_length = config.generation_config['max_length']
 
         self.setup_attr_for_model(config)
         self.init_model(config)
@@ -576,9 +576,9 @@ class NeuronBaseForCausalLM(NeuronSpeculation):
         new_config.bucket_n_active_tokens = False
 
         if not new_config.enable_bucketing:
-            new_config.buckets = generate_buckets(new_config.max_length,new_config.max_length)
+            new_config.buckets = generate_buckets(new_config.generation_config['max_length'],new_config.generation_config['max_length'])
         else:
-            new_config.buckets = generate_buckets(128, new_config.max_length)
+            new_config.buckets = generate_buckets(128, new_config.generation_config['max_length'])
 
 
         self.token_generation_model = ModelWrapper(
@@ -617,6 +617,7 @@ class NeuronBaseForCausalLM(NeuronSpeculation):
         if os.path.exists(model_path + "/medusa_heads.pt"):
             medusa_head = torch.load(model_path + "/medusa_heads.pt", map_location="cpu")
             model_sd.update(medusa_head)
+        model_sd["lm_head.weight"] = model_sd["embed_tokens.weight"].clone()
         return model_sd
 
     @classmethod
@@ -1069,8 +1070,9 @@ class NeuronBaseForCausalLM(NeuronSpeculation):
         if max_length is not None:
             stopping_criteria = validate_stopping_criteria(stopping_criteria, max_length)
         logits_warper = logits_warper if logits_warper is not None else LogitsProcessorList()
-        pad_token_id = pad_token_id if pad_token_id is not None else self.generation_config.pad_token_id
         eos_token_id = eos_token_id if eos_token_id is not None else self.generation_config.eos_token_id
+        pad_token_id = pad_token_id if pad_token_id is not None else self.config.generation_config["pad_token_id"]
+
         if isinstance(eos_token_id, int):
             eos_token_id = [eos_token_id]
 

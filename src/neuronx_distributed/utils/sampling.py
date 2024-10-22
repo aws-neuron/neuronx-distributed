@@ -10,13 +10,14 @@ class Sampler:
     """
 
     def __init__(self, config: PretrainedConfig):
+        print('On device sampling: ', config.on_device_sampling)
         self.on_device_sampling = config.on_device_sampling
         if hasattr(config, "is_medusa"):
             self.is_medusa = config.is_medusa
         else:
             self.is_medusa = False
-        if config.do_sample and config.num_beams == 1:
-            self.top_k = config.top_k
+        if config.generation_config['do_sample'] and config.num_beams == 1:
+            self.top_k = config.generation_config['top_k']
             self.sampling_method = self.multinomial
         else:
             raise Exception("Selected sampling method is not supported.")

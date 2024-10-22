@@ -31,14 +31,10 @@ from transformers.activations import ACT2FN
 from transformers.generation import SampleDecoderOnlyOutput, SampleEncoderDecoderOutput
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.llama.modeling_llama import (
-    LlamaRMSNorm,
-)
-
-from transformers.models.llama.modeling_llama import (
     LlamaRotaryEmbedding,
-    LlamaDynamicNTKScalingRotaryEmbedding,
-    LlamaLinearScalingRotaryEmbedding,
+    LlamaRMSNorm
 )
+import math
 SampleOutput = Union[SampleEncoderDecoderOutput, SampleDecoderOnlyOutput]
 
 from modules.autobucketing import slice_lhs, slice_rhs  # noqa: E402
@@ -106,6 +102,7 @@ class NeuronLlamaConfig(NeuronInferenceConfig, LlamaConfig):
             self, max_batch_size=1, tp_degree=1, n_positions=128, padding_side="right", speculation_length=0, **kwargs
     ):
         self.attn_cls = "NeuronLlamaAttention"
+        self.generation_config = {}
 
         super().__init__(
             tp_degree=tp_degree,
@@ -215,25 +212,90 @@ class NeuronLlamaAttention(NeuronAttentionBase):
                     base=self.rope_theta,
                 )
         else:
-            scaling_type = self.config.rope_scaling["type"]
-            scaling_factor = self.config.rope_scaling["factor"]
-            if scaling_type == "linear":
-                self.rotary_emb = LlamaLinearScalingRotaryEmbedding(
-                    self.head_dim,
+            rope_type = self.config.rope_scaling.get(
+                "rope_type", self.config.rope_scaling.get("type", None)
+            )
+            if rope_type == "llama3":
+                self.rotary_emb = Llama3RotaryEmbedding(
+                    dim=self.head_dim,
                     max_position_embeddings=self.max_position_embeddings,
-                    scaling_factor=scaling_factor,
                     base=self.rope_theta,
-                )
-            elif scaling_type == "dynamic":
-                self.rotary_emb = LlamaDynamicNTKScalingRotaryEmbedding(
-                    self.head_dim,
-                    max_position_embeddings=self.max_position_embeddings,
-                    scaling_factor=scaling_factor,
-                    base=self.rope_theta,
+                    factor=self.config.rope_scaling["factor"],
+                    low_freq_factor=self.config.rope_scaling["low_freq_factor"],
+                    high_freq_factor=self.config.rope_scaling["high_freq_factor"],
+                    original_max_position_embeddings=self.config.rope_scaling[
+                        "original_max_position_embeddings"
+                    ],
                 )
             else:
-                raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
+                # LlamaRotaryEmbedding automatically chooses the correct scaling type from config.
+                self.rotary_emb = LlamaRotaryEmbedding(self.config)
 
+class Llama3RotaryEmbedding(nn.Module):
+    """
+    Adapted from Llama 4.43 impl
+    * https://github.com/huggingface/transformers/blob/v4.43.4/src/transformers/models/llama/modeling_llama.py#L78
+    * https://github.com/huggingface/transformers/blob/v4.43.4/src/transformers/modeling_rope_utils.py#L345
+
+    This implementation ensures inv_freq is calculated and stored in fp32.
+    """
+
+    def __init__(
+        self,
+        dim,
+        max_position_embeddings=131072,
+        base=500000.0,
+        factor=8.0,
+        low_freq_factor=1.0,
+        high_freq_factor=4.0,
+        original_max_position_embeddings=8192,
+    ):
+        super().__init__()
+        self.dim = dim
+        self.max_position_embeddings = max_position_embeddings
+        self.base = base
+        self.factor = factor
+        self.low_freq_factor = low_freq_factor
+        self.high_freq_factor = high_freq_factor
+        self.old_context_len = original_max_position_embeddings
+        self.register_buffer("inv_freq", None, persistent=False)
+
+    @torch.no_grad()
+    def forward(self, x, position_ids):
+        # x: [bs, num_attention_heads, seq_len, head_size]
+        if self.inv_freq is None:
+            inv_freq = 1.0 / (
+                self.base
+                ** (torch.arange(0, self.dim, 2, dtype=torch.int64).float().to(x.device) / self.dim)
+            )
+
+            low_freq_wavelen = self.old_context_len / self.low_freq_factor
+            high_freq_wavelen = self.old_context_len / self.high_freq_factor
+            new_freqs = []
+            for freq in inv_freq:
+                wavelen = 2 * math.pi / freq
+                if wavelen < high_freq_wavelen:
+                    new_freqs.append(freq)
+                elif wavelen > low_freq_wavelen:
+                    new_freqs.append(freq / self.factor)
+                else:
+                    assert low_freq_wavelen != high_freq_wavelen
+                    smooth = (self.old_context_len / wavelen - self.low_freq_factor) / (
+                        self.high_freq_factor - self.low_freq_factor
+                    )
+                    new_freqs.append((1 - smooth) * freq / self.factor + smooth * freq)
+            self.inv_freq = torch.tensor(new_freqs, dtype=inv_freq.dtype, device=inv_freq.device)
+
+        inv_freq_expanded = (
+            self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+        )
+        position_ids_expanded = position_ids[:, None, :].float()
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos()
+            sin = emb.sin()
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 class NeuronLlamaDecoderLayer(nn.Module):
     """
@@ -327,8 +389,8 @@ class NeuronLlamaModel(NeuronBaseModel, LlamaPreTrainedModel):
         self.buckets = config.buckets
 
     def init_model(self, config: NeuronLlamaConfig):
-
-        self.padding_idx = config.pad_token_id
+        print("pad token id: ", None)
+        self.padding_idx = None
         self.vocab_size = config.vocab_size
 
         if parallel_state.model_parallel_is_initialized():
