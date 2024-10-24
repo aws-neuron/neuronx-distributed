@@ -1,5 +1,5 @@
 import torch
-from llama2.neuron_modeling_llama import (
+from llama3.neuron_modeling_llama import (
     NeuronLlamaConfig,
     NeuronLlamaForCausalLM,
     NeuronLlamaModel,
