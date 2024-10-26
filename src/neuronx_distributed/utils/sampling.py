@@ -10,7 +10,6 @@ class Sampler:
     """
 
     def __init__(self, config: PretrainedConfig):
-        print('On device sampling: ', config.on_device_sampling)
         self.on_device_sampling = config.on_device_sampling
         if hasattr(config, "is_medusa"):
             self.is_medusa = config.is_medusa

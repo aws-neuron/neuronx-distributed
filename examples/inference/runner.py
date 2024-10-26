@@ -50,7 +50,6 @@ class InferenceRunner:
         self._is_torch_profile_enabled = False
 
         if generation_config is None:
-            print('no generation config input')
             generation_config = GenerationConfig.from_pretrained(model_path)
             generation_config.top_k = 1
             generation_config.do_sample = True

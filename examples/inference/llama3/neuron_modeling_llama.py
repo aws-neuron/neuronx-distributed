@@ -389,7 +389,6 @@ class NeuronLlamaModel(NeuronBaseModel, LlamaPreTrainedModel):
         self.buckets = config.buckets
 
     def init_model(self, config: NeuronLlamaConfig):
-        print("pad token id: ", None)
         self.padding_idx = None
         self.vocab_size = config.vocab_size
 
