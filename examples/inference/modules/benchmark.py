@@ -56,7 +56,7 @@ def generate_report(latency_list, config):
     latency_array = np.array(latency_list)
 
     n_runs = len(latency_list)
-    max_length = config.max_length
+    max_length = config.generation_config['max_length']
     batch_size = config.max_batch_size
     total_time = np.sum(latency_array)
     throughput = (n_runs * max_length * batch_size) / total_time

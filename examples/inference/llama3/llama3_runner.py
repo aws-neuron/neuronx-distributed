@@ -1,5 +1,5 @@
 import torch
-from llama2.neuron_modeling_llama import (
+from llama3.neuron_modeling_llama import (
     NeuronLlamaConfig,
     NeuronLlamaForCausalLM,
     NeuronLlamaModel,
@@ -68,7 +68,6 @@ class LlamaRunner(InferenceRunner):
         config = NeuronLlamaConfig.from_pretrained(traced_model_path)
         model = NeuronLlamaForCausalLM.from_pretrained("", config)
         self.config = config
-
         model.load(traced_model_path)
         if config.torch_dtype == torch.bfloat16:
             model.bfloat16()

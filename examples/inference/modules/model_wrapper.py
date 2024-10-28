@@ -246,7 +246,7 @@ class ModelWrapper(torch.nn.Module):
             args = (*padded_args,*args[3:])
         else:
             input_ids,attention_mask,*rest_of_args = args
-            pad_len = self.config.max_length - attention_mask.shape[1]
+            pad_len = self.config.generation_config['max_length'] - attention_mask.shape[1]
             padded_attention_mask = F.pad(attention_mask, (0, pad_len), "constant", 0)
             args = (input_ids,padded_attention_mask,*rest_of_args)
 
