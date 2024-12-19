@@ -23,6 +23,7 @@ from neuronx_distributed.pipeline.comm import (
     send_python_object,
 )
 from neuronx_distributed.utils.serialization import SerializationManager, TensorMeta
+from neuronx_distributed.utils import cpu_mode, mark_step, get_device
 
 datetime_str = str(datetime.now())
 
@@ -66,21 +67,21 @@ def test_send_and_recv():
             device=None,
         )
         if get_pipeline_model_parallel_rank() == 0:
-            a = torch.rand(2, 3, device=xm.xla_device())
+            a = torch.rand(2, 3, device=get_device())
             t = send(a) #noqa
-            xm.mark_step()
+            mark_step()
             torch.save(a.cpu(), "tensor.pt")
         elif get_pipeline_model_parallel_rank() < 7:
             recv_a = recv_from(tensor_meta)
-            xm.mark_step()
+            mark_step()
             t = send(recv_a) #noqa
-            xm.mark_step()
+            mark_step()
             recv_a_cpu = recv_a.to(torch.device("cpu"))
             a = torch.load("tensor.pt", map_location=torch.device("cpu"))
             assert torch.equal(a, recv_a_cpu)
         else:
             recv_a = recv_from(tensor_meta)
-            xm.mark_step()
+            mark_step()
             recv_a_cpu = recv_a.to(torch.device("cpu"))
             a = torch.load("tensor.pt", map_location=torch.device("cpu"))
             assert torch.equal(a, recv_a_cpu)
@@ -112,24 +113,24 @@ def test_1f_1b_comm():
         )
         # Testing 1F1B communication
         if get_pipeline_model_parallel_rank() == 0:
-            forward = torch.rand(2, 3, device=xm.xla_device())
+            forward = torch.rand(2, 3, device=get_device())
             t = send(forward) #noqa
-            xm.mark_step()
+            mark_step()
             torch.save(forward.cpu(), "forward.pt")
             recv_backward = recv_from(backward_tensor_meta, recv_prev=False)
-            xm.mark_step()
+            mark_step()
             recv_backward_cpu = recv_backward.to(torch.device("cpu"))
             backward = torch.load("backward.pt", map_location=torch.device("cpu"))
             assert torch.equal(backward, recv_backward_cpu)
         elif get_pipeline_model_parallel_rank() < 7:
             recv_forward = recv_from(forward_tensor_meta)
-            xm.mark_step()
+            mark_step()
             t = send(recv_forward) #noqa
-            xm.mark_step()
+            mark_step()
             recv_backward = recv_from(backward_tensor_meta, recv_prev=False)
-            xm.mark_step()
+            mark_step()
             t = send(recv_backward, send_next=False) #noqa
-            xm.mark_step()
+            mark_step()
             recv_forward_cpu = recv_forward.to(torch.device("cpu"))
             forward = torch.load("forward.pt", map_location=torch.device("cpu"))
             assert torch.equal(forward, recv_forward_cpu)
@@ -138,10 +139,10 @@ def test_1f_1b_comm():
             assert torch.equal(backward, recv_backward_cpu)
         else:
             recv_forward = recv_from(forward_tensor_meta)
-            xm.mark_step()
-            backward = torch.rand(1, 2, device=xm.xla_device())
+            mark_step()
+            backward = torch.rand(1, 2, device=get_device())
             t = send(backward, send_next=False) #noqa
-            xm.mark_step()
+            mark_step()
             torch.save(backward.cpu(), "backward.pt")
             recv_forward_cpu = recv_forward.to(torch.device("cpu"))
             forward = torch.load("forward.pt", map_location=torch.device("cpu"))

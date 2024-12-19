@@ -302,9 +302,11 @@ class pretraining_dataset(Dataset):
             masked_lm_ids,
             next_sentence_labels,
         ] = [
-            torch.from_numpy(input[index].astype(np.int64))
-            if indice < 5
-            else torch.from_numpy(np.asarray(input[index].astype(np.int64)))
+            (
+                torch.from_numpy(input[index].astype(np.int64))
+                if indice < 5
+                else torch.from_numpy(np.asarray(input[index].astype(np.int64)))
+            )
             for indice, input in enumerate(self.inputs)
         ]
 
@@ -533,7 +535,7 @@ def train_bert_hdf5(flags):
                 running_loss_reduced = xm.all_reduce(
                     xm.REDUCE_SUM,
                     running_loss_div,
-                    groups=parallel_state.get_data_parallel_group(as_list=True),
+                    groups=parallel_state.get_data_parallel_replica_groups(),
                 )
                 running_loss_reduced_detached = running_loss_reduced.detach()
                 running_loss.zero_()

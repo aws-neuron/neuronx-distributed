@@ -6,8 +6,8 @@ import os
 import pathlib
 import shutil
 from collections import defaultdict
-from typing import Any, Callable, List, Optional, Union, Tuple
-from typing import cast
+from typing import Any, Callable, List, Optional, Union, Tuple, cast
+from unittest.mock import MagicMock
 
 
 import torch
@@ -25,6 +25,10 @@ from neuronx_distributed.parallel_layers.layers import (
     ColumnParallelLinear,
     ParallelEmbedding,
     RowParallelLinear,
+    OutputChannelParallelConv2d,
+    InputChannelParallelConv2d,
+    BaseParallelLinear,
+    SPMDRank
 )
 from neuronx_distributed.parallel_layers.utils import (
     divide,
@@ -39,13 +43,17 @@ from neuronx_distributed.utils.model_utils import init_on_device
 
 logger = logging.getLogger("Neuron")
 
-# Varible to specify the types of Moduels that are currently Sharded
+# Variable to specify the types of Modules that are currently Sharded
 __SUPPORTED_SHARDED_MODULES = (
     ColumnParallelLinear,
     RowParallelLinear,
     ParallelEmbedding,
+    OutputChannelParallelConv2d,
+    InputChannelParallelConv2d,
     QuantizedRowParallel,
     QuantizedColumnParallel,
+    BaseParallelLinear,
+    SPMDRank
 )
 
 
@@ -507,6 +515,7 @@ def _validate_traceable(func: Callable, tp_degree: int, force_custom_init_on_dev
     SPMD traceable.
     """
     _mock_parallel_state(tp_degree, rank=0)
+
     with init_on_device(torch.device("meta"), force_custom_init_on_device=force_custom_init_on_device):
         model, _ = func()
 
@@ -617,6 +626,12 @@ def _load_weights(
 
 def get_sharded_checkpoint(checkpoint, model, rank, tp_degree):
     invoke_preshard_hook(model, checkpoint, "")
+    if hasattr(model, "lora_wrapped_model"):
+        checkpoint = model.update_weights_for_lora(checkpoint)
+
+    keys_to_delete = [key for key in checkpoint.keys() if key not in model.state_dict()]
+    for key in keys_to_delete:
+        checkpoint.pop(key, None)
 
     dtype = None
     if hasattr(model, "config") and hasattr(model.config, "torch_dtype"):
@@ -634,17 +649,23 @@ def create_local_weight_qkv(rank, world_size, full_weight, partition_dim, q_len,
     v_weight_list = torch.split(v_weight, divide(kv_len, world_size), dim=partition_dim)[rank::world_size]
 
     with torch.no_grad():
-        return torch.cat((
-            torch.cat(q_weight_list, dim=partition_dim),
-            torch.cat(k_weight_list, dim=partition_dim),
-            torch.cat(v_weight_list, dim=partition_dim),
-        ), dim=partition_dim, out=out_weight)
+        return torch.cat(
+            (
+                torch.cat(q_weight_list, dim=partition_dim),
+                torch.cat(k_weight_list, dim=partition_dim),
+                torch.cat(v_weight_list, dim=partition_dim),
+            ),
+            dim=partition_dim,
+            out=out_weight,
+        )
+
 
 def create_local_weight(rank, world_size, full_weight, partition_dim, per_partition_size, stride, out_weight=None):
     per_partition_per_stride_size = divide(per_partition_size, stride)
     weight_list = torch.split(full_weight, per_partition_per_stride_size, dim=partition_dim)
     my_weight_list = weight_list[rank::world_size]
-
+    if is_torch_version_greater_than_2() and full_weight.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
+        return my_weight_list[0].clone()
     with torch.no_grad():
         return torch.cat(my_weight_list, dim=partition_dim, out=out_weight)
 
@@ -655,18 +676,15 @@ def _mock_parallel_state(tp_degree: int, rank: int):
     load on CPU. This is done to load Neuron models outside
     torch distributed process group.
     """
-
-    class Mock:
-        def __init__(self, world_size):
-            self.world_size = world_size
-
-        def size(self):
-            return self.world_size
-
-    parallel_state._TENSOR_MODEL_PARALLEL_GROUP = Mock(tp_degree)
-    parallel_state._DATA_PARALLEL_GROUP = Mock(1)
+    parallel_state._TENSOR_MODEL_PARALLEL_GROUP = MagicMock(spec=torch.distributed.ProcessGroup)
+    parallel_state._TENSOR_MODEL_PARALLEL_GROUP.size.return_value = tp_degree
+    parallel_state._MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE = tp_degree
     parallel_state._MPU_TENSOR_MODEL_PARALLEL_RANK = rank
-    parallel_state._EXPERT_MODEL_PARALLEL_GROUP = Mock(1)
+    parallel_state._DATA_PARALLEL_GROUP = MagicMock(spec=torch.distributed.ProcessGroup)
+    parallel_state._DATA_PARALLEL_GROUP.size.return_value = 1
+    parallel_state._EXPERT_MODEL_PARALLEL_GROUP = MagicMock(spec=torch.distributed.ProcessGroup)
+    parallel_state._EXPERT_MODEL_PARALLEL_GROUP.size.return_value = 1
+    parallel_state._MPU_EXPERT_MODEL_PARALLEL_WORLD_SIZE = 1
 
 
 def invoke_preshard_hook(module, checkpoint, prefix):
@@ -703,6 +721,9 @@ def shard_children(module, checkpoint, prefix, dtype, rank, tp_degree):
         return
 
     for module_parameter_name, module_parameter in module.named_parameters():
+        # only split parameters that are leaf nodes of the parent module to prevent double splitting of nested parallel modules
+        if len(module_parameter_name.split(".")) != 1:
+            continue
         parameter_name = prefix + module_parameter_name
 
         # If a few cases, the module parameter name might not appear exactly in the state dict
@@ -713,24 +734,28 @@ def shard_children(module, checkpoint, prefix, dtype, rank, tp_degree):
         else:
             if parameter_name not in checkpoint:
                 return
-            if dtype and checkpoint[parameter_name].dtype != dtype:
-                checkpoint[parameter_name] = checkpoint[parameter_name].to(dtype)
+            if dtype and checkpoint[parameter_name].dtype != dtype \
+                and torch.is_floating_point(checkpoint[parameter_name]):  # only cast float types
+                    checkpoint[parameter_name] = checkpoint[parameter_name].to(dtype)
             tensor = checkpoint[parameter_name]
 
         if hasattr(module_parameter, "tensor_model_parallel") and module_parameter.tensor_model_parallel:
             partition_dim = module_parameter.partition_dim
             stride = module_parameter.partition_stride
+            num_partitions = module_parameter.num_partitions
+            per_partition_size = tensor.shape[partition_dim] // num_partitions
+            partition_rank = rank % num_partitions
 
-            per_partition_size = tensor.shape[partition_dim] // tp_degree
+            # todo: get rank within the process group
             if hasattr(module_parameter, "fused_qkv"):
                 query_len = module_parameter.num_attention_heads * module_parameter.head_dim
                 kv_len = module_parameter.num_key_value_heads * module_parameter.head_dim
                 checkpoint[parameter_name] = create_local_weight_qkv(
-                    rank, tp_degree, tensor, partition_dim, query_len, kv_len
+                    partition_rank, num_partitions, tensor, partition_dim, query_len, kv_len
                 )
             else:
                 checkpoint[parameter_name] = create_local_weight(
-                    rank, tp_degree, tensor, partition_dim, per_partition_size, stride
+                    partition_rank, num_partitions, tensor, partition_dim, per_partition_size, stride
                 )
         else:
             checkpoint[parameter_name] = tensor

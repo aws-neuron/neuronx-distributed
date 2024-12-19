@@ -83,7 +83,7 @@ class TestLogger(unittest.TestCase):
         wrapped = _rank0_only(fn)
         # Assert
         self.assertEqual(wrapped(), fn.return_value)
-        fn.assert_called_once_with()
+        fn.assert_called_once_with(stacklevel=2)
 
     @patch.dict("os.environ", {"RANK": "1"})
     @patch("torch.distributed")
@@ -119,4 +119,4 @@ class TestLogger(unittest.TestCase):
         wrapped = _rank0_only(fn)
         # Assert
         self.assertEqual(wrapped(), fn.return_value)
-        fn.assert_called_once_with()
+        fn.assert_called_once_with(stacklevel=2)

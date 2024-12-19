@@ -1,6 +1,7 @@
 import time
 from abc import ABC, abstractmethod, abstractproperty
 from collections import OrderedDict
+from typing import Any, List, Optional
 
 
 class Event:
@@ -35,6 +36,7 @@ class Timeline(ABC):
                     f.write("[")
         else:
             self.enabled = False
+        self.all_rank_events: Optional[List[Any]] = None
 
     @abstractproperty
     def should_record(self):
@@ -67,6 +69,7 @@ class Timeline(ABC):
 
     def _dump_events(self):
         with open(self.trace_file_path, "a") as f:
+            assert self.all_rank_events
             for events in self.all_rank_events:
                 for _, event in events.items():
                     trace_events = self._creat_sync_event(event)

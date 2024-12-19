@@ -1,9 +1,9 @@
+import logging
 import torch
+from modules.config import MoENeuronConfig
 from mixtral.neuron_modeling_mixtral import (
-    NeuronMixtralConfig,
     NeuronMixtralForCausalLM,
     NeuronMixtralModel,
-    preshard_hook_fn,
 )
 from runner import InferenceRunner
 from transformers import AutoTokenizer
@@ -17,41 +17,32 @@ class MixtralRunner(InferenceRunner):
 
     def load_neuron_model_on_cpu(self, max_prompt_length, sequence_length, batch_size, **kwargs):
         # On CPU we can only run tensor parallelism with degree 1
-        config = self.get_config_for_nxd(
+        hf_config = self.get_hf_config(sequence_length=sequence_length, **kwargs)
+        neuron_config = self.get_config_for_nxd(
+            hf_config,
             batch_size,
             1,
             max_prompt_length=max_prompt_length,
             sequence_length=sequence_length,
             enable_bucketing=False,
             **kwargs)
-        config.torch_dtype = torch.float32
-        config.on_cpu = True  # to avoid running custom RMSNorm on cpu
+        hf_config.torch_dtype = torch.float32
 
         self.init_ditributed_env()
-        neuron_model = NeuronMixtralModel(config)
+        neuron_model = NeuronMixtralModel(neuron_config)
 
-        state_dict = NeuronMixtralForCausalLM.get_state_dict(self.model_path)
+        state_dict = NeuronMixtralForCausalLM.get_state_dict(self.model_path, neuron_config)
 
-        _invoke_preshard_hook(preshard_hook_fn, neuron_model, state_dict)
+        _invoke_preshard_hook(neuron_model, state_dict)
 
         neuron_model.load_state_dict(state_dict, strict=False)
 
-        if config.torch_dtype == torch.bfloat16:
+        if hf_config.torch_dtype == torch.bfloat16:
             neuron_model.bfloat16()
 
-        model = NeuronMixtralForCausalLM(None, config)
+        model = NeuronMixtralForCausalLM(None, neuron_config)
         model.context_encoding_model.model = neuron_model
         model.token_generation_model.model = neuron_model
-        return model
-
-    def load_neuron_model(self, traced_model_path):
-        config = NeuronMixtralConfig.from_pretrained(traced_model_path)
-        model = NeuronMixtralForCausalLM.from_pretrained("", config)
-
-        model.load(traced_model_path)
-        if config.torch_dtype == torch.bfloat16:
-            model.bfloat16()
-
         return model
 
     def load_tokenizer(self, padding_side=None):
@@ -61,7 +52,7 @@ class MixtralRunner(InferenceRunner):
         return tokenizer
 
     def get_config_cls(self):
-        return NeuronMixtralConfig
+        return MoENeuronConfig
 
     def get_model_cls(self):
         return NeuronMixtralForCausalLM

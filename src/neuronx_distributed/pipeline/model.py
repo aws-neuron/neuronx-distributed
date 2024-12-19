@@ -10,6 +10,13 @@ import torch_xla.core.xla_model as xm
 from torch import nn
 from torch.autograd.variable import Variable
 from torch_xla.distributed.parallel_loader import MpDeviceLoader
+from neuronx_distributed.utils import cpu_mode
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import _CHECKPOINT_PREFIX
+
+if not cpu_mode():
+    from torch_neuronx.xla_impl.ops import neuron_layer
+else:
+    def neuron_layer(x): return x
 
 from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.parallel_layers.grads import bucket_allreduce_gradients
@@ -67,8 +74,8 @@ class NxDPPModel(nn.Module):
         pipeline_cuts: Optional[List[str]] = None,
         input_names: Optional[List[str]] = None,
         leaf_module_cls: Optional[List[Any]] = None,
-        autowrap_functions: Optional[Tuple[ModuleType]] = None,
-        autowrap_modules: Optional[Tuple[Callable, ...]] = None,
+        autowrap_functions: Optional[Tuple[Callable]] = None,
+        autowrap_modules: Optional[Tuple[ModuleType, ...]] = None,
         autowrap_obj_methods: Optional[Dict[Any, List[Callable]]] = None,
         tracer_cls: Optional[Union[str, Any]] = None,
         param_init_fn: Optional[Any] = None,
@@ -213,6 +220,9 @@ class NxDPPModel(nn.Module):
             raise ValueError("NxDPPModel requires transformer_layer_cls as input")
         self.original_torch_module = module
 
+        # Add layer boundary markers in HLO
+        neuron_layer(transformer_layer_cls)
+
         # Public configs
         self.output_loss_value_spec = output_loss_value_spec
         self.transformer_layer_cls = transformer_layer_cls
@@ -272,29 +282,33 @@ class NxDPPModel(nn.Module):
         # Pipeline status
         self.traced_model = None
         self.paritioned_model = None
-        self.pipeline_cuts = []
+        self.pipeline_cuts: Optional[List[str]] = []
         self.partitioned = False
         self.model_moved_to_device = False
         self.shape_traced = False
-        self.input_names = None
+        self.input_names: Optional[List[str]] = None
         # Outputs from analyze_pipeline_module
         self.stage_id_to_IO_input_names = None
         self.stage_id_to_model_input_names = None
         self.stage_id_to_input_count = None
         self.stage_id_to_output_count = None
         # Static states of pipeline
-        self.shared_weights_name_to_pg = {}
-        self.local_name_to_original_name = {}
-        self.original_name_to_local_name = {}
-        self.local_stage_modules = []
+        self.shared_weights_name_to_pg: Dict[str, torch.distributed.ProcessGroup] = {}
+        self.local_name_to_original_name: Dict[str, str] = {}
+        self.original_name_to_local_name: Dict[str, str] = {}
+        self.local_stage_modules: List[Any] = []
         self._delay_tracing = _delay_tracing
         self.meta_device_parameter_map = None
         self.leaf_module_cls = leaf_module_cls
-        self.autowrap_functions = autowrap_functions
-        self.autowrap_modules = autowrap_modules
+        self.autowrap_functions: List[Callable] = []
+        if autowrap_functions is not None:
+            self.autowrap_functions.extend(autowrap_functions)
+        self.autowrap_modules = [*autowrap_modules] if autowrap_modules else []
+        if autowrap_modules is not None:
+            self.autowrap_modules.extend(autowrap_modules)
         self.autowrap_obj_methods = autowrap_obj_methods
         self.tracer_cls = tracer_cls
-        self.meta_named_parameters = {}
+        self.meta_named_parameters: Dict[str, torch.nn.Parameter] = {}
 
         self.clear_minibatch_state()
         if not _debug_mode:
@@ -323,13 +337,14 @@ class NxDPPModel(nn.Module):
                 raise ValueError(
                     "Input names are required for tracing when the NxD optimizer and model wrapper are not used"
                 )
+
             self.trace(
                 args=None,
                 kwargs=None,
                 input_names=input_names,
                 leaf_modules=leaf_module_cls,
-                autowrap_functions=autowrap_functions,
-                autowrap_modules=autowrap_modules,
+                autowrap_functions=self.autowrap_functions,
+                autowrap_modules=self.autowrap_modules,
                 autowrap_obj_methods=autowrap_obj_methods,
                 tracer_cls=tracer_cls,
             )
@@ -350,6 +365,7 @@ class NxDPPModel(nn.Module):
         """
         self.training = None
         self.losses = []
+        self.losses_for_printing = []
         self.model_inputs_iter = {model_chunk_id: None for model_chunk_id in range(self.virtual_pipeline_size)}
         self.input_name_to_iter_idx = {model_chunk_id: None for model_chunk_id in range(self.virtual_pipeline_size)}
         self.current_mb = -1
@@ -453,7 +469,7 @@ class NxDPPModel(nn.Module):
         if self.partitioned:
             logging.warning("NxDPPModel.partition() is called while model is already partitioned, skipping...")
             return
-        num_stages = len(self.pipeline_cuts) + 1
+        num_stages = 1 + (len(self.pipeline_cuts) if self.pipeline_cuts is not None else 0)
 
         if (self.pipeline_parallel_size * self.virtual_pipeline_size) != num_stages:
             raise ValueError(
@@ -622,9 +638,12 @@ class NxDPPModel(nn.Module):
             for local_module in self.local_stage_modules:
                 for n, p in local_module.named_parameters():
                     if shared_name == n and p.requires_grad:
-                        assert p.grad is not None, f"Found shared weight {n} has None grad"
+                        assert p.grad is not None or hasattr(p, "main_grad"), f"Found shared weight {n} has None grad"
                         logger.debug(rmsg(f"Reduce shared weight {shared_name}"))
-                        torch.distributed.all_reduce(p.grad, group=pg)
+                        if p.grad is not None:
+                            torch.distributed.all_reduce(p.grad, group=pg)
+                        elif hasattr(p, "main_grad"):
+                            torch.distributed.all_reduce(p.main_grad, group=pg)
                         break
 
     def _sync_shared_weights(self):
@@ -667,9 +686,10 @@ class NxDPPModel(nn.Module):
 
     def cut_pipeline_stage(self, cut_point):
         # [TODO] make sure cut point is only at transformer layers
-        assert (
-            cut_point not in self.pipeline_cuts
-        ), f"each cutpoint can be only marked once, but {cut_point} is marked twice"
+        if self.pipeline_cuts is not None:
+            assert (
+                cut_point not in self.pipeline_cuts
+            ), f"each cutpoint can be only marked once, but {cut_point} is marked twice"
         assert (
             not self.partitioned
         ), f"cut_pipeline_stage({cut_point}) is called after model is partitioned, which is not allowed."
@@ -858,6 +878,7 @@ class NxDPPModel(nn.Module):
                 batch_size = t.size()[0]
             else:
                 assert batch_size == t.size()[0], f"batch dimension does not match, {batch_size} and {t.size()[0]}"
+        assert batch_size
         if batch_size % self.num_microbatches != 0:
             raise RuntimeError(
                 f"Input batch size {batch_size} must be divisible with the num_microbatches {self.num_microbatches}"
@@ -883,7 +904,7 @@ class NxDPPModel(nn.Module):
         """
         self._verify_inputs(input_kwargs)
         for model_chunk_id in range(self.virtual_pipeline_size):
-            inputs_ = []
+            inputs_: List[torch.Tensor] = []
             input_name_to_iter_idx = {}
             stage_id = self.get_current_stage(model_chunk_id)
             for inp_name in self.stage_id_to_model_input_names[stage_id].keys():
@@ -1022,6 +1043,7 @@ class NxDPPModel(nn.Module):
                     f"User provided output_loss_value_spec {self.output_loss_value_spec} failed to fetch the loss"
                 )
             self.losses.append(current_mb_loss)
+            self.losses_for_printing.append(current_mb_loss.detach().clone())
         else:
             current_stage = self.get_current_stage(self.current_model_chunk)
             outputs = self._handle_stage_outputs(outputs, current_stage)
@@ -1076,6 +1098,7 @@ class NxDPPModel(nn.Module):
         if self.is_last_pp_rank_last_model_chunk(self.current_model_chunk):
             self.timeline.mark_event_start(f"mb_{self.current_mb}_BackwardStep")
             scaled_loss = self.losses[self.current_mb] / self.num_microbatches
+            self.losses[self.current_mb] = None
             scaled_loss.backward()
             if self.should_graph_break:
                 self._mark_step()
@@ -1477,7 +1500,9 @@ class NxDPPModel(nn.Module):
         self._validate_partitioned()
         for local_module in self.local_stage_modules:
             for n, p in local_module.named_parameters(recurse=recurse):
-                original_name = self.local_name_to_original_name[n]
+                # remove wrapper prefix for checkpointing RMSNorm to avoid mapping key error
+                updated_name = n.replace(_CHECKPOINT_PREFIX, "")
+                original_name = self.local_name_to_original_name[updated_name]
                 yield original_name, p
 
     def local_buffers(self, recurse=True):
@@ -1580,10 +1605,10 @@ class NxDPPModel(nn.Module):
         self.send_op = send
         self.recv_op = recv_from
 
-    def _mark_step(self):
+    def _mark_step(self) -> None:
         xm.mark_step()
 
-    def _create_pg_with_ranks(self, ranks):
+    def _create_pg_with_ranks(self, ranks: List[int]) -> torch.distributed.ProcessGroup:
         pg = parallel_state.create_pg_with_ranks(ranks)
         return pg
 
@@ -1605,7 +1630,9 @@ class NxDPPModel(nn.Module):
                 # Casting local module to xla device
                 move_model_to_device(local_module, xm.xla_device())
                 self._sync_shared_weights()
-                self._mark_step()
+                # We no longer need this mark_step as we are guarding
+                # the fwd-bwd inside its own
+                # self._mark_step()
                 self.model_moved_to_device = True
 
     def _process_loss(self):
@@ -1614,7 +1641,7 @@ class NxDPPModel(nn.Module):
         """
         if self.pipeline_parallel_rank == self.pipeline_parallel_size - 1:
             loss_all = []
-            for loss in self.losses:
+            for loss in self.losses_for_printing:
                 loss_all.append(loss)
             if not self.return_mb_loss:
                 if not self.broadcast_and_average_loss:

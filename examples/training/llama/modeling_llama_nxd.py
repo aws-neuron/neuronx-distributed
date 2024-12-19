@@ -19,6 +19,7 @@
 # limitations under the License.
 """ PyTorch LLaMA model."""
 import math
+import os
 from functools import partial
 from typing import List, Optional, Tuple, Union
 
@@ -142,11 +143,15 @@ class LlamaRMSNorm(LlamaRMSNormHF):
     def forward(self, hidden_states):
         input_dtype = hidden_states.dtype
 
-        hidden_states = hidden_states.to(torch.double)
+        if os.environ.get("XLA_DOWNCAST_BF16", None) == "1":
+            hidden_states = hidden_states.to(torch.double)
+        else:
+            hidden_states = hidden_states.to(torch.float32)
 
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
+        output = self.weight * hidden_states
+        return output.to(input_dtype)
 
 
 class LlamaMLP(LlamaMLPHF):
@@ -167,6 +172,7 @@ class LlamaMLP(LlamaMLPHF):
             gather_output=False,
             init_method=init_method,
             sequence_parallel_enabled=self.config.sequence_parallel_enabled,
+            dtype=self.config.torch_dtype,
         )
         self.down_proj = RowParallelLinear(
             self.intermediate_size,
@@ -175,6 +181,7 @@ class LlamaMLP(LlamaMLPHF):
             input_is_parallel=True,
             init_method=init_method,
             sequence_parallel_enabled=self.config.sequence_parallel_enabled,
+            dtype=self.config.torch_dtype,
         )
         self.split_size = self.intermediate_size // get_tensor_model_parallel_size()
         if config.move_model_to_device:
@@ -229,7 +236,8 @@ class CoreAttention(nn.Module):
         causal_mask = torch.triu(torch.ones((1, 1, q_len, kv_seq_len), device="xla"), diagonal=1).bool()
         attn_weights = attn_weights.masked_fill_(causal_mask, -10000.0)
 
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.double).to(query_states.dtype)
+        dtype = torch.double if os.environ.get("XLA_DOWNCAST_BF16", None) == "1" else torch.float32
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=dtype).to(query_states.dtype)
 
         attn_output = torch.matmul(attn_weights, value_states)
         return attn_output
@@ -256,8 +264,8 @@ class LlamaAttention(LlamaAttentionHF):
         if not hasattr(config, "qkv_linear"):
             config.qkv_linear = False
 
-        if not hasattr(config, "separate_qkv"):
-            config.separate_qkv = False
+        if not hasattr(config, "fuse_qkv"):
+            config.fuse_qkv = False
 
         if not hasattr(config, "use_flash_attention"):
             self.use_flash_attention = False
@@ -272,18 +280,7 @@ class LlamaAttention(LlamaAttentionHF):
         self._init_rope()
 
         init_method = partial(_init_normal, config.initializer_range)
-        if not self.config.separate_qkv and self.num_heads == self.num_key_value_heads:
-            self.qkv_proj = ColumnParallelLinear(
-                self.hidden_size,
-                3 * self.num_heads * self.head_dim,
-                stride=3,
-                bias=False,
-                gather_output=False,
-                init_method=init_method,
-                sequence_parallel_enabled=self.config.sequence_parallel_enabled,
-            )
-            self.split_size = self.num_heads * self.head_dim // get_tensor_model_parallel_size()
-        elif self.config.qkv_linear:
+        if self.config.qkv_linear:
             self.qkv_proj = GQAQKVColumnParallelLinear(
                 self.hidden_size,
                 [self.num_heads * self.head_dim, self.num_key_value_heads * self.head_dim],
@@ -292,7 +289,21 @@ class LlamaAttention(LlamaAttentionHF):
                 init_method=init_method,
                 sequence_parallel_enabled=self.config.sequence_parallel_enabled,
                 kv_size_multiplier=self.config.kv_shared_group_size,
+                fuse_qkv=self.config.fuse_qkv,
+                dtype=self.config.torch_dtype,
             )
+        elif self.config.fuse_qkv and self.num_heads == self.num_key_value_heads:
+            self.qkv_proj = ColumnParallelLinear(
+                self.hidden_size,
+                3 * self.num_heads * self.head_dim,
+                stride=3,
+                bias=False,
+                gather_output=False,
+                init_method=init_method,
+                sequence_parallel_enabled=self.config.sequence_parallel_enabled,
+                dtype=self.config.torch_dtype,
+            )
+            self.split_size = self.num_heads * self.head_dim // get_tensor_model_parallel_size()
         else:
             self.q_proj = ColumnParallelLinear(
                 self.hidden_size,
@@ -301,6 +312,7 @@ class LlamaAttention(LlamaAttentionHF):
                 gather_output=False,
                 init_method=init_method,
                 sequence_parallel_enabled=self.config.sequence_parallel_enabled,
+                dtype=self.config.torch_dtype,
             )
             self.k_proj = ColumnParallelLinear(
                 self.hidden_size,
@@ -309,6 +321,7 @@ class LlamaAttention(LlamaAttentionHF):
                 gather_output=False,
                 init_method=init_method,
                 sequence_parallel_enabled=self.config.sequence_parallel_enabled,
+                dtype=self.config.torch_dtype,
             )
             self.v_proj = ColumnParallelLinear(
                 self.hidden_size,
@@ -317,6 +330,7 @@ class LlamaAttention(LlamaAttentionHF):
                 gather_output=False,
                 init_method=init_method,
                 sequence_parallel_enabled=self.config.sequence_parallel_enabled,
+                dtype=self.config.torch_dtype,
             )
         self.o_proj = RowParallelLinear(
             self.num_heads * self.head_dim,
@@ -325,6 +339,7 @@ class LlamaAttention(LlamaAttentionHF):
             input_is_parallel=True,
             init_method=init_method,
             sequence_parallel_enabled=self.config.sequence_parallel_enabled,
+            dtype=self.config.torch_dtype,
         )
         self.num_heads = neuronx_dist_utils.divide(config.num_attention_heads, get_tensor_model_parallel_size())
         self.num_key_value_heads = neuronx_dist_utils.divide(
@@ -370,7 +385,7 @@ class LlamaAttention(LlamaAttentionHF):
 
         else:
             if (
-                not self.config.separate_qkv
+                self.config.fuse_qkv
                 and self.num_heads == self.num_key_value_heads
                 and self.config.kv_shared_group_size == 1
             ):
@@ -474,7 +489,8 @@ class LlamaModel(LlamaModelHF):
 
         init_method = partial(_init_normal, config.initializer_range)
         self.embed_tokens = ParallelEmbedding(
-            config.vocab_size, config.hidden_size, self.padding_idx, init_method=init_method
+            config.vocab_size, config.hidden_size, self.padding_idx, init_method=init_method,
+            sequence_parallel_enabled=config.sequence_parallel_enabled, dtype=config.torch_dtype,
         )
         self.layers = nn.ModuleList([LlamaDecoderLayer(config) for _ in range(config.num_hidden_layers)])
         self.norm = LlamaRMSNorm(
@@ -575,9 +591,6 @@ class LlamaModel(LlamaModelHF):
         all_self_attns = () if output_attentions else None
         next_decoder_cache = () if use_cache else None
 
-        if self.config.sequence_parallel_enabled:
-            hidden_states = hidden_states.transpose(0, 1).contiguous()
-            hidden_states = mappings.scatter_to_sequence_parallel_region(hidden_states)
 
         for idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
@@ -621,10 +634,6 @@ class LlamaModel(LlamaModelHF):
 
         hidden_states = self.norm(hidden_states)
 
-        if self.config.sequence_parallel_enabled:
-            hidden_states = mappings.gather_from_sequence_parallel_region(hidden_states, to_model_parallel=False)
-            hidden_states = hidden_states.transpose(0, 1).contiguous()
-
         # add hidden states from the last decoder layer
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
@@ -656,6 +665,8 @@ class LlamaForCausalLM(LlamaForCausalLMHF):
             bias=False,
             gather_output=False,
             init_method=init_method,
+            sequence_parallel_enabled=config.sequence_parallel_enabled,
+            dtype=self.config.torch_dtype,
         )
         # Initialize weights and apply final processing
         self.post_init()
@@ -727,8 +738,14 @@ class LlamaForCausalLM(LlamaForCausalLMHF):
             logits = torch.cat(logits, dim=-1)
         else:
             logits = self.lm_head(hidden_states)
+            if self.config.sequence_parallel_enabled:
+                logits = logits.transpose(0, 1).contiguous()
 
-        logits = logits.double()
+
+        if os.environ.get("XLA_DOWNCAST_BF16", None) == "1":
+            logits = logits.double()
+        else:
+            logits = logits.to(torch.float32)
 
         loss = None
         if labels is not None:
@@ -759,11 +776,16 @@ class LlamaForCausalLM(LlamaForCausalLMHF):
         )
 
 
-def init_weights(module):
+def init_weights(module, device):
     """
     Re-init weights after partition
     Referred from HF transformers https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py#L690
     """
+    for key, nested_module in module._modules.items():
+        if isinstance(nested_module, LlamaRotaryEmbedding):
+            module._modules[key] = LlamaRotaryEmbedding(
+                nested_module.dim, nested_module.max_position_embeddings, nested_module.base, device
+                )
     if isinstance(module, LlamaRMSNorm):
         module.weight.data.fill_(1.0)
     elif isinstance(module, (ParallelEmbedding, RowParallelLinear, ColumnParallelLinear)):

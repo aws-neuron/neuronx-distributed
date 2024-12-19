@@ -26,11 +26,7 @@ if not torch.distributed.is_initialized():
     os.environ["RANK"] = "0"
     os.environ["WORLD_SIZE"] = "1"
     torch.distributed.init_process_group(backend="xla", init_method="env://")
-parallel_layers.parallel_state.initialize_model_parallel(
-    tensor_model_parallel_size=1,
-    pipeline_model_parallel_size=1,
-)
-parallel_layers.random.model_parallel_xla_manual_seed(0)
+ut.nxd_init(tp_degree=1, ep_degree=1, token_shuffle_group_size=1, seed=0)
 
 
 # IMPORTANT:
@@ -292,13 +288,11 @@ class TestImplCorrectness(unittest.TestCase):
 
         with torch.no_grad():
             for it in range(cfg.num_iters):
-                if cfg.test_mode == "inference":
-                    # Inference: input is BSH
+                if model_neuron.sequence_dimension == 1:
                     ip = torch.randn(
                         cfg.batch_size, cfg.seq_len, cfg.hidden_size, dtype=cfg.dtype, device=cfg.device
                     )
                 else:
-                    # Training: input is SBH
                     ip = torch.randn(
                         cfg.seq_len, cfg.batch_size, cfg.hidden_size, dtype=cfg.dtype, device=cfg.device
                     )
@@ -374,7 +368,14 @@ class TestImplCorrectness(unittest.TestCase):
 
         for it in range(cfg.num_iters):
             # Generate random input tensor
-            ip = torch.randn(cfg.seq_len, cfg.batch_size, cfg.hidden_size, dtype=cfg.dtype, device=cfg.device)
+            if model_neuron.sequence_dimension == 1:
+                ip = torch.randn(
+                    cfg.batch_size, cfg.seq_len, cfg.hidden_size, dtype=cfg.dtype, device=cfg.device
+                )
+            else:
+                ip = torch.randn(
+                    cfg.seq_len, cfg.batch_size, cfg.hidden_size, dtype=cfg.dtype, device=cfg.device
+                )
 
             if cfg.dtype == torch.bfloat16:
                 # Simulate dropping of tokens in input where the expert assignments are not matching with neuron

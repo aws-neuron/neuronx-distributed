@@ -1,42 +1,81 @@
 import copy
+import random
 from typing import Any, Dict, Iterator, List, Optional, Type, Union
+
+import numpy as np
 
 import torch
 from torch import Tensor
 from torch.optim import Optimizer
 
 from neuronx_distributed.parallel_layers.parallel_state import (
-    get_data_parallel_group,
+    get_data_parallel_replica_groups,
+    get_data_parallel_rank,
     get_data_parallel_size,
-    get_pipeline_model_parallel_group,
+    get_pipeline_model_parallel_replica_groups,
+    get_pipeline_model_parallel_rank,
     get_pipeline_model_parallel_size,
-    get_tensor_model_parallel_group,
+    get_tensor_model_parallel_replica_groups,
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_size,
+    get_expert_model_parallel_replica_groups,
+    get_expert_model_parallel_rank,
+    get_expert_model_parallel_size,
+    get_expert_data_parallel_replica_groups,
+    get_expert_data_parallel_rank,
+    get_expert_data_parallel_size,
 )
 
 PP_GROUP_PG_GLOO = None
 TP_GROUP_PG_GLOO = None
 DP_GROUP_PG_GLOO = None
+EMP_GROUP_PG_GLOO = None
+EDP_GROUP_PG_GLOO = None
 
 
-def get_test_params(dtype=None, device=None):
-    params = [torch.randn(512, 512) for _ in range(24)]
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+
+def get_test_params(use_ep=False, dtype=None, device=None):
+    seed = int(
+        "11{}{}".format(
+            get_pipeline_model_parallel_rank(),
+            get_tensor_model_parallel_rank(),
+        )
+    )
+    set_seed(seed)
+    params = [torch.randn(32, 32) for _ in range(12)]
+    seed = int(
+        "1{}{}{}".format(
+            get_expert_model_parallel_rank(),
+            get_pipeline_model_parallel_rank(),
+            get_tensor_model_parallel_rank(),
+        )
+    )
+    set_seed(seed)
+    params = params + [torch.randn(32, 32) for _ in range(12)]
+
     if dtype is not None:
         params = [p.to(dtype=dtype) for p in params]
-
     if device is not None:
         params = [p.to(device=device) for p in params]
-    for p in params:
+    for idx, p in enumerate(params):
         p.tensor_model_parallel = True
         p.requires_grad = True
+        if idx >= 12:
+            p.expert_model_parallel = True
     return params
 
 
 def initialize_gloo_groups():
+    rank = torch.distributed.get_rank()
+
     global PP_GROUP_PG_GLOO
     assert PP_GROUP_PG_GLOO is None, "pp gloo groups are already initialized!"
-    pp_group_spmd = get_pipeline_model_parallel_group(as_list=True)
-    rank = torch.distributed.get_rank()
+    pp_group_spmd = get_pipeline_model_parallel_replica_groups()
     for pp_group in pp_group_spmd:
         pg = torch.distributed.new_group(ranks=pp_group, backend="gloo")
         if rank in pp_group:
@@ -44,8 +83,7 @@ def initialize_gloo_groups():
 
     global TP_GROUP_PG_GLOO
     assert TP_GROUP_PG_GLOO is None, "tp gloo groups are already initialized!"
-    tp_group_spmd = get_tensor_model_parallel_group(as_list=True)
-    rank = torch.distributed.get_rank()
+    tp_group_spmd = get_tensor_model_parallel_replica_groups()
     for tp_group in tp_group_spmd:
         pg = torch.distributed.new_group(ranks=tp_group, backend="gloo")
         if rank in tp_group:
@@ -53,12 +91,27 @@ def initialize_gloo_groups():
 
     global DP_GROUP_PG_GLOO
     assert DP_GROUP_PG_GLOO is None, "dp gloo groups are already initialized!"
-    dp_group_spmd = get_data_parallel_group(as_list=True)
-    rank = torch.distributed.get_rank()
+    dp_group_spmd = get_data_parallel_replica_groups()
     for dp_group in dp_group_spmd:
         pg = torch.distributed.new_group(ranks=dp_group, backend="gloo")
         if rank in dp_group:
             DP_GROUP_PG_GLOO = pg
+
+    global EMP_GROUP_PG_GLOO
+    assert EMP_GROUP_PG_GLOO is None, "emp gloo groups are already initialized!"
+    emp_group_spmd = get_expert_model_parallel_replica_groups()
+    for emp_group in emp_group_spmd:
+        pg = torch.distributed.new_group(ranks=emp_group, backend="gloo")
+        if rank in emp_group:
+            EMP_GROUP_PG_GLOO = pg
+
+    global EDP_GROUP_PG_GLOO
+    assert EDP_GROUP_PG_GLOO is None, "edp gloo groups are already initialized!"
+    edp_group_spmd = get_expert_data_parallel_replica_groups()
+    for edp_group in edp_group_spmd:
+        pg = torch.distributed.new_group(ranks=edp_group, backend="gloo")
+        if rank in edp_group:
+            EDP_GROUP_PG_GLOO = pg
 
 
 def get_pp_gloo_group():
@@ -79,13 +132,29 @@ def get_dp_gloo_group():
     return DP_GROUP_PG_GLOO
 
 
+def get_emp_gloo_group():
+    global EMP_GROUP_PG_GLOO
+    assert EMP_GROUP_PG_GLOO is not None, "emp gloo groups are not initialized!"
+    return EMP_GROUP_PG_GLOO
+
+
+def get_edp_gloo_group():
+    global EDP_GROUP_PG_GLOO
+    assert EDP_GROUP_PG_GLOO is not None, "edp gloo groups are not initialized!"
+    return EDP_GROUP_PG_GLOO
+
+
 def destroy_gloo_groups():
     global PP_GROUP_PG_GLOO
     global TP_GROUP_PG_GLOO
     global DP_GROUP_PG_GLOO
+    global EMP_GROUP_PG_GLOO
+    global EDP_GROUP_PG_GLOO
     PP_GROUP_PG_GLOO = None
     TP_GROUP_PG_GLOO = None
     DP_GROUP_PG_GLOO = None
+    EMP_GROUP_PG_GLOO = None
+    EDP_GROUP_PG_GLOO = None
 
 
 class RefOptimizer(torch.optim.Optimizer):
@@ -170,23 +239,31 @@ class RefOptimizer(torch.optim.Optimizer):
                 dst_param_group[attr] = src_param_group[attr]
 
     @torch.no_grad()
-    def _clip_grad_norm(
+    def _get_grad_norm(
         self,
-        max_norm: Union[float, int],
         norm_type: Union[float, int] = 2.0,
     ) -> torch.Tensor:
-        all_parameters = []
+        # calculate norm's square sum
+        dtype = torch.float32
+        total_norm = torch.tensor([float(0.0)], dtype=dtype)
+        ep_total_norm = torch.tensor([float(0.0)], dtype=dtype)
         for param_group, copied_param_group in zip(self.param_groups, self.base_optimizer.param_groups):
             for param, copied in zip(param_group["params"], copied_param_group["params"]):
                 if param.grad is not None:
-                    all_parameters.append(copied)
+                    grad_norm = torch.norm(copied.grad, norm_type)
+                    if hasattr(param, "expert_model_parallel") and param.expert_model_parallel:
+                        ep_total_norm += grad_norm**norm_type
+                    else:
+                        total_norm += grad_norm**norm_type
 
-        total_norm = torch.nn.utils.clip_grad_norm_(
-            all_parameters,
-            max_norm=max_norm,
-            norm_type=norm_type,
-        )
-        total_norm = total_norm.double()  # gloo not support bfloat16
+        # all-reduce
+        if get_expert_model_parallel_size() > 1:
+            torch.distributed.all_reduce(
+                ep_total_norm,
+                op=torch.distributed.ReduceOp.SUM,
+                group=get_emp_gloo_group(),
+            )
+        total_norm += ep_total_norm
         if get_tensor_model_parallel_size() > 1:
             torch.distributed.all_reduce(
                 total_norm,
@@ -199,7 +276,36 @@ class RefOptimizer(torch.optim.Optimizer):
                 op=torch.distributed.ReduceOp.SUM,
                 group=get_pp_gloo_group(),
             )
+
+        # calculate final norm value
+        total_norm = torch.pow(total_norm, 1.0 / norm_type)
+        return total_norm
+
+    @torch.no_grad()
+    def _clip_grad_norm(
+        self,
+        max_norm: Union[float, int],
+        norm_type: Union[float, int] = 2.0,
+    ) -> torch.Tensor:
+        total_norm = self._get_grad_norm(norm_type=norm_type)
         self._grad_norm = total_norm.to(self.optimizer_dtype)
+
+        grads = []
+        for param_group, copied_param_group in zip(self.param_groups, self.base_optimizer.param_groups):
+            for param, copied in zip(param_group["params"], copied_param_group["params"]):
+                if param.grad is not None:
+                    grads.append(copied.grad.detach())
+
+        clip_coeff = max_norm / (total_norm + 1.0e-6)
+        for g in grads:
+            g.data.mul_(
+                torch.where(
+                    clip_coeff < 1,
+                    clip_coeff.to(dtype=total_norm.dtype),
+                    torch.tensor(1.0, dtype=total_norm.dtype),
+                )
+            )
+        return self._grad_norm
 
     @torch.no_grad()
     def step(self, closure=None, **kwargs):
@@ -213,7 +319,7 @@ class RefOptimizer(torch.optim.Optimizer):
         # sync to base optimizer
         self._sync_param_groups(self.param_groups, self.base_optimizer.param_groups)
 
-        # do master copy
+        # do master copy and all-reduce
         for param_group, copied_param_group in zip(self.param_groups, self.base_optimizer.param_groups):
             for param, copied in zip(param_group["params"], copied_param_group["params"]):
                 if param.grad is not None:
@@ -224,12 +330,27 @@ class RefOptimizer(torch.optim.Optimizer):
                     # cast to fp32 and cast back as gloo not support bf16
                     original_dtype = grad_copied.dtype
                     grad_copied = grad_copied.to(dtype=torch.float32)
-                    grad_copied /= get_data_parallel_size()
-                    torch.distributed.all_reduce(
-                        grad_copied,
-                        op=torch.distributed.ReduceOp.SUM,
-                        group=get_dp_gloo_group(),
-                    )
+                    if hasattr(param, "expert_model_parallel") and param.expert_model_parallel:
+                        torch.distributed.all_reduce(
+                            grad_copied,
+                            op=torch.distributed.ReduceOp.SUM,
+                            group=get_edp_gloo_group(),
+                        )
+                        grad_copied /= get_expert_data_parallel_size()
+                        grad_copied /= get_expert_model_parallel_size()
+                    else:
+                        torch.distributed.all_reduce(
+                            grad_copied,
+                            op=torch.distributed.ReduceOp.SUM,
+                            group=get_edp_gloo_group(),
+                        )
+                        grad_copied /= get_expert_data_parallel_size()
+                        torch.distributed.all_reduce(
+                            grad_copied,
+                            op=torch.distributed.ReduceOp.SUM,
+                            group=get_emp_gloo_group(),
+                        )
+                        grad_copied /= get_expert_model_parallel_size()
                     grad_copied = grad_copied.to(dtype=original_dtype)
 
                     if grad_copied.dtype != self.optimizer_dtype:
@@ -260,3 +381,9 @@ class RefOptimizer(torch.optim.Optimizer):
         self._sync_param_groups(self.base_optimizer.param_groups, self.param_groups)
 
         return loss
+
+    def state_dict(self):
+        state_dict = super().state_dict()
+        base_state = self.base_optimizer.state_dict()["state"]
+        state_dict["base_state"] = base_state
+        return state_dict

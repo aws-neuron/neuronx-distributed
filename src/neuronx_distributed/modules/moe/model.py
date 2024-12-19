@@ -1,6 +1,9 @@
-import torch
+from typing import Optional
 
-from neuronx_distributed.modules.moe import expert_mlps, routing
+import torch
+from torch.distributed import ProcessGroup
+
+from neuronx_distributed.modules.moe import expert_mlps, routing, token_shuffling
 from neuronx_distributed.parallel_layers import mappings, parallel_state
 
 
@@ -59,6 +62,9 @@ class MoE(torch.nn.Module):
         expert_mlps: Obtains the output of the MoE layer by passing tokens through the chosen experts
         sequence_parallel_enabled: Whether the model is running in sequence parallel or not
         return_router_logits: Whether to return the router logits in the forward pass
+        token_shuffle_group_size: Size of token shuffling group. If size=1, token shuffling is disabled.
+        1 <= token_shuffle_group_size <= dp_size.
+        token_shuffle_seed: Seed for token shuffling. If None, a random seed is used.
     """
 
     # Flag used in testing. Should not be used in production.
@@ -69,7 +75,11 @@ class MoE(torch.nn.Module):
         router: routing.RouterBase,
         expert_mlps: expert_mlps.ExpertMLPs,
         sequence_parallel_enabled: bool = False,
+        sequence_dimension: Optional[int] = None,
         return_router_logits: bool = False,
+        token_shuffle_group_size: int = 1,  # disable token shuffle by default
+        token_shuffle_seed=None,
+        tensor_model_parallel_group: Optional[ProcessGroup] = None,
     ):
         super().__init__()
 
@@ -77,11 +87,31 @@ class MoE(torch.nn.Module):
             if getattr(router, attr) != getattr(expert_mlps, attr):
                 raise ValueError("Inconsistent {attr} across the router and expert_mlps")
 
+        if router.sequence_parallel_enabled:
+            if not sequence_parallel_enabled:
+                raise ValueError("MoE layer must have SP enabled to run router in SP")
+            if router.sequence_dimension != sequence_dimension:
+                raise ValueError("Inconsistent sequence_dimension across MoE and router modules")
+
         self.router = router
         self.expert_mlps = expert_mlps
+
         self.sequence_parallel_enabled = sequence_parallel_enabled
+        if sequence_dimension is None:
+            # Default to 0
+            sequence_dimension = 0
+        self.sequence_dimension = sequence_dimension
+
         self.return_router_logits = return_router_logits
         self.ep_enabled = parallel_state.get_expert_model_parallel_size() > 1
+        self.token_shuffle_group_size = token_shuffle_group_size
+        self.token_shuffle_seed = token_shuffle_seed
+        self.shuffle_permutation = None
+        if self.token_shuffle_group_size > 1:
+            parallel_state.initialize_token_shuffle_group(self.token_shuffle_group_size)
+
+        self.tensor_parallel_group = tensor_model_parallel_group if \
+            tensor_model_parallel_group is not None else parallel_state.get_tensor_model_parallel_group()
 
     def forward(self, hidden_states):
         """Forward pass of the MoE layer.
@@ -91,8 +121,16 @@ class MoE(torch.nn.Module):
             S': Sequence length (when the input is in SP)
             T: Tokens = S * B (token dimension obtained by flattening S and B)
 
+        Layout of input hidden_states:
+            - In the training flow,
+                With SP enabled  : (S', B, H)
+                With SP disabled : (B, S, H)
+            - In the inference flow,
+                With SP enabled  : (B, S', H)
+                With SP disabled : (B, S, H)
+
         Arguments:
-            hidden_states: Input tensor of shape (S, B, H) or (S', B, H) in training, (B, S, H) in inference.
+            hidden_states: Input tensor (of shape as described above)
 
         Returns:
             output: Output tensor of the same shape as hidden_states, containing the output of the MoE layer.
@@ -103,31 +141,41 @@ class MoE(torch.nn.Module):
                                      Returned if self.is_test is True.
         """
 
-        # hidden_states: (S, B, H) or (S', B, H) in training, (B, S, H) in inference
-
-        if not self.training:
-            # Sequence parallelism is only supported for training
-            assert self.sequence_parallel_enabled is False, "SP is not currently supported for inference"
+        if self.token_shuffle_group_size > 1:
+            hidden_states, shuffle_permutation = token_shuffling.token_shuffle(
+                hidden_states, seed=self.token_shuffle_seed
+            )
+            if self.token_shuffle_seed is not None:
+                # store for debugging purpose, which is when user specifies a seed
+                self.shuffle_permutation = shuffle_permutation
 
         if self.sequence_parallel_enabled:
             # All-Gather the hidden_states to exit sequence parallel
             # full_hidden_states: (S', B, H) -> (S, B, H)
-            full_hidden_states = mappings.gather_from_sequence_parallel_region(hidden_states, to_model_parallel=False)
+            full_hidden_states = mappings.gather_from_sequence_parallel_region(
+                hidden_states,
+                sequence_dimension=self.sequence_dimension,
+                to_model_parallel=False,
+                process_group=self.tensor_parallel_group,
+            )
         else:
             full_hidden_states = hidden_states
 
-        # full_hidden_states: (S, B, H) in training, (B, S, H) in inference
+        # full_hidden_states: (S, B, H) or (B, S, H)
         full_hidden_states_shape = full_hidden_states.shape
-        seq_len = full_hidden_states_shape[0] if self.training else full_hidden_states_shape[1]
-
-        # full_hidden_states: (T, H)
-        full_hidden_states = full_hidden_states.view(-1, full_hidden_states.shape[-1])
+        seq_len = full_hidden_states_shape[self.sequence_dimension]
 
         # Get the router_logits, expert_affinities and expert_index from the router
         # router_logits: (T, E), expert_affinities: (T, E), expert_index: (T, top_k)
-        router_logits, expert_affinities, expert_index = self.router(full_hidden_states)
+        if self.router.sequence_parallel_enabled:
+            router_logits, expert_affinities, expert_index = self.router(hidden_states)
+        else:
+            router_logits, expert_affinities, expert_index = self.router(full_hidden_states)
 
-        # Get the output from the ExpertMLPs: (T, H)
+        # full_hidden_states: (S, B, H) or (B, S, H) -> (T, H)
+        full_hidden_states = full_hidden_states.view(-1, full_hidden_states_shape[-1])
+
+        # Get the output from the ExpertMLPs
         output = self.expert_mlps(
             hidden_states=full_hidden_states,
             expert_affinities=expert_affinities,
@@ -135,19 +183,26 @@ class MoE(torch.nn.Module):
             seq_len=seq_len,
         )
 
-        # output: (S, B, H) in training, (B, S, H) in inference
+        # output: (T, H) -> (S, B, H) or (B, S, H)
         output = output.view(full_hidden_states_shape)
 
         if self.sequence_parallel_enabled and self.ep_enabled:
             # Reduction is done earlier in the case of EP
-            output = mappings.scatter_to_sequence_parallel_region(output)
+            output = mappings.scatter_to_sequence_parallel_region(
+                output, self.sequence_dimension, process_group=self.tensor_parallel_group,
+            )
         elif self.sequence_parallel_enabled:
             # Reduce-scatter back to sequence parallel (as the hidden_states were in sequence parallel)
-            # output: (S, B, H) -> (S', B, H)
-            output = mappings.reduce_scatter_to_sequence_parallel_region(output)
+            output = mappings.reduce_scatter_to_sequence_parallel_region(
+                output, self.sequence_dimension, process_group=self.tensor_parallel_group,
+            )
         elif not self.ep_enabled:
-            # output: (S, B, H) in training, (B, S, H) in inference
-            output = mappings.reduce_from_tensor_model_parallel_region(output)
+            output = mappings.reduce_from_tensor_model_parallel_region(
+                output, process_group=self.tensor_parallel_group
+            )
+
+        if self.token_shuffle_group_size > 1:
+            output = token_shuffling.token_unshuffle(output, shuffle_permutation)
 
         return_op = (output,)
         if self.expert_mlps.return_bias:

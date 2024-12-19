@@ -23,6 +23,8 @@ from neuronx_distributed.parallel_layers.parallel_state import (
 from .accelerator import NeuronXLAAccelerator
 from .checkpoint_io import NeuronCheckpointIO
 from .launcher import _NeuronXLALauncher
+import torch_xla.core.xla_model as xm
+from torch_xla.distributed.parallel_loader import MpDeviceLoader
 
 if TYPE_CHECKING:
     from pytorch_lightning.strategies.strategy import TBroadcast
@@ -89,8 +91,6 @@ class NeuronXLAStrategy(XLAStrategy):
         if self.cluster_environment.creates_processes_externally:
             global_rank = int(os.environ["RANK"])
         else:
-            import torch_xla.core.xla_model as xm
-
             global_rank = xm.get_ordinal()
         if torch.__version__.startswith("2.0"):
             import torch_xla.experimental.pjrt_backend  # noqa
@@ -164,8 +164,6 @@ class NeuronXLAStrategy(XLAStrategy):
             )
 
         # Replace xm.mesh_reduce since it will cause error in PT2.x
-        import torch_xla.core.xla_model as xm
-
         xm.mark_step()
 
         torch.distributed.all_reduce(output, op=torch.distributed.ReduceOp.SUM)
@@ -175,8 +173,7 @@ class NeuronXLAStrategy(XLAStrategy):
         xm.mark_step()
         return output.cpu()
 
-    def process_dataloader(self, dataloader: object) -> object:
-        from torch_xla.distributed.parallel_loader import MpDeviceLoader
+    def process_dataloader(self, dataloader: torch.utils.data.DataLoader) -> MpDeviceLoader:
 
         # PP requires input data on CPU
         if self.pipeline_parallel_size > 1:
@@ -189,26 +186,28 @@ class NeuronXLAStrategy(XLAStrategy):
             # dataloader is already wrapped by MpDeviceLoader
             return dataloader
 
-        dataloader = MpDeviceLoader(dataloader, self.root_device)
+        mpdl = MpDeviceLoader(dataloader, self.root_device)
         # Mimic interface to torch.utils.data.DataLoader
-        dataloader.dataset = dataloader._loader.dataset
-        dataloader.batch_sampler = getattr(dataloader._loader, "batch_sampler", None)
-        return dataloader
+        mpdl.dataset = mpdl._loader.dataset
+        mpdl.batch_sampler = getattr(mpdl._loader, "batch_sampler", None)
+        return mpdl
 
     def save_checkpoint(
         self, checkpoint: Dict[str, Any], filepath: _PATH, storage_options: Optional[Any] = None
     ) -> None:
         # When zero1 enabled, save to all dp rank. TODO: Optimize by saving model to dp rank 0 and opt to all ranks
+        master_dp_only = not (self.nxd_config or {}).get("optimizer_config", {})["zero_one_enabled"]
         self.checkpoint_io.save_checkpoint(
             checkpoint,
             filepath,
             storage_options=storage_options,
-            master_dp_only=not self.nxd_config["optimizer_config"]["zero_one_enabled"],
+            master_dp_only=master_dp_only,
         )
 
     def load_checkpoint(self, checkpoint_path: _PATH) -> Dict[str, Any]:
         # torch.cuda.empty_cache()
+        master_dp_only = not (self.nxd_config or {}).get("optimizer_config", {})["zero_one_enabled"]
         return self.checkpoint_io.load_checkpoint(
             checkpoint_path,
-            master_dp_only=not self.nxd_config["optimizer_config"]["zero_one_enabled"],
+            master_dp_only=master_dp_only,
         )

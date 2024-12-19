@@ -363,7 +363,7 @@ def train_gpt_neox(flags):
                 running_loss_reduced = xm.all_reduce(
                     xm.REDUCE_SUM,
                     running_loss_div,
-                    groups=parallel_state.get_data_parallel_group(as_list=True),
+                    groups=parallel_state.get_data_parallel_replica_groups(),
                 )
                 running_loss_reduced_detached = running_loss_reduced.detach()
                 running_loss.zero_()

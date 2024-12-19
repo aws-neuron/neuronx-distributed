@@ -7,16 +7,18 @@ from neuronx_distributed.parallel_layers import (
     ColumnParallelLinear,
     RowParallelLinear,
 )
+from neuronx_distributed.modules.qkv_linear import GQAQKVColumnParallelLinear
 from neuronx_distributed.modules.lora import LoraConfig, LoraModel, get_lora_model
+from . import MockGroup
 
 
 class NxDModule(torch.nn.Module):
     def __init__(self):
         super().__init__()
-        self.rpl = ColumnParallelLinear(32, 32)
-        self.cpl = RowParallelLinear(32, 32)
+        self.rpl = ColumnParallelLinear(32, 32, tensor_model_parallel_group=MockGroup())
+        self.cpl = RowParallelLinear(32, 32, tensor_model_parallel_group=MockGroup())
+        self.qkv = GQAQKVColumnParallelLinear(32, [4 * 32, 1 * 32])
         self.linear = torch.nn.Linear(32, 32)
-
 
 
 class Module(torch.nn.Module):
@@ -27,24 +29,22 @@ class Module(torch.nn.Module):
         self.embedding = torch.nn.Embedding(32, 32)
 
 
-
 def get_nxd_lora_config(save_lora_base, merge_lora, load_lora_from_ckpt=False):
     return LoraConfig(
-        enable_lora=True,
         lora_rank=8,
         lora_alpha=16,
         lora_dropout=0.05,
         lora_verbose=True,
-        target_modules=["rpl", "cpl"],
+        target_modules=["rpl", "cpl", "qkv"],
         save_lora_config_adapter=False,
         save_lora_base=save_lora_base,
         merge_lora=merge_lora,
         load_lora_from_ckpt=load_lora_from_ckpt,
+        merge_sharded_lora=False,
     )
 
 def get_lora_config(save_lora_base, merge_lora, load_lora_from_ckpt=False):
     return LoraConfig(
-        enable_lora=True,
         lora_rank=8,
         lora_alpha=16,
         lora_dropout=0.05,
@@ -54,8 +54,8 @@ def get_lora_config(save_lora_base, merge_lora, load_lora_from_ckpt=False):
         save_lora_base=save_lora_base,
         merge_lora=merge_lora,
         load_lora_from_ckpt=load_lora_from_ckpt,
+        merge_sharded_lora=False,
     )
-
 
 
 class TestLoraSaveLoad(unittest.TestCase):
@@ -114,6 +114,8 @@ class TestLoraSaveLoad(unittest.TestCase):
         "neuronx_distributed.parallel_layers.parallel_state.model_parallel_is_initialized", MagicMock(return_value=True)
     )
     @patch("neuronx_distributed.utils.model_utils.get_local_world_size", MagicMock(return_value=32))
+    @patch("neuronx_distributed.modules.qkv_linear.GQAQKVColumnParallelLinear.initialize_weight_biases", MagicMock(return_value=True))
+    @patch("neuronx_distributed.parallel_layers.parallel_state.initialize_kv_group", MagicMock(return_value=True))
     def test_save_load_no_base(self):
         model = NxDModule()
         base_model_state_dict = model.state_dict()
@@ -140,6 +142,8 @@ class TestLoraSaveLoad(unittest.TestCase):
         "neuronx_distributed.parallel_layers.parallel_state.model_parallel_is_initialized", MagicMock(return_value=True)
     )
     @patch("neuronx_distributed.utils.model_utils.get_local_world_size", MagicMock(return_value=32))
+    @patch("neuronx_distributed.modules.qkv_linear.GQAQKVColumnParallelLinear.initialize_weight_biases", MagicMock(return_value=True))
+    @patch("neuronx_distributed.parallel_layers.parallel_state.initialize_kv_group", MagicMock(return_value=True))
     def test_save_load_with_base(self):
         model = NxDModule()
         lora_config = get_nxd_lora_config(save_lora_base=True, merge_lora=False)
@@ -162,6 +166,8 @@ class TestLoraSaveLoad(unittest.TestCase):
         "neuronx_distributed.parallel_layers.parallel_state.model_parallel_is_initialized", MagicMock(return_value=True)
     )
     @patch("neuronx_distributed.utils.model_utils.get_local_world_size", MagicMock(return_value=32))
+    @patch("neuronx_distributed.modules.qkv_linear.GQAQKVColumnParallelLinear.initialize_weight_biases", MagicMock(return_value=True))
+    @patch("neuronx_distributed.parallel_layers.parallel_state.initialize_kv_group", MagicMock(return_value=True))
     def test_save_load_with_base_merged(self):
         model = NxDModule()
         base_model_state_dict = model.state_dict()

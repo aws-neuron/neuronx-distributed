@@ -1,5 +1,6 @@
 import os
 from pprint import pformat
+from typing import Optional
 
 import torch
 import torch_xla.core.xla_model as xm
@@ -9,7 +10,6 @@ from neuronx_distributed.optimizer import NeuronZero1Optimizer, NeuronEPZero1Opt
 from neuronx_distributed.modules.lora import LoraConfig, LoraModel
 from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.parallel_layers.pad import pad_model
-from neuronx_distributed.parallel_layers.parallel_state import rmsg, get_expert_model_parallel_size
 from neuronx_distributed.pipeline import NxDPPModel
 from neuronx_distributed.trainer.model import NxDModel
 from neuronx_distributed.trainer.optimizer import NxDOptimizer
@@ -23,9 +23,8 @@ from neuronx_distributed.utils.model_utils import (
     is_hf_pretrained_model,
     is_nxdt_pretrained_model,
     check_delay_tracing,
-    get_delay_tracing
+    get_delay_tracing,
 )
-
 
 logger = get_logger()
 
@@ -40,8 +39,10 @@ def neuronx_distributed_config(
     pad_model=False,
     sequence_parallel=False,
     model_init_config=None,
-    lora_config: LoraConfig = None,
+    lora_config: Optional[LoraConfig] = None,
     mixed_precision_config=None,
+    sequential_move_factor=11,
+    lnc_size=1,
 ):
     if optimizer_config is None:
         optimizer_config = {"zero_one_enabled": False, "grad_clipping": True, "max_grad_norm": 1.0}
@@ -92,7 +93,7 @@ def neuronx_distributed_config(
 
     if model_init_config is None:
         model_init_config = {
-            "sequential_move_factor": 11,  # randomly chosen number, work for 20B size model
+            "sequential_move_factor": sequential_move_factor,  # randomly chosen number, work for 20B size model
             "meta_device_init": False,
             "param_init_fn": None,
         }
@@ -103,7 +104,7 @@ def neuronx_distributed_config(
                 logger.warning(
                     "sequential_move_factor is not set, automatically set it to 11, this number works for 20B size model."
                 )
-            model_init_config.update({"sequential_move_factor": 11})  # randomly chosen number, work for 20B size model
+            model_init_config.update({"sequential_move_factor": sequential_move_factor})  # randomly chosen number, work for 20B size model
         if "meta_device_init" not in model_init_config:
             if parallel_state.is_global_rank_zero():
                 logger.warning("meta_device_init is not set, automatically set it to False.")
@@ -124,6 +125,7 @@ def neuronx_distributed_config(
         "model_init_config": model_init_config,
         "lora_config": lora_config,
         "mixed_precision_config": mixed_precision_config,
+        "lnc_size": lnc_size,
     }
 
     if torch.distributed.is_initialized():
@@ -131,6 +133,7 @@ def neuronx_distributed_config(
             tensor_model_parallel_size=config["tensor_parallel_size"],
             pipeline_model_parallel_size=config["pipeline_parallel_size"],
             expert_model_parallel_size=config["expert_parallel_size"],
+            lnc_size=lnc_size,
         )
 
     if torch.distributed.is_initialized() and parallel_state.is_global_rank_zero():
@@ -138,12 +141,13 @@ def neuronx_distributed_config(
     return config
 
 
-def initialize_parallel_model(nxd_config, model_fn, *model_args, **model_kwargs):
+def initialize_parallel_model(nxd_config, model_fn, include_buffers: bool = False, *model_args, **model_kwargs):
     if not parallel_state.model_parallel_is_initialized():
         parallel_state.initialize_model_parallel(
             tensor_model_parallel_size=nxd_config["tensor_parallel_size"],
             pipeline_model_parallel_size=nxd_config["pipeline_parallel_size"],
             expert_model_parallel_size=nxd_config["expert_parallel_size"],
+            lnc_size=nxd_config["lnc_size"],
         )
 
     # Phase 1: get the base model
@@ -154,7 +158,7 @@ def initialize_parallel_model(nxd_config, model_fn, *model_args, **model_kwargs)
     if meta_device_init:
         # We force the init to use custom function, since there is a bug in accelerate's
         # API, as it doesn't handle weight sharing. TODO: Add a fix to accelerate
-        with init_on_device(device=torch.device("meta"), force_custom_init_on_device=True):
+        with init_on_device(device=torch.device("meta"), include_buffers=include_buffers, force_custom_init_on_device=True):
             model = model_fn(*model_args, **model_kwargs)
     else:
         model = model_fn(*model_args, **model_kwargs)
@@ -168,7 +172,6 @@ def initialize_parallel_model(nxd_config, model_fn, *model_args, **model_kwargs)
         nxd_config["pipeline_config"]["_delay_tracing"] = check_delay_tracing(nxd_config)
         model = NxDPPModel(model, **nxd_config["pipeline_config"])
 
-
     # Phase 3: materialize model and move to device
     sequential_move_factor = nxd_config["model_init_config"]["sequential_move_factor"]
 
@@ -177,7 +180,7 @@ def initialize_parallel_model(nxd_config, model_fn, *model_args, **model_kwargs)
 
     # Phase 4: wrap the model with LoraModel
     lora_config = nxd_config.get("lora_config", None)
-    if lora_config is not None and lora_config.enable_lora:
+    if lora_config is not None:
         model = LoraModel(model, lora_config)
 
     # Phase 5: apply optimization what will change model structure
@@ -195,7 +198,7 @@ def initialize_parallel_model(nxd_config, model_fn, *model_args, **model_kwargs)
     if nxd_config["activation_checkpoint_config"] is not None:
         if nxd_config["activation_checkpoint_config"] == "full":
             if pp_enabled:
-                activation_checkpoint_classes = (model.transformer_layer_cls,)
+                activation_checkpoint_classes = [model.transformer_layer_cls]
             elif is_hf_pretrained_model(base_model):
                 activation_checkpoint_classes = []
                 from transformers.trainer_pt_utils import get_module_class_from_name
@@ -204,9 +207,7 @@ def initialize_parallel_model(nxd_config, model_fn, *model_args, **model_kwargs)
                     activation_checkpoint_classes.append(get_module_class_from_name(nxd_model, name))
             elif is_nxdt_pretrained_model(base_model):
                 # NxDT transformer layer will always be this type
-                from neuronx_distributed_training.models.megatron.transformer import (
-                    ParallelTransformerLayer,
-                )
+                from neuronx_distributed_training.models.megatron.transformer import ParallelTransformerLayer
 
                 activation_checkpoint_classes = [ParallelTransformerLayer]
             else:
@@ -217,13 +218,13 @@ def initialize_parallel_model(nxd_config, model_fn, *model_args, **model_kwargs)
         else:
             activation_checkpoint_classes = nxd_config["activation_checkpoint_config"]
             if not isinstance(activation_checkpoint_classes, (list, tuple)):
-                activation_checkpoint_classes = (activation_checkpoint_classes,)
-        activation_checkpoint_classes = tuple(activation_checkpoint_classes)
-        assert len(activation_checkpoint_classes) > 0
-        assert all(issubclass(c, torch.nn.Module) for c in activation_checkpoint_classes)
+                activation_checkpoint_classes = [activation_checkpoint_classes]
+        activation_checkpoint_classes_tuple = tuple(activation_checkpoint_classes)
+        assert len(activation_checkpoint_classes_tuple) > 0
+        assert all(issubclass(c, torch.nn.Module) for c in activation_checkpoint_classes_tuple)
         apply_activation_checkpointing(
             nxd_model,
-            check_fn=lambda m: isinstance(m, activation_checkpoint_classes),
+            check_fn=lambda m: isinstance(m, activation_checkpoint_classes_tuple),
         )
 
     return nxd_model
@@ -239,16 +240,26 @@ def initialize_optimizer_from_class(nxd_config, optimizer_class, parameters, mod
     optimizer_config = nxd_config["optimizer_config"]
     mixed_precision_config = nxd_config["mixed_precision_config"]
     if optimizer_config["zero_one_enabled"]:
-        ep_enabled = get_expert_model_parallel_size() > 1
+        ep_enabled = parallel_state.get_expert_model_parallel_size() > 1
         zero1_optimizer_cls = NeuronEPZero1Optimizer if ep_enabled else NeuronZero1Optimizer
         zero1_configs = {
             "grad_clipping": optimizer_config["grad_clipping"],
             "pin_layout": False,
-            "sharding_groups": parallel_state.get_data_parallel_group(as_list=True),
-            "grad_norm_groups": parallel_state.get_tensor_model_parallel_group(as_list=True),
+            "sharding_groups": parallel_state.get_data_parallel_replica_groups(),
+            "grad_norm_groups": parallel_state.get_tensor_model_parallel_replica_groups(),
         }
-        if version.parse(torch.__version__) >= version.parse("2.1"):
+        if version.parse(torch.__version__) == version.parse("2.1"):
             zero1_configs.update({"coalesce_cc": True})
+        if version.parse(torch.__version__) >= version.parse("2.2"):
+            # P148368176: Bucket cap >140MB causes NaN at step 3 (known issue)
+            _ALL_GATHER_REDUCE_SCATTER_BUCKET_CAP_MB = 130
+            bucket_cap = int(
+                os.getenv("ALL_GATHER_REDUCE_SCATTER_BUCKET_CAP_MB", _ALL_GATHER_REDUCE_SCATTER_BUCKET_CAP_MB)
+            )
+            reduce_scatter_bucket_cap = bucket_cap
+            all_gather_bucket_cap = max(1, bucket_cap // parallel_state.get_data_parallel_size())
+            zero1_configs.update({"bucket_cap_mb_all_gather": all_gather_bucket_cap})
+            zero1_configs.update({"bucket_cap_mb_reduce_scatter": reduce_scatter_bucket_cap})
         if mixed_precision_config["use_master_weights"]:
             if "XLA_DOWNCAST_BF16" in os.environ and os.environ["XLA_DOWNCAST_BF16"] == "1":
                 defaults.update({"optimizer_dtype": torch.double})

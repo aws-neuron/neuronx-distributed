@@ -44,6 +44,8 @@ LR=5.0e-5
 MODEL_PATH=$SCRIPT_DIR/finetune_config
 # pretrained weight path
 PRETRAINED_PATH="$HOME/llama-2-7b-sharded"
+# base model name
+BASE_MODEL="NousResearch/Llama-2-7b-hf"
 # sequence length
 SEQ_LEN=4096
 # golden rouge score path
@@ -123,8 +125,9 @@ echo STEPS_THIS_RUN=$STEPS_THIS_RUN
 echo OUTPUT_LOG=$OUTPUT_LOG
 
 torchrun $DISTRIBUTED_ARGS \
-    tp_zero1_llama2_7b_hf_finetune_ptl.py \
+    tp_llama_hf_finetune_ptl.py \
     --model_path $MODEL_PATH \
+    --model_name $BASE_MODEL \
     --data_dir "databricks/databricks-dolly-15k" \
     --task "open_qa" \
     --pretrained_ckpt $PRETRAINED_PATH \
@@ -138,7 +141,7 @@ torchrun $DISTRIBUTED_ARGS \
     --grad_accum_usteps $ACC_STEPS \
     --seq_len $SEQ_LEN \
     --selective_checkpoint_enabled \
-    --separate_qkv \
+    --fuse_qkv 0 \
     --golden_rouge_score_path $GOLDEN_ROUGE_SCORE_PATH \
     $EXTRA_ARGS |& tee $OUTPUT_LOG
 
@@ -166,3 +169,5 @@ else
       fi
   fi
 fi
+
+exit $ret_val

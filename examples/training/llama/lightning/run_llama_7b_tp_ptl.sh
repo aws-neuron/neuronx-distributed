@@ -117,5 +117,6 @@ torchrun $DISTRIBUTED_ARGS \
     --use_fp32_optimizer 1 \
     --use_zero1_optimizer 1 \
     --scheduler_type 'linear' \
+    --fuse_qkv 1 \
     --use_flash_attention 1 |& tee $OUTPUT_LOG
 exit ${PIPESTATUS[0]}

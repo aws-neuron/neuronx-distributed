@@ -105,11 +105,17 @@ class NxDOptimizer(torch.optim.Optimizer):
             for group, params in param_group.items():
                 if group == "params":
                     for p in params:
-                        if isinstance(p, torch.Tensor) and p.grad is not None:
-                            if hasattr(p, "expert_model_parallel") and p.expert_model_parallel:
-                                ep_gradients.append(p.grad.data)
-                            else:
-                                gradients.append(p.grad.data)
+                        if isinstance(p, torch.Tensor):
+                            if p.grad is not None:
+                                if hasattr(p, "expert_model_parallel") and p.expert_model_parallel:
+                                    ep_gradients.append(p.grad.data)
+                                else:
+                                    gradients.append(p.grad.data)
+                            elif hasattr(p, "main_grad"):
+                                if hasattr(p, "expert_model_parallel") and p.expert_model_parallel:
+                                    ep_gradients.append(p.main_grad.data)
+                                else:
+                                    gradients.append(p.main_grad.data)
 
         return gradients, ep_gradients
 

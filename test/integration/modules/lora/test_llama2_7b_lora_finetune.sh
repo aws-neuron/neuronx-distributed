@@ -129,10 +129,10 @@ torchrun $DISTRIBUTED_ARGS \
     --grad_accum_usteps $ACC_STEPS \
     --seq_len $SEQ_LEN \
     --selective_checkpoint_enabled \
-    --separate_qkv \
     --golden_rouge_score_path $GOLDEN_ROUGE_SCORE_PATH  \
     --pretrained_ckpt $PRETRAINED_PATH \
     --task "open_qa" \
+    --fuse_qkv 0 \
     $EXTRA_ARGS \
     --enable_lora \
     --use_gpu_compatible_precision 0 \

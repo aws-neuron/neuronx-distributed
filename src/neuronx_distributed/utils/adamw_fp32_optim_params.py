@@ -20,7 +20,7 @@
 import math
 import os
 import warnings
-from typing import Callable, Iterable, Tuple
+from typing import Callable, Iterable, Tuple, Optional
 
 import torch
 from torch import nn
@@ -88,7 +88,7 @@ class AdamW_FP32OptimParams(Optimizer):
         self.upcast_optim_states = os.environ.get("XLA_DOWNCAST_BF16", "0") == "1"
         super().__init__(params, defaults)
 
-    def step(self, closure: Callable = None):
+    def step(self, closure: Optional[Callable] = None):
         """
         Performs a single optimization step.
         Arguments:

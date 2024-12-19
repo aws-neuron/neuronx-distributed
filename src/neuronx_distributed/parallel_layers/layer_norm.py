@@ -1,5 +1,5 @@
 from typing import List, Union
-
+import os
 import torch
 from torch import Size
 
@@ -35,3 +35,11 @@ class LayerNorm(torch.nn.LayerNorm):
         if self.elementwise_affine:
             _set_sequence_parallel_enabled(self.weight, self.sequence_parallel_enabled)
             _set_sequence_parallel_enabled(self.bias, self.sequence_parallel_enabled)
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        original_input_dtype = input.dtype
+        if os.environ.get("XLA_DOWNCAST_BF16") == "1":
+            input = input.to(torch.double)
+        output = super().forward(input)
+        output.to(original_input_dtype)
+        return output

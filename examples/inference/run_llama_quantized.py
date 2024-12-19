@@ -7,6 +7,20 @@ from transformers import GenerationConfig
 model_path = "/home/ubuntu/LLama7b/"
 traced_model_path = "/home/ubuntu/traced_model/LLama7b_quantized/"
 
+def prune_state_dict(state_dict):
+    """
+    A helper function that deletes None values in the state_dict before saving 
+    as torch.save does not like None values in the state dict.
+    """
+    keys_to_delete = []
+    for key in state_dict:
+        if state_dict[key] is None:
+            keys_to_delete.append(key)
+
+    print(f"Will be deleting following keys as its Value is None: {keys_to_delete}")
+
+    pruned_state_dict = {k:v for k,v in state_dict.items() if v is not None}
+    return pruned_state_dict
 
 def llama_get_quantized_checkpoint(path_to_save):
     """
@@ -31,17 +45,8 @@ def llama_get_quantized_checkpoint(path_to_save):
         quantization_type="per_channel_symmetric",
     )
 
-    # delete None values in the quantized_state_dict
-    keys_to_delete = []
-    for key in quantized_state_dict:
-        if quantized_state_dict[key] is None:
-            keys_to_delete.append(key)
-
-    print(f"Will be deleting following keys as its Value is None: {keys_to_delete}")
-
-    for key in keys_to_delete:
-        del quantized_state_dict[key]
-
+    # delete None values in the quantized_state_dict. torch.save crashes if None values exist.
+    quantized_state_dict = prune_state_dict(quantized_state_dict)
     torch.save(quantized_state_dict, path_to_save)
 
     return quantized_state_dict
@@ -94,7 +99,10 @@ def llama_sample(generate_checkpoint=False):
         quantized_state_dict = runner.generate_quantized_hf_checkpoints_on_cpu(
             max_prompt_length=max_prompt_length, sequence_length=sequence_length, batch_size=batch_size
         )
+        # delete None values in the quantized_state_dict. torch.save crashes if None values exist.
+        quantized_state_dict = prune_state_dict(quantized_state_dict)
         torch.save(quantized_state_dict, quantized_checkpoints_path)
+        
 
     runner.trace(
         traced_model_path=traced_model_path,

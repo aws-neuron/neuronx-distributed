@@ -36,7 +36,6 @@ class LoraConfig:
             List of modules apart from adapter layers to be set as trainable and saved in the final checkpoint.
     """
 
-    enable_lora: bool = field(default=False, metadata={"help": "Will apply LoRA for the model fine-tuning."})
     lora_rank: int = field(default=16, metadata={"help": "Lora attention dimension"})
     target_modules: Optional[List[str]] = field(
         default=None,
@@ -113,6 +112,9 @@ class LoraConfig:
     save_lora_config_adapter: bool = field(
         default=True, metadata={"help": "save LoRA configuration and LoRA adapter in the same checkpoint file."}
     )
+    merge_sharded_lora: bool = field(
+        default=True, metadata={"help": "merge the sharded LoRA adapter checkpoints into a single one."}
+    )
 
     @staticmethod
     def get_selected_fields():
@@ -142,4 +144,4 @@ class LoraConfig:
         return selected_dict
 
     def __post_init__(self):
-        self.target_modules = set(self.target_modules) if isinstance(self.target_modules, list) else self.target_modules
+        self.target_modules = list(set(self.target_modules)) if isinstance(self.target_modules, list) else self.target_modules

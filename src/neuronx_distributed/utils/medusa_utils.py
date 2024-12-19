@@ -6,24 +6,24 @@ TOPK=10 # topk for sparse tree (10 is a placeholder and it is sufficient)
 def pad_path(path, length, pad_value=-2):
     """
     Pad the given path list with a specific value up to a specified length.
-    
+
     Parameters:
     - path (list): The original list that needs padding.
     - length (int): The desired length of the padded list.
     - pad_value (optional, default=-2): The value to use for padding.
-    
+
     Returns:
     - list: A new list based on the original path but padded to the desired length.
-    
+
     Example:
     >>> pad_path([1,2,3], 5)
     [1, 2, 3, -2, -2]
-    
+
     Note:
-    If the given path is already longer than the specified length, 
+    If the given path is already longer than the specified length,
     then no padding occurs, and the original path is returned.
     """
-    
+
     # Calculate the number of padding values needed by subtracting the length
     # of the path from the desired length.
     # Append the padding values to the original path and return the new list.
@@ -32,11 +32,11 @@ def pad_path(path, length, pad_value=-2):
 def generate_medusa_buffers(medusa_choices):
     """
     Generate buffers for the Medusa structure based on the provided choices.
-    
+
     Parameters:
     - medusa_choices (list): A nested list representing tree in the Medusa structure.
     - device (str): Device to which the tensors should be moved. Default is "cuda".
-    
+
     Returns:
     - dict: A dictionary containing buffers related to the Medusa structure.
     """
@@ -54,7 +54,7 @@ def generate_medusa_buffers(medusa_choices):
             depth_counts.append(0)
         depth_counts[depth - 1] += 1
         prev_depth = depth
-    
+
     # Create the attention mask for Medusa
     medusa_attn_mask = torch.eye(medusa_len, medusa_len)
     medusa_attn_mask[:, 0] = 1
@@ -103,16 +103,16 @@ def generate_medusa_buffers(medusa_choices):
         retrieve_indices_nest.append(retrieve_indice)
     max_length = max([len(x) for x in retrieve_indices_nest])
     retrieve_indices = [pad_path(path, max_length) for path in retrieve_indices_nest]
-    retrieve_indices = torch.tensor(retrieve_indices, dtype=torch.long)
-    retrieve_indices = retrieve_indices + 1
-    retrieve_indices = torch.cat([torch.zeros((retrieve_indices.shape[0], 1), dtype=torch.long), retrieve_indices], dim=1)
+    retrieve_indices_tensor: torch.Tensor = torch.tensor(retrieve_indices, dtype=torch.long)
+    retrieve_indices_tensor = retrieve_indices_tensor + 1
+    retrieve_indices_tensor = torch.cat([torch.zeros((retrieve_indices_tensor.shape[0], 1), dtype=torch.long), retrieve_indices_tensor], dim=1)
 
     # Aggregate the generated buffers into a dictionary
     medusa_buffers = {
         "medusa_attn_mask": medusa_attn_mask.unsqueeze(0).unsqueeze(0)[0][0],
         "tree_indices": medusa_tree_indices,
         "medusa_position_ids": medusa_position_ids,
-        "retrieve_indices": retrieve_indices,
+        "retrieve_indices": retrieve_indices_tensor,
         }
 
     return medusa_buffers
@@ -127,7 +127,7 @@ def generate_candidates(medusa_logits, logits, tree_indices, retrieve_indices):
         2. Tree candidates mapped from the Cartesian candidates using tree indices.
     """
     # Greedy decoding: Select the most probable candidate from the original logits.
-   
+
     candidates_logit=logits.squeeze(0).squeeze(0)[:1]
     candidates_medusa_logits=medusa_logits.squeeze(1).squeeze(1)
 
@@ -198,7 +198,7 @@ def update_inference_inputs(
     # Map the best candidate indices to the original indices in the sequence
     select_indices = (
         retrieve_indices[best_candidate, : accept_length + 1] + prev_input_len
-    ) 
+    )
     # Append the tokens from the best candidate to the input sequence
     input_ids = torch.cat(
         [input_ids, candidates[None, best_candidate, : accept_length + 1]], dim=-1

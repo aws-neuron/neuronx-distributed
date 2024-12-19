@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import time
+from typing import Any, Dict, List, Union, Callable
 
 import torch
 import torch.nn.functional as F
@@ -64,6 +65,7 @@ def merge_optim_dp_checkpoints(args, tp_rank, pp_rank):
     del merged_ckpt["base_state"]
 
     def _merge(values, shape):
+        result: Union[torch.Tensor, Dict]
         if isinstance(values[0], torch.Tensor):
             # concat
             result = torch.cat(values)
@@ -101,6 +103,7 @@ def merge_optim_dp_checkpoints(args, tp_rank, pp_rank):
 
 def split_and_save_ckpts(args, merged_ckpt, tp_rank, pp_rank):
     def _split(value, idx):
+        result: Union[Dict[str, Any], List[Any]]
         if isinstance(value, torch.Tensor):
             # pad
             if value.size(0) % args.new_dp_size != 0:
@@ -196,13 +199,14 @@ def main():
     shutil.rmtree(os.path.join(args.output_dir, "optim"), ignore_errors=True)
     os.makedirs(os.path.join(args.output_dir, "optim"), exist_ok=True)
 
-    task = None
+    task: Callable[[Any, int, int], Any]
     if args.convert_to_full:
         if is_full(args):
             raise ValueError("Invalid inputs: convert full optim states to full optim states")
         else:
             task = _sharded_to_full_task
-    elif args.convert_to_sharded:
+    else:
+        assert args.convert_to_sharded, "At least one of convert_to_full or convert_to_sharded should be specified."
         if is_full(args):
             task = _full_to_sharded_task
         else:

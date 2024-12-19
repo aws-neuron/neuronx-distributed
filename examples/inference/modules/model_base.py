@@ -1,35 +1,33 @@
 import os
 import copy
+import random
 import tempfile
 import warnings
 
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 import logging
 
+import numpy as np
 import torch
-from torch import nn
 from modules.autobucketing import generate_buckets
 from modules.checkpoint import load_state_dict
-from transformers import PretrainedConfig, PreTrainedModel
-from transformers.generation import SampleDecoderOnlyOutput, SampleEncoderDecoderOutput
-from transformers.modeling_outputs import CausalLMOutputWithPast, ModelOutput
-from transformers.generation.logits_process import LogitsProcessorList
-from transformers.generation.stopping_criteria import (
-    StoppingCriteriaList,
-    validate_stopping_criteria,
-)
-
-from neuronx_distributed.quantization.quantization_config import QuantizationType
+from modules.config import NeuronConfig
+from modules.hf_adapter import HuggingFaceGenerationAdapter
+from modules.kvcache.kv_cache_manager import KVCacheManager
 from safetensors.torch import load_file
+from transformers import PreTrainedModel
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
+import neuronx_distributed as nxd
+from neuronx_distributed.parallel_layers import utils
+from neuronx_distributed.parallel_layers.layers import SPMDRank
+from neuronx_distributed.quantization.quantization_config import QuantizationType
 from neuronx_distributed.quantization.quantization_utils import (
     convert_qint8_to_int8_state_dict,
     quantize_pytorch_model_per_channel_symmetric,
     quantize_pytorch_model_per_tensor_symmetric,
 )
-from neuronx_distributed.parallel_layers import parallel_state, utils  # noqa: E402
 from neuronx_distributed.trace.model_builder import ModelBuilder
-from neuronx_distributed.utils.speculative_decoding import NeuronSpeculation
 from neuronx_distributed.utils.sampling import Sampler  # noqa: E402
 
 from modules.model_wrapper import (  # noqa: E402
@@ -39,14 +37,16 @@ from modules.model_wrapper import (  # noqa: E402
     TOKEN_GENERATION_MODEL_TAG,  # noqa: E402
     ModelWrapper,  # noqa: E402
 )
+from neuronx_distributed.parallel_layers.parallel_state import get_world_group
+from modules.flashdecode.util import mask_util, turn_2d_mask_to_4d
 
-SampleOutput = Union[SampleEncoderDecoderOutput, SampleDecoderOnlyOutput]
 
-from modules.autobucketing import slice_lhs, slice_rhs  # noqa: E402
-from modules.gqa import (  # noqa: E402
-    determine_sharding_strategy,  # noqa: E402
-    get_shardable_head_counts,  # noqa: E402
-)  # noqa: E402
+def set_random_seed(seed):
+    """Set random seed for reproducability."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    nxd.parallel_layers.random.model_parallel_xla_manual_seed(seed)
 
 
 class NeuronBaseModel(PreTrainedModel):
@@ -56,24 +56,27 @@ class NeuronBaseModel(PreTrainedModel):
     The forward() function will be traced and compiled by NxD.
     """
 
-    SEQ_DIM = 2
+    def __init__(self, neuron_config: NeuronConfig, optimize_inference=True):
+        super().__init__(neuron_config.hf_config)
 
-    def __init__(self, config: PretrainedConfig):
-        super().__init__(config)
+        self.sampler = None
+        self.kv_mgr = None
+        self.neuron_config = neuron_config
+        self.batch_size = neuron_config.batch_size
+        self.n_positions = neuron_config.n_positions
+        self.vocab_size = neuron_config.hf_config.vocab_size
+        self.speculation_length = neuron_config.speculation_length
+        self.padding_side = neuron_config.padding_side
+        self.max_length = neuron_config.max_length
 
-        self.batch_size = config.batch_size
-        self.n_positions = config.n_positions
-        self.vocab_size = config.vocab_size
-        self.speculation_length = config.speculation_length
-        self.padding_side = config.padding_side
-        self.max_length = config.max_length
-
-        self.setup_attr_for_model(config)
-        self.init_model(config)
-        self.init_inference_optimization(config)
+        self.rank_util = SPMDRank(world_size=get_world_group().size())
+        self.setup_attr_for_model(neuron_config)
+        self.init_model(neuron_config)
+        if optimize_inference:
+            self.init_inference_optimization(neuron_config)
         self.post_init()
 
-    def setup_attr_for_model(self, config: PretrainedConfig):
+    def setup_attr_for_model(self, neuron_config: NeuronConfig):
         """
         Please provide model-specific definition for the following attributes
             self.on_device_sampling
@@ -86,7 +89,23 @@ class NeuronBaseModel(PreTrainedModel):
         """
         raise NotImplementedError("setup_attr_for_model() is not implemented")
 
-    def init_model(self, config: PretrainedConfig):
+    def initialize_process_group(self, world_size, seed:int = 17):
+        if not torch.distributed.is_initialized():
+            torch.dist.init_process_group(backend="xla")
+        else:
+            logging.info("torch.distributed was already initialized, skipping...")
+
+        if not nxd.parallel_layers.parallel_state.model_parallel_is_initialized():
+            nxd.parallel_layers.initialize_model_parallel(
+                tensor_model_parallel_size=world_size,
+            )
+        else:
+            logging.info("nxd was already initialized, skipping...")
+
+        # set seed
+        set_random_seed(seed)
+
+    def init_model(self, neuron_config: NeuronConfig):
         """
         Please provide definition for the following components:
             self.embed_tokens
@@ -96,50 +115,10 @@ class NeuronBaseModel(PreTrainedModel):
         """
         raise NotImplementedError("init_model() is not implemented")
 
-    def init_inference_optimization(self, config: PretrainedConfig):
+    def init_inference_optimization(self, neuron_config: NeuronConfig):
         if self.on_device_sampling:
-            self.sampler = Sampler(config)
-
-        gqa_sharding_strategy = determine_sharding_strategy(self.tp_degree, self.num_key_value_heads)
-        _, num_key_value_heads = get_shardable_head_counts(
-            self.tp_degree, self.num_attention_heads, self.num_key_value_heads, gqa_sharding_strategy
-        )
-        if parallel_state.model_parallel_is_initialized():
-            num_kv_heads_per_partition = utils.divide(num_key_value_heads, self.tp_degree)
-        else:
-            num_kv_heads_per_partition = num_key_value_heads
-
-        hidden_dim_per_head = self.hidden_size // self.num_attention_heads
-
-        self.kv_shape = (
-            self.max_batch_size,
-            num_kv_heads_per_partition,
-            self.max_length,
-            hidden_dim_per_head,
-        )
-        self.past_key_values = nn.ParameterList(
-            [
-                nn.Parameter(torch.zeros(self.kv_shape, dtype=config.torch_dtype), requires_grad=False)
-                for _ in range(config.num_hidden_layers * 2)
-            ]
-        )
-
-    def _bucket_slice_kv_cacheline(self, cache):
-
-        if self.padding_side == "right":
-            return slice_lhs(cache, self.n_positions, self.SEQ_DIM)
-        else:
-            max_idx = cache.shape[self.SEQ_DIM]
-            return slice_rhs(cache, self.n_positions, max_idx, self.SEQ_DIM)
-
-    def _gather_bucket_slice_into_kv_cacheline(self, idx, bucket_slice):
-        max_idx = self.past_key_values[idx].shape[self.SEQ_DIM]
-        if self.padding_side == "right":
-            remaining = slice_rhs(self.past_key_values[idx], max_idx - self.n_positions, max_idx, self.SEQ_DIM)
-            return torch.cat([bucket_slice, remaining], dim=self.SEQ_DIM)
-        else:
-            remaining = slice_lhs(self.past_key_values[idx], max_idx - self.n_positions, self.SEQ_DIM)
-            return torch.cat([remaining, bucket_slice], dim=self.SEQ_DIM)
+            self.sampler = Sampler(neuron_config)
+        self.kv_mgr = KVCacheManager(neuron_config, num_kv_head=self.num_key_value_heads)
 
     def _create_context_attn_mask(self, attention_mask):
         mask = torch.full((self.n_positions, self.n_positions), True, device=attention_mask.device).tril(diagonal=0)
@@ -174,19 +153,18 @@ class NeuronBaseModel(PreTrainedModel):
             return self._create_simple_attn_mask(attention_mask)
 
     def _medusa_forward(
-        self,
-        input_ids,
-        attention_mask,
-        position_ids,
-        seq_ids,
-        accepted_indices = None,
-        current_length = None,
-        medusa_mask = None,
-        scatter_index = None,
+            self,
+            input_ids,
+            attention_mask,
+            position_ids,
+            seq_ids,
+            accepted_indices=None,
+            current_length=None,
+            medusa_mask=None,
+            scatter_index=None,
     ):
         is_for_context_encoding = (
-            input_ids.shape[-1] > 1
-            and self.medusa_speculation_length != input_ids.shape[-1]
+                1 < input_ids.shape[-1] != self.medusa_speculation_length
         )
         is_for_medusa_speculation = input_ids.shape[-1] == self.medusa_speculation_length
 
@@ -194,37 +172,11 @@ class NeuronBaseModel(PreTrainedModel):
         if is_for_context_encoding:
             past_key_values = None
         else:
-            past_key_values = []
-            if is_for_medusa_speculation:
-                index = current_length.view(-1, 1, current_length.shape[-1], 1).expand_as(
-                    self.past_key_values[0][:, :, 0 : self.config.num_medusa_heads + 1, :]
-                )
-                gather_index = accepted_indices.view(-1, 1, accepted_indices.shape[-1], 1).expand_as(
-                    self.past_key_values[0][:, :, 0 : self.config.num_medusa_heads + 1, :]
-                )
-
-                for key_layer_idx in range(0, len(self.past_key_values), 2):
-                    k_cache = self.past_key_values[key_layer_idx]
-                    v_cache = self.past_key_values[key_layer_idx + 1]
-
-                    accepted_k_cache = torch.gather(k_cache, dim=2, index=gather_index)
-                    accepted_v_cache = torch.gather(v_cache, dim=2, index=gather_index)
-                    k_cache = torch.scatter(k_cache, 2, index, accepted_k_cache)
-                    v_cache = torch.scatter(v_cache, 2, index, accepted_v_cache)
-
-                    key_state = self._bucket_slice_kv_cacheline(k_cache)
-                    value_state = self._bucket_slice_kv_cacheline(v_cache)
-
-                    past_key_values.append([key_state, value_state])
-
-            else:
-                for key_layer_idx in range(0, len(self.past_key_values), 2):
-                    k_cache = self.past_key_values[key_layer_idx]
-                    v_cache = self.past_key_values[key_layer_idx + 1]
-                    key_state = self._bucket_slice_kv_cacheline(k_cache)
-                    value_state = self._bucket_slice_kv_cacheline(v_cache)
-
-                    past_key_values.append([key_state, value_state])
+            medusa_metadata = {
+                "current_length": current_length,
+                "accepted_indices": accepted_indices,
+            }
+            past_key_values = self.kv_mgr.get_cache(self.n_positions, medusa_metadata=medusa_metadata)
 
         # Prepare attention mask(s)
         attention_mask = self.create_attn_mask(
@@ -245,45 +197,8 @@ class NeuronBaseModel(PreTrainedModel):
             active_mask=active_mask,
         )
 
-        updated_kv_cache = []
-        for idx, kv_per_layer in enumerate(past_key_values):
-            k_cache = self.past_key_values[idx * 2]
-            v_cache = self.past_key_values[idx * 2 + 1]
-
-            if is_for_context_encoding:
-                if self.config.is_continuous_batching:
-                    # scatter back to the desired seq_ids
-                    seq_id_index_shape = seq_ids.shape[:1] + k_cache.shape[1:]
-                    seq_id_index = seq_ids.view(-1, 1, 1, 1).expand(seq_id_index_shape)
-                    k_cache = torch.scatter(k_cache, 0, seq_id_index, kv_per_layer[0])
-                    v_cache = torch.scatter(v_cache, 0, seq_id_index, kv_per_layer[1])
-                else:
-                    # assign back to full kv_cacheline
-                    k_cache = kv_per_layer[0]
-                    v_cache = kv_per_layer[1]
-                    k_cache = self._gather_bucket_slice_into_kv_cacheline(idx * 2, k_cache)
-                    v_cache = self._gather_bucket_slice_into_kv_cacheline(idx * 2 + 1, v_cache)
-            else:
-                if self.padding_side == "left":
-                    # TODO: fix it with scatter after right padding
-                    k_cache = k_cache[:, :, 1:, :]
-                    v_cache = v_cache[:, :, 1:, :]
-                    k_cache = torch.cat([k_cache, kv_per_layer[0]], dim=2)
-                    v_cache = torch.cat([v_cache, kv_per_layer[1]], dim=2)
-                else:
-                    if is_for_medusa_speculation:
-                        scatter_index_new = scatter_index.view(-1, 1, scatter_index.shape[-1], 1).expand_as(
-                            kv_per_layer[0]
-                        )
-                    else:
-                        scatter_index_new = position_ids.view(-1, 1, position_ids.shape[-1], 1).expand_as(
-                            kv_per_layer[0]
-                        )
-                    k_cache = torch.scatter(k_cache, 2, scatter_index_new, kv_per_layer[0])
-                    v_cache = torch.scatter(v_cache, 2, scatter_index_new, kv_per_layer[1])
-
-            updated_kv_cache.append(k_cache)
-            updated_kv_cache.append(v_cache)
+        updated_kv_cache = self.kv_mgr.update_cache(is_for_context_encoding, seq_ids, position_ids, past_key_values,
+                                              self.n_positions, scatter_index)
 
         if self.padding_side == "left":
             index = torch.tensor([hidden_states.shape[1] - 1], device=hidden_states.device)
@@ -315,16 +230,16 @@ class NeuronBaseModel(PreTrainedModel):
         res = logits
         if is_for_context_encoding:
             result = [
-                self.sampler.sample(stacked_logits[i : i + 1, -1, :].squeeze(0))
-                for i in range(self.config.num_medusa_heads + 1)
+                self.sampler.sample(stacked_logits[i: i + 1, -1, :].squeeze(0))
+                for i in range(self.neuron_config.num_medusa_heads + 1)
             ]
             res = torch.stack(result, dim=0)  # 5, 1, 10
         else:
             results = []
             for i in range(stacked_logits.shape[1]):
                 result = [
-                    self.sampler.sample(stacked_logits[j : j + 1, i, :].squeeze(0))
-                    for j in range(self.config.num_medusa_heads + 1)
+                    self.sampler.sample(stacked_logits[j: j + 1, i, :].squeeze(0))
+                    for j in range(self.neuron_config.num_medusa_heads + 1)
                 ]
                 res = torch.stack(result, dim=0)
                 results.append(res)
@@ -332,37 +247,36 @@ class NeuronBaseModel(PreTrainedModel):
         return [res] + updated_kv_cache
 
     def forward(
-        self,
-        input_ids,
-        attention_mask,
-        position_ids,
-        seq_ids,
-        accepted_indices = None,
-        current_length = None,
-        medusa_mask = None,
-        scatter_index = None,
+            self,
+            input_ids,
+            attention_mask,
+            position_ids,
+            seq_ids,
+            accepted_indices=None,
+            current_length=None,
+            medusa_mask=None,
+            scatter_index=None,
+
+            # In llava context encoding model, input_embeds is precomputed
+            inputs_embeds: Optional[torch.FloatTensor] = None
     ):
-        if self.config.is_medusa:
-            return self._medusa_forward(input_ids, attention_mask, position_ids, seq_ids, accepted_indices, current_length, medusa_mask, scatter_index)
+        if self.neuron_config.is_medusa:
+            return self._medusa_forward(input_ids, attention_mask, position_ids, seq_ids, accepted_indices,
+                                        current_length, medusa_mask, scatter_index)
 
         is_for_context_encoding = (
-            input_ids.shape[-1] > 1
-            and self.speculation_length != input_ids.shape[-1]
+                1 < input_ids.shape[-1] != self.speculation_length
         )
         is_for_speculation = input_ids.shape[-1] == self.speculation_length
+
+        cache_size = utils.divide(self.n_positions, self.neuron_config.num_cores_per_group) \
+            if self.neuron_config.flash_decoding_enabled else self.n_positions
 
         # It is either for context encoding or for token generation
         if is_for_context_encoding:
             past_key_values = None
         else:
-            past_key_values = []
-            for key_layer_idx in range(0, len(self.past_key_values), 2):
-                k_cache = self.past_key_values[key_layer_idx]
-                v_cache = self.past_key_values[key_layer_idx + 1]
-                key_state = self._bucket_slice_kv_cacheline(k_cache)
-                value_state = self._bucket_slice_kv_cacheline(v_cache)
-
-                past_key_values.append([key_state, value_state])
+            past_key_values = self.kv_mgr.get_cache(cache_size)
 
         # Prepare attention mask(s)
         attention_mask = self.create_attn_mask(
@@ -377,50 +291,27 @@ class NeuronBaseModel(PreTrainedModel):
                 self.batch_size, 1, self.speculation_length, self.speculation_length
             )
 
+        # FD masks
+        active_mask_2d = None
+        if self.neuron_config.flash_decoding_enabled and not is_for_context_encoding:
+            rank_id = self.rank_util.get_rank()
+            active_mask_2d, attention_mask_2d = mask_util(pos_ids=position_ids, rank_id=rank_id,
+                                                          num_cores_per_group=self.neuron_config.num_cores_per_group,
+                                                          cache_size=cache_size)
+            active_mask = turn_2d_mask_to_4d(active_mask_2d, n_positions=1, batch_size=self.batch_size)
+            attention_mask = turn_2d_mask_to_4d(attention_mask_2d, n_positions=cache_size, batch_size=self.batch_size)
+
         hidden_states, past_key_values = self.get_model_output(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
             active_mask=active_mask,
+            inputs_embeds=inputs_embeds
         )
 
-        updated_kv_cache = []
-        for idx, kv_per_layer in enumerate(past_key_values):
-            k_cache = self._bucket_slice_kv_cacheline(self.past_key_values[idx*2])
-            v_cache = self._bucket_slice_kv_cacheline(self.past_key_values[idx*2+1])
-
-            if is_for_context_encoding:
-                if self.config.is_continuous_batching:
-                    # scatter back to the desired seq_ids
-                    seq_id_index_shape = seq_ids.shape[:1] + k_cache.shape[1:]
-                    seq_id_index = seq_ids.view(-1, 1, 1, 1).expand(seq_id_index_shape)
-                    k_cache = torch.scatter(k_cache, 0, seq_id_index, kv_per_layer[0])
-                    v_cache = torch.scatter(v_cache, 0, seq_id_index, kv_per_layer[1])
-                else:
-                    # assign back to full kv_cacheline
-                    k_cache = kv_per_layer[0]
-                    v_cache = kv_per_layer[1]
-            else:
-                if self.padding_side == "left":
-                    # TODO: fix it with scatter after right padding
-                    k_cache = k_cache[:, :, 1:, :]
-                    v_cache = v_cache[:, :, 1:, :]
-                    k_cache = torch.cat([k_cache, kv_per_layer[0]], dim=2)
-                    v_cache = torch.cat([v_cache, kv_per_layer[1]], dim=2)
-                else:
-                    scatter_index_new = position_ids.view(-1, 1, position_ids.shape[-1], 1).expand_as(
-                        kv_per_layer[0]
-                    )
-                    k_cache = torch.scatter(k_cache, 2, scatter_index_new, kv_per_layer[0])
-                    v_cache = torch.scatter(v_cache, 2, scatter_index_new, kv_per_layer[1])
-
-            k_cache = self._gather_bucket_slice_into_kv_cacheline(idx * 2, k_cache)
-            v_cache = self._gather_bucket_slice_into_kv_cacheline(idx * 2 + 1, v_cache)
-
-            updated_kv_cache.append(k_cache)
-            updated_kv_cache.append(v_cache)
-
+        updated_kv_cache = self.kv_mgr.update_cache(is_for_context_encoding, seq_ids, position_ids, past_key_values,
+                                                    cache_size, scatter_index, active_mask_2d)
         if self.padding_side == "left":
             index = torch.tensor([hidden_states.shape[1] - 1], device=hidden_states.device)
             index = index.unsqueeze(1).expand(self.batch_size, 1, self.hidden_size)
@@ -463,6 +354,8 @@ class NeuronBaseModel(PreTrainedModel):
             position_ids: Optional[torch.LongTensor] = None,
             past_key_values: Optional[List[torch.FloatTensor]] = None,
             active_mask: Optional[List[torch.FloatTensor]] = None,
+            # In llava context encoding model, input_embeds is precomputed
+            inputs_embeds: Optional[torch.FloatTensor] = None
     ):
         batch_size, seq_length = input_ids.shape[:2]
 
@@ -470,7 +363,9 @@ class NeuronBaseModel(PreTrainedModel):
         if past_key_values is not None:
             past_key_values_length = past_key_values[0][0].shape[2]
 
-        inputs_embeds = self.embed_tokens(input_ids)
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
+
         if position_ids is None:
             device = input_ids.device if input_ids is not None else inputs_embeds.device  #noqa
             position_ids = torch.arange(
@@ -479,8 +374,6 @@ class NeuronBaseModel(PreTrainedModel):
             position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
         else:
             position_ids = position_ids.view(-1, seq_length).long()
-
-
 
         # NeuronLlamaModel class manages the KV cache. So the attention_mask will be generated and passed
         # through to LlamaModel. We override the HF's code that generates attention mask because HF does
@@ -518,28 +411,30 @@ class NeuronBaseModel(PreTrainedModel):
         return (hidden_states, next_decoder_cache)
 
 
-class NeuronBaseForCausalLM(NeuronSpeculation):
+class NeuronBaseForCausalLM(HuggingFaceGenerationAdapter):
     _STATE_DICT_MODEL_PREFIX = "model."
+    _NEW_STATE_DICT_MODEL_PREFIX = ""
 
     _model_cls = None
 
-    def __init__(self, model_path: str, config: PretrainedConfig):
-        super().__init__(config)
+    def __init__(self, model_path: str, neuron_config: NeuronConfig):
+        super().__init__(neuron_config)
 
-        self.config = config
-        self.vocab_size = config.vocab_size
-        self.padding_side = config.padding_side
+        self.neuron_config = neuron_config
+        self.vocab_size = neuron_config.hf_config.vocab_size
+        self.padding_side = neuron_config.padding_side
         self.kv_cache_populated = False
 
         self.sampler = None
+        self.model_wrapper = self.get_model_wrapper_cls()
 
         self.models = []
         self.enable_context_encoding()
-        if config.trace_tokengen_model:
+        if neuron_config.trace_tokengen_model:
             self.enable_token_generation()
-        if config.speculation_length > 0:
+        if neuron_config.speculation_length > 0:
             self.enable_speculation()
-        if config.medusa_speculation_length > 0:
+        if neuron_config.medusa_speculation_length > 0:
             self.enable_medusa_speculation()
         self.model_path = model_path
 
@@ -550,19 +445,23 @@ class NeuronBaseForCausalLM(NeuronSpeculation):
     def get_compiler_args(self):
         return None
 
+    def get_model_wrapper_cls(self):
+        return ModelWrapper
+
     def enable_context_encoding(self):
-        new_config = copy.deepcopy(self.config)
-        new_config.batch_size = self.config.ctx_batch_size
-        new_config.n_active_tokens = self.config.max_context_length
-        new_config.bucket_n_active_tokens = True
+        new_neuron_config = copy.deepcopy(self.neuron_config)
+        new_neuron_config.batch_size = self.neuron_config.ctx_batch_size
+        new_neuron_config.n_active_tokens = self.neuron_config.max_context_length
+        new_neuron_config.bucket_n_active_tokens = True
 
-        if not new_config.enable_bucketing:
-            new_config.buckets = generate_buckets(new_config.max_context_length,new_config.max_context_length)
+        if not new_neuron_config.enable_bucketing:
+            new_neuron_config.buckets = generate_buckets(new_neuron_config.max_context_length,
+                                                         new_neuron_config.max_context_length)
         else:
-            new_config.buckets = generate_buckets(128, new_config.max_context_length)
+            new_neuron_config.buckets = generate_buckets(128, new_neuron_config.max_context_length)
 
-        self.context_encoding_model = ModelWrapper(
-            config=new_config,
+        self.context_encoding_model = self.model_wrapper(
+            neuron_config=new_neuron_config,
             model_cls=self._model_cls,
             tag=CONTEXT_ENCODING_MODEL_TAG,
             compiler_args=self.get_compiler_args(),
@@ -570,19 +469,19 @@ class NeuronBaseForCausalLM(NeuronSpeculation):
         self.models.append(self.context_encoding_model)
 
     def enable_token_generation(self):
-        new_config = copy.deepcopy(self.config)
-        new_config.batch_size = self.config.tkg_batch_size
-        new_config.n_active_tokens = 1
-        new_config.bucket_n_active_tokens = False
+        new_neuron_config = copy.deepcopy(self.neuron_config)
+        new_neuron_config.batch_size = self.neuron_config.tkg_batch_size
+        new_neuron_config.n_active_tokens = 1
+        new_neuron_config.bucket_n_active_tokens = False
 
-        if not new_config.enable_bucketing:
-            new_config.buckets = generate_buckets(new_config.max_length,new_config.max_length)
+        if not new_neuron_config.enable_bucketing:
+            new_neuron_config.buckets = generate_buckets(self.neuron_config.max_length, self.neuron_config.max_length)
         else:
-            new_config.buckets = generate_buckets(128, new_config.max_length)
+            new_neuron_config.buckets = generate_buckets(128, self.neuron_config.max_length)
 
+        self.token_generation_model = self.model_wrapper(
+            neuron_config=new_neuron_config,
 
-        self.token_generation_model = ModelWrapper(
-            config=new_config,
             model_cls=self._model_cls,
             tag=TOKEN_GENERATION_MODEL_TAG,
             compiler_args=self.get_compiler_args(),
@@ -590,45 +489,87 @@ class NeuronBaseForCausalLM(NeuronSpeculation):
         self.models.append(self.token_generation_model)
 
     def enable_speculation(self):
-        new_config = copy.deepcopy(self.config)
-        new_config.batch_size = self.config.spec_batch_size
-        new_config.n_active_tokens = self.config.speculation_length
-        self.speculation_model = ModelWrapper(new_config, self._model_cls, tag=SPECULATION_MODEL_TAG)
+        new_neuron_config = copy.deepcopy(self.neuron_config)
+        new_neuron_config.batch_size = self.neuron_config.spec_batch_size
+        new_neuron_config.n_active_tokens = self.neuron_config.speculation_length
+        self.speculation_model = self.model_wrapper(
+            neuron_config=new_neuron_config,
+            model_cls=self._model_cls,
+            tag=SPECULATION_MODEL_TAG,
+        )
 
         self.models.append(self.speculation_model)
 
     def enable_medusa_speculation(self):
-        new_config = copy.deepcopy(self.config)
-        new_config.batch_size = self.config.spec_batch_size
-        new_config.n_active_tokens = self.config.medusa_speculation_length
-        self.medusa_speculation_model = ModelWrapper(new_config, self._model_cls, tag=MEDUSA_MODEL_TAG)
+        new_neuron_config = copy.deepcopy(self.neuron_config)
+        new_neuron_config.batch_size = self.neuron_config.spec_batch_size
+        new_neuron_config.n_active_tokens = self.neuron_config.medusa_speculation_length
+        self.medusa_speculation_model = self.model_wrapper(
+            neuron_config=new_neuron_config,
+            model_cls=self._model_cls,
+            tag=MEDUSA_MODEL_TAG
+        )
 
         self.models.append(self.medusa_speculation_model)
 
     @classmethod
-    def get_state_dict(cls, model_path: str, config: PretrainedConfig) -> dict:
+    def get_state_dict(cls, model_path: str, neuron_config: NeuronConfig) -> dict:
         model_sd = load_state_dict(model_path)
         param_name_list = list(model_sd.keys())
         for param_name in param_name_list:
             if param_name.startswith(cls._STATE_DICT_MODEL_PREFIX):
-                updated_param_name = param_name.replace(cls._STATE_DICT_MODEL_PREFIX, "", 1)
+                updated_param_name = param_name.replace(cls._STATE_DICT_MODEL_PREFIX, cls._NEW_STATE_DICT_MODEL_PREFIX,
+                                                        1)
                 model_sd[updated_param_name] = model_sd[param_name]
                 del model_sd[param_name]
         if os.path.exists(model_path + "/medusa_heads.pt"):
             medusa_head = torch.load(model_path + "/medusa_heads.pt", map_location="cpu")
             model_sd.update(medusa_head)
+        model_sd = cls.convert_hf_to_neuron_state_dict(model_sd, neuron_config)
         return model_sd
 
     @classmethod
-    def generate_quantized_state_dict(cls, model_path: str, config: PretrainedConfig) -> dict:
+    def get_quantized_state_dict(cls, neuron_config: NeuronConfig, mmap: bool = False) -> dict:
+        """
+        This function loads the checkpointed float model state dictionary and weights from the quantized hf model
+        This will be removed once we move to safe tensors in NxD
+        """
+        existing_checkpoint_path = neuron_config.quantized_checkpoints_path
+        if not os.path.exists(existing_checkpoint_path):
+            raise FileNotFoundError(f"Quantized checkpoint file not found: {existing_checkpoint_path}")
+
+        print(f"Using existing checkpoint: {existing_checkpoint_path}")
+        model_quant_sd = torch.load(existing_checkpoint_path)
+        model_quant_sd = cls.convert_hf_to_neuron_state_dict(model_quant_sd, neuron_config)
+
+        # Make sure that the non quantized weights are in bfloat16 and not float32
+        if neuron_config.hf_config.torch_dtype == torch.bfloat16:
+            for name, param in model_quant_sd.items():
+                # TODO: Reduce and clean-up these warnings
+                if param is not None and param.dtype == torch.float32:
+                    if name.endswith(".scale"):
+                        warnings.warn(f"Found float32 weights in quantized checkpoint: {name}. Will skip converting to bfloat16 as its scale")
+                    else:
+                        warnings.warn(f"Found float32 weights in quantized checkpoint: {name}. Will convert to bfloat16")
+                        model_quant_sd[name] = param.bfloat16()
+
+        return model_quant_sd
+
+    @staticmethod
+    def convert_hf_to_neuron_state_dict(state_dict: dict, neuron_config: NeuronConfig) -> dict:
+        """ This function should be over-ridden in child classes as needed """
+        return state_dict
+
+    @classmethod
+    def generate_quantized_state_dict(cls, model_path: str, neuron_config: NeuronConfig) -> dict:
         hf_model = cls.load_hf_model(model_path)
-        quantization_type = QuantizationType(config.quantization_type)
+        quantization_type = QuantizationType(neuron_config.quantization_type)
         if quantization_type == QuantizationType.PER_TENSOR_SYMMETRIC:
             hf_model_quant = quantize_pytorch_model_per_tensor_symmetric(float_model=hf_model, inplace=True)
         elif quantization_type == QuantizationType.PER_CHANNEL_SYMMETRIC:
             hf_model_quant = quantize_pytorch_model_per_channel_symmetric(float_model=hf_model, inplace=True)
         else:
-            raise RuntimeError(f"{config.quantization_type} not supported")
+            raise RuntimeError(f"{neuron_config.quantization_type} not supported")
 
         model_quant_sd = hf_model_quant.model.state_dict()
         lm_head_quant_sd = hf_model_quant.lm_head.state_dict()
@@ -641,42 +582,22 @@ class NeuronBaseForCausalLM(NeuronSpeculation):
         return model_quant_sd
 
     @classmethod
-    def from_pretrained(cls, model_path: str, config: PretrainedConfig):
-        return cls(model_path, config)
+    def from_pretrained(cls, model_path: str, neuron_config: NeuronConfig):
+        return cls(model_path, neuron_config)
 
     def checkpoint_loader_fn(self, mmap: bool = False):
-        # this function loads the model's state dictionary and weights from
-        # the hf model
-        if self.config.quantized is False:
-            model_sd = self.get_state_dict(self.model_path, self.config)
-            if self.config.torch_dtype == torch.bfloat16:
+        """ This function loads the model's state dictionary and weights from the hf model """
+
+        if self.neuron_config.quantized:
+            return self.get_quantized_state_dict(self.neuron_config)
+        else:
+            model_sd = self.get_state_dict(self.model_path, self.neuron_config)
+            if self.neuron_config.hf_config.torch_dtype == torch.bfloat16:
                 for name, param in model_sd.items():
-                    model_sd[name] = param.bfloat16()
+                    if torch.is_floating_point(param):
+                        # only cast floating types
+                        model_sd[name] = param.bfloat16()
             return model_sd
-        return self.get_quantized_checkpoints()
-
-    def get_quantized_checkpoints(self, mmap: bool = False):
-        # this function loads the checkpointed float model state dictionary and weights
-        # from the quantized hf model
-        # This will be removed once we move to safe tensors in NxD
-        existing_checkpoint_path = self.config.quantized_checkpoints_path
-        if not os.path.exists(existing_checkpoint_path):
-            raise FileNotFoundError(f"Quantized checkpoint file not found: {existing_checkpoint_path}")
-
-        print(f"Using existing checkpoint: {existing_checkpoint_path}")
-        model_quant_sd = torch.load(existing_checkpoint_path)
-
-        # Make sure that the non quantized weights are in bfloat16 and not float32
-        if self.config.torch_dtype == torch.bfloat16:
-            for name, param in model_quant_sd.items():
-                if param is not None and param.dtype == torch.float32:
-                    if name.endswith(".scale"):
-                        warnings.warn(f"Found float32 weights in quantized checkpoint: {name}. Will skip converting to bfloat16 as its scale")
-                    else:
-                        warnings.warn(f"Found float32 weights in quantized checkpoint: {name}. Will convert to bfloat16")
-                        model_quant_sd[name] = param.bfloat16()
-
-        return model_quant_sd
 
     def compile(self, serialize_base_path=None):
 
@@ -684,9 +605,14 @@ class NeuronBaseForCausalLM(NeuronSpeculation):
 
         builder = ModelBuilder(
             router=None,
-            tp_degree=self.config.tp_degree,
+            tp_degree=self.neuron_config.tp_degree,
+            pp_degree=self.neuron_config.pp_degree,
+            ep_degree=self.neuron_config.ep_degree,
+            world_size=self.neuron_config.world_size,
+            start_rank_id=self.neuron_config.start_rank_id,
+            local_ranks_size=self.neuron_config.local_ranks_size,
             checkpoint_loader=self.checkpoint_loader_fn,
-            compiler_workdir=base_compile_work_dir
+            compiler_workdir=base_compile_work_dir,
         )
 
         for model in self.models:
@@ -698,7 +624,8 @@ class NeuronBaseForCausalLM(NeuronSpeculation):
                 bucket_config=model.bucket_config,
                 priority_model_idx=model.priority_model_idx,
             )
-
+        if self.neuron_config.flash_decoding_enabled:
+            builder.num_cores_per_group = self.neuron_config.num_cores_per_group  # FD needs this to initialize KV groups
         traced_model = builder.trace(initialize_model_weights=False)
         torch.jit.save(traced_model, serialize_base_path + "model.pt")
         del traced_model
@@ -706,16 +633,22 @@ class NeuronBaseForCausalLM(NeuronSpeculation):
         builder.shard_checkpoint(serialize_path=os.path.join(serialize_base_path, "weights/"))
         self.is_loaded_to_neuron = True
 
-    def load(self, serialize_base_path):
+    def load(self, serialize_base_path, start_rank_id=None, local_ranks_size=None):
+        if start_rank_id is None:
+            start_rank_id = 0
+        if local_ranks_size is None:
+            local_ranks_size = self.neuron_config.local_ranks_size
 
         traced_model = torch.jit.load(serialize_base_path + "model.pt")
+        logging.info(f"loading neuron model for ranks {start_rank_id}...{start_rank_id+local_ranks_size-1}")
 
         weights = []
-        for rank in range(self.config.tp_degree):
+        for rank in range(start_rank_id, start_rank_id+local_ranks_size):
             ckpt = load_file(os.path.join(serialize_base_path, f"weights/tp{rank}_sharded_checkpoint.safetensors"))
             weights.append(ckpt)
 
-        traced_model.nxd_model.initialize(weights)
+        start_rank_tensor = torch.tensor([start_rank_id], dtype=torch.int32, device="cpu")
+        traced_model.nxd_model.initialize(weights, start_rank_tensor)
 
         for model_wrapper in self.models:
             model_wrapper.model = traced_model
@@ -741,7 +674,7 @@ class NeuronBaseForCausalLM(NeuronSpeculation):
     def forward(
             self,
             input_ids: torch.LongTensor = None,
-            seq_ids: torch.LongTensor = None,
+            seq_ids: Optional[torch.LongTensor] = None,
             attention_mask: Optional[torch.Tensor] = None,
             position_ids: Optional[torch.LongTensor] = None,
             past_key_values: Optional[List[torch.FloatTensor]] = None,
@@ -750,8 +683,9 @@ class NeuronBaseForCausalLM(NeuronSpeculation):
             use_cache: Optional[bool] = None,
             output_attentions: Optional[bool] = None,
             output_hidden_states: Optional[bool] = None,
-            medusa_args = None,
+            medusa_args=None,
             return_dict: Optional[bool] = None,
+            llava_args: Optional[List] = []
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         """
         Args:
@@ -774,9 +708,10 @@ class NeuronBaseForCausalLM(NeuronSpeculation):
         if seq_ids is None:
             seq_ids = torch.arange(input_ids.shape[0])
 
-        outputs, is_run_on_neuron = self._get_model_outputs(input_ids, attention_mask, position_ids, seq_ids, medusa_args)
+        outputs, is_run_on_neuron = self._get_model_outputs(input_ids, attention_mask, position_ids, seq_ids,
+                                                            medusa_args, llava_args)
 
-        if self.config.trace_tokengen_model and not self.token_generation_model.is_neuron():
+        if self.neuron_config.trace_tokengen_model and not self.token_generation_model.is_neuron():
             self._copy_past_key_values(outputs)
 
         if is_run_on_neuron:
@@ -787,23 +722,24 @@ class NeuronBaseForCausalLM(NeuronSpeculation):
             logits_or_next_tokens, *_ = outputs
 
         logging.debug("---output---")
-        logging.debug(f"{'tokens' if self.config.on_device_sampling else 'logits'} = %s, ", logits_or_next_tokens)
+        logging.debug(f"{'tokens' if self.neuron_config.on_device_sampling else 'logits'} = %s, ",
+                      logits_or_next_tokens)
 
         return self._construct_output(logits_or_next_tokens)
 
     def _setup_func_config(self, output_attentions, output_hidden_states, return_dict):
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_attentions = output_attentions if output_attentions is not None else self.neuron_config.hf_config.output_attentions
         output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+            output_hidden_states if output_hidden_states is not None else self.neuron_config.hf_config.output_hidden_states
         )
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        return_dict = return_dict if return_dict is not None else self.neuron_config.hf_config.use_return_dict
         return output_attentions, output_hidden_states, return_dict
 
     def _infer_attention_mask(self, position_ids):
         assert position_ids is not None, "need to call forward with position_ids if attention_mask is not provided"
         batch_size, seq_len = position_ids.shape
         if position_ids.shape[-1] == 1:
-            seq_len = self.config.n_positions
+            seq_len = self.neuron_config.n_positions
             position_ids_to_compare = position_ids.expand(batch_size, seq_len) - 1
         else:
             seq_len = position_ids.shape[-1]
@@ -812,7 +748,7 @@ class NeuronBaseForCausalLM(NeuronSpeculation):
         attention_mask = (position_ids_to_compare >= mask).to(dtype=position_ids.dtype)
         return attention_mask
 
-    def _log_input(self, input_ids, attention_mask, position_ids, seq_ids):
+    def _log_input(self, input_ids, attention_mask, position_ids, seq_ids, **kwargs):
         logging.debug("---input---")
         logging.debug("input_ids shape = %s type=%s", input_ids.shape, input_ids.type())
         logging.debug("attention_mask shape = %s type=%s", attention_mask.shape, attention_mask.type())
@@ -822,23 +758,23 @@ class NeuronBaseForCausalLM(NeuronSpeculation):
         logging.debug("position_ids =%s", position_ids)
         logging.debug(f"seq_ids: {seq_ids}")
 
-        if self.config.trace_tokengen_model and not self.token_generation_model.is_neuron():
-            logging.debug(f"first layer kv_cache: {self.token_generation_model.model.past_key_values[0][:, 0, :, 0]}")
+        if self.neuron_config.trace_tokengen_model and not self.token_generation_model.is_neuron():
+            logging.debug(f"first layer kv_cache: {self.token_generation_model.model.kv_mgr.past_key_values[0][:, 0, :, 0]}")
 
-    def _get_model_outputs(self, input_ids, attention_mask, position_ids, seq_ids, medusa_args):
+    def _get_model_outputs(self, input_ids, attention_mask, position_ids, seq_ids, medusa_args, llava_args):
         if (
-            input_ids.shape[-1] > 1
-            and input_ids.shape[-1] != self.config.speculation_length
-            and input_ids.shape[-1] != self.config.medusa_speculation_length
+                input_ids.shape[-1] > 1
+                and input_ids.shape[-1] != self.neuron_config.speculation_length
+                and input_ids.shape[-1] != self.neuron_config.medusa_speculation_length
         ):
-            if self.config.is_medusa:
+            if self.neuron_config.is_medusa:
                 medusa_args = self._prepare_inputs()
                 outputs = self.context_encoding_model(
                     input_ids,
                     attention_mask,
                     position_ids,
                     seq_ids,
-                    *medusa_args,
+                    *medusa_args
                 )
             else:
                 outputs = self.context_encoding_model(
@@ -846,24 +782,24 @@ class NeuronBaseForCausalLM(NeuronSpeculation):
                     attention_mask,
                     position_ids,
                     seq_ids,
+                    *llava_args
                 )
             self.kv_cache_populated = True
             is_run_on_neuron = self.context_encoding_model.is_neuron()
-        elif input_ids.shape[-1] == self.config.speculation_length:
+        elif input_ids.shape[-1] == self.neuron_config.speculation_length:
             outputs = self.speculation_model(
                 input_ids,
                 attention_mask,
                 position_ids,
-                seq_ids,
+                seq_ids
             )
             is_run_on_neuron = self.speculation_model.is_neuron()
-        elif input_ids.shape[-1] == self.config.medusa_speculation_length:
+        elif input_ids.shape[-1] == self.neuron_config.medusa_speculation_length:
             outputs = self.medusa_speculation_model(
                 input_ids,
                 attention_mask,
                 position_ids,
-                seq_ids,
-                *medusa_args,
+                seq_ids
             )
             is_run_on_neuron = self.medusa_speculation_model.is_neuron()
         else:
@@ -872,6 +808,7 @@ class NeuronBaseForCausalLM(NeuronSpeculation):
                 attention_mask,
                 position_ids,
                 seq_ids,
+                *llava_args
             )
             is_run_on_neuron = self.token_generation_model.is_neuron()
 
@@ -891,18 +828,18 @@ class NeuronBaseForCausalLM(NeuronSpeculation):
             self.context_encoding_model.model.past_key_values[i].data = new_past_key_value
 
     def _construct_output(self, logits_or_next_tokens):
-        if self.config.is_medusa:
+        if self.neuron_config.is_medusa:
             next_tokens = logits_or_next_tokens[:1, :, :]
         else:
             next_tokens = logits_or_next_tokens
 
         OutputParams = CausalLMOutputWithPast(
-            logits=None if self.config.on_device_sampling else logits_or_next_tokens,
+            logits=None if self.neuron_config.on_device_sampling else logits_or_next_tokens,
             hidden_states=logits_or_next_tokens,
             attentions=None,
         )
 
-        if self.config.is_medusa:
+        if self.neuron_config.is_medusa:
             OutputParams.tokens = next_tokens[:1, :, :]
             OutputParams.medusa_tokens = next_tokens[1:, :, :]
         else:
@@ -910,114 +847,18 @@ class NeuronBaseForCausalLM(NeuronSpeculation):
 
         return OutputParams
 
-    # We override this function because we want to change the way attention_mask
-    # is updated each iteration.
-    def _update_model_kwargs_for_generation(
-            self,
-            outputs: ModelOutput,
-            model_kwargs: Dict[str, Any],
-            is_for_token_generation: Optional[bool] = False,
-            is_encoder_decoder: bool = False,
-    ) -> Dict[str, Any]:
-
-        if getattr(outputs, "state", None) is not None:
-            model_kwargs["state"] = outputs.state
-
-        # update token_type_ids with last value
-        if "token_type_ids" in model_kwargs:
-            token_type_ids = model_kwargs["token_type_ids"]
-            model_kwargs["token_type_ids"] = torch.cat([token_type_ids, token_type_ids[:, -1].unsqueeze(-1)], dim=-1)
-
-        # update attention mask
-        if "attention_mask" in model_kwargs:
-            attention_mask = model_kwargs["attention_mask"]
-            if is_for_token_generation:
-                if self.padding_side == "left":
-                    attention_mask = torch.cat(
-                        [attention_mask, attention_mask.new_ones((attention_mask.shape[0], 1))], dim=-1
-                    )
-                    attention_mask = attention_mask[:, 1:]
-                else:
-                    attention_mask = torch.cat(
-                        [attention_mask.new_ones((attention_mask.shape[0], 1)), attention_mask], dim=-1
-                    )
-            model_kwargs["attention_mask"] = attention_mask
-        return model_kwargs
-
-    def prepare_inputs_for_generation(
-            self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
-    ):
-        if self.kv_cache_populated:
-            input_ids = input_ids[:, -1:]
-
-        accepted_indices = kwargs.get("accepted_indices", None)
-        current_length = kwargs.get("current_length", None)
-        medusa_mask = kwargs.get("medusa_mask", None)
-        scatter_index = kwargs.get("scatter_index", None)
-
-        position_ids = kwargs.get("position_ids", None)
-        if attention_mask is not None and position_ids is None:
-            # create position_ids on the fly for batch generation
-            position_ids = attention_mask.long().cumsum(-1) - 1
-            position_ids.masked_fill_(attention_mask == 0, 1)
-            if self.kv_cache_populated:
-                position_ids = torch.amax(position_ids, 1, keepdim=True)
-                position_ids = position_ids + 1
-
-        # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
-        if inputs_embeds is not None and past_key_values is None:
-            model_inputs = {"inputs_embeds": inputs_embeds}
-        else:
-            model_inputs = {"input_ids": input_ids}
-
-        model_inputs.update(
-            {
-                "position_ids": position_ids,
-                "past_key_values": past_key_values,
-                "use_cache": kwargs.get("use_cache", False),
-                "attention_mask": attention_mask,
-                "medusa_args": (accepted_indices, current_length, medusa_mask, scatter_index),
-            }
-        )
-        return model_inputs
-
-    def prepare_medusa_inputs_for_generation(
-        self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
-    ):
-        if self.kv_cache_populated:
-            input_ids = input_ids[:, -self.config.medusa_speculation_length :]
-        position_ids = kwargs.get("position_ids")
-
-        # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
-        if inputs_embeds is not None and past_key_values is None:
-            model_inputs = {"inputs_embeds": inputs_embeds}
-        else:
-            model_inputs = {"input_ids": input_ids}
-
-        model_inputs.update(
-            {
-                "position_ids": position_ids,
-                "past_key_values": past_key_values,
-                "use_cache": kwargs.get("use_cache"),
-                "attention_mask": attention_mask,
-                "medusa_args": (
-                    kwargs.get("accepted_indices"),
-                    kwargs.get("current_length"),
-                    kwargs.get("medusa_mask"),
-                    kwargs.get("scatter_index"),
-                ),
-            }
-        )
-        return model_inputs
-
     def _prepare_inputs(self):
-        accepted_indices = torch.zeros((self.config.batch_size, self.config.num_medusa_heads + 1), dtype=torch.int64)
-        current_length = torch.zeros((self.config.batch_size, self.config.num_medusa_heads + 1), dtype=torch.int64)
+        accepted_indices = torch.zeros((self.neuron_config.batch_size, self.neuron_config.num_medusa_heads + 1),
+                                       dtype=torch.int64)
+        current_length = torch.zeros((self.neuron_config.batch_size, self.neuron_config.num_medusa_heads + 1),
+                                     dtype=torch.int64)
         medusa_mask = torch.zeros(
-            (self.config.batch_size, self.config.medusa_speculation_length, self.config.medusa_speculation_length),
+            (self.neuron_config.batch_size, self.neuron_config.medusa_speculation_length,
+             self.neuron_config.medusa_speculation_length),
             dtype=torch.int64,
         )
-        scatter_index = torch.zeros((self.config.batch_size, self.config.medusa_speculation_length), dtype=torch.int64)
+        scatter_index = torch.zeros((self.neuron_config.batch_size, self.neuron_config.medusa_speculation_length),
+                                    dtype=torch.int64)
         return accepted_indices, current_length, medusa_mask, scatter_index
 
     @staticmethod
@@ -1045,98 +886,3 @@ class NeuronBaseForCausalLM(NeuronSpeculation):
         if not self.token_generation_model.is_neuron():
             for i, kv_tensor in enumerate(self.token_generation_model.model.past_key_values):
                 self.token_generation_model.model.past_key_values[i] = torch.zeros_like(kv_tensor)
-
-    def _sample(
-            self,
-            input_ids: torch.LongTensor,
-            logits_processor: Optional[LogitsProcessorList] = None,
-            stopping_criteria: Optional[StoppingCriteriaList] = None,
-            logits_warper: Optional[LogitsProcessorList] = None,
-            max_length: Optional[int] = None,
-            pad_token_id: Optional[int] = None,
-            eos_token_id: Optional[Union[int, List[int]]] = None,
-            output_scores: Optional[bool] = None,
-            output_logits: Optional[bool] = None,
-            return_dict_in_generate: Optional[bool] = None,
-            **model_kwargs,
-    ) -> Union[SampleOutput, torch.LongTensor]:
-        r"""
-        We override the GenerationMixin sample function (_sample for transformers>=4.39.0) to add support for right side padding.
-        """
-        # init values
-        logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList()
-        stopping_criteria = stopping_criteria if stopping_criteria is not None else StoppingCriteriaList()
-        if max_length is not None:
-            stopping_criteria = validate_stopping_criteria(stopping_criteria, max_length)
-        logits_warper = logits_warper if logits_warper is not None else LogitsProcessorList()
-        pad_token_id = pad_token_id if pad_token_id is not None else self.generation_config.pad_token_id
-        eos_token_id = eos_token_id if eos_token_id is not None else self.generation_config.eos_token_id
-        if isinstance(eos_token_id, int):
-            eos_token_id = [eos_token_id]
-
-        # init attention / hidden states / scores tuples
-        scores = () if (return_dict_in_generate and output_scores) else None
-        raw_logits = () if (return_dict_in_generate and output_logits) else None
-
-        # keep track of which sequences are already finished
-        unfinished_sequences = torch.ones(input_ids.shape[0], dtype=torch.long, device=input_ids.device)
-
-        this_peer_finished = False
-        # auto-regressive generation
-        while not this_peer_finished:
-            # prepare model inputs
-            model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
-
-            is_for_token_generation = self.kv_cache_populated
-
-            # forward pass to get next token
-            outputs = self(**model_inputs, return_dict=True)
-
-            if not self.config.on_device_sampling:
-                next_token_logits = outputs.logits[:, -1, :]
-
-                # pre-process distribution
-                next_token_scores = logits_processor(input_ids, next_token_logits)
-                next_token_scores = logits_warper(input_ids, next_token_scores)
-
-                if return_dict_in_generate:
-                    if output_scores:
-                        scores += (next_token_scores,)
-                    if output_logits:
-                        raw_logits += (next_token_logits,)
-
-            if not self.config.on_device_sampling:
-                if self.sampler is None:
-                    self.config.do_sample = True
-                    self.sampler = Sampler(self.config)
-                next_tokens = self.sampler.sample(outputs.logits[:, -1, :])
-            else:
-                next_tokens = outputs.tokens
-
-            # finished sentences should have their next token be a padding token
-            if eos_token_id is not None:
-                if pad_token_id is None:
-                    raise ValueError("If `eos_token_id` is defined, make sure that `pad_token_id` is defined.")
-                next_tokens = next_tokens * unfinished_sequences + pad_token_id * (1 - unfinished_sequences)
-
-            # update generated ids, model inputs, and length for next step
-            input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
-
-            model_kwargs = self._update_model_kwargs_for_generation(
-                outputs,
-                model_kwargs,
-                is_encoder_decoder=self.config.is_encoder_decoder,
-                is_for_token_generation=is_for_token_generation,
-            )
-
-            unfinished_sequences = unfinished_sequences & ~stopping_criteria(input_ids, None)
-            this_peer_finished = unfinished_sequences.max() == 0
-
-        if return_dict_in_generate:
-            return SampleDecoderOnlyOutput(
-                sequences=input_ids,
-                scores=scores,
-                logits=raw_logits,
-            )
-        else:
-            return input_ids

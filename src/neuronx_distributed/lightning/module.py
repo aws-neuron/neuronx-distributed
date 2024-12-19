@@ -65,6 +65,7 @@ class NeuronLTModule(LightningModule):
         self.global_norm = None
 
         self.should_print = False
+        self._metric_attributes: Dict[int, str]
 
     def forward(self, batch):
         return self.model.forward()
@@ -99,10 +100,11 @@ class NeuronLTModule(LightningModule):
     def on_train_batch_end(self, *args, **kwargs):
         pass  # Customer defined
 
-    def setup(self, stage=None):
+    def setup(self, stage=None, include_buffers=False):
         self.model = initialize_parallel_model(
             self.nxd_config,
             self.model_fn,
+            include_buffers,
             *self.model_args,
             **self.model_kwargs,
         )
@@ -287,11 +289,11 @@ class NeuronLTModule(LightningModule):
             # we could set false here if there's no configured logger, however, we still need to compute the "logged"
             # metrics anyway because that's what the evaluation loops use as return value
             logger = True
-        value = apply_to_collection(value, (Tensor, numbers.Number), self.__to_tensor, name)
+        val: Union[Metric, Tensor] = apply_to_collection(value, (Tensor, numbers.Number), self.__to_tensor, name)
         results.log(
             self._current_fx_name,
             name,
-            value,
+            val,
             prog_bar=prog_bar,
             logger=logger,
             on_step=on_step,

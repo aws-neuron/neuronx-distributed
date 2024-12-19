@@ -7,7 +7,7 @@ BENCHMARK_REPORT_FILENAME = "benchmark_report.json"
 
 
 class Benchmark:
-    def __init__(self, benchmark_func, input_param, config, num_runs=20, preprocess_func=None, post_warmup_func=None) -> None:
+    def __init__(self, benchmark_func, input_param, num_runs=20, preprocess_func=None, post_warmup_func=None) -> None:
         if isinstance(input_param, (tuple, list)):
             self.benchmark_func = partial(benchmark_func, *input_param)
         elif isinstance(input_param, dict):
@@ -15,7 +15,6 @@ class Benchmark:
         else:
             self.benchmark_func = partial(benchmark_func, input_param)
 
-        self.config = config
         self.num_runs = num_runs
         self.preprocess_func = preprocess_func
         self.post_warmup_func = post_warmup_func
@@ -52,14 +51,14 @@ class LatencyCollector:
         self.latency_list.append(time.time() - self.start)
 
 
-def generate_report(latency_list, config):
+def generate_report(latency_list, max_length=1, max_batch_size=1):
     latency_array = np.array(latency_list)
 
     n_runs = len(latency_list)
-    max_length = config.max_length
-    batch_size = config.max_batch_size
     total_time = np.sum(latency_array)
-    throughput = (n_runs * max_length * batch_size) / total_time
+    # The max_length is set to 1 by default to support image encoding tasks,
+    # as these tasks do not involve the concept of a maximum sequence length.
+    throughput = (n_runs * max_length * max_batch_size) / total_time
 
     return {
         "latency_ms_p50": np.percentile(latency_array, 50) * 1000,

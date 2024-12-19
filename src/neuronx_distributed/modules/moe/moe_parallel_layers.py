@@ -1,13 +1,17 @@
 import math
-from typing import Optional, Tuple, Callable, Any
+from typing import Optional, Tuple, Callable, Any, Sequence
 
 import torch
 import torch.nn as nn
 import torch.distributed
+from torch.distributed import ProcessGroup
 from torch import Tensor
 
 from neuronx_distributed.parallel_layers import layers, mappings, parallel_state, utils
-from neuronx_distributed.parallel_layers.parallel_state import get_expert_model_parallel_size
+from neuronx_distributed.parallel_layers.parallel_state import (
+    get_expert_model_parallel_size,
+    get_tensor_model_parallel_group,
+)
 
 
 class ExpertFusedLinearWithAsyncCommunication(torch.autograd.Function):
@@ -47,7 +51,9 @@ class ExpertFusedLinearWithAsyncCommunication(torch.autograd.Function):
         bias: Optional[Tensor],
         async_grad_allreduce: bool,
         sequence_parallel_enabled: bool,
+        sequence_dimension: Optional[int] = 0,
         save_for_backward: bool = True,
+        process_group: Optional[ProcessGroup] = None,
     ):
         if bias is not None:
             raise NotImplementedError("Bias is not currently supported for MoE")
@@ -57,6 +63,7 @@ class ExpertFusedLinearWithAsyncCommunication(torch.autograd.Function):
                 "fused linear layers. If SP is in use for the model, then we "
                 "currently expect SP to be exited before linear layers are applied."
             )
+        # sequence_dimension parameter is unused (defined for compatibility with LinearWithAsyncCommunication)
         if input.shape[0] != weight.shape[0] and input.shape[0] > 1:
             raise RuntimeError(
                 f"input and weight disagree on number of experts (first dimension). "
@@ -65,6 +72,9 @@ class ExpertFusedLinearWithAsyncCommunication(torch.autograd.Function):
 
         ctx.async_grad_allreduce = async_grad_allreduce
         ctx.compute_weight_gradient = weight.requires_grad
+        if process_group is None:
+            process_group = get_tensor_model_parallel_group()
+        ctx.process_group = process_group
 
         if save_for_backward:
             if ctx.compute_weight_gradient:
@@ -73,15 +83,24 @@ class ExpertFusedLinearWithAsyncCommunication(torch.autograd.Function):
                 ctx.save_for_backward(weight)
 
         # E: num_experts, H: input_size, I: intermediate/output_size
-	    # ... might refer to 1 or more dimensions, including C dimension (expert capacity)
+        # ... might refer to 1 or more dimensions, including C dimension (expert capacity)
         # input: (E, ..., H), weight: (E, H, I)
         output = torch.einsum("e...h,ehi->e...i", input, weight)
 
-	    # output: (E, ..., I)
+        # output: (E, ..., I)
         return output
 
     @staticmethod
-    def backward(ctx, grad_output: Tensor) -> Tuple[Tensor]:
+    def backward(ctx: Any, *grad_outputs: Sequence[Tensor]) -> Tuple[
+        Tensor,
+        Optional[Tensor],
+        Optional[Tensor],
+        Optional[Tensor],
+        Optional[Tensor],
+        Optional[Tensor],
+        Optional[Tensor],
+        Optional[Tensor],
+    ]:
         # grad_output: (E, ..., I)
         # input: (E, ..., H), weight: (E, H, I)
         if ctx.compute_weight_gradient:
@@ -89,6 +108,7 @@ class ExpertFusedLinearWithAsyncCommunication(torch.autograd.Function):
         else:
             weight = ctx.saved_tensors[0]
             input = None
+        grad_output: torch.Tensor = grad_outputs[0]
 
         # grad_input: (E, ..., H)
         grad_input = torch.einsum("e...i,ehi->e...h", grad_output, weight)
@@ -97,34 +117,34 @@ class ExpertFusedLinearWithAsyncCommunication(torch.autograd.Function):
             # Asynchronous all-reduce
             torch.distributed.all_reduce(
                 grad_input,
-                group=parallel_state.get_tensor_model_parallel_group(),
+                group=ctx.process_group,
             )
 
         # if no weight gradient, immediately return
         if not ctx.compute_weight_gradient:
-            return grad_input, None, None, None, None, None, None
+            return grad_input, None, None, None, None, None, None, None
 
         # grad_weight: (E, H, I)
         grad_weight = torch.einsum("e...h,e...i->ehi", input, grad_output)
 
-        return grad_input, grad_weight, None, None, None, None, None
+        return grad_input, grad_weight, None, None, None, None, None, None
 
 
 class ExpertFusedLinear(nn.Module):
     def _mark_expert_parallel_weights(self, iterable=None):
-        """ Register expert parallel parameters """
+        """Register expert parallel parameters"""
 
         if get_expert_model_parallel_size() > 1:
             if iterable is None:
-               iterable = self.parameters()
+                iterable = self.parameters()
 
             for p in iterable:
                 p.expert_model_parallel = True
 
     def _apply(self, fn, *args, **kwargs):
-        """ Moving parameters from cpu to device creates new parameters. to() method
+        """Moving parameters from cpu to device creates new parameters. to() method
         internally calls the _apply method for all the submodules, which we override
-        here to make sure ep parameters are marked on device as well """
+        here to make sure ep parameters are marked on device as well"""
 
         out = super()._apply(fn, *args, **kwargs)
         self._mark_expert_parallel_weights()
@@ -161,6 +181,7 @@ class ExpertFusedColumnParallelLinear(layers.ColumnParallelLinear, ExpertFusedLi
         stride: int = 1,
         init_method: Optional[Callable[..., Any]] = None,
         keep_master_weight: bool = False,
+        tensor_model_parallel_group: Optional[ProcessGroup] = None,
     ) -> None:
         self.num_experts = num_experts
         self._n_local_experts = utils.divide(num_experts, parallel_state.get_expert_model_parallel_size())
@@ -177,6 +198,7 @@ class ExpertFusedColumnParallelLinear(layers.ColumnParallelLinear, ExpertFusedLi
             sequence_parallel_enabled=False,
             keep_master_weight=keep_master_weight,
             skip_bias_add=False,
+            tensor_model_parallel_group=tensor_model_parallel_group,
         )
         self._mark_expert_parallel_weights()
 
@@ -200,16 +222,17 @@ class ExpertFusedColumnParallelLinear(layers.ColumnParallelLinear, ExpertFusedLi
             else:
                 self.arg_init_method(weight[e])
 
-    def forward(
-        self, input_: torch.Tensor, expert_indices: torch.Tensor = None
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def forward(self, input_: torch.Tensor, expert_indices: Optional[torch.Tensor] = None, *_: Any) -> torch.Tensor:
         """If expert_indices is provided, then the computations are performed only on the specified experts.
         Otherwise, the input is passed through all experts in the layer."""
 
         if self.async_tensor_model_parallel_allreduce or self.sequence_parallel_enabled:
             input_parallel = input_
         else:
-            input_parallel = mappings.copy_to_tensor_model_parallel_region(input_)
+            input_parallel = mappings.copy_to_tensor_model_parallel_region(
+                input_,
+                process_group=self.tensor_parallel_group,
+            )
 
         # Matrix multiply.
         weight = self.weight[expert_indices, :, :] if expert_indices is not None else self.weight
@@ -220,6 +243,7 @@ class ExpertFusedColumnParallelLinear(layers.ColumnParallelLinear, ExpertFusedLi
             async_grad_allreduce=self.async_tensor_model_parallel_allreduce,
             sequence_parallel_enabled=self.sequence_parallel_enabled,
             autograd_func_class=self.autograd_func_class,
+            process_group=self.tensor_parallel_group,
         )
         return output
 
@@ -249,12 +273,10 @@ class ExpertFusedRowParallelLinear(layers.RowParallelLinear, ExpertFusedLinear):
         stride: int = 1,
         init_method: Optional[Callable[..., Any]] = None,
         keep_master_weight: bool = False,
+        tensor_model_parallel_group: Optional[ProcessGroup] = None,
     ) -> None:
         self.num_experts = num_experts
         self._n_local_experts = utils.divide(num_experts, parallel_state.get_expert_model_parallel_size())
-
-        # Whether to all-reduce the output across TP ranks or not
-        self.reduce_output = reduce_output
 
         super().__init__(
             input_size=input_size,
@@ -268,6 +290,8 @@ class ExpertFusedRowParallelLinear(layers.RowParallelLinear, ExpertFusedLinear):
             sequence_parallel_enabled=False,
             keep_master_weight=keep_master_weight,
             skip_bias_add=False,
+            reduce_output=reduce_output,
+            tensor_model_parallel_group=tensor_model_parallel_group,
         )
         self._mark_expert_parallel_weights()
 
@@ -291,9 +315,7 @@ class ExpertFusedRowParallelLinear(layers.RowParallelLinear, ExpertFusedLinear):
             else:
                 self.arg_init_method(weight[e])
 
-    def forward(
-        self, input_: torch.Tensor, expert_indices: torch.Tensor = None
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def forward(self, input_: torch.Tensor, expert_indices: Optional[torch.Tensor] = None) -> torch.Tensor:
         """If expert_indices is provided, then the computations are performed only on the specified experts.
         Otherwise, the input is passed through all experts in the layer."""
 
@@ -306,10 +328,13 @@ class ExpertFusedRowParallelLinear(layers.RowParallelLinear, ExpertFusedLinear):
             async_grad_allreduce=False,
             sequence_parallel_enabled=False,
             autograd_func_class=self.autograd_func_class,
+            process_group=self.tensor_parallel_group,
         )
 
         if self.reduce_output:
-            output = mappings.reduce_from_tensor_model_parallel_region(output_parallel)
+            output = mappings.reduce_from_tensor_model_parallel_region(
+                output_parallel, process_group=self.tensor_parallel_group,
+            )
             return output
         else:
             # Return without output all-reduce, in favor of an all-reduce or reduce-scatter after the MoE output combine.
@@ -322,27 +347,29 @@ class LinearWithWeightGradAR(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, input, weight, reduce_weight_grad):
-        # input: (T, H), weight: (E, H)
+    def forward(ctx, input, weight, reduce_weight_grad, process_group: Optional[ProcessGroup] = None):
+        # input: (*, H), weight: (E, H)
         assert weight.requires_grad
         ctx.reduce_weight_grad = reduce_weight_grad
         ctx.save_for_backward(input, weight)
-        # output: (T, E)
+        ctx.process_group = process_group if process_group is not None \
+            else parallel_state.get_tensor_model_parallel_group()
+        # output: (*, E)
         output = torch.matmul(input, weight.t())
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
-        # grad_output: (T, E)
+        # grad_output: (*, E)
         input, weight = ctx.saved_tensors
-        # grad_input: (T, H)
+        # grad_input: (*, H)
         grad_input = grad_output.matmul(weight)
         # grad_weight: (E, H)
-        grad_weight = torch.einsum("te,th->eh", grad_output, input)
+        grad_weight = torch.einsum("...e, ...h->eh", grad_output, input)
         if parallel_state.get_tensor_model_parallel_size() > 1 and ctx.reduce_weight_grad:
             # All-reduce the gradients of the weight
-            torch.distributed.all_reduce(grad_weight, group=parallel_state.get_tensor_model_parallel_group())
-        return grad_input, grad_weight, None
+            torch.distributed.all_reduce(grad_weight, group=ctx.process_group)
+        return grad_input, grad_weight, None, None
 
 
 class LinearRouter(torch.nn.Module):
@@ -367,6 +394,7 @@ class LinearRouter(torch.nn.Module):
         output_size: int,
         dtype: torch.dtype = torch.float32,
         device: torch.device = torch.device("cpu"),
+        tensor_model_parallel_group: Optional[ProcessGroup] = None,
     ):
         super().__init__()
 
@@ -377,6 +405,9 @@ class LinearRouter(torch.nn.Module):
             assert self.device.type == "xla", "Currently only xla device type is supported"
             self.weight = torch.nn.Parameter(torch.empty(output_size, input_size, device=device, dtype=dtype))
 
+        self.process_group = tensor_model_parallel_group if tensor_model_parallel_group is not None \
+            else parallel_state.get_tensor_model_parallel_group()
+
         if self.weight.device != torch.device("meta"):
             self.init_weight_cpu()
 
@@ -385,7 +416,7 @@ class LinearRouter(torch.nn.Module):
 
         # if ep is enabled do not reduce weight grad because we don't do delayed allreduce
         reduce_weight_grad = get_expert_model_parallel_size() == 1
-        args = utils.cast_if_autocast_enabled(input_, self.weight, reduce_weight_grad)
+        args = utils.cast_if_autocast_enabled(input_, self.weight, reduce_weight_grad, self.process_group)
         utils.verify_casted_dtype(args)
         with torch.cuda.amp.autocast(enabled=False):
             return LinearWithWeightGradAR.apply(*args)

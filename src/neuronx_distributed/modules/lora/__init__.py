@@ -5,7 +5,7 @@ __all__ = ["LoraConfig", "LoraModel", "get_lora_model"]
 
 
 def get_lora_model(model, lora_config: LoraConfig):
-    if lora_config is None or not lora_config.enable_lora:
+    if lora_config is None:
         return model
 
     from neuronx_distributed.trainer.model import NxDModel

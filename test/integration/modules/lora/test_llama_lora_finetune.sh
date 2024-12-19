@@ -142,8 +142,8 @@ torchrun $DISTRIBUTED_ARGS \
     --seq_len $SEQ_LEN \
     --pretrained_ckpt $PRETRAINED_PATH \
     --sequence_parallel_enabled \
-    --separate_qkv \
     --task "open_qa" \
+    --fuse_qkv 0 \
     $EXTRA_ARGS \
     --use_gpu_compatible_precision 0 \
     --enable_lora \

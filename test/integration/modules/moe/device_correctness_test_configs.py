@@ -220,10 +220,11 @@ class ExptCfgParallel(ExptCfg):
     # Default values must be over-ridden
     tp_degree: int = 0
     ep_degree: int = 0
+    token_shuffle_group_size: int = 1
     sequence_parallel_enabled: bool = False
 
 
-def get_device_correctness_parallel_test_configs(dtype, test_mode, tp_degree, ep_degree, zero1):
+def get_device_correctness_parallel_test_configs(dtype, test_mode, tp_degree, ep_degree, token_shuffle_group_size, zero1):
     assert test_mode in {"training", "inference"}
 
     test_configs = []
@@ -364,14 +365,23 @@ def get_device_correctness_parallel_test_configs(dtype, test_mode, tp_degree, ep
         if ep_degree > 1 and cfg.seq_len == 1 and cfg.test_mode == "inference":
             continue
 
-        # Enable SP in training, disable SP in inference
-        sequence_parallel_enabled = True if test_mode == "training" else False
-        cfg_parallel = dataclasses.replace(
-            cfg,
-            tp_degree=tp_degree,
-            ep_degree=ep_degree,
-            sequence_parallel_enabled=sequence_parallel_enabled,
-        )
-        test_configs_parallel.append(cfg_parallel)
+        # Run training test in SP, test both with and without SP for inference
+        if test_mode == "training":
+            sp_modes = [True]
+        else:
+            sp_modes = [True, False]
+
+        for sp_mode in sp_modes:
+            if cfg.seq_len == 1 and sp_mode:
+                # Token gen cannot be run in SP
+                continue
+            cfg_parallel = dataclasses.replace(
+                cfg,
+                tp_degree=tp_degree,
+                ep_degree=ep_degree,
+                token_shuffle_group_size=token_shuffle_group_size,
+                sequence_parallel_enabled=sp_mode,
+            )
+            test_configs_parallel.append(cfg_parallel)
 
     return test_configs_parallel

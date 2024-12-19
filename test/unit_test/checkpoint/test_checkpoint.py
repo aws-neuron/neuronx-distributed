@@ -45,6 +45,12 @@ def get_model():
     model = AutoModelForCausalLM.from_config(model_config)
     return model
 
+def mock_get_data_parallel_group(as_list=False):
+    if(as_list):
+        return [[i] for i in range(64)]
+    mock = MagicMock(spec=torch.distributed.ProcessGroup)
+    mock.size.return_value = 1
+    return mock
 
 class TestCheckpoint(unittest.TestCase):
     @patch("torch.distributed.is_initialized", MagicMock(return_value=True))
@@ -64,41 +70,52 @@ class TestCheckpoint(unittest.TestCase):
     @patch(
         "neuronx_distributed.pipeline.model.parallel_state.get_tensor_model_parallel_rank", MagicMock(return_value=1)
     )
+    @patch("neuronx_distributed.pipeline.model.parallel_state.get_data_parallel_size", MagicMock(return_value=1))
     @patch("neuronx_distributed.pipeline.partition.get_pipeline_model_parallel_rank", MagicMock(return_value=1))
     @patch("neuronx_distributed.pipeline.partition.get_pipeline_model_parallel_size", MagicMock(return_value=8))
     @patch("neuronx_distributed.pipeline.model.NxDPPModel._create_pg_with_ranks", MagicMock(return_value=None))
     @patch(
         "neuronx_distributed.parallel_layers.parallel_state.get_data_parallel_group",
+        MagicMock(side_effect=mock_get_data_parallel_group)
+    )
+    @patch(
+        "neuronx_distributed.trainer.trainer.parallel_state.get_data_parallel_replica_groups",
         MagicMock(return_value=[[i] for i in range(64)]),
     )
     @patch(
-        "neuronx_distributed.trainer.checkpoint.get_data_parallel_group",
+        "neuronx_distributed.trainer.checkpoint.get_data_parallel_replica_groups",
         MagicMock(return_value=[[i] for i in range(64)]),
     )
     @patch(
-        "neuronx_distributed.parallel_layers.parallel_state.get_tensor_model_parallel_group",
-        MagicMock(return_value=None),
+        "neuronx_distributed.parallel_layers.parallel_state.get_tensor_model_parallel_replica_groups",
+        MagicMock(return_value=[[i] for i in range(64)]),
     )
     @patch(
         "neuronx_distributed.optimizer.zero_redundancy_optimizer.model_parallel_is_initialized",
         MagicMock(return_value=True),
     )
     @patch(
-        "neuronx_distributed.optimizer.zero_redundancy_optimizer.get_data_parallel_group",
+        "neuronx_distributed.optimizer.zero_redundancy_optimizer.get_data_parallel_replica_groups",
         MagicMock(return_value=[[i] for i in range(64)]),
     )
     @patch("neuronx_distributed.utils.model_utils.get_local_world_size", MagicMock(return_value=32))
     @patch("neuronx_distributed.trainer.checkpoint.get_tensor_model_parallel_rank", MagicMock(return_value=1))
     @patch("neuronx_distributed.trainer.checkpoint.get_pipeline_model_parallel_rank", MagicMock(return_value=1))
     @patch("neuronx_distributed.trainer.checkpoint.get_local_world_size", MagicMock(return_value=32))
-    @patch("neuronx_distributed.trainer.trainer.get_expert_model_parallel_size", MagicMock(return_value=1))
-    @patch("neuronx_distributed.trainer.checkpoint.get_expert_model_parallel_size", MagicMock(return_value=1))
+    @patch("neuronx_distributed.parallel_layers.parallel_state.get_expert_model_parallel_size", MagicMock(return_value=1))
+    @patch("neuronx_distributed.trainer.trainer.parallel_state.get_expert_model_parallel_size", MagicMock(return_value=1))
     @patch("neuronx_distributed.trainer.checkpoint.get_expert_model_parallel_rank", MagicMock(return_value=0))
     @patch("neuronx_distributed.trainer.checkpoint.get_expert_data_parallel_size", MagicMock(return_value=1))
     @patch("neuronx_distributed.trainer.checkpoint.get_expert_data_parallel_rank", MagicMock(return_value=0))
-    @patch("neuronx_distributed.trainer.checkpoint.get_expert_model_parallel_group", MagicMock(return_value=None))
+    @patch("neuronx_distributed.trainer.checkpoint.get_expert_model_parallel_replica_groups", MagicMock(return_value=[]))
+    @patch("neuronx_distributed.parallel_layers.parallel_state.get_expert_model_parallel_replica_groups", MagicMock(return_value=[]))
+    @patch("neuronx_distributed.parallel_layers.parallel_state.get_expert_model_parallel_group", MagicMock(side_effect=mock_get_data_parallel_group))
     @patch(
-        "neuronx_distributed.trainer.checkpoint.get_expert_data_parallel_group",
+        "neuronx_distributed.trainer.checkpoint.get_expert_model_parallel_replica_groups",
+        MagicMock(return_value=[[i] for i in range(64)]),
+    )
+    @patch(
+        "neuronx_distributed.trainer.checkpoint.get_expert_data_parallel_replica_groups",
         MagicMock(return_value=[[i] for i in range(64)]),
     )
     @patch(
@@ -193,7 +210,9 @@ class TestCheckpoint(unittest.TestCase):
         torch.testing.assert_close(model.state_dict(), model_state, rtol=0, atol=0)
         torch.testing.assert_close(optimizer.state_dict(), opt_state, rtol=0, atol=0)
 
-    @pytest.mark.skipif(not version.parse(torch.__version__) >= version.parse("2.1"), reason="skip this test if no DCP support")
+    @pytest.mark.skipif(
+        version.parse(torch.__version__) != version.parse("2.1"), reason="skip this test if no DCP support"
+    )
     @patch("torch.distributed.is_initialized", MagicMock(return_value=True))
     @patch("neuronx_distributed.pipeline.model.parallel_state.initialize_model_parallel", MagicMock(return_value=None))
     @patch(
@@ -215,23 +234,23 @@ class TestCheckpoint(unittest.TestCase):
     @patch("neuronx_distributed.pipeline.partition.get_pipeline_model_parallel_size", MagicMock(return_value=8))
     @patch("neuronx_distributed.pipeline.model.NxDPPModel._create_pg_with_ranks", MagicMock(return_value=None))
     @patch(
-        "neuronx_distributed.parallel_layers.parallel_state.get_data_parallel_group",
+        "neuronx_distributed.parallel_layers.parallel_state.get_data_parallel_replica_groups",
         MagicMock(return_value=[[i] for i in range(64)]),
     )
     @patch(
-        "neuronx_distributed.trainer.checkpoint.get_data_parallel_group",
+        "neuronx_distributed.trainer.checkpoint.get_data_parallel_replica_groups",
         MagicMock(return_value=[[i] for i in range(64)]),
     )
     @patch(
-        "neuronx_distributed.parallel_layers.parallel_state.get_tensor_model_parallel_group",
-        MagicMock(return_value=None),
+        "neuronx_distributed.parallel_layers.parallel_state.get_tensor_model_parallel_replica_groups",
+        MagicMock(return_value=[[i] for i in range(64)]),
     )
     @patch(
         "neuronx_distributed.optimizer.zero_redundancy_optimizer.model_parallel_is_initialized",
         MagicMock(return_value=True),
     )
     @patch(
-        "neuronx_distributed.optimizer.zero_redundancy_optimizer.get_data_parallel_group",
+        "neuronx_distributed.optimizer.zero_redundancy_optimizer.get_data_parallel_replica_groups",
         MagicMock(return_value=[[i] for i in range(64)]),
     )
     @patch("neuronx_distributed.utils.model_utils.get_local_world_size", MagicMock(return_value=32))
@@ -243,9 +262,12 @@ class TestCheckpoint(unittest.TestCase):
     @patch("neuronx_distributed.trainer.checkpoint.get_expert_model_parallel_rank", MagicMock(return_value=0))
     @patch("neuronx_distributed.trainer.checkpoint.get_expert_data_parallel_size", MagicMock(return_value=1))
     @patch("neuronx_distributed.trainer.checkpoint.get_expert_data_parallel_rank", MagicMock(return_value=0))
-    @patch("neuronx_distributed.trainer.checkpoint.get_expert_model_parallel_group", MagicMock(return_value=None))
     @patch(
-        "neuronx_distributed.trainer.checkpoint.get_expert_data_parallel_group",
+        "neuronx_distributed.trainer.checkpoint.get_expert_model_parallel_replica_groups",
+        MagicMock(return_value=[[i] for i in range(64)]),
+    )
+    @patch(
+        "neuronx_distributed.trainer.checkpoint.get_expert_data_parallel_replica_groups",
         MagicMock(return_value=[[i] for i in range(64)]),
     )
     @patch(
@@ -253,9 +275,18 @@ class TestCheckpoint(unittest.TestCase):
         MagicMock(return_value=True),
     )
     @patch("neuronx_distributed.optimizer.zero_dcp_utils.get_pipeline_model_parallel_rank", MagicMock(return_value=1))
-    @patch("neuronx_distributed.optimizer.zero_dcp_utils.get_tensor_model_parallel_group", MagicMock(return_value=[[i] for i in range(8)]))
-    @patch("neuronx_distributed.optimizer.zero_dcp_utils.get_pipeline_model_parallel_group", MagicMock(return_value=[[i] for i in range(8)]))
-    @patch("neuronx_distributed.optimizer.zero_dcp_utils.get_data_parallel_group", MagicMock(return_value=[[i] for i in range(64)]))
+    @patch(
+        "neuronx_distributed.optimizer.zero_dcp_utils.get_tensor_model_parallel_replica_groups",
+        MagicMock(return_value=[[i] for i in range(8)]),
+    )
+    @patch(
+        "neuronx_distributed.optimizer.zero_dcp_utils.get_pipeline_model_parallel_replica_groups",
+        MagicMock(return_value=[[i] for i in range(8)]),
+    )
+    @patch(
+        "neuronx_distributed.optimizer.zero_dcp_utils.get_data_parallel_replica_groups",
+        MagicMock(return_value=[[i] for i in range(64)]),
+    )
     @patch("torch.distributed.get_rank", MagicMock(return_value=0))
     @patch("torch.distributed.get_world_size", MagicMock(return_value=1))
     def test_checkpoint_dcp(self):

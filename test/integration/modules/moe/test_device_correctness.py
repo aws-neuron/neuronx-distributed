@@ -17,7 +17,7 @@ from device_correctness_test_runner import run_device_correctness_test
 from neuronx_distributed.modules.moe import (
     load_balancing_loss_func as neuron_load_balancing_loss_func,
 )
-from neuronx_distributed.parallel_layers.utils import is_pjrt_device
+from neuronx_distributed.parallel_layers.utils import requires_init_pg_override
 
 SEPARATOR = "-" * 70
 
@@ -151,9 +151,8 @@ def test_loss_fn_device_correctness():
 
 
 if __name__ == "__main__":
-    if is_pjrt_device():
+    if requires_init_pg_override():
         import torch_xla.experimental.pjrt_backend  # noqa
-
         torch.distributed.init_process_group("xla", init_method="pjrt://")
     else:
         torch.distributed.init_process_group("xla")

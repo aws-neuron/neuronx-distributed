@@ -26,9 +26,9 @@ torchrun --nproc_per_node=32 \
     --master_addr=${MASTER_ADDR_JOB} \
     --master_port=2020 \
     $SCRIPT_DIR/test_device_correctness_parallel.py \
-    --test_json test.json \
     --test_tp_degree=$1 \
     --test_ep_degree=$2 \
+    --token_shuffle_group_size=$3 \
     --test_mode=training \
-    --test_dtype=$4 \
-    --zero1=$3
+    --test_dtype=$5 \
+    --zero1=$4

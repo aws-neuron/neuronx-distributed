@@ -68,6 +68,7 @@ from transformers.utils import (
 )
 
 import neuronx_distributed.parallel_layers.utils as neuronx_dist_utils
+from neuronx_distributed.kernels.flash_attn import nki_flash_attn_func
 from neuronx_distributed.modules.moe.expert_mlps import ExpertMLPs
 from neuronx_distributed.modules.moe.loss_function import load_balancing_loss_func
 from neuronx_distributed.modules.moe.model import MoE
@@ -85,6 +86,8 @@ from neuronx_distributed.parallel_layers.parallel_state import (
     get_tensor_model_parallel_size,
 )
 from neuronx_distributed.utils.model_utils import move_model_to_device
+
+
 
 
 def _init_normal(std, w):
@@ -178,6 +181,11 @@ class MixtralAttention(MixtralAttentionHF):
 
         if not hasattr(config, "qkv_linear"):
             config.qkv_linear = False
+
+        if not hasattr(config, "use_flash_attention"):
+            self.use_flash_attention = False
+        else:
+            self.use_flash_attention = config.use_flash_attention
 
         if (self.head_dim * self.num_heads) != self.hidden_size:
             raise ValueError(
@@ -319,7 +327,11 @@ class MixtralAttention(MixtralAttentionHF):
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-        attn_output = self.core_attn(query_states, key_states, value_states)
+        attn_output = (
+            nki_flash_attn_func(query_states, key_states, value_states)
+            if self.use_flash_attention
+            else self.core_attn(query_states, key_states, value_states)
+        )
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
             raise ValueError(
@@ -552,8 +564,7 @@ class MixtralDecoderLayer(MixtralDecoderLayerHF):
 
             outputs += (router_logits,)
 
-        # TODO: Return a tuple here to workaround a NxD PP issue, can revert once the issue is fixed.
-        return (outputs,)
+        return outputs
 
 
 @add_start_docstrings(
@@ -686,7 +697,6 @@ class MixtralModel(MixtralModelHF):
                     output_router_logits=output_router_logits,
                     use_cache=use_cache,
                 )
-            layer_outputs = layer_outputs[0]
 
             hidden_states = layer_outputs[0]
 
@@ -874,7 +884,7 @@ class MixtralForCausalLM(MixtralForCausalLMHF):
         )
 
 
-def init_weights(module):
+def init_weights(module, device):
     """
     Re-init weights after partition
     Referred from HF transformers https://github.com/huggingface/transformers/blob/v4.36.1/src/transformers/models/mixtral/modeling_mixtral.py#L849

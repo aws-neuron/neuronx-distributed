@@ -1,15 +1,22 @@
 import math
 import warnings
-from typing import Optional, Tuple, Union, Any, Callable, List, Dict
+from typing import (
+    Optional, Tuple, Union, Any, Callable, Dict, Type, cast
+)
+import os
 
 import torch
+import torch.distributed
 import torch.nn.functional as F
 import torch.nn.grad as grad
 import torch.nn.init as init
 import torch_xla.core.xla_model as xm
+from torch.distributed import ProcessGroup
 from torch.nn.parameter import Parameter
 
 from .mappings import (
+    _gather_along_dim,
+    _reduce_scatter_along_dim,
     copy_to_tensor_model_parallel_region,
     gather_from_tensor_model_parallel_region,
     gather_from_tensor_model_parallel_region_with_dim,
@@ -22,6 +29,7 @@ from .parallel_state import (
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_size,
+    get_aot_mode
 )
 from .random import get_xla_rng_tracker
 from .utils import (
@@ -29,10 +37,13 @@ from .utils import (
     cast_if_autocast_enabled,
     divide,
     get_padding_length,
+    is_torch_version_greater_than_2,
     set_tensor_model_parallel_attributes,
     verify_casted_dtype,
 )
 from .utils import param_is_not_tensor_parallel_duplicate  # noqa: F401 # pylint: disable=W0611
+from neuronx_distributed.utils.utils import hardware
+from torch_neuronx.utils import get_platform_target
 
 if "reduce_scatter_tensor" not in dir(torch.distributed):
     torch.distributed.reduce_scatter_tensor = torch.distributed._reduce_scatter_base
@@ -40,7 +51,13 @@ if "all_gather_into_tensor" not in dir(torch.distributed):
     torch.distributed.all_gather_into_tensor = torch.distributed._all_gather_base
 
 
-def _initialize_affine_weight_neuron(weight: torch.Tensor, init_method: Callable[[torch.Tensor], None], partition_dim: int, stride: int = 1) -> None:
+def _initialize_affine_weight_neuron(
+    weight: torch.Tensor,
+    init_method: Callable[[torch.Tensor], None],
+    partition_dim: int,
+    num_partitions:int,
+    stride: int = 1,
+) -> None:
     """Initialize affine weight for model parallel on Neuron device.
 
     Args:
@@ -49,18 +66,35 @@ def _initialize_affine_weight_neuron(weight: torch.Tensor, init_method: Callable
         partition_dim (int): Dimension to apply partition.
     """
 
-    set_tensor_model_parallel_attributes(tensor=weight, is_parallel=True, dim=partition_dim, stride=stride)
+    set_tensor_model_parallel_attributes(
+        tensor=weight,
+        is_parallel=True,
+        dim=partition_dim,
+        stride=stride,
+        num_partitions=num_partitions,
+    )
 
     with get_xla_rng_tracker().fork():
         init_method(weight)
 
 
-def create_local_weight(full_weight: torch.Tensor, partition_dim: int, per_partition_size: Union[int, List[int]], stride: int, out_weight: Optional[torch.Tensor] = None) -> torch.Tensor:
+def create_local_weight(
+    full_weight: torch.Tensor,
+    partition_dim: int,
+    per_partition_size: int,
+    stride: int,
+    out_weight: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
     per_partition_per_stride_size = divide(per_partition_size, stride)
     weight_list = torch.split(full_weight, per_partition_per_stride_size, dim=partition_dim)
     rank = get_tensor_model_parallel_rank()
     world_size = get_tensor_model_parallel_size()
     my_weight_list = weight_list[rank::world_size]
+    #TODO: Remove this check when torch 2.1 is default
+    if stride == 1 and is_torch_version_greater_than_2() and full_weight.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
+        # torch cat is not supported for float8 dtypes from torch
+        # Either way, here cat with stride = 1, is literally just a view[0]
+        return my_weight_list[0]
 
     with torch.no_grad():
         return torch.cat(my_weight_list, dim=partition_dim, out=out_weight)
@@ -71,18 +105,33 @@ def create_local_weight(full_weight: torch.Tensor, partition_dim: int, per_parti
 def _initialize_parameter_cpu(
     param: torch.Tensor,  # shape should already be partitioned
     partition_dim: int,
+    num_partitions: int,
     init_method: Callable[[torch.Tensor], None],
-    return_master_param=False,
+    return_master_param: bool = False,
     *,
-    param_dtype=torch.float32,
+    param_dtype: torch.dtype = torch.float32,
     stride: int = 1,
 ) -> Optional[torch.Tensor]:
     """Initialize a parameter for tensor parallelism
 
-    Build a master copy of the parameter on all processes and scatter to the
-    relevant chunk
+    During training, the primary purpose of this function is to ensure that
+    weights are deterministically initialized regardless of the tensor
+    parallel degree used. To ensure this, a master copy of the parameter is
+    constructed on all processes first and then it is chunked and allocated to
+    the relevant rank.
+
+    When using a model architecture for inference using AOT tracing, all
+    initialization logic can be skipped since only the weight shape is required
+    to produce a compiled graph.
     """
-    set_tensor_model_parallel_attributes(tensor=param, is_parallel=True, dim=partition_dim, stride=stride)
+
+    set_tensor_model_parallel_attributes(
+        tensor=param, is_parallel=True, dim=partition_dim, stride=stride, num_partitions=num_partitions
+    )
+
+    # Skip all initialization logic during AOT tracing
+    if get_aot_mode():
+        return param
 
     # Create the master param
     master_param_shape = list(param.shape)
@@ -92,10 +141,10 @@ def _initialize_parameter_cpu(
 
     init_method(master_param)
 
-    master_param = master_param.to(dtype=param_dtype)
-    create_local_weight(master_param, partition_dim, param.shape[partition_dim], stride, out_weight=param)
+    master_param_weight = master_param.to(dtype=param_dtype)
+    create_local_weight(master_param_weight, partition_dim, param.shape[partition_dim], stride, out_weight=param)
 
-    return master_param if return_master_param else None
+    return master_param_weight if return_master_param else None
 
 
 class ParallelEmbedding(torch.nn.Module):
@@ -120,11 +169,14 @@ class ParallelEmbedding(torch.nn.Module):
         norm_type: float = 2.0,
         scale_grad_by_freq: bool = False,
         sparse: bool = False,
-        init_method: Callable[..., torch.Tensor] = init.normal_,
+        init_method: Callable[[Any], Any] = init.normal_,
         device: Optional[torch.device] = None,
         dtype: torch.dtype = torch.float32,
         shard_across_embedding: bool = False,
         pad: bool = False,
+        sequence_parallel_enabled: bool = False,
+        tensor_model_parallel_group: Optional[ProcessGroup] = None,
+        use_spmd_rank: bool = False
     ):
         super().__init__()
         # Keep the input dimensions.
@@ -134,10 +186,17 @@ class ParallelEmbedding(torch.nn.Module):
         self.norm_type = norm_type
         self.scale_grad_by_freq = scale_grad_by_freq
         self.sparse = sparse
-        self.tensor_model_parallel_size = get_tensor_model_parallel_size()
+        self.tensor_model_parallel_group = tensor_model_parallel_group if \
+            tensor_model_parallel_group is not None else cast(ProcessGroup, get_tensor_model_parallel_group())
+        self.tensor_model_parallel_size = self.tensor_model_parallel_group.size()
         self.shard_across_embedding = shard_across_embedding
         self.stride = 1
         self.pad = pad
+        self.sequence_parallel_enabled = sequence_parallel_enabled
+
+        self.rank_util: Optional[SPMDRank] = None
+        if use_spmd_rank:
+            self.rank_util = SPMDRank(self.tensor_model_parallel_size)
 
         if shard_across_embedding:
             # Divide the weight matrix along the embedding dimension.
@@ -159,7 +218,7 @@ class ParallelEmbedding(torch.nn.Module):
                 self.end_index,
             ) = EmbeddingUtility.range_from_global_vocab_size(
                 self.num_embeddings,
-                get_tensor_model_parallel_rank(),
+                self.tensor_model_parallel_group.rank(),
                 self.tensor_model_parallel_size,
             )
             self.num_embeddings_per_partition = self.end_index - self.start_index
@@ -190,7 +249,11 @@ class ParallelEmbedding(torch.nn.Module):
                 self.init_weight_cpu()
             else:
                 set_tensor_model_parallel_attributes(
-                    tensor=self.weight, is_parallel=True, dim=self.weight_partition_dim, stride=1
+                    tensor=self.weight,
+                    is_parallel=True,
+                    dim=self.weight_partition_dim,
+                    stride=1,
+                    num_partitions=self.tensor_model_parallel_size,
                 )
         else:
             assert device.type == "xla", "Currently only xla device type is supported"
@@ -202,21 +265,32 @@ class ParallelEmbedding(torch.nn.Module):
                     dtype=dtype,
                 )
             )
-            _initialize_affine_weight_neuron(self.weight, init_method, partition_dim=self.weight_partition_dim)
+            _initialize_affine_weight_neuron(
+                self.weight,
+                init_method,
+                partition_dim=self.weight_partition_dim,
+                num_partitions=self.tensor_model_parallel_size,
+            )
 
     def init_weight_cpu(self) -> None:
         _initialize_parameter_cpu(
             param=self.weight,
             partition_dim=self.weight_partition_dim,
+            num_partitions=self.tensor_model_parallel_size,
             init_method=self.init_method,
             param_dtype=self.dtype,
         )
 
     def _forward_shard_across_vocab(self, input_: torch.Tensor) -> Any:
+        start_index = self.start_index
+        end_index = self.end_index
+        if self.rank_util:
+            start_index = self.num_embeddings_per_partition * self.rank_util.get_rank()
+            end_index = self.num_embeddings_per_partition * (self.rank_util.get_rank() + 1)
         if self.tensor_model_parallel_size > 1:
-            input_mask = (input_ >= self.start_index) & (input_ < self.end_index)
+            input_mask = (input_ >= start_index) & (input_ < end_index)
             # Mask the input.
-            masked_input = input_.clone() - self.start_index
+            masked_input = input_.clone() - start_index
             masked_input = torch.mul(masked_input, input_mask.long())
         else:
             masked_input = input_
@@ -233,9 +307,17 @@ class ParallelEmbedding(torch.nn.Module):
         )
         # Mask the output embedding.
         if self.tensor_model_parallel_size > 1:
-            output_parallel = torch.mul(output_parallel, torch.unsqueeze(input_mask.float(), dim=-1))
+            output_parallel = torch.mul(output_parallel, torch.unsqueeze(input_mask.float(), dim=-1)).to(self.dtype)
 
-        return reduce_from_tensor_model_parallel_region(output_parallel)
+        if self.sequence_parallel_enabled:
+            # TODO: use sequence dimension instead of a manual transpose which assumes a layout
+            return reduce_scatter_to_sequence_parallel_region(
+                output_parallel.transpose(0, 1).contiguous(), process_group=self.tensor_model_parallel_group,
+            )
+        else:
+            return reduce_from_tensor_model_parallel_region(
+                output_parallel, process_group=self.tensor_model_parallel_group,
+            )
 
     def _forward_shard_across_embed(self, input_: torch.Tensor) -> torch.Tensor:
         output_parallel = F.embedding(
@@ -247,7 +329,9 @@ class ParallelEmbedding(torch.nn.Module):
             self.scale_grad_by_freq,
             self.sparse,
         )
-        return gather_from_tensor_model_parallel_region(output_parallel)
+        return gather_from_tensor_model_parallel_region(
+            output_parallel, process_group=self.tensor_model_parallel_group,
+        )
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
         if self.pad and self.training:
@@ -262,7 +346,7 @@ class ParallelEmbedding(torch.nn.Module):
             output = self._forward_shard_across_vocab(input_)
             return output
 
-    def preshard_hook(self, model_state_dict: Dict[str, Any], prefix: str) -> bool:
+    def preshard_hook(self, model_state_dict: Dict[str, Any], prefix: str) -> None:
         if not self.pad or self.pad_size == 0:
             return
 
@@ -296,12 +380,23 @@ class LinearWithAsyncCommunication(torch.autograd.Function):
         bias: Optional[torch.Tensor],
         async_grad_allreduce: bool,
         sequence_parallel_enabled: bool,
+        sequence_dimension: Optional[int] = 0,
         save_for_backward: bool = True,
+        process_group: Optional[ProcessGroup] = None,
     ) -> torch.Tensor:
         ctx.use_bias = bias is not None and weight.requires_grad
         ctx.async_grad_allreduce = async_grad_allreduce
         ctx.sequence_parallel_enabled = sequence_parallel_enabled
+        ctx.sequence_dimension = sequence_dimension
         ctx.compute_weight_gradient = weight.requires_grad
+        if process_group is None:
+            process_group = get_tensor_model_parallel_group(as_list=True)
+        ctx.process_group = process_group
+
+        if ctx.sequence_parallel_enabled:
+            assert (
+                ctx.sequence_dimension is not None
+            ), "Found `sequence_parallel_enabled` set to True, but `sequence_dimension` was None, and this occured in an unexpected area"
 
         if save_for_backward:
             if ctx.compute_weight_gradient:
@@ -310,22 +405,25 @@ class LinearWithAsyncCommunication(torch.autograd.Function):
                 ctx.save_for_backward(weight)
 
         if ctx.sequence_parallel_enabled:
-            # `input` is supposed to be 3D and its order of dimension is [sequence, batch, hidden]
-            total_input = xm.all_gather(
-                input,
-                groups=get_tensor_model_parallel_group(as_list=True),
-                pin_layout=False,
-            )
+            # `input` is supposed to be 3D and the optimal order of dimension is [sequence, batch, hidden]
+            # If not SBH, the necessary transposes will be added
+            total_input = _gather_along_dim(input, ctx.sequence_dimension, process_group=ctx.process_group)
         else:
             total_input = input
 
-        output = torch.matmul(total_input, weight.t())
+        output = torch.einsum('...m,mn->...n', total_input, weight.t())
         if bias is not None:
             output = output + bias
         return output
 
     @staticmethod
-    def backward(ctx: Any, grad_output: Any) -> Any:
+    def backward(ctx: Any, *grad_outputs: Any) -> Any:
+        grad_output = grad_outputs[0]
+        if ctx.sequence_parallel_enabled:
+            assert (
+                ctx.sequence_dimension is not None
+            ), "Found `sequence_parallel_enabled` set to True, but `sequence_dimension` was None, and this occured in an unexpected area"
+
         if ctx.compute_weight_gradient:
             input, weight = ctx.saved_tensors
         else:
@@ -333,15 +431,14 @@ class LinearWithAsyncCommunication(torch.autograd.Function):
             input = None
 
         use_bias = ctx.use_bias
+        process_group = ctx.process_group
+        hardware_type = hardware(get_platform_target())
 
         handle = None
         if ctx.compute_weight_gradient:
             if ctx.sequence_parallel_enabled:
-                total_input = xm.all_gather(
-                    input,
-                    groups=get_tensor_model_parallel_group(as_list=True),
-                    pin_layout=False,
-                )
+                # Optimal layout is SBH, but if not, transposes are added
+                total_input = _gather_along_dim(input, ctx.sequence_dimension, process_group=process_group)
             else:
                 total_input = input
 
@@ -350,42 +447,30 @@ class LinearWithAsyncCommunication(torch.autograd.Function):
         if handle is not None:
             handle.wait()
 
+        original_dtype = grad_input.dtype
+
         if ctx.async_grad_allreduce:
             # Asynchronous all-reduce
-            handle = torch.distributed.all_reduce(grad_input, group=get_tensor_model_parallel_group(), async_op=True)
+            if os.getenv("XLA_DOWNCAST_BF16") == "1" and hardware_type == hardware.TRN2:
+                grad_input = grad_input.to(torch.float64)
+            handle = torch.distributed.all_reduce(grad_input, group=process_group, async_op=True)
 
         # if no weight gradient, immediately return
         if not ctx.compute_weight_gradient:
             if ctx.sequence_parallel_enabled:
                 assert not ctx.async_grad_allreduce
-                world_size = get_tensor_model_parallel_size()
-                shape = list(grad_input.shape)
-                shape[0] //= world_size
-
-                sub_grad_input = torch.empty(
-                    torch.Size(shape),
-                    dtype=grad_input.dtype,
-                    device=grad_input.device,
-                    requires_grad=False,
-                )
-                groups = get_tensor_model_parallel_group()._mesh
-
-                xm.reduce_scatter(
-                    xm.REDUCE_SUM,
-                    grad_input,
-                    output=sub_grad_input,
-                    groups=groups,
-                    shard_count=len(groups[0]),
-                    scatter_dim=0,
-                    scale=1,
-                    pin_layout=False,
-                )
-
-                return sub_grad_input, None, None, None, None, None, None
+                # Optimal layout is SBH, but if not, transposes are added
+                if os.getenv("XLA_DOWNCAST_BF16") == "1" and hardware_type == hardware.TRN2:
+                    grad_input = grad_input.to(torch.float64)
+                sub_grad_input = _reduce_scatter_along_dim(grad_input, ctx.sequence_dimension, process_group=process_group)
+                sub_grad_input = sub_grad_input.to(original_dtype)
+                return sub_grad_input, None, None, None, None, None, None, None
 
             if ctx.async_grad_allreduce:
+                assert handle
                 handle.wait()
-            return grad_input, None, None, None, None, None, None
+                grad_input = grad_input.to(original_dtype)
+            return grad_input, None, None, None, None, None, None, None
 
         # Convert the tensor shapes to 2D for execution compatibility
         grad_output = grad_output.view(grad_output.shape[0] * grad_output.shape[1], grad_output.shape[2])
@@ -393,28 +478,23 @@ class LinearWithAsyncCommunication(torch.autograd.Function):
 
         if ctx.sequence_parallel_enabled:
             assert not ctx.async_grad_allreduce
-            sub_grad_input = torch.empty(input.shape, dtype=input.dtype, device=input.device, requires_grad=False)
-            groups = get_tensor_model_parallel_group()._mesh
-            xm.reduce_scatter(
-                xm.REDUCE_SUM,
-                grad_input,
-                output=sub_grad_input,
-                groups=groups,
-                shard_count=len(groups[0]),
-                scatter_dim=0,
-                scale=1,
-                pin_layout=False,
-            )
+            # optimal layout is SBH, but if not, transposes will be added
+            if os.getenv("XLA_DOWNCAST_BF16") == "1" and hardware_type == hardware.TRN2:
+                grad_input = grad_input.to(torch.float64)
+            sub_grad_input = _reduce_scatter_along_dim(grad_input, ctx.sequence_dimension, process_group=process_group)
+            sub_grad_input=sub_grad_input.to(original_dtype)
 
         grad_weight = grad_output.t().matmul(total_input)
         grad_bias = grad_output.sum(dim=0) if use_bias else None
 
         if ctx.sequence_parallel_enabled:
-            return sub_grad_input, grad_weight, grad_bias, None, None, None, None
+            return sub_grad_input, grad_weight, grad_bias, None, None, None, None, None
 
         if ctx.async_grad_allreduce:
+            assert handle
             handle.wait()
-        return grad_input, grad_weight, grad_bias, None, None, None, None
+            grad_input=grad_input.to(original_dtype)
+        return grad_input, grad_weight, grad_bias, None, None, None, None, None
 
 
 def linear_with_async_allreduce(
@@ -423,8 +503,10 @@ def linear_with_async_allreduce(
     bias: Optional[torch.Tensor],
     async_grad_allreduce: bool,
     sequence_parallel_enabled: bool,
-    autograd_func_class: torch.autograd.Function = LinearWithAsyncCommunication,
+    sequence_dimension: Optional[int] = 0,
+    autograd_func_class: Type[torch.autograd.Function] = LinearWithAsyncCommunication,
     save_for_backward: bool = True,
+    process_group: Optional[ProcessGroup] = None,
 ) -> torch.Tensor:
     args = cast_if_autocast_enabled(
         input,
@@ -432,7 +514,9 @@ def linear_with_async_allreduce(
         bias,
         async_grad_allreduce,
         sequence_parallel_enabled,
+        sequence_dimension,
         save_for_backward,
+        process_group,
     )
     verify_casted_dtype(args)
     with torch.cuda.amp.autocast(enabled=False):
@@ -440,7 +524,7 @@ def linear_with_async_allreduce(
 
 
 class BaseParallelLinear(torch.nn.Module):
-    autograd_func_class = LinearWithAsyncCommunication
+    autograd_func_class: Type[torch.autograd.Function] = LinearWithAsyncCommunication
 
     def __init__(self):
         super().__init__()
@@ -461,7 +545,8 @@ class ColumnParallelLinear(BaseParallelLinear):
     """Linear layer with column parallelism.
 
     The linear layer is defined as Y = XA + b. A is parallelized along
-    its second dimension as A = [A_1, ..., A_p].
+    its second dimension as A = [A_1, ..., A_p]. Here A is the weight matrix,
+    X is the input.
 
     .. note::
         Input is supposed to be three dimensional and each dimension
@@ -471,7 +556,7 @@ class ColumnParallelLinear(BaseParallelLinear):
         input_size: first dimension of matrix A.
         output_size: second dimension of matrix A.
         bias: If true, add bias
-        gather_output: If true, call all-gether on output and make Y avaiable
+        gather_output: If true, call all-gather on output and make Y available
                        to all Neuron devices, otherwise, every Neuron device will have its output
                        which is Y_i = XA_i
         dtype: dtype of the weights
@@ -487,11 +572,13 @@ class ColumnParallelLinear(BaseParallelLinear):
         dtype: torch.dtype = torch.float32,
         device: Optional[torch.device] = None,
         stride: int = 1,
-        init_method: Optional[Callable[..., torch.Tensor]] = None,
+        init_method: Optional[Callable[[Any], torch.Tensor]] = None,
         sequence_parallel_enabled: bool = False,
+        sequence_dimension: Optional[int] = None,
         keep_master_weight: bool = False,
         skip_bias_add: bool = False,
         pad: bool = False,
+        tensor_model_parallel_group: Optional[ProcessGroup] = None,
     ):
         super().__init__()
 
@@ -501,7 +588,11 @@ class ColumnParallelLinear(BaseParallelLinear):
         self.add_bias = bias
         self.gather_output = gather_output
         self.arg_init_method = init_method
-        world_size = get_tensor_model_parallel_size()
+
+        self.tensor_parallel_group = tensor_model_parallel_group if \
+            tensor_model_parallel_group is not None else cast(ProcessGroup, get_tensor_model_parallel_group())
+
+        world_size = torch.distributed.get_world_size(group=self.tensor_parallel_group)
         self.pad = pad
         if self.pad:
             self.pad_size = get_padding_length(self.output_size, world_size)
@@ -514,6 +605,7 @@ class ColumnParallelLinear(BaseParallelLinear):
         self.stride = stride
         self.keep_master_weight = keep_master_weight
         self.skip_bias_add = skip_bias_add
+        self.bias_shape: Optional[Tuple[int]]
 
         self.initialize_weight_and_bias()
 
@@ -521,7 +613,15 @@ class ColumnParallelLinear(BaseParallelLinear):
         if sequence_parallel_enabled:
             if world_size <= 1:
                 warnings.warn(f"`sequence_parallel_enabled` is set to `True`, but got world_size of {world_size}")
+
+            if sequence_dimension is None:
+                warnings.warn(
+                    "`sequence_parallel_enabled` is set to `True`, but got `sequence_dimension` as `None`. Defaulting `sequence_dimension` to 0."
+                )
+                sequence_dimension = 0
+
         self.sequence_parallel_enabled = sequence_parallel_enabled
+        self.sequence_dimension = sequence_dimension
 
         if self.async_tensor_model_parallel_allreduce and self.sequence_parallel_enabled:
             raise RuntimeError(
@@ -556,13 +656,17 @@ class ColumnParallelLinear(BaseParallelLinear):
             self.init_weight_cpu()
         elif self.device.type == "meta":
             set_tensor_model_parallel_attributes(
-                tensor=self.weight, is_parallel=True, dim=self.weight_partition_dim, stride=self.stride
+                tensor=self.weight, is_parallel=True, dim=self.weight_partition_dim,
+                stride=self.stride, num_partitions=self.tensor_parallel_group.size(),
             )
         else:
             _initialize_affine_weight_neuron(
-                self.weight, self._init_weight, partition_dim=self.weight_partition_dim, stride=self.stride
+                self.weight, self._init_weight, partition_dim=self.weight_partition_dim,
+                num_partitions=self.tensor_parallel_group.size(),
+                stride=self.stride
             )
         if self.add_bias:
+            assert self.bias_shape
             if self.device is None or self.device.type == "cpu":
                 self.bias = Parameter(torch.empty(*self.bias_shape, dtype=self.dtype))
             else:
@@ -571,7 +675,9 @@ class ColumnParallelLinear(BaseParallelLinear):
                 self._init_bias()
 
             if not self.gather_output:
-                set_tensor_model_parallel_attributes(self.bias, True, 0, stride=self.stride)
+                set_tensor_model_parallel_attributes(
+                    self.bias, True, 0, stride=self.stride, num_partitions=self.tensor_parallel_group.size(),
+                )
         else:
             self.register_parameter("bias", None)
 
@@ -579,13 +685,14 @@ class ColumnParallelLinear(BaseParallelLinear):
         self.master_weight = _initialize_parameter_cpu(
             param=self.weight,
             partition_dim=self.weight_partition_dim,
+            num_partitions=self.tensor_parallel_group.size(),
             init_method=self._init_weight,
             param_dtype=self.dtype,
             stride=self.stride,
             return_master_param=self.keep_master_weight,
         )
 
-    def forward(self, input: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def forward(self, input: torch.Tensor, *_: Any) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """Forward of ColumnParallelLinear
 
         Args:
@@ -600,7 +707,7 @@ class ColumnParallelLinear(BaseParallelLinear):
         if self.async_tensor_model_parallel_allreduce or self.sequence_parallel_enabled:
             input_parallel = input
         else:
-            input_parallel = copy_to_tensor_model_parallel_region(input)
+            input_parallel = copy_to_tensor_model_parallel_region(input, process_group=self.tensor_parallel_group)
 
         # Matrix multiply.
         output_parallel = self._forward_impl(
@@ -609,12 +716,14 @@ class ColumnParallelLinear(BaseParallelLinear):
             bias=None,
             async_grad_allreduce=self.async_tensor_model_parallel_allreduce,
             sequence_parallel_enabled=self.sequence_parallel_enabled,
+            sequence_dimension=self.sequence_dimension,
             autograd_func_class=self.autograd_func_class,
+            process_group=self.tensor_parallel_group
         )
         if self.gather_output:
             # All-gather across the partitions.
             assert not self.sequence_parallel_enabled
-            output = gather_from_tensor_model_parallel_region(output_parallel)
+            output = gather_from_tensor_model_parallel_region(output_parallel, process_group=self.tensor_parallel_group)
             if self.pad and self.pad_size > 0:
                 output = torch.narrow(output, -1, 0, self.output_size - self.pad_size)
         else:
@@ -624,14 +733,13 @@ class ColumnParallelLinear(BaseParallelLinear):
         output = (output + self.bias) if self.bias is not None else output
         return output
 
-    def preshard_hook(self, model_state_dict: Dict[str, Any], prefix: str) -> bool:
+    def preshard_hook(self, model_state_dict: Dict[str, Any], prefix: str) -> None:
         if not self.pad or self.pad_size == 0:
             return
         if self.output_size != model_state_dict[prefix].shape[0] + self.pad_size:
             size = model_state_dict[prefix].shape[0]
             raise RuntimeError(f"State dict {prefix} is of an unexpected size {size} expected {size - self.pad_size}")
         model_state_dict[prefix] = torch.nn.functional.pad(model_state_dict[prefix], (0, 0, 0, self.pad_size))
-        return
 
 
 class RowParallelLinear(BaseParallelLinear):
@@ -648,8 +756,9 @@ class RowParallelLinear(BaseParallelLinear):
                -   -
 
     .. note::
-        Input is supposed to be three dimensional and each dimension
+        Input(X) is supposed to be three dimensional and each dimension
         is expected to be batch, sequence, and hidden feature, respectively.
+        A is the weight matrix.
 
     Arguments:
         input_size: first dimension of matrix A.
@@ -673,9 +782,13 @@ class RowParallelLinear(BaseParallelLinear):
         stride: int = 1,
         init_method: Optional[Callable[..., Any]] = None,
         sequence_parallel_enabled: bool = False,
+        sequence_dimension: Optional[int] = None,
         keep_master_weight: bool = False,
         skip_bias_add: bool = False,
         pad: bool = False,
+        reduce_output: bool = True,
+        tensor_model_parallel_group: Optional[ProcessGroup] = None,
+        reduce_dtype: torch.dtype = None,
     ):
         super().__init__()
 
@@ -685,7 +798,22 @@ class RowParallelLinear(BaseParallelLinear):
         self.add_bias = bias
         self.input_is_parallel = input_is_parallel
         self.pad = pad
-        world_size = get_tensor_model_parallel_size()
+        self.reduce_output = reduce_output
+        self.tensor_parallel_group = tensor_model_parallel_group if \
+            tensor_model_parallel_group is not None else cast(ProcessGroup, get_tensor_model_parallel_group())
+
+        if reduce_dtype is None:
+            reduce_dtype = dtype
+            
+        hardware_type = hardware(get_platform_target())
+        # Updating the reduction dtype to be FLOAT32 to reduce errors due to precision
+        if os.getenv("XLA_DOWNCAST_BF16") == "1" and hardware_type == hardware.TRN2:
+            if reduce_dtype==torch.float32:
+                reduce_dtype=torch.float64
+
+        self.reduce_dtype = reduce_dtype
+
+        world_size = self.tensor_parallel_group.size()
         if self.pad:
             self.pad_size = get_padding_length(self.input_size, world_size)
             self.input_size = self.input_size + self.pad_size
@@ -695,12 +823,20 @@ class RowParallelLinear(BaseParallelLinear):
         self.sequence_parallel_enabled = sequence_parallel_enabled
         if self.sequence_parallel_enabled and not self.input_is_parallel:
             raise RuntimeError("To enable `sequence_parallel_enabled`, `input_is_parallel` must be `True`")
+
+        if self.sequence_parallel_enabled and sequence_dimension is None:
+            warnings.warn(
+                "`sequence_parallel_enabled` is set to `True`, but got `sequence_dimension` as `None`. Defaulting `sequence_dimension` to 0."
+            )
+            sequence_dimension = 0
+
+        self.sequence_dimension: int = sequence_dimension  # type: ignore
         self.dtype = dtype
         self.device = device
         self.stride = stride
         self.keep_master_weight = keep_master_weight
         self.skip_bias_add = skip_bias_add
-
+        self.bias_shape: Optional[Tuple[int]]
         self.initialize_weight_and_bias()
 
         self._forward_impl = linear_with_async_allreduce
@@ -729,14 +865,18 @@ class RowParallelLinear(BaseParallelLinear):
             self.init_weight_cpu()
         elif self.device.type == "meta":
             set_tensor_model_parallel_attributes(
-                tensor=self.weight, is_parallel=True, dim=self.weight_partition_dim, stride=self.stride
+                tensor=self.weight, is_parallel=True, dim=self.weight_partition_dim,
+                stride=self.stride, num_partitions=self.tensor_parallel_group.size(),
             )
         else:
             _initialize_affine_weight_neuron(
-                self.weight, self._init_weight, partition_dim=self.weight_partition_dim, stride=self.stride
+                self.weight, self._init_weight, partition_dim=self.weight_partition_dim,
+                num_partitions=self.tensor_parallel_group.size(),
+                stride=self.stride,
             )
 
         if self.add_bias:
+            assert self.bias_shape
             if self.device is None or self.device.type == "cpu":
                 self.bias = Parameter(torch.empty(*self.bias_shape, dtype=self.dtype))
             else:
@@ -751,6 +891,7 @@ class RowParallelLinear(BaseParallelLinear):
         self.master_weight = _initialize_parameter_cpu(
             param=self.weight,
             partition_dim=self.weight_partition_dim,
+            num_partitions=self.tensor_parallel_group.size(),
             init_method=self._init_weight,
             param_dtype=self.dtype,
             stride=self.stride,
@@ -761,7 +902,7 @@ class RowParallelLinear(BaseParallelLinear):
         bound = 1 / math.sqrt(self.input_size_per_partition) if self.input_size_per_partition > 0 else 0
         torch.nn.init.uniform_(self.bias, -bound, bound)
 
-    def forward(self, input_: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def forward(self, input_: torch.Tensor) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """Forward of RowParallelLinear
 
         Args:
@@ -780,34 +921,49 @@ class RowParallelLinear(BaseParallelLinear):
             if self.pad and self.pad_size > 0:
                 input_ = torch.nn.functional.pad(input_, (0, self.pad_size))
             assert not self.sequence_parallel_enabled
-            input_parallel = scatter_to_tensor_model_parallel_region(input_)
+            input_parallel = scatter_to_tensor_model_parallel_region(input_, process_group=self.tensor_parallel_group)
+
         # Matrix multiply.
-        output_parallel = self._forward_impl(
+        output_ = self._forward_impl(
             input=input_parallel,
             weight=self.weight,
             bias=None,
             async_grad_allreduce=False,
             sequence_parallel_enabled=False,
+            sequence_dimension=self.sequence_dimension,
             autograd_func_class=self.autograd_func_class,
+            process_group=self.tensor_parallel_group,
         )
-        # All-reduce across all the partitions.
-        if self.sequence_parallel_enabled:
-            output_ = reduce_scatter_to_sequence_parallel_region(output_parallel)
-        else:
-            output_ = reduce_from_tensor_model_parallel_region(output_parallel)
+
+        if self.reduce_output:
+            # All-reduce across all the partitions.
+            original_dtype = output_.dtype
+
+            output_ = output_.to(self.reduce_dtype)
+
+            if self.sequence_parallel_enabled:
+                output_ = reduce_scatter_to_sequence_parallel_region(
+                    output_, self.sequence_dimension, process_group=self.tensor_parallel_group,
+                )
+            else:
+                output_ = reduce_from_tensor_model_parallel_region(
+                    output_, process_group=self.tensor_parallel_group,
+                )
+
+            output_ = output_.to(original_dtype)
+
         if self.skip_bias_add:
             return output_, self.bias
         output = (output_ + self.bias) if self.bias is not None else output_
         return output
 
-    def preshard_hook(self, model_state_dict: dict, prefix: str) -> bool:
+    def preshard_hook(self, model_state_dict: dict, prefix: str) -> None:
         if not self.pad or self.pad_size == 0:
             return
         if self.input_size != model_state_dict[prefix].shape[1] + self.pad_size:
             size = model_state_dict[prefix].shape[1]
             raise RuntimeError(f"State dict {prefix} is of an unexpected size {size} expected {size - self.pad_size}")
         model_state_dict[prefix] = torch.nn.functional.pad(model_state_dict[prefix], (0, self.pad_size))
-        return
 
 
 class Conv2dWithInputGradAllReduce(torch.autograd.Function):
@@ -838,8 +994,9 @@ class Conv2dWithInputGradAllReduce(torch.autograd.Function):
         return output
 
     @staticmethod
-    def backward(ctx: Any, grad_output: Any) -> Any:
+    def backward(ctx: Any, *grad_outputs: Any) -> Any:
         # Adapted from https://stackoverflow.com/questions/74949892/implementing-a-conv2d-backward-in-pytorch
+        grad_output = grad_outputs[0]
         input, weight = ctx.saved_tensors
 
         handle = None
@@ -869,6 +1026,7 @@ class Conv2dWithInputGradAllReduce(torch.autograd.Function):
             grad_bias = grad_output.sum((0, 2, 3)).squeeze(0)
 
         if ctx.needs_input_grad[0] and ctx.allreduce_weight_grad:
+            assert handle
             handle.wait()
 
         return grad_input, grad_weight, grad_bias, None, None, None
@@ -906,20 +1064,21 @@ class BaseParallelConv(torch.nn.Module):
         self,
         in_channels: int,
         out_channels: int,
-        kernel_size: Tuple[int, ...],
-        stride: Tuple[int, ...],
-        padding: Tuple[int, ...],
-        dilation: Tuple[int, ...],
+        kernel_size: Union[int, Tuple[int, int]],
+        stride: Union[int, Tuple[int, int]],
+        padding: Union[int, Tuple[int, int]],
+        dilation: Union[int, Tuple[int, int]],
         groups: int,
         bias: bool,
         padding_mode: str,
         partition_dim: int,
         dtype: torch.dtype,
-        device: torch.device,
-        init_method: Callable[..., torch.Tensor],
-        keep_master_params: bool,
+        device: Optional[torch.device] = None,
+        init_method: Optional[Callable[[Any], torch.Tensor]] = None,
+        keep_master_params: bool = False,
+        partition_pad: bool = False,
     ):
-        if not all(d == 1 for d in dilation):
+        if not all(d == 1 for d in _as_tuple2(dilation)):
             raise NotImplementedError(f"Non-1 dilation is not yet supported. Received: {dilation}")
         if groups != 1:
             raise NotImplementedError(f"Non-1 groups is not yet supported. Received: {groups}")
@@ -936,17 +1095,26 @@ class BaseParallelConv(torch.nn.Module):
         self.arg_init_method = init_method
         self.dtype = dtype
         self.keep_master_params = keep_master_params
+        self.partition_pad = partition_pad
 
         world_size = get_tensor_model_parallel_size()
 
         # Parameters
         # Convs have a kernel shape of [c_out, c_in, *kernel_dims]
         if partition_dim == CONV_KERNEL_OUTPUT_CHANNEL_DIMENSION:
-            self.channels_per_partition = divide(out_channels, world_size)
-            weight_shape = [self.channels_per_partition, in_channels, *kernel_size]
+            if self.partition_pad:
+                self.partition_pad_size = get_padding_length(self.out_channels, world_size)
+                self.out_channels = self.out_channels + self.partition_pad_size
+
+            self.channels_per_partition = divide(self.out_channels, world_size)
+            weight_shape = [self.channels_per_partition, in_channels, *_as_tuple2(kernel_size)]
         elif partition_dim == CONV_KERNEL_INPUT_CHANNEL_DIMENSION:
-            self.channels_per_partition = divide(in_channels, world_size)
-            weight_shape = [out_channels, self.channels_per_partition, *kernel_size]
+            if self.partition_pad:
+                self.partition_pad_size = get_padding_length(self.in_channels, world_size)
+                self.in_channels = self.in_channels + self.partition_pad_size
+
+            self.channels_per_partition = divide(self.in_channels, world_size)
+            weight_shape = [out_channels, self.channels_per_partition, *_as_tuple2(kernel_size)]
         else:
             assert False, f"Unsupported partition dim: {partition_dim}"
 
@@ -958,19 +1126,29 @@ class BaseParallelConv(torch.nn.Module):
         # Initialize weight
         self.weight = Parameter(torch.empty(weight_shape, dtype=dtype, device=device))
         if self.weight.device.type == "cpu":
-            # Initializing a "meta" device weight is a no-op, but we want to skip it to avoid wasting cycles
             if self.weight.device != torch.device("meta"):
                 self.master_weight = _initialize_parameter_cpu(
                     self.weight,
-                    partition_dim,
-                    self._init_weight,
+                    partition_dim=partition_dim,
+                    num_partitions=world_size,
+                    init_method=self._init_weight,
                     return_master_param=self.keep_master_params,
                     param_dtype=self.dtype,
                     stride=1,
                 )
+        elif self.weight.device.type == "meta":
+            set_tensor_model_parallel_attributes(
+                tensor=self.weight, is_parallel=True, dim=partition_dim, stride=1, num_partitions=world_size,
+            )
         else:
-            assert device.type == "xla", "Currently only xla device type is supported"
-            _initialize_affine_weight_neuron(self.weight, self._init_weight, partition_dim=partition_dim, stride=1)
+            assert device and device.type == "xla", "Currently only xla device type is supported"
+            _initialize_affine_weight_neuron(
+                self.weight,
+                self._init_weight,
+                partition_dim=partition_dim,
+                num_partitions=world_size,
+                stride=1,
+            )
 
         # Initialize bias
         if bias:
@@ -990,7 +1168,8 @@ class BaseParallelConv(torch.nn.Module):
                     self.master_bias = _initialize_parameter_cpu(
                         self.bias,
                         CONV_KERNEL_OUTPUT_CHANNEL_DIMENSION,
-                        self._init_bias,
+                        num_partitions=world_size,
+                        init_method=self._init_bias,
                         return_master_param=self.keep_master_params,
                         param_dtype=self.dtype,
                         stride=1,
@@ -1022,11 +1201,11 @@ class BaseParallelConv(torch.nn.Module):
 
 # Convolutions can take an int or tuple for most of their __init__ args
 # This function broadcasts the given arg to a tuple if it's not a tuple already
-def _convert_conv_arg_to_tuple_if_needed(arg: Union[int, Tuple[int, ...]], dimensions: int) -> Tuple[int, ...]:
+def _as_tuple2(arg: Union[int, Tuple[int, int]]) -> Tuple[int, int]:
     if isinstance(arg, tuple):
         return arg
     if isinstance(arg, int):
-        return tuple(arg for _ in range(dimensions))
+        return (arg, arg)
     raise TypeError(f"Arg should be int or tuple of int, but received {type(arg)}")
 
 
@@ -1052,6 +1231,7 @@ class OutputChannelParallelConv2d(BaseParallelConv):
         device: Device on which the weights should be initialized
         init_method: Method for initializing the weight
         keep_master_weight: If device="cpu", whether to keep the original ("master") weight the per-worker weights are split from
+        partition_pad: Pad the output channel dimension if needed to make the output channel count divisible by the tensor model parallel size
     """
 
     def __init__(
@@ -1068,14 +1248,15 @@ class OutputChannelParallelConv2d(BaseParallelConv):
         gather_output: bool = True,
         dtype: torch.dtype = torch.float32,
         device: Optional[torch.device] = None,
-        init_method: Optional[Callable[..., Any]] = None,
+        init_method: Optional[Callable[[Any], torch.Tensor]] = None,
         keep_master_weight: bool = False,
+        partition_pad: bool = False,
     ):
         # Base class expects these all to be tuples so it can support N-dimensional convs
-        kernel_size = _convert_conv_arg_to_tuple_if_needed(kernel_size, 2)
-        stride = _convert_conv_arg_to_tuple_if_needed(stride, 2)
-        padding = _convert_conv_arg_to_tuple_if_needed(padding, 2)
-        dilation = _convert_conv_arg_to_tuple_if_needed(dilation, 2)
+        kernel_size = _as_tuple2(kernel_size)
+        stride = _as_tuple2(stride)
+        padding = _as_tuple2(padding)
+        dilation = _as_tuple2(dilation)
 
         super().__init__(
             in_channels,
@@ -1092,12 +1273,17 @@ class OutputChannelParallelConv2d(BaseParallelConv):
             device,
             init_method,
             keep_master_weight,
+            partition_pad,
         )
+        self.kernel_size: Tuple[int, int]
+        self.stride: Tuple[int, int]
+        self.padding: Tuple[int, int]
+        self.dilation: Tuple[int, int]
 
         self.allreduce_weight_grad = get_tensor_model_parallel_size() > 1
         self.gather_output = gather_output
 
-    def forward(self, in_tensor: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def forward(self, in_tensor: torch.Tensor) -> torch.Tensor:
         """Forward of OutputChannelParallelConv2d
 
         Args:
@@ -1126,9 +1312,24 @@ class OutputChannelParallelConv2d(BaseParallelConv):
         if self.gather_output:
             # All-gather across the partitions
             output = gather_from_tensor_model_parallel_region_with_dim(output_parallel, gather_dim=1)
+            if self.partition_pad and self.partition_pad_size > 0:
+                output = torch.narrow(output, 1, 0, self.out_channels - self.partition_pad_size)
         else:
             output = output_parallel
+
         return output
+
+    def preshard_hook(self, model_state_dict: dict, prefix: str) -> None:
+        if not self.partition_pad or self.partition_pad_size == 0:
+            return
+        if self.out_channels != model_state_dict[prefix].shape[0] + self.partition_pad_size:
+            size = model_state_dict[prefix].shape[0]
+            raise RuntimeError(
+                f"State dict {prefix} is of an unexpected size {size} expected {size - self.partition_pad_size}"
+            )
+        model_state_dict[prefix] = torch.nn.functional.pad(
+            model_state_dict[prefix], (0, 0, 0, 0, 0, 0, 0, self.partition_pad_size)
+        )
 
 
 class InputChannelParallelConv2d(BaseParallelConv):
@@ -1144,15 +1345,16 @@ class InputChannelParallelConv2d(BaseParallelConv):
     Arguments:
         in_channels: Number of input channels in the original Conv that is being parallelized. Parallelization is handled internally by this class
         out_channels: Number of output channels
+        device: Device on which the weights should be initialized
         kernel_size: Size of the kernel. Can be a single number for a square kernel or a tuple of two numbers
         stride: Stride of the convolution. Can be a single number for uniform H/W stride or a tuple of two numbers
         padding: Padding of the convolution. Can be a single number for uniform H/W padding or a tuple of two numbers
         bias: If true, add bias
         input_is_parallel: Whether the input to this layer is already split among workers, e.g. by being the output of a OutputChannelParallelConv2d
         dtype: Datatype of the weights
-        device: Device on which the weights should be initialized
         init_method: Method for initializing the weight
         keep_master_weight: If device="cpu", whether to keep the original ("master") weight the per-worker weights are split from
+        partition_pad: Pad the input channel dimension if needed to make the input channel count divisible by the tensor model parallel size
     """
 
     def __init__(
@@ -1166,17 +1368,18 @@ class InputChannelParallelConv2d(BaseParallelConv):
         groups: int = 1,
         bias: bool = True,
         padding_mode: str = "zeros",
-        input_is_parallel=False,
+        input_is_parallel: bool = False,
         dtype: torch.dtype = torch.float32,
         device: Optional[torch.device] = None,
-        init_method: Optional[Callable[..., Any]] = None,
+        init_method: Optional[Callable[[Any], torch.Tensor]] = None,
         keep_master_weight: bool = False,
+        partition_pad: bool = False,
     ):
         # Base class expects these all to be tuples so it can support N-dimensional convs
-        kernel_size = _convert_conv_arg_to_tuple_if_needed(kernel_size, 2)
-        stride = _convert_conv_arg_to_tuple_if_needed(stride, 2)
-        padding = _convert_conv_arg_to_tuple_if_needed(padding, 2)
-        dilation = _convert_conv_arg_to_tuple_if_needed(dilation, 2)
+        kernel_size = _as_tuple2(kernel_size)
+        stride = _as_tuple2(stride)
+        padding = _as_tuple2(padding)
+        dilation = _as_tuple2(dilation)
 
         super().__init__(
             in_channels,
@@ -1193,7 +1396,12 @@ class InputChannelParallelConv2d(BaseParallelConv):
             device,
             init_method,
             keep_master_weight,
+            partition_pad,
         )
+        self.kernel_size: Tuple[int, int]
+        self.stride: Tuple[int, int]
+        self.padding: Tuple[int, int]
+        self.dilation: Tuple[int, int]
 
         self.input_is_parallel = input_is_parallel
 
@@ -1233,3 +1441,31 @@ class InputChannelParallelConv2d(BaseParallelConv):
             output = output + self.bias[:, None, None]
 
         return output
+
+
+class SPMDRank(torch.nn.Module):
+    """
+        This is a temporary workaround for getting rank in traced SPMD model. To be replaced
+        with ReplicaID in HLO once compiler adds support.
+
+        To use this temporary fix,
+        1. Register SPMDRank as a module where you need the rank.
+        2. Save weight as arange tensor in model checkpoint
+
+        >>> self.spmd_rank = SPMDRank(world_rank)
+        >>> ckpt['spmd_rank.rank'] = torch.arange(0, world_size, dtype=torch.int32)
+    """
+    def __init__(self, world_size: int):
+        super().__init__()
+        self.world_size = world_size
+        self.rank = torch.nn.Parameter(torch.zeros(1, dtype=torch.int32), requires_grad=False)
+        set_tensor_model_parallel_attributes(
+            self.rank,
+            is_parallel=True,
+            dim=0,
+            stride=1,
+            num_partitions=self.world_size,
+        )
+
+    def get_rank(self) -> torch.Tensor:
+        return self.rank

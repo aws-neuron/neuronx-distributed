@@ -13,8 +13,9 @@ from device_correctness_test_configs import (
 from device_correctness_test_runner import run_device_correctness_test
 from checkpoint_test_runner import run_checkpoint_test
 
+import neuronx_distributed as nxd
 from neuronx_distributed.parallel_layers.parallel_state import rmsg
-from neuronx_distributed.parallel_layers.utils import is_pjrt_device
+from neuronx_distributed.parallel_layers.utils import requires_init_pg_override
 
 SEPARATOR = "-" * 70
 
@@ -51,15 +52,18 @@ def parse_args():
         "--test_ep_degree", required=False, default=1, type=int, choices=[1, 2, 4, 8, 16, 32], help="One of 1, 2, 4, 8, 16 or 32"
     )
     parser.add_argument(
+        "--token_shuffle_group_size", required=False, type=int, default=1,
+    )
+    parser.add_argument(
         "--zero1", required=False, default=1, type=int, choices=[0, 1], help="Enable zero-1"
     )
     args, leftovers = parser.parse_known_args()
     S3_BUCKET_NAME = args.s3_bucket
     test_dtype = torch.float32 if args.test_dtype == "fp32" else torch.bfloat16
-    return S3_BUCKET_NAME, args, test_dtype, args.test_mode, args.test_tp_degree, args.test_ep_degree, args.zero1
+    return S3_BUCKET_NAME, args, test_dtype, args.test_mode, args.test_tp_degree, args.test_ep_degree, args.token_shuffle_group_size, args.zero1
 
 
-S3_BUCKET_NAME, args, TEST_DTYPE, TEST_MODE, TEST_TP_DEGREE, TEST_EP_DEGREE, ZERO1 = parse_args()
+S3_BUCKET_NAME, args, TEST_DTYPE, TEST_MODE, TEST_TP_DEGREE, TEST_EP_DEGREE, TEST_TOKEN_SHUFFLE_GROUP_SIZE, ZERO1 = parse_args()
 results = {"inference_success": 1}
 
 # Set compiler flags before TRN enablement
@@ -92,7 +96,12 @@ def test_moe_layer_device_correctness_parallel():
 
     def _test_moe_layer_device_correctness_parallel():
         test_configs = get_device_correctness_parallel_test_configs(
-            dtype=TEST_DTYPE, tp_degree=TEST_TP_DEGREE, ep_degree=TEST_EP_DEGREE, test_mode=TEST_MODE, zero1=ZERO1,
+            dtype=TEST_DTYPE,
+            tp_degree=TEST_TP_DEGREE,
+            ep_degree=TEST_EP_DEGREE,
+            token_shuffle_group_size=TEST_TOKEN_SHUFFLE_GROUP_SIZE,
+            test_mode=TEST_MODE,
+            zero1=ZERO1,
         )
         start_time = time.time()
         failed = 0
@@ -118,7 +127,7 @@ def test_moe_layer_device_correctness_parallel():
 
 
 if __name__ == "__main__":
-    if is_pjrt_device():
+    if requires_init_pg_override():
         import torch_xla.experimental.pjrt_backend  # noqa
 
         torch.distributed.init_process_group("xla", init_method="pjrt://")

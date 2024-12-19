@@ -12,16 +12,17 @@ This should be done in the way pytorch is doing: torch/nn/modules/linear.py wher
 We would be creating neuronx_distributed.functional API for this purpose. NAPP-2202
 """
 
-
 import warnings
 from abc import ABCMeta, abstractmethod
-from typing import Optional, Tuple, Union
+from typing import Optional, Union, Any, Sequence, Dict, cast, Type
 
 import torch
 from torch.nn.parameter import Parameter
+from torch.distributed import ProcessGroup
 
 from neuronx_distributed.modules.moe.moe_parallel_layers import (
-    ExpertFusedLinearWithAsyncCommunication, ExpertFusedLinear
+    ExpertFusedLinearWithAsyncCommunication,
+    ExpertFusedLinear,
 )
 from neuronx_distributed.parallel_layers.layers import (
     LinearWithAsyncCommunication,
@@ -37,11 +38,15 @@ from neuronx_distributed.parallel_layers.mappings import (
     scatter_to_tensor_model_parallel_region,
 )
 from neuronx_distributed.parallel_layers.parallel_state import (
-    get_tensor_model_parallel_size, get_expert_model_parallel_size
+    get_expert_model_parallel_size,
+    get_tensor_model_parallel_group,
+    get_tensor_model_parallel_size,
 )
 from neuronx_distributed.parallel_layers.utils import (
     divide,
     set_tensor_model_parallel_attributes,
+    get_padding_length,
+    is_torch_version_greater_than_2
 )
 from neuronx_distributed.quantization.dequantize import direct_cast_dequantize, scale_dequantize
 from neuronx_distributed.quantization.quantization_config import (
@@ -58,14 +63,15 @@ logger = get_logger()
 
 
 class BaseQuantizeParallelLinear(torch.nn.Module, metaclass=ABCMeta):
-    autograd_func_class = LinearWithAsyncCommunication
+    autograd_func_class: Type[torch.autograd.Function] = LinearWithAsyncCommunication
 
     def __init__(
         self,
         quantization_type: Union[QuantizationType, str] = "per_tensor_symmetric",
         dequantized_dtype: torch.dtype = torch.bfloat16,
-        quantized_dtype: torch.dtype = torch.int8,
-        device: torch.device = None,
+        quantized_dtype: Union[QuantizedDtype, torch.dtype] = torch.int8,
+        device: Optional[torch.device] = None,
+        tensor_model_parallel_group: Optional[ProcessGroup] = None,
     ) -> None:
         """_summary_
 
@@ -86,16 +92,18 @@ class BaseQuantizeParallelLinear(torch.nn.Module, metaclass=ABCMeta):
         self.dequantized_dtype = dequantized_dtype
         self.quantized_dtype = QuantizedDtype(quantized_dtype).value
         self.device = device
+        self.tensor_parallel_group = tensor_model_parallel_group if \
+            tensor_model_parallel_group is not None else cast(ProcessGroup, get_tensor_model_parallel_group())
+
         self.register_parameter("scale", None)
 
-        self.keep_master_weight = None
+        self.keep_master_weight: Optional[bool] = None
+        self.weight_shape: Optional[Sequence[int]] = None
+        self.weight_partition_dim: Optional[int] = None
+        self.stride: Optional[int] = None
+        self.bias_shape: Optional[Sequence[int]] = None
 
-        self.weight_shape = None
-        self.weight_partition_dim = None
-        self.stride = None
-        self.bias_shape = None
-
-    def _init_weight(self, weight: torch.Tensor):
+    def _init_weight(self, weight: torch.Tensor) -> None:
         """Init the weight in Quantized Parallel layers with zeroes.
 
         We fill with zeroes just to put up some value in it. The actualy value would come from loading the checkpoints.
@@ -103,9 +111,11 @@ class BaseQuantizeParallelLinear(torch.nn.Module, metaclass=ABCMeta):
         Args:
             weight (torch.Tensor): Weight to initialize
         """
-        torch.nn.init._no_grad_fill_(weight, 0.0)
+        if not is_torch_version_greater_than_2() or weight.dtype not in [QuantizedDtype.F8E4M3, QuantizedDtype.F8E5M2]:
+            # For FP8 dtypes , RuntimeError: "fill_cpu" not implemented for 'Float8_e4m3fn'
+            torch.nn.init._no_grad_fill_(weight, 0.0)
 
-    def _init_bias(self, bias: torch.Tensor):
+    def _init_bias(self, bias: torch.Tensor) -> None:
         """Init the bias in Quantized Parallel layers with zeroes.
 
         Args:
@@ -113,16 +123,21 @@ class BaseQuantizeParallelLinear(torch.nn.Module, metaclass=ABCMeta):
         """
         torch.nn.init._no_grad_fill_(bias, 0.0)
 
-    def _setup_for_weight(self):
+    def _setup_for_weight(self) -> None:
         init_device = self.device
+        assert self.weight_shape is not None, "self.weight_shape is None and it should be a proper value."
         weight = torch.empty(*self.weight_shape, dtype=self.quantized_dtype, device=init_device)
         self.weight = Parameter(weight, requires_grad=False)
         self.device = self.weight.device
 
+        assert self.stride is not None
+        assert self.weight_partition_dim is not None
         if self.device.type == "cpu":
+            assert self.keep_master_weight is not None
             self.master_weight = _initialize_parameter_cpu(
                 param=self.weight,
                 partition_dim=self.weight_partition_dim,
+                num_partitions=self.tensor_parallel_group.size(),
                 init_method=self._init_weight,
                 param_dtype=self.quantized_dtype,
                 stride=self.stride,
@@ -134,20 +149,23 @@ class BaseQuantizeParallelLinear(torch.nn.Module, metaclass=ABCMeta):
                 is_parallel=True,
                 dim=self.weight_partition_dim,
                 stride=self.stride,
+                num_partitions=self.tensor_parallel_group.size()
             )
         else:
             _initialize_affine_weight_neuron(
                 weight=self.weight,
                 init_method=self._init_weight,
                 partition_dim=self.weight_partition_dim,
+                num_partitions=self.tensor_parallel_group.size(),
                 stride=self.stride,
             )
 
         setattr(self.weight, "get_tensor_from_state_dict", self.get_weight_from_state_dict)
         setattr(self.weight, "set_tensor_to_state_dict", self.set_weight_to_state_dict)
 
-    def _base_setup_for_bias(self, bias: bool):
+    def _base_setup_for_bias(self, bias: bool) -> None:
         if bias:
+            assert self.bias_shape is not None, "self.bias_shape is None and it should be a proper value."
             if self.device is None or self.device.type == "cpu":
                 self.bias = Parameter(torch.empty(*self.bias_shape, dtype=self.dequantized_dtype), requires_grad=False)
             else:
@@ -164,7 +182,7 @@ class BaseQuantizeParallelLinear(torch.nn.Module, metaclass=ABCMeta):
 
     def _setup_for_scale(
         self,
-        weight_shape: tuple,
+        weight_shape: Sequence[int],
         quantization_type: QuantizationType,
         weight_partition_dim: Optional[int] = None,
         per_channel_axis: Optional[int] = None,
@@ -186,8 +204,10 @@ class BaseQuantizeParallelLinear(torch.nn.Module, metaclass=ABCMeta):
         This is to make it uniform. After KVCache quantization is implemented(as K and V have different quantization schemes) and if the uniformity is not required, remove it.
         """
         if quantization_type == QuantizationType.PER_TENSOR_SYMMETRIC:
-            self.scale = Parameter(torch.tensor([1.0]), requires_grad=False)
-            set_tensor_model_parallel_attributes(tensor=self.scale, is_parallel=False, dim=None, stride=None)
+            self.scale = Parameter(torch.tensor([1.0], device=self.weight.device), requires_grad=False)
+            set_tensor_model_parallel_attributes(
+                tensor=self.scale, is_parallel=False, dim=0, stride=1, num_partitions=1,
+            )
         elif quantization_type == QuantizationType.PER_CHANNEL_SYMMETRIC:
             assert (
                 per_channel_axis is not None
@@ -200,41 +220,47 @@ class BaseQuantizeParallelLinear(torch.nn.Module, metaclass=ABCMeta):
             if weight_partition_dim == per_channel_axis:
                 # we need to partition scale as well
                 set_tensor_model_parallel_attributes(
-                    tensor=self.scale, is_parallel=True, dim=weight_partition_dim, stride=self.stride
+                    tensor=self.scale,
+                    is_parallel=True,
+                    dim=weight_partition_dim, # type: ignore
+                    stride=self.stride, # type: ignore
+                    num_partitions=self.tensor_parallel_group.size(),
                 )
             else:
-                set_tensor_model_parallel_attributes(tensor=self.scale, is_parallel=False, dim=None, stride=None)
+                set_tensor_model_parallel_attributes(
+                    tensor=self.scale, is_parallel=False, dim=0, stride=1, num_partitions=1,
+                )
         else:
             raise ValueError(f"scale for quantization_type: {quantization_type} not supported")
 
         setattr(self.scale, "get_tensor_from_state_dict", BaseQuantizeParallelLinear.get_scale_from_state_dict)
 
     @staticmethod
-    def get_weight_from_state_dict(prefix: str, state_dict: dict) -> torch.Tensor:
+    def get_weight_from_state_dict(prefix: str, state_dict: Dict[str, Any]) -> torch.Tensor:
         return QuantizedParallelLinearLayerStateDictAdaptor.get_weight_from_state_dict(
             prefix=prefix, state_dict=state_dict
         )
 
     @staticmethod
-    def set_weight_to_state_dict(prefix: str, tensor: torch.Tensor, state_dict: dict) -> None:
-        return QuantizedParallelLinearLayerStateDictAdaptor.set_weight_to_state_dict(
+    def set_weight_to_state_dict(prefix: str, tensor: torch.Tensor, state_dict: Dict[str, Any]) -> None:
+        QuantizedParallelLinearLayerStateDictAdaptor.set_weight_to_state_dict(
             prefix=prefix, tensor=tensor, state_dict=state_dict
         )
 
     @staticmethod
-    def get_bias_from_state_dict(prefix: str, state_dict: dict) -> torch.Tensor:
+    def get_bias_from_state_dict(prefix: str, state_dict: Dict[str, Any]) -> Optional[torch.Tensor]:
         return QuantizedParallelLinearLayerStateDictAdaptor.get_bias_from_state_dict(
             prefix=prefix, state_dict=state_dict
         )
 
     @staticmethod
-    def set_bias_to_state_dict(prefix: str, tensor: torch.Tensor, state_dict: dict) -> torch.Tensor:
-        return QuantizedParallelLinearLayerStateDictAdaptor.set_bias_to_state_dict(
+    def set_bias_to_state_dict(prefix: str, tensor: torch.Tensor, state_dict: Dict[str, Any]) -> None:
+        QuantizedParallelLinearLayerStateDictAdaptor.set_bias_to_state_dict(
             prefix=prefix, tensor=tensor, state_dict=state_dict
         )
 
     @staticmethod
-    def get_scale_from_state_dict(prefix: str, state_dict):
+    def get_scale_from_state_dict(prefix: str, state_dict: Dict[str, Any]) -> torch.Tensor:
         return QuantizedParallelLinearLayerStateDictAdaptor.get_scale_from_state_dict(
             prefix=prefix, state_dict=state_dict
         )
@@ -277,7 +303,7 @@ class QuantizedParallelLinearLayerStateDictAdaptor(object):
             raise RuntimeError(f"Cannot find {(prefix + 'weight')} in the state_dict")
 
     @staticmethod
-    def set_weight_to_state_dict(prefix: str, tensor: torch.Tensor, state_dict: dict) -> None:
+    def set_weight_to_state_dict(prefix: str, tensor: torch.Tensor, state_dict: Dict[str, Any]) -> None:
         if (prefix + "weight") in state_dict:
             state_dict[prefix + "weight"] = tensor
         elif (prefix + "_packed_params.dtype") in state_dict:
@@ -286,7 +312,7 @@ class QuantizedParallelLinearLayerStateDictAdaptor(object):
             raise RuntimeError(f"Cannot find {(prefix + 'weight')} in the state_dict")
 
     @staticmethod
-    def get_bias_from_state_dict(prefix: str, state_dict: dict) -> torch.Tensor:
+    def get_bias_from_state_dict(prefix: str, state_dict: Dict[str, Any]) -> Optional[torch.Tensor]:
         """Get bias from state dict
 
         Args:
@@ -300,7 +326,7 @@ class QuantizedParallelLinearLayerStateDictAdaptor(object):
             torch.Tensor: bias tensor
         """
         if (prefix + "bias") in state_dict:
-            return state_dict[prefix + "weight"]
+            return state_dict[prefix + "bias"]
         elif (prefix + "_packed_params.dtype") in state_dict:
             bias = state_dict[prefix + "_packed_params._packed_params"][1]
             if isinstance(bias, torch.nn.Parameter):
@@ -311,11 +337,11 @@ class QuantizedParallelLinearLayerStateDictAdaptor(object):
             return None
 
     @staticmethod
-    def set_bias_to_state_dict(prefix: str, tensor: torch.Tensor, state_dict: dict) -> None:
+    def set_bias_to_state_dict(prefix: str, tensor: torch.Tensor, state_dict: Dict[str, Any]) -> None:
         raise NotImplementedError()
 
     @staticmethod
-    def get_scale_from_state_dict(prefix: str, state_dict) -> torch.Tensor:
+    def get_scale_from_state_dict(prefix: str, state_dict: Dict[str, Any]) -> torch.Tensor:
         """Get scale value from state dict
 
         Args:
@@ -369,23 +395,34 @@ class QuantizedColumnParallel(BaseQuantizeParallelLinear):
         gather_output: bool = True,
         dtype: torch.dtype = torch.float32,
         quantized_dtype: Union[QuantizedDtype, torch.dtype] = QuantizedDtype.INT8,
-        device: torch.device = None,
+        device: Optional[torch.device] = None,
         stride: int = 1,
         sequence_parallel_enabled: bool = False,
         keep_master_weight: bool = False,
         quantization_per_channel_axis: Optional[int] = None,
+        tensor_model_parallel_group: Optional[ProcessGroup] = None,
+        pad: bool = False
     ):
         super().__init__(
-            quantization_type=quantization_type, dequantized_dtype=dtype, quantized_dtype=quantized_dtype, device=device
+            quantization_type=quantization_type,
+            dequantized_dtype=dtype,
+            quantized_dtype=quantized_dtype,
+            device=device,
+            tensor_model_parallel_group=tensor_model_parallel_group,
         )
 
         # Keep input parameters
         self.input_size = input_size
         self.output_size = output_size
         self.gather_output = gather_output
-        world_size = get_tensor_model_parallel_size()
-        self.output_size_per_partition = divide(output_size, world_size)
-        self.stride = stride
+        world_size = self.tensor_parallel_group.size()
+        self.pad = pad
+        if self.pad:
+            self.pad_size = get_padding_length(self.output_size, world_size)
+            self.output_size = self.output_size + self.pad_size
+
+        self.output_size_per_partition = divide(self.output_size, world_size)
+        self.stride: int = stride
         self.keep_master_weight = keep_master_weight
         self.sequence_parallel_enabled = sequence_parallel_enabled
 
@@ -400,6 +437,16 @@ class QuantizedColumnParallel(BaseQuantizeParallelLinear):
         ###### Bias setup #####
         self._setup_for_bias(bias=bias)
         ###### Scale setup #####
+        if quantization_type == QuantizationType.PER_CHANNEL_SYMMETRIC:
+            if quantization_per_channel_axis is None:
+                quantization_per_channel_axis = 0  # Default to 0
+            if self.__class__.__name__ == "QuantizedColumnParallel":
+                # For post-matmul output dequantization, we need the per_channel_axis = output_dim
+                assert (
+                    quantization_per_channel_axis == 0
+                ), "Only per_channel_axis=0 supported for post-matmul output dequantization"
+
+        assert self.weight_shape is not None, "self.weight_shape is None and it should be a proper value."
         self._setup_for_scale(
             weight_shape=self.weight_shape,
             quantization_type=self.quantization_type,
@@ -428,20 +475,24 @@ class QuantizedColumnParallel(BaseQuantizeParallelLinear):
         self._base_setup_for_bias(bias=bias)
         if bias:
             if not self.gather_output:
-                set_tensor_model_parallel_attributes(self.bias, True, 0, stride=self.stride)
+                set_tensor_model_parallel_attributes(
+                    self.bias, True, 0, stride=self.stride, num_partitions=self.tensor_parallel_group.size(),
+                )
 
     def _setup_for_parallelism(self, world_size: int):
         self.async_tensor_model_parallel_allreduce = not self.sequence_parallel_enabled and world_size > 1
         if self.sequence_parallel_enabled:
             if world_size <= 1:
-                warnings.warn(f"`sequence_parallel_enabled` is set to `True`, but got world_size of {world_size}")
+                warnings.warn(f"`sequence_parallel_enabled` is set to `True`, "
+                              f"but got world_size of {world_size}")
 
         if self.async_tensor_model_parallel_allreduce and self.sequence_parallel_enabled:
             raise RuntimeError(
-                "`async_tensor_model_parallel_allreduce` and `sequence_parallel_enabled` cannot be enabled at the same time."
+                "`async_tensor_model_parallel_allreduce` and `sequence_parallel_enabled` cannot "
+                "be enabled at the same time."
             )
 
-    def forward(self, input: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def forward(self, input: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
         """Forward of ColumnParallelLinear
 
         Args:
@@ -454,7 +505,9 @@ class QuantizedColumnParallel(BaseQuantizeParallelLinear):
         if self.async_tensor_model_parallel_allreduce or self.sequence_parallel_enabled:
             input_parallel = input
         else:
-            input_parallel = copy_to_tensor_model_parallel_region(input)
+            input_parallel = copy_to_tensor_model_parallel_region(
+                input, process_group=self.tensor_parallel_group,
+            )
 
         # Matrix multiply.
         weight_for_matmul = direct_cast_dequantize(tensor=self.weight, upcast_dtype=input_parallel.dtype)
@@ -466,12 +519,17 @@ class QuantizedColumnParallel(BaseQuantizeParallelLinear):
             sequence_parallel_enabled=self.sequence_parallel_enabled,
             autograd_func_class=self.autograd_func_class,
             save_for_backward=False,
+            process_group=self.tensor_parallel_group,
         )
-        output_parallel = scale_dequantize(tensor=output_parallel, scale=self.scale.T, upcast_dtype=output_parallel.dtype)
+        output_parallel = scale_dequantize(
+            tensor=output_parallel, scale=self.scale.T, upcast_dtype=output_parallel.dtype
+        )
         if self.gather_output:
             # All-gather across the partitions.
             assert not self.sequence_parallel_enabled
-            output = gather_from_tensor_model_parallel_region(output_parallel)
+            output = gather_from_tensor_model_parallel_region(
+                output_parallel, process_group=self.tensor_parallel_group,
+            )
         else:
             output = output_parallel
         output = (output + self.bias) if self.bias is not None else output
@@ -483,13 +541,9 @@ class QuantizedColumnParallel(BaseQuantizeParallelLinear):
     ):
         """Create a QuantizedColumnParallel from a float module."""
         assert mod.__class__.__name__ == "ColumnParallelLinear", "ColumnParallelLinear expected"
-        if q_config["quantization_type"] == QuantizationType.PER_CHANNEL_SYMMETRIC:
-            assert q_config["quantization_per_channel_axis"] is not None
-        else:
-            q_config["quantization_per_channel_axis"] = None
         new_mod = QuantizedColumnParallel(
             input_size=mod.input_size,
-            output_size=mod.output_size,
+            output_size=mod.output_size if not mod.pad else mod.output_size - mod.pad_size,
             quantization_type=q_config["quantization_type"],
             bias=mod.bias is not None,
             quantized_dtype=q_config["quantized_dtype"],
@@ -499,9 +553,23 @@ class QuantizedColumnParallel(BaseQuantizeParallelLinear):
             stride=mod.stride,
             sequence_parallel_enabled=mod.sequence_parallel_enabled,
             keep_master_weight=mod.keep_master_weight,
-            quantization_per_channel_axis=q_config["quantization_per_channel_axis"],
+            quantization_per_channel_axis=cast(int, q_config.get("quantization_per_channel_axis")),
+            tensor_model_parallel_group=mod.tensor_parallel_group,
+            pad=mod.pad
         )
         return new_mod
+
+    def preshard_hook(self, model_state_dict: Dict[str, Any], prefix: str) -> None:
+        if not self.pad or self.pad_size == 0:
+            return
+        if self.output_size != model_state_dict[prefix].shape[0] + self.pad_size:
+            size = model_state_dict[prefix].shape[0]
+            raise RuntimeError(f"State dict {prefix} is of an unexpected size {size} expected {size - self.pad_size}")
+
+        model_state_dict[prefix] = torch.nn.functional.pad(model_state_dict[prefix], (0, 0, 0, self.pad_size))
+        assert prefix.endswith(".weight")
+        scale_prefix = prefix.replace(".weight", ".scale")
+        model_state_dict[scale_prefix] = torch.nn.functional.pad(model_state_dict[scale_prefix], (0, 0, 0, self.pad_size))
 
 
 class QuantizedRowParallel(BaseQuantizeParallelLinear):
@@ -535,27 +603,40 @@ class QuantizedRowParallel(BaseQuantizeParallelLinear):
         input_is_parallel: bool = False,
         dtype: torch.dtype = torch.float32,
         quantized_dtype: Union[QuantizedDtype, torch.dtype] = QuantizedDtype.INT8,
-        device: torch.device = None,
+        device: Optional[torch.device] = None,
         stride: int = 1,
         sequence_parallel_enabled: bool = False,
         keep_master_weight: bool = False,
         quantization_per_channel_axis: Optional[int] = None,
+        reduce_output: bool = True,
+        tensor_model_parallel_group: Optional[ProcessGroup] = None,
+        pad: bool = False
     ):
         super().__init__(
-            quantization_type=quantization_type, dequantized_dtype=dtype, quantized_dtype=quantized_dtype, device=device
+            quantization_type=quantization_type,
+            dequantized_dtype=dtype,
+            quantized_dtype=quantized_dtype,
+            device=device,
+            tensor_model_parallel_group=tensor_model_parallel_group,
         )
 
         # Keep input parameters
         self.input_size = input_size
         self.output_size = output_size
         self.input_is_parallel = input_is_parallel
-        world_size = get_tensor_model_parallel_size()
-        self.input_size_per_partition = divide(input_size, world_size)
+        world_size = self.tensor_parallel_group.size()
+        self.pad = pad
+        if self.pad:
+            self.pad_size = get_padding_length(self.input_size, world_size)
+            self.input_size = self.input_size + self.pad_size
+
+        self.input_size_per_partition = divide(self.input_size, world_size)
         self.sequence_parallel_enabled = sequence_parallel_enabled
         if self.sequence_parallel_enabled and not self.input_is_parallel:
             raise RuntimeError("To enable `sequence_parallel_enabled`, `input_is_parallel` must be `True`")
         self.stride = stride
         self.keep_master_weight = keep_master_weight
+        self.reduce_output = reduce_output
 
         # Parameters.
         # Note: torch.nn.functional.linear performs XA^T + b and as a result
@@ -569,6 +650,16 @@ class QuantizedRowParallel(BaseQuantizeParallelLinear):
         self._setup_for_bias(bias=bias)
 
         ###### Quantization Scale setup #####
+        if quantization_type == QuantizationType.PER_CHANNEL_SYMMETRIC:
+            if quantization_per_channel_axis is None:
+                quantization_per_channel_axis = 0  # Default to 0
+            if self.__class__.__name__ == "QuantizedRowParallel":
+                # For post-matmul output dequantization, we need the per_channel_axis = output_dim
+                assert (
+                    quantization_per_channel_axis == 0
+                ), "Only per_channel_axis=0 supported for post-matmul output dequantization"
+
+        assert self.weight_shape, "self.weight_shape is None and it should be a proper value."
         self._setup_for_scale(
             weight_shape=self.weight_shape,
             quantization_type=self.quantization_type,
@@ -596,7 +687,7 @@ class QuantizedRowParallel(BaseQuantizeParallelLinear):
         if bias:
             setattr(self.bias, "sequence_parallel_enabled", self.sequence_parallel_enabled)
 
-    def forward(self, input_: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def forward(self, input_: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
         """Forward of QuantizedRowParallel
 
         Args:
@@ -610,10 +701,12 @@ class QuantizedRowParallel(BaseQuantizeParallelLinear):
             input_parallel = input_
         else:
             assert not self.sequence_parallel_enabled
-            input_parallel = scatter_to_tensor_model_parallel_region(input_)
+            input_parallel = scatter_to_tensor_model_parallel_region(
+                input_, process_group=self.tensor_parallel_group,
+            )
         # Matrix multiply.
         weight_for_matmul = direct_cast_dequantize(tensor=self.weight, upcast_dtype=input_parallel.dtype)
-        output_parallel = self._forward_impl(
+        output_ = self._forward_impl(
             input=input_parallel,
             weight=weight_for_matmul,
             bias=None,
@@ -621,13 +714,22 @@ class QuantizedRowParallel(BaseQuantizeParallelLinear):
             sequence_parallel_enabled=False,
             autograd_func_class=self.autograd_func_class,
             save_for_backward=False,
+            process_group=self.tensor_parallel_group,
         )
-        output_parallel = scale_dequantize(tensor=output_parallel, scale=self.scale.T, upcast_dtype=output_parallel.dtype)
-        # All-reduce across all the partitions.
-        if self.sequence_parallel_enabled:
-            output_ = reduce_scatter_to_sequence_parallel_region(output_parallel)
-        else:
-            output_ = reduce_from_tensor_model_parallel_region(output_parallel)
+        output_ = scale_dequantize(
+            tensor=output_, scale=self.scale.T, upcast_dtype=output_.dtype,
+        )
+
+        if self.reduce_output:
+            # All-reduce across all the partitions.
+            if self.sequence_parallel_enabled:
+                output_ = reduce_scatter_to_sequence_parallel_region(
+                    output_, process_group=self.tensor_parallel_group,
+                )
+            else:
+                output_ = reduce_from_tensor_model_parallel_region(
+                    output_, process_group=self.tensor_parallel_group,
+                )
         output = (output_ + self.bias) if self.bias is not None else output_
         return output
 
@@ -643,14 +745,8 @@ class QuantizedRowParallel(BaseQuantizeParallelLinear):
             mod: float module
         """
         assert mod.__class__.__name__ == "RowParallelLinear", "RowParallelLinear expected"
-
-        if q_config["quantization_type"] == QuantizationType.PER_CHANNEL_SYMMETRIC:
-            assert q_config["quantization_per_channel_axis"] is not None
-        else:
-            q_config["quantization_per_channel_axis"] = None
-
         return QuantizedRowParallel(
-            input_size=mod.input_size,
+            input_size=mod.input_size if not mod.pad else mod.input_size - mod.pad_size,
             output_size=mod.output_size,
             bias=mod.bias is not None,
             quantization_type=q_config["quantization_type"],
@@ -661,9 +757,19 @@ class QuantizedRowParallel(BaseQuantizeParallelLinear):
             stride=mod.stride,
             sequence_parallel_enabled=mod.sequence_parallel_enabled,
             keep_master_weight=mod.keep_master_weight,
-            quantization_per_channel_axis=q_config["quantization_per_channel_axis"],
+            quantization_per_channel_axis=cast(int, q_config.get("quantization_per_channel_axis")),
+            reduce_output=mod.reduce_output,
+            tensor_model_parallel_group=mod.tensor_parallel_group,
+            pad=mod.pad,
         )
 
+    def preshard_hook(self, model_state_dict: dict, prefix: str) -> None:
+        if not self.pad or self.pad_size == 0:
+            return
+        if self.input_size != model_state_dict[prefix].shape[1] + self.pad_size:
+            size = model_state_dict[prefix].shape[1]
+            raise RuntimeError(f"State dict {prefix} is of an unexpected size {size} expected {size - self.pad_size}")
+        model_state_dict[prefix] = torch.nn.functional.pad(model_state_dict[prefix], (0, self.pad_size))
 
 class QuantizedExpertFusedColumnParallel(QuantizedColumnParallel, ExpertFusedLinear):
     """
@@ -680,18 +786,22 @@ class QuantizedExpertFusedColumnParallel(QuantizedColumnParallel, ExpertFusedLin
         quantization_type: Union[QuantizationType, str] = "per_tensor_symmetric",
         dtype: torch.dtype = torch.float32,
         quantized_dtype: Union[QuantizedDtype, torch.dtype] = QuantizedDtype.INT8,
-        device: torch.device = None,
+        device: Optional[torch.device] = None,
         stride: int = 1,
         keep_master_weight: bool = False,
         quantization_per_channel_axis: Optional[int] = None,
+        tensor_model_parallel_group: Optional[ProcessGroup] = None,
     ):
         self.num_experts = num_experts
         self._n_local_experts = divide(num_experts, get_expert_model_parallel_size())
 
-        if quantization_per_channel_axis is not None:
+        if quantization_type == QuantizationType.PER_CHANNEL_SYMMETRIC:
+            if quantization_per_channel_axis is None:
+                quantization_per_channel_axis = 2  # Default to 2
+            # For post-matmul output dequantization, we need the per_channel_axis = output_dim
             assert (
-                quantization_per_channel_axis != 0
-            ), "For QuantizedExpertFusedColumnParallel, quantization_per_channel_axis cannot be the dimension 0, which is expert dimension"
+                quantization_per_channel_axis == 2
+            ), "Only per_channel_axis=2 supported for post-matmul output dequantization"
 
         super().__init__(
             input_size=input_size,
@@ -706,6 +816,7 @@ class QuantizedExpertFusedColumnParallel(QuantizedColumnParallel, ExpertFusedLin
             sequence_parallel_enabled=False,
             keep_master_weight=keep_master_weight,
             quantization_per_channel_axis=quantization_per_channel_axis,
+            tensor_model_parallel_group=tensor_model_parallel_group,
         )
 
     def _setup_for_weight_and_bias_config(self, bias: bool):
@@ -720,20 +831,20 @@ class QuantizedExpertFusedColumnParallel(QuantizedColumnParallel, ExpertFusedLin
         self.weight_partition_dim = 2
         self.bias_shape = None
 
-    def forward(
-        self, input_: torch.Tensor, expert_indices: torch.Tensor = None
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def forward(self, input: torch.Tensor, expert_indices: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Same as the forward of ExpertFusedColumnParallelLinear, except with weight dequantization,
         and save_for_backward=False."""
 
         if self.async_tensor_model_parallel_allreduce or self.sequence_parallel_enabled:
-            input_parallel = input_
+            input_parallel = input
         else:
-            input_parallel = copy_to_tensor_model_parallel_region(input_)
+            input_parallel = copy_to_tensor_model_parallel_region(
+                input, process_group=self.tensor_parallel_group,
+            )
 
         # Matrix multiply.
         weight = self.weight[expert_indices, :, :] if expert_indices is not None else self.weight
-        weight_for_matmul = scale_dequantize(weight, self.scale, input_parallel.dtype)
+        weight_for_matmul = direct_cast_dequantize(tensor=weight, upcast_dtype=input_parallel.dtype)
         output = self._forward_impl(
             input=input_parallel,
             weight=weight_for_matmul,
@@ -742,7 +853,9 @@ class QuantizedExpertFusedColumnParallel(QuantizedColumnParallel, ExpertFusedLin
             sequence_parallel_enabled=self.sequence_parallel_enabled,
             autograd_func_class=self.autograd_func_class,
             save_for_backward=False,
+            process_group=self.tensor_parallel_group,
         )
+        output = scale_dequantize(tensor=output, scale=self.scale, upcast_dtype=output.dtype)
         return output
 
     @classmethod
@@ -754,11 +867,6 @@ class QuantizedExpertFusedColumnParallel(QuantizedColumnParallel, ExpertFusedLin
         """Create a QuantizedExpertFusedColumnParallel from a float module."""
         assert mod.__class__.__name__ == "ExpertFusedColumnParallelLinear", "ExpertFusedColumnParallelLinear expected"
 
-        if q_config["quantization_type"] == QuantizationType.PER_CHANNEL_SYMMETRIC:
-            assert q_config["quantization_per_channel_axis"] is not None
-        else:
-            q_config["quantization_per_channel_axis"] = None
-
         new_mod = QuantizedExpertFusedColumnParallel(
             num_experts=mod.num_experts,
             input_size=mod.input_size,
@@ -769,7 +877,8 @@ class QuantizedExpertFusedColumnParallel(QuantizedColumnParallel, ExpertFusedLin
             device=mod.weight.device,
             stride=mod.stride,
             keep_master_weight=mod.keep_master_weight,
-            quantization_per_channel_axis=q_config["quantization_per_channel_axis"],
+            quantization_per_channel_axis=cast(int, q_config.get("quantization_per_channel_axis")),
+            tensor_model_parallel_group=mod.tensor_parallel_group,
         )
         return new_mod
 
@@ -790,21 +899,22 @@ class QuantizedExpertFusedRowParallel(QuantizedRowParallel, ExpertFusedLinear):
         quantization_type: Union[QuantizationType, str] = "per_tensor_symmetric",
         quantized_dtype: Union[QuantizedDtype, torch.dtype] = QuantizedDtype.INT8,
         dtype: torch.dtype = torch.float32,
-        device: torch.device = None,
+        device: Optional[torch.device] = None,
         stride: int = 1,
         keep_master_weight: bool = False,
         quantization_per_channel_axis: Optional[int] = None,
+        tensor_model_parallel_group: Optional[ProcessGroup] = None,
     ):
         self.num_experts = num_experts
         self._n_local_experts = divide(num_experts, get_expert_model_parallel_size())
 
-        # Whether to all-reduce the output across TP ranks or not
-        self.reduce_output = reduce_output
-
-        if quantization_per_channel_axis is not None:
+        if quantization_type == QuantizationType.PER_CHANNEL_SYMMETRIC:
+            if quantization_per_channel_axis is None:
+                quantization_per_channel_axis = 2  # Default to 2
+            # For post-matmul output dequantization, we need the per_channel_axis = output_dim
             assert (
-                quantization_per_channel_axis != 0
-            ), "For QuantizedExpertFusedRowParallel, quantization_per_channel_axis cannot be the dimension 0, which is expert dimension"
+                quantization_per_channel_axis == 2
+            ), "Only per_channel_axis=2 supported for post-matmul output dequantization"
 
         super().__init__(
             input_size=input_size,
@@ -819,6 +929,8 @@ class QuantizedExpertFusedRowParallel(QuantizedRowParallel, ExpertFusedLinear):
             sequence_parallel_enabled=False,
             keep_master_weight=keep_master_weight,
             quantization_per_channel_axis=quantization_per_channel_axis,
+            reduce_output=reduce_output,
+            tensor_model_parallel_group=tensor_model_parallel_group,
         )
 
     def _setup_for_weight_and_bias_config(self, bias: bool):
@@ -833,15 +945,13 @@ class QuantizedExpertFusedRowParallel(QuantizedRowParallel, ExpertFusedLinear):
         self.weight_partition_dim = 1
         self.bias_shape = None
 
-    def forward(
-        self, input_: torch.Tensor, expert_indices: torch.Tensor = None
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def forward(self, input_: torch.Tensor, expert_indices: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Same as the forward of ExpertFusedRowParallelLinear, except with weight dequantization,
         and save_for_backward=False."""
 
         # Matrix multiply.
         weight = self.weight[expert_indices, :, :] if expert_indices is not None else self.weight
-        weight_for_matmul = scale_dequantize(weight, self.scale, input_.dtype)
+        weight_for_matmul = direct_cast_dequantize(tensor=weight, upcast_dtype=input_.dtype)
         output_parallel = self._forward_impl(
             input=input_,
             weight=weight_for_matmul,
@@ -850,10 +960,14 @@ class QuantizedExpertFusedRowParallel(QuantizedRowParallel, ExpertFusedLinear):
             sequence_parallel_enabled=False,
             autograd_func_class=self.autograd_func_class,
             save_for_backward=False,
+            process_group=self.tensor_parallel_group,
         )
+        output_parallel = scale_dequantize(tensor=output_parallel, scale=self.scale, upcast_dtype=output_parallel.dtype)
 
         if self.reduce_output:
-            output = reduce_from_tensor_model_parallel_region(output_parallel)
+            output = reduce_from_tensor_model_parallel_region(
+                output_parallel, process_group=self.tensor_parallel_group,
+            )
             return output
         else:
             # Return without output all-reduce, in favor of an all-reduce or reduce-scatter after the MoE output combine.
@@ -870,11 +984,6 @@ class QuantizedExpertFusedRowParallel(QuantizedRowParallel, ExpertFusedLinear):
         """
         assert mod.__class__.__name__ == "ExpertFusedRowParallelLinear", "ExpertFusedRowParallelLinear expected"
 
-        if q_config["quantization_type"] == QuantizationType.PER_CHANNEL_SYMMETRIC:
-            assert q_config["quantization_per_channel_axis"] is not None
-        else:
-            q_config["quantization_per_channel_axis"] = None
-
         return QuantizedExpertFusedRowParallel(
             num_experts=mod.num_experts,
             input_size=mod.input_size,
@@ -886,5 +995,6 @@ class QuantizedExpertFusedRowParallel(QuantizedRowParallel, ExpertFusedLinear):
             device=mod.weight.device,
             stride=mod.stride,
             keep_master_weight=mod.keep_master_weight,
-            quantization_per_channel_axis=q_config["quantization_per_channel_axis"],
+            quantization_per_channel_axis=cast(int, q_config.get("quantization_per_channel_axis")),
+            tensor_model_parallel_group=mod.tensor_parallel_group,
         )

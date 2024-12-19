@@ -1,7 +1,7 @@
 import math
 import warnings
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, Optional, Union, Sequence
 
 import torch
 import torch.nn as nn
@@ -28,10 +28,11 @@ class LoraLayer(torch.nn.Module, ABC):
         self.lora_rank = lora_config.lora_rank
         self.lora_alpha = lora_config.lora_alpha
         self.base_layer = base_layer
-        self.lora_A = None
-        self.lora_B = None
-        self.lora_embedding_A = None
-        self.lora_embedding_B = None
+        self.lora_A: Optional[nn.Module] = None
+        self.lora_B: Optional[nn.Module] = None
+        self.lora_embedding_A: Optional[nn.Parameter] = None
+        self.lora_embedding_B: Optional[nn.Parameter] = None
+        self.lora_dropout: Optional[nn.Module] = None
         self.lora_config = lora_config
 
         base_layer = self.get_base_layer()
@@ -78,7 +79,7 @@ class LoraLayer(torch.nn.Module, ABC):
         This is necessary for the case that the tuner layer wraps another tuner layer.
 
         """
-        base_layer = self
+        base_layer: torch.nn.Module = self
         while hasattr(base_layer, "base_layer"):
             base_layer = base_layer.base_layer
         return base_layer
@@ -118,13 +119,13 @@ class LoraLayer(torch.nn.Module, ABC):
         self.merged = False
 
     @abstractmethod
-    def update_layer(self):
+    def update_layer(self, *args: Any) -> None:
         r"""
         inject LoRA matrices into the base layer.
         """
 
     @abstractmethod
-    def get_delta_weight(self) -> torch.Tensor:
+    def get_delta_weight(self) -> Union[torch.Tensor, Sequence[torch.Tensor]]:
         r"""
         return the matrix multiplication of A and B in LoRA.
         """
@@ -174,7 +175,7 @@ class LoraLinear(LoraLayer):
         self.is_conv_1d_layer = is_conv_1d_layer
         self.update_layer(lora_config)
 
-    def update_layer(self, lora_config: LoraConfig):
+    def update_layer(self, lora_config: LoraConfig) -> None:
         lora_dropout = lora_config.lora_dropout
         if lora_dropout > 0.0:
             self.lora_dropout = nn.Dropout(p=lora_dropout)
@@ -196,6 +197,7 @@ class LoraLinear(LoraLayer):
         """
         Compute the matrix multiplication of A and B in LoRA.
         """
+        assert self.lora_A is not None and self.lora_B is not None
         device = self.lora_B.weight.device
         dtype = self.lora_B.weight.dtype
 
@@ -227,16 +229,12 @@ class LoraLinear(LoraLayer):
 
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
         previous_dtype = x.dtype
-        if self.merged:
-            result = self.base_layer(x, *args, **kwargs)
-        else:
-            result = self.base_layer(x, *args, **kwargs)
-            lora_A = self.lora_A
-            lora_B = self.lora_B
-            dropout = self.lora_dropout
+        result = self.base_layer(x, *args, **kwargs)
+        if not self.merged:
+            assert self.lora_A is not None and self.lora_B is not None and self.lora_dropout is not None
             scaling = self.scaling
-            x = x.to(lora_A.weight.dtype)
-            result += lora_B(lora_A(dropout(x))) * scaling
+            x = x.to(self.lora_A.weight.dtype)
+            result += self.lora_B(self.lora_A(self.lora_dropout(x))) * scaling
 
         result = result.to(previous_dtype)
         return result
@@ -276,6 +274,7 @@ class LoraEmbedding(LoraLayer):
             adapter (str):
                 The name of the adapter for which the delta weight should be computed.
         """
+        assert self.lora_embedding_A is not None and self.lora_embedding_B is not None
         device = self.lora_embedding_B.device
         dtype = self.lora_embedding_A.dtype
 
@@ -284,8 +283,8 @@ class LoraEmbedding(LoraLayer):
         # float16 because the `@` and matmul operation in general is not supported in torch + cpu + fp16.
         cast_to_fp32 = device.type == "cpu" and dtype == torch.float16
 
-        weight_A = self.lora_embedding_A
-        weight_B = self.lora_embedding_B
+        weight_A = self.lora_embedding_A.data
+        weight_B = self.lora_embedding_B.data
 
         if cast_to_fp32:
             weight_A = weight_A.float()
@@ -297,8 +296,8 @@ class LoraEmbedding(LoraLayer):
             output_tensor = output_tensor.to(dtype=dtype)
 
             # cast back the weights
-            self.lora_embedding_A = weight_A.to(dtype)
-            self.lora_embedding_B = weight_B.to(dtype)
+            self.lora_embedding_A.data = weight_A.to(dtype)
+            self.lora_embedding_B.data = weight_B.to(dtype)
 
         return output_tensor
 
@@ -316,11 +315,9 @@ class LoraEmbedding(LoraLayer):
 
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
         previous_dtype = x.dtype
-
-        if self.merged:
-            result = self.base_layer(x, *args, **kwargs)
-        else:
-            result = self.base_layer(x, *args, **kwargs)
+        result = self.base_layer(x, *args, **kwargs)
+        if not self.merged:
+            assert self.lora_embedding_A is not None and self.lora_embedding_B is not None
             embedding_A = self.lora_embedding_A.T
             embedding_B = self.lora_embedding_B.T
             scaling = self.scaling
@@ -366,6 +363,7 @@ class LoraConv2d(LoraLayer):
             adapter (str):
                 The name of the adapter for which the delta weight should be computed.
         """
+        assert self.lora_A is not None and self.lora_B is not None
         device = self.lora_B.weight.device
         dtype = self.lora_A.weight.dtype
 
@@ -408,17 +406,12 @@ class LoraConv2d(LoraLayer):
 
     def forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
         previous_dtype = x.dtype
-
-        if self.merged:
-            result = self.base_layer(x, *args, **kwargs)
-        else:
-            result = self.base_layer(x, *args, **kwargs)
-            lora_A = self.lora_A
-            lora_B = self.lora_B
-            dropout = self.lora_dropout
+        result = self.base_layer(x, *args, **kwargs)
+        if not self.merged:
+            assert self.lora_A is not None and self.lora_B is not None and self.lora_dropout is not None
             scaling = self.scaling
-            x = x.to(lora_A.weight.dtype)
-            result += lora_B(lora_A(dropout(x))) * scaling
+            x = x.to(self.lora_A.weight.dtype)
+            result += self.lora_B(self.lora_A(self.lora_dropout(x))) * scaling
 
         result = result.to(previous_dtype)
         return result

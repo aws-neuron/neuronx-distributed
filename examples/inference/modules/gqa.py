@@ -4,6 +4,7 @@ from typing import Optional, Tuple
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torch.distributed import ProcessGroup
 
 from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.parallel_layers.layers import (
@@ -106,8 +107,9 @@ def should_pad_scale(tensor_scale: torch.Tensor, pad_dim: int) -> bool:
 
 
 def verify_scale_dimension(tensor: torch.Tensor, tensor_scale: torch.Tensor):
-    channel_axis = get_tensor_per_channel_scale_axis(scale=tensor_scale)
-    assert tensor_scale.shape[channel_axis] == tensor.shape[channel_axis]
+    if is_per_channel(tensor_scale):
+        channel_axis = get_tensor_per_channel_scale_axis(scale=tensor_scale)
+        assert tensor_scale.shape[channel_axis] == tensor.shape[channel_axis]
 
 
 def maybe_pad_interleaved(
@@ -195,8 +197,24 @@ class BaseGroupQueryAttention(nn.Module):
         dtype: torch.dtype = torch.float32,
         bias: bool = False,
         desired_sharding_strategy: Optional[GQA] = None,
+        tensor_model_parallel_group: Optional[ProcessGroup] = None
     ):
         super().__init__()
+
+        if tensor_model_parallel_group is not None:
+            self.tensor_model_parallel_group = tensor_model_parallel_group
+        elif parallel_state.model_parallel_is_initialized():
+            self.tensor_model_parallel_group = parallel_state.get_tensor_model_parallel_group()
+        else:
+            self.tensor_model_parallel_group = None
+
+        if tensor_model_parallel_group:
+            if tp_degree == 1:
+                # update default value
+                tp_degree = tensor_model_parallel_group.size()
+            else:
+                assert tp_degree == self.tensor_model_parallel_group.size() , \
+                    "TP Degree and tensor model parallel group size does not match"
 
         self.hidden_size = hidden_size
         self.tp_degree = tp_degree
@@ -252,6 +270,7 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
         gather_output: bool = True,
         fused_qkv: bool = False,
         clip_qkv: Optional[float] = None,
+        tensor_model_parallel_group: Optional[ProcessGroup] = None,
     ):
         super().__init__(
             hidden_size=hidden_size,
@@ -262,6 +281,7 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
             dtype=dtype,
             bias=bias,
             desired_sharding_strategy=desired_sharding_strategy,
+            tensor_model_parallel_group=tensor_model_parallel_group,
         )
         if fused_qkv and gather_output:
             raise ValueError(
@@ -280,6 +300,7 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                     bias=self.bias,
                     gather_output=self.gather_output,
                     dtype=dtype,
+                    tensor_model_parallel_group=self.tensor_model_parallel_group,
                 )
                 # Set heads info as weight parameter attributes to be used in weights sharding
                 setattr(self.Wqkv.weight, "fused_qkv", True)
@@ -293,6 +314,7 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                     bias=self.bias,
                     gather_output=self.gather_output,
                     dtype=dtype,
+                    tensor_model_parallel_group=self.tensor_model_parallel_group,
                 )
                 self.k_proj = ColumnParallelLinear(
                     self.hidden_size,
@@ -300,6 +322,7 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                     bias=self.bias,
                     gather_output=self.gather_output,
                     dtype=dtype,
+                    tensor_model_parallel_group=self.tensor_model_parallel_group,
                 )
                 self.v_proj = ColumnParallelLinear(
                     self.hidden_size,
@@ -307,6 +330,7 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                     bias=self.bias,
                     gather_output=self.gather_output,
                     dtype=dtype,
+                    tensor_model_parallel_group=self.tensor_model_parallel_group,
                 )
         else:
             if self.fused_qkv:
@@ -625,6 +649,8 @@ class GroupQueryAttention_O(BaseGroupQueryAttention):
         bias: bool = False,
         desired_sharding_strategy: Optional[GQA] = None,
         input_is_parallel: bool = False,
+        layer_name: str = "o_proj",
+        tensor_model_parallel_group: Optional[ProcessGroup] = None,
     ):
         super().__init__(
             hidden_size=hidden_size,
@@ -635,6 +661,7 @@ class GroupQueryAttention_O(BaseGroupQueryAttention):
             dtype=dtype,
             bias=bias,
             desired_sharding_strategy=desired_sharding_strategy,
+            tensor_model_parallel_group=tensor_model_parallel_group,
         )
 
         self.input_is_parallel = input_is_parallel
@@ -646,9 +673,14 @@ class GroupQueryAttention_O(BaseGroupQueryAttention):
                 bias=self.bias,
                 input_is_parallel=self.input_is_parallel,
                 dtype=self.dtype,
+                tensor_model_parallel_group=self.tensor_model_parallel_group,
             )
         else:
             self.o_proj = nn.Linear(self.num_attention_heads * self.head_dim, self.hidden_size, bias=self.bias)
+
+        # Prepared for changing "o_proj" to the corresponding name in model_state_dict
+        # For example, in CLIP vision model, we use "out_proj"
+        self.layer_name = layer_name
 
     def forward(self, attention_output: torch.Tensor):
         o = self.o_proj(attention_output)
@@ -660,7 +692,7 @@ class GroupQueryAttention_O(BaseGroupQueryAttention):
         hf_prefix = ".".join(prefix_parts[:-2])
 
         self.replace_prefixes(
-            old_prefix=f"{hf_prefix}.o_proj", new_prefix=f"{prefix}.o_proj", model_state_dict=model_state_dict
+            old_prefix=f"{hf_prefix}.{self.layer_name}", new_prefix=f"{prefix}.o_proj", model_state_dict=model_state_dict
         )
         o_proj_weight = model_state_dict[f"{prefix}.o_proj.weight"]
         o_proj_scale = model_state_dict.get(f"{prefix}.o_proj.scale", None)

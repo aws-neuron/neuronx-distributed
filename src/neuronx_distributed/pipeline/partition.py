@@ -1,5 +1,5 @@
 from collections import OrderedDict
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Dict
 
 import torch
 from torch.fx.passes.split_module import split_module
@@ -148,11 +148,11 @@ def analyze_pipeline_module(top_mod):
         raise RuntimeError(f"Unsupported type {node_or_str} {type(node_or_str)}")
 
     curr_stage_id = 0
-    stage_id_to_IO_input_names = {}
-    stage_id_to_IO_output_names = {}
-    stage_id_to_model_input_names = {}
-    stage_id_to_input_count = {}
-    stage_id_to_output_count = {}
+    stage_id_to_IO_input_names: Dict[int, OrderedDict[str, PipelineIO]] = {}
+    stage_id_to_IO_output_names: Dict[int, OrderedDict[str, PipelineIO]] = {}
+    stage_id_to_model_input_names: Dict[int, Dict[str, int]] = {}
+    stage_id_to_input_count: Dict[int, int] = {}
+    stage_id_to_output_count: Dict[int, int] = {}
     model_inputs = set()
     for node in top_mod.graph.nodes:
         if node.op == "placeholder":
@@ -256,7 +256,7 @@ def analyze_shared_weights_across_stages(top_module, partitions):
         # mark it as shared
         return True, True
 
-    param_to_partition = {p: [] for p in top_module.parameters()}
+    param_to_partition: Dict[torch.nn.Parameter, List[Any]] = {p: [] for p in top_module.parameters()}
     for stage, partition in enumerate(partitions):
         for name, p in partition.named_parameters():
             pp_rank = stage_to_pipeline_parallel_rank(stage)

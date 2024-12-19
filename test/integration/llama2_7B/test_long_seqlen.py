@@ -52,9 +52,14 @@ def run_job(seq_len=32768, mem_threshold=0, throughputs_threshold=99999):
 
     throughputs = extract_throughput(seq_len)
     print(f"throughputs are {throughputs}")
-    if float(throughputs[25]) < throughputs_threshold:
+    tolerance_success, lower_bound, upper_bound, tolerance = within_tolerance(float(throughputs[25]), throughputs_threshold)
+    if not tolerance_success:
         print(
-            f"throughputs {throughputs[25]} doesn't match throughputs threshold {throughputs_threshold} for seqlen {seq_len}"
+            f"Throughput mismatch for sequence length {seq_len}:\n"
+            f"  Actual:     {float(throughputs[25]):.4f}\n"
+            f"  Expected:   {throughputs_threshold:.4f}\n"
+            f"  Tolerance:  ±{tolerance:.2%}\n"
+            f"  Valid range: {lower_bound:.4f} to {upper_bound:.4f}"
         )
         return PERFORMANCE_DEGADATION
     return SUCCEEDED
@@ -78,6 +83,10 @@ def extract_throughput(seq_len=32768):
         throughputs.extend(extracted)
     return throughputs
 
+def within_tolerance(actual, expected, tolerance=0.05):
+    lower_bound = expected * (1 - tolerance)
+    upper_bound = expected * (1 + tolerance)
+    return lower_bound <= actual <= upper_bound, lower_bound, upper_bound, tolerance
 
 if __name__ == "__main__":
     succeeded = []
@@ -86,7 +95,7 @@ if __name__ == "__main__":
         # Threshold with 5%-8% tolarance
         [8192, 88590512128, 6.60],
         [16384, 109604828160, 2.60],
-        [32768, 124354230272, 1.00],
+        [32768, 124354230272, 1.04],
     ]:
         return_status = run_job(seq_len, mem_thershold, perf_threshold)
         if return_status == SUCCEEDED:

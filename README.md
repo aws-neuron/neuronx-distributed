@@ -11,7 +11,7 @@ To build from source, run the following command:
 ```
 bash ./build.sh
 ```
- 
+
 It should place the wheel at `build/`
 
 ## API Reference Guide

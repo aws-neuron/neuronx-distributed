@@ -8,16 +8,19 @@ from neuronx_distributed.parallel_layers import (
     ColumnParallelLinear,
     RowParallelLinear,
 )
+from neuronx_distributed.modules.qkv_linear import GQAQKVColumnParallelLinear
 import neuronx_distributed as nxd
 from neuronx_distributed.modules.lora import LoraConfig, LoraModel, get_lora_model
 from neuronx_distributed.pipeline.model import NxDPPModel
+from . import MockGroup
 
 
 class NxDModule(torch.nn.Module):
     def __init__(self):
         super().__init__()
-        self.rpl = ColumnParallelLinear(32, 32)
-        self.cpl = RowParallelLinear(32, 32)
+        self.rpl = ColumnParallelLinear(32, 32, tensor_model_parallel_group=MockGroup())
+        self.cpl = RowParallelLinear(32, 32, tensor_model_parallel_group=MockGroup())
+        self.qkv = GQAQKVColumnParallelLinear(32, [4 * 32, 1 * 32])
         self.linear = torch.nn.Linear(32, 32)
 
 
@@ -28,9 +31,17 @@ def get_nxd_model():
 class NxDPPModule(torch.nn.Module):
     def __init__(self, num_layers):
         super().__init__()
-        self.rpl = RowParallelLinear(10, 10)
-        self.cpl = ColumnParallelLinear(10, 10)
+        self.rpl = RowParallelLinear(32, 32, tensor_model_parallel_group=MockGroup())
+        self.cpl = ColumnParallelLinear(32, 32, tensor_model_parallel_group=MockGroup())
+        self.qkv = GQAQKVColumnParallelLinear(32, [4 * 32, 1 * 32])
         self.layers = torch.nn.ModuleList([torch.nn.Linear(2, 2) for _ in range(num_layers)])
+
+    def forward(self, input):
+        x = self.rpl(input)
+        x = self.cpl(x)
+        for layer in self.layers:
+            x = layer(x)
+        return x
 
 
 def get_pp_model(num_layers=4):
@@ -47,16 +58,14 @@ class Module(torch.nn.Module):
 
 def get_nxd_lora_config():
     return LoraConfig(
-        enable_lora=True,
         lora_rank=8,
         lora_alpha=16,
         lora_dropout=0.05,
-        target_modules=["rpl", "cpl"],
+        target_modules=["rpl", "cpl", "qkv"],
     )
 
 def get_lora_config():
     return LoraConfig(
-        enable_lora=True,
         lora_rank=8,
         lora_alpha=16,
         lora_dropout=0.05,
@@ -92,6 +101,8 @@ class TestModelWrapper(unittest.TestCase):
     @patch("neuronx_distributed.utils.model_utils.get_local_world_size", MagicMock(return_value=32))
     @patch("neuronx_distributed.utils.model_utils.move_model_to_device", MagicMock(return_value=None))
     @patch("neuronx_distributed.parallel_layers.move_model_to_device", MagicMock(return_value=None))
+    @patch("neuronx_distributed.modules.qkv_linear.GQAQKVColumnParallelLinear.initialize_weight_biases", MagicMock(return_value=True))
+    @patch("neuronx_distributed.parallel_layers.parallel_state.initialize_kv_group", MagicMock(return_value=True))
     def test_model_wrapper(self):
         nxd_config = nxd.neuronx_distributed_config(
             tensor_parallel_size=8,
@@ -116,6 +127,8 @@ class TestModelWrapper(unittest.TestCase):
     @patch("neuronx_distributed.utils.model_utils.get_local_world_size", MagicMock(return_value=32))
     @patch("neuronx_distributed.utils.model_utils.move_model_to_device", MagicMock(return_value=None))
     @patch("neuronx_distributed.parallel_layers.move_model_to_device", MagicMock(return_value=None))
+    @patch("neuronx_distributed.modules.qkv_linear.GQAQKVColumnParallelLinear.initialize_weight_biases", MagicMock(return_value=True))
+    @patch("neuronx_distributed.parallel_layers.parallel_state.initialize_kv_group", MagicMock(return_value=True))
     def test_unified_model_wrapper(self):
         lora_config = get_nxd_lora_config()
         model = NxDModule()
@@ -151,6 +164,10 @@ class TestModelWrapper(unittest.TestCase):
     @patch("neuronx_distributed.utils.model_utils.get_local_world_size", MagicMock(return_value=32))
     @patch("neuronx_distributed.utils.model_utils.move_model_to_device", MagicMock(return_value=None))
     @patch("neuronx_distributed.parallel_layers.move_model_to_device", MagicMock(return_value=None))
+    @patch("torch.distributed.get_rank", MagicMock(return_value=0))
+    @patch("neuronx_distributed.pipeline.model.parallel_state.get_data_parallel_rank", MagicMock(return_value=0))
+    @patch("neuronx_distributed.modules.qkv_linear.GQAQKVColumnParallelLinear.initialize_weight_biases", MagicMock(return_value=True))
+    @patch("neuronx_distributed.parallel_layers.parallel_state.initialize_kv_group", MagicMock(return_value=True))
     def test_pp_model_wrapper(self):
         pipeline_cuts = [
             "layers.1",
@@ -165,7 +182,7 @@ class TestModelWrapper(unittest.TestCase):
                 "param_init_fn": None,
                 "use_zero1_optimizer": True,
                 "use_optimizer_wrapper": True,
-                "input_names": ["input_ids", "attention_mask", "labels"],
+                "input_names": ["input"],
             },
             optimizer_config={
                 "zero_one_enabled": True,
@@ -214,6 +231,8 @@ class TestModelWrapper(unittest.TestCase):
     @patch("neuronx_distributed.utils.model_utils.get_local_world_size", MagicMock(return_value=32))
     @patch("neuronx_distributed.utils.model_utils.move_model_to_device", MagicMock(return_value=None))
     @patch("neuronx_distributed.parallel_layers.move_model_to_device", MagicMock(return_value=None))
+    @patch("neuronx_distributed.modules.qkv_linear.GQAQKVColumnParallelLinear.initialize_weight_biases", MagicMock(return_value=True))
+    @patch("neuronx_distributed.parallel_layers.parallel_state.initialize_kv_group", MagicMock(return_value=True))
     def test_unified_pp_model_wrapper(self):
         model = NxDPPModel(module=NxDPPModule(4), transformer_layer_cls=torch.nn.Linear, tracer_cls="torch")
         model = get_lora_model(model, get_nxd_lora_config())

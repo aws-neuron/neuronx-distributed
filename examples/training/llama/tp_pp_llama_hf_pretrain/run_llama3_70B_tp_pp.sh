@@ -73,7 +73,7 @@ if [ "$NEURON_EXTRACT_GRAPHS_ONLY" = "1" ]; then
     tb_dir="/shared/tensorboard/llama${LLAMA_VERSION}_${MODEL_SIZE}_compile"
     checkpoint_freq=-1
 elif [ -v PERF_TEST ] && [ $PERF_TEST -gt 0 ]; then
-    max_steps=100
+    max_steps=${EARLY_EXIT_STEPS:-100}
     tb_dir="/shared/tensorboard/llama${LLAMA_VERSION}_${MODEL_SIZE}_${WORLD_SIZE}nodes_${JOB_ID}"
     mkdir -p $tb_dir
     checkpoint_freq=-1

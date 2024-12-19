@@ -2,6 +2,7 @@ import functools
 from typing import List, Union
 
 import torch
+import torch_xla
 from lightning_fabric.accelerators.registry import _AcceleratorRegistry
 from lightning_fabric.accelerators.xla import (
     _XLA_AVAILABLE,
@@ -9,8 +10,10 @@ from lightning_fabric.accelerators.xla import (
     _using_pjrt,
 )
 from lightning_fabric.utilities.device_parser import _check_data_type
+from lightning_fabric.accelerators.accelerator import Accelerator
 from pytorch_lightning.accelerators import XLAAccelerator
-
+from packaging import version
+from typing import Any
 
 class NeuronXLAAccelerator(XLAAccelerator):
     """
@@ -18,24 +21,35 @@ class NeuronXLAAccelerator(XLAAccelerator):
     parse_devices(), get_parallel_devices() are directly copied from XLAAccelerator
     since they have call to _check_tpu_devices_valid() method which we're overriding
     """
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        if not _XLA_AVAILABLE:
+            raise ModuleNotFoundError(str(_XLA_AVAILABLE))
+        Accelerator.__init__(self, *args, **kwargs)
 
     @staticmethod
-    def parse_devices(devices: Union[int, str, List[int]]) -> Union[int, List[int]]:
+    def parse_devices(devices: Union[int, str, List[int]]) -> Union[int, str, List[int]]:
         """Accelerator device parsing logic."""
         return _parse_tpu_devices(devices)
 
     @staticmethod
     def get_parallel_devices(devices: Union[int, List[int]]) -> List[torch.device]:
         """Gets parallel devices for the Accelerator."""
-        devices = _parse_tpu_devices(devices)
+        devices_parsed = _parse_tpu_devices(devices)
+        assert not isinstance(devices_parsed, str), "devices_parsed should not be a str."
+
         # In XLA XRT index 0 maps to CPU, in fact, a `xla_device()` with no arguments has index 1
         # since the user passes a 0-based index, we need to adjust the indices
-        device_offset = 0 if _using_pjrt() else 1
+        # _using_pjrt() is deprecated in xla >= 2.5.0, setting offset to 0 in this case.
+        current_version = torch_xla.__version__
+        if version.parse(current_version) >= version.parse("2.5.0"):
+            device_offset = 0
+        else:
+            device_offset = 0 if _using_pjrt() else 1
 
-        if isinstance(devices, int):
-            return [torch.device("xla", i) for i in range(device_offset, devices + device_offset)]
+        if isinstance(devices_parsed, int):
+            return [torch.device("xla", i) for i in range(device_offset, devices_parsed + device_offset)]
         # list of devices is not supported, just a specific index, fine to access [0]
-        return [torch.device("xla", devices[0] + device_offset)]
+        return [torch.device("xla", devices_parsed[0] + device_offset)]
         # we cannot create `xla_device` here because processes have not been spawned yet (this is called in the
         # accelerator connector init). However, there doesn't seem to be a problem with instantiating `torch.device`.
         # it will be replaced with `xla_device` (also a torch.device`, but with extra logic) in the strategy
@@ -71,15 +85,14 @@ class NeuronXLAAccelerator(XLAAccelerator):
         accelerator_registry.register("neuron", cls, description=cls.__name__)
 
 
-def _parse_tpu_devices(devices: Union[int, str, List[int]]) -> Union[int, List[int]]:
+def _parse_tpu_devices(devices: Union[int, str, List[int]]) -> Union[int, str, List[int]]:
     """
     Directly copied from PTL code, to let it call _check_tpu_devices_valid() method which we're overriding
     """
     _check_data_type(devices)
-    if isinstance(devices, str):
-        devices = _parse_tpu_devices_str(devices)
-    _check_tpu_devices_valid(devices)
-    return devices
+    d = _parse_tpu_devices_str(devices) if isinstance(devices, str) else devices
+    _check_tpu_devices_valid(d)
+    return d
 
 
 def _check_tpu_devices_valid(devices: object) -> None:

@@ -9,6 +9,7 @@ from transformers.models.gpt2.modeling_gpt2 import GPT2Block
 
 import neuronx_distributed as nxd
 
+
 def get_model():
     seq_len = 512
     model_config = GPT2Config(
@@ -71,22 +72,24 @@ class TestOptimizerWrapper(unittest.TestCase):
     @patch("neuronx_distributed.pipeline.partition.get_pipeline_model_parallel_size", MagicMock(return_value=8))
     @patch("neuronx_distributed.pipeline.model.NxDPPModel._create_pg_with_ranks", MagicMock(return_value=None))
     @patch(
-        "neuronx_distributed.parallel_layers.parallel_state.get_data_parallel_group",
+        "neuronx_distributed.parallel_layers.parallel_state.get_data_parallel_replica_groups",
         MagicMock(return_value=[list(range(32))]),
     )
     @patch(
-        "neuronx_distributed.parallel_layers.parallel_state.get_tensor_model_parallel_group",
-        MagicMock(return_value=None),
+        "neuronx_distributed.parallel_layers.parallel_state.get_tensor_model_parallel_replica_groups",
+        MagicMock(return_value=[list(range(32))]),
     )
     @patch(
         "neuronx_distributed.optimizer.zero_redundancy_optimizer.model_parallel_is_initialized",
         MagicMock(return_value=True),
     )
     @patch(
-        "neuronx_distributed.optimizer.zero_redundancy_optimizer.get_data_parallel_group",
+        "neuronx_distributed.optimizer.zero_redundancy_optimizer.get_data_parallel_replica_groups",
         MagicMock(return_value=[list(range(32))]),
     )
     @patch("neuronx_distributed.utils.model_utils.get_local_world_size", MagicMock(return_value=32))
+    @patch("neuronx_distributed.trainer.trainer.parallel_state.get_expert_model_parallel_size", MagicMock(return_value=1))
+    @patch("torch.distributed.get_world_size", MagicMock(return_value=1))
     @patch("torch.distributed.get_rank")
     def test_optimizer_wrapper(self, rank_mock):
         pipeline_cuts = [
@@ -135,6 +138,12 @@ class TestOptimizerWrapper(unittest.TestCase):
             getattr(optimizer, method)()
             assert getattr(nxd.optimizer.zero_redundancy_optimizer.NeuronZero1Optimizer, method).called
 
+        for p in model.parameters():
+            if p.requires_grad:
+                p.main_grad = torch.randn_like(p)
+        grads, _ = optimizer._fetch_gradients()
+        assert len(grads) > 0
+
     @patch("torch.optim.AdamW.step", MagicMock(return_value=None))
     @patch("torch.optim.AdamW.zero_grad", MagicMock(return_value=None))
     @patch("torch.optim.AdamW.state_dict", MagicMock(return_value=None))
@@ -158,12 +167,12 @@ class TestOptimizerWrapper(unittest.TestCase):
     @patch("neuronx_distributed.pipeline.partition.get_pipeline_model_parallel_size", MagicMock(return_value=8))
     @patch("neuronx_distributed.pipeline.model.NxDPPModel._create_pg_with_ranks", MagicMock(return_value=None))
     @patch(
-        "neuronx_distributed.parallel_layers.parallel_state.get_data_parallel_group",
+        "neuronx_distributed.parallel_layers.parallel_state.get_data_parallel_replica_groups",
         MagicMock(return_value=[list(range(32))]),
     )
     @patch(
-        "neuronx_distributed.parallel_layers.parallel_state.get_tensor_model_parallel_group",
-        MagicMock(return_value=None),
+        "neuronx_distributed.parallel_layers.parallel_state.get_tensor_model_parallel_replica_groups",
+        MagicMock(return_value=[list(range(32))]),
     )
     @patch("neuronx_distributed.utils.model_utils.get_local_world_size", MagicMock(return_value=32))
     @patch("neuronx_distributed.trainer.optimizer.grads.clip_grad_norm", MagicMock(return_value=None))

@@ -7,7 +7,6 @@ from .parallel_state import (
 )
 from .utils import EmbeddingUtility
 
-
 class _ParallelCrossEntropy(torch.autograd.Function):
     @staticmethod
     def forward(ctx, vocab_parallel_logits, target, label_smoothing=0.0):
@@ -129,6 +128,91 @@ class _ParallelCrossEntropy(torch.autograd.Function):
 
         return grad_input, None, None
 
+@torch.no_grad()
+def _compute_distributed_log_softmax(vocab_parallel_logits):
+    """Expects a size B x S x V//TP tensor, computes a stable distributed softmax
+        return shape B x S x V//TP but softmaxed across the V dimension. More stable than just computing softmax
+    """
+    logits_max = torch.amax(vocab_parallel_logits, dim=-1, keepdim=True)
+    torch.distributed.all_reduce(
+        logits_max, op=torch.distributed.ReduceOp.MAX, group=get_tensor_model_parallel_group()
+    )
+
+    # Subtract the maximum value.
+    vocab_parallel_logits = vocab_parallel_logits - logits_max
+
+    sum_exp_logits = vocab_parallel_logits.exp().sum(-1, keepdim=True).float()
+
+    torch.distributed.all_reduce(
+        sum_exp_logits, op=torch.distributed.ReduceOp.SUM, group=get_tensor_model_parallel_group(),
+    )
+
+    return vocab_parallel_logits - sum_exp_logits.log_().to(vocab_parallel_logits.dtype)
+
+class DistributedLogprob(torch.autograd.Function):
+    """Function to get logprobs out and differentiate through it
+    """
+
+    @staticmethod
+    def forward(ctx, vocab_parallel_logits, target, inference=True):
+        get_vocab_range = EmbeddingUtility.range_from_per_partition_vocab_size
+        partition_vocab_size = vocab_parallel_logits.size(-1)
+        rank = get_tensor_model_parallel_rank()
+        world_size = get_tensor_model_parallel_size()
+        vocab_start_index, vocab_end_index = get_vocab_range(partition_vocab_size, rank, world_size)
+        
+        # Create a mask of valid vocab ids (1 means it needs to be masked).
+        target_mask = (target < vocab_start_index) | (target >= vocab_end_index)
+        masked_target = target.clone() - vocab_start_index
+        masked_target= torch.mul(masked_target, (~target_mask).long())
+
+        # numerically stable distributed log_sofmax offers higher stability 
+        # however, it uses more VRAM because there is an unavoidable exp() OP on the entire logits tensor
+        # some models (like DPO) will get -inf in the resulting logprobs unless using log_softmax
+        log_softmax_output = _compute_distributed_log_softmax(vocab_parallel_logits)
+        log_probs = log_softmax_output.clone()
+        softmax_output = log_softmax_output.exp_()
+        
+        log_probs = torch.gather(log_probs, -1, masked_target.unsqueeze(-1)).squeeze(-1)
+        
+        log_probs = torch.mul(log_probs, (~target_mask).float())
+
+        torch.distributed.all_reduce(
+            log_probs, op=torch.distributed.ReduceOp.SUM, group=get_tensor_model_parallel_group(),
+        )
+        if not inference:
+            ctx.save_for_backward(softmax_output, target_mask, masked_target)
+
+        return log_probs
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        softmax, target_mask, masked_target = ctx.saved_tensors
+        partition_vocab_size = softmax.size(-1)
+
+        # 1 if it's the chosen log prob, 0 otherwise
+        is_chosen = (~target_mask).unsqueeze(-1) * torch.zeros(
+                *masked_target.shape, partition_vocab_size, dtype=torch.int64, device=masked_target.device
+            ).scatter_(-1, masked_target.unsqueeze(-1), 1.0)
+
+        grad_input = is_chosen.float().sub_(softmax)
+
+        grad_input.mul_(grad_output.unsqueeze(dim=-1))
+
+        # if you add an argument to the forward method, then you must add a corresponding None here
+        return grad_input, None, None
+
+
+def from_parallel_logits_to_logprobs(vocab_parallel_logits, target, inference=True):
+    """get log probs out of a B x S x V//TP tensor
+        NOTE: this function shifts the target, which means you must give it the unmodified targets
+
+    Returns a B x S-1 tensor
+    """
+    target = target.roll(shifts=-1, dims=-1)
+    return DistributedLogprob.apply(vocab_parallel_logits, target, inference)[
+        :, :-1
+    ].contiguous()
 
 def parallel_cross_entropy(vocab_parallel_logits, target, label_smoothing=0.0):
     """Helper function for the cross entropy."""

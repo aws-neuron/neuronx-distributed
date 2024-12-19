@@ -1,6 +1,7 @@
 import math
 import warnings
-from typing import Optional, Tuple, Callable, Any
+from typing import Optional, Tuple, Callable, Any, List
+import os
 
 import torch
 import torch_xla.core.xla_model as xm
@@ -14,7 +15,9 @@ from neuronx_distributed.parallel_layers.mappings import (
     copy_to_tensor_model_parallel_region,
     gather_from_tensor_model_parallel_region,
 )
+from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.parallel_layers.parallel_state import (
+    get_tensor_model_parallel_replica_groups,
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_size,
 )
@@ -25,64 +28,11 @@ from neuronx_distributed.parallel_layers.utils import (
     set_tensor_model_parallel_attributes,
     verify_casted_dtype,
 )
+from neuronx_distributed.utils.logger import get_logger
+from neuronx_distributed.utils.utils import hardware
+from torch_neuronx.utils import get_platform_target
 
-_KV_SHARED_GROUP = None
-_KV_SHARED_GROUP_SPMD = None
-_KV_GROUP_SIZE = None
-
-
-def _initialize_kv_group(kv_shared_group_size=1):
-    # Build the kv-shared model-parallel groups.
-    global _KV_SHARED_GROUP
-    global _KV_SHARED_GROUP_SPMD
-    global _KV_GROUP_SIZE
-    all_kv_shred_group_ranks = []
-    tensor_model_parallel_size = get_tensor_model_parallel_size()
-    world_size = torch.distributed.get_world_size()
-    num_tensor_model_parallel_groups = world_size // tensor_model_parallel_size
-    if _KV_SHARED_GROUP is not None:
-        assert (
-            kv_shared_group_size == _KV_GROUP_SIZE
-        ), "Currently the library supports only single KV size for all layers"
-        return
-
-    assert tensor_model_parallel_size % kv_shared_group_size == 0, (
-        f"kv_shared_group_size: {kv_shared_group_size}, "
-        f"should divide tensor model parallel group {tensor_model_parallel_size} "
-    )
-    _KV_GROUP_SIZE = kv_shared_group_size
-    rank = torch.distributed.get_rank()
-    if rank == 0:
-        print("> initializing kv group with size {}".format(kv_shared_group_size))
-    for i in range(num_tensor_model_parallel_groups):
-        for j in range(tensor_model_parallel_size // kv_shared_group_size):
-            ranks = list(
-                range(
-                    i * tensor_model_parallel_size + j,
-                    (i + 1) * tensor_model_parallel_size,
-                    tensor_model_parallel_size // kv_shared_group_size,
-                )
-            )
-            all_kv_shred_group_ranks.append(ranks)
-    _KV_SHARED_GROUP_SPMD = all_kv_shred_group_ranks
-    for ranks in all_kv_shred_group_ranks:
-        pg_options = {"xla_pg_options": {"mesh": _KV_SHARED_GROUP_SPMD}}
-        if rank in ranks:
-            group = torch.distributed.new_group(ranks, pg_options=pg_options)
-            _KV_SHARED_GROUP = group
-
-
-def get_kv_shared_group(as_list=False):
-    """Get the KV shared group the caller rank belongs to."""
-    assert _KV_SHARED_GROUP is not None, "kv_shared parallel group is not initialized"
-    return _KV_SHARED_GROUP._mesh if as_list else _KV_SHARED_GROUP
-
-
-def destroy_kv_group():
-    global _KV_SHARED_GROUP
-    _KV_SHARED_GROUP = None
-    global _KV_SHARED_GROUP_SPMD
-    _KV_SHARED_GROUP_SPMD = None
+logger = get_logger()
 
 
 def _initialize_affine_weight(
@@ -104,7 +54,9 @@ def _initialize_affine_weight(
     Build the master weight on all processes and scatter
     the relevant chunk."""
 
-    set_tensor_model_parallel_attributes(tensor=weight, is_parallel=True, dim=partition_dim, stride=stride)
+    set_tensor_model_parallel_attributes(
+        tensor=weight, is_parallel=True, dim=partition_dim, stride=stride, num_partitions=get_tensor_model_parallel_size(),
+    )
 
     # Initialize master weight
     master_weight = Parameter(
@@ -118,7 +70,15 @@ def _initialize_affine_weight(
         init_method(master_weight)
 
     # here we are repeating along the 0th dim which is the num_heads dim.
-    repeated_weight = master_weight.repeat(tp_size_multiplier, 1)
+    if hardware(get_platform_target()) == hardware.TRN2:
+        # Replicate single kv head on adjacent ranks (specific to Trn2 currently)
+        # For TP64 with kv_replication 8: (K0,K0,K0….. 8 times)(K1,K1,……. 8 times) … for all K heads
+        repeated_weight = torch.repeat_interleave(master_weight, tp_size_multiplier, dim=0)
+    elif hardware(get_platform_target()) == hardware.TRN1:
+        # On Trn1: TP32 with kv_replication 4: (K0,K1,K2,K3)(K0,K1,K2,K3)…. 4 times each nearby ranks holding different K heads
+        repeated_weight = master_weight.repeat(tp_size_multiplier, 1)
+    else:
+        raise Exception("Configure kv weight initialization as per hw architecture")
 
     repeated_weight = repeated_weight.to(dtype=params_dtype)
 
@@ -128,14 +88,16 @@ def _initialize_affine_weight(
     return None
 
 
-def _linear_forward(input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+def _linear_forward(input: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None) -> torch.Tensor:
     output = torch.matmul(input, weight.t())
     if bias is not None:
         output = output + bias
     return output
 
 
-def _compute_gradients(input: torch.Tensor, weight: torch.Tensor, grad_output: torch.Tensor, use_bias: bool) -> Tuple[torch.Tensor, torch.Tensor]:
+def _compute_gradients(
+    input: torch.Tensor, weight: torch.Tensor, grad_output: torch.Tensor, use_bias: bool
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """
     This method computes the gradients for the weight and bias,
     given the output gradient and input.
@@ -151,11 +113,13 @@ def _compute_gradients(input: torch.Tensor, weight: torch.Tensor, grad_output: t
 
 
 def check_requires_grad(weight_qkv, fuse_qkv, weight_q):
-    return (weight_qkv.requires_grad if fuse_qkv else weight_q.requires_grad)
+    return weight_qkv.requires_grad if fuse_qkv else weight_q.requires_grad
 
 
 def check_use_bias(weight_qkv, fuse_qkv, weight_q, bias_q, bias_qkv):
-    return (bias_qkv is not None if fuse_qkv else bias_q is not None) and check_requires_grad(weight_qkv, fuse_qkv, weight_q)
+    return (bias_qkv is not None if fuse_qkv else bias_q is not None) and check_requires_grad(
+        weight_qkv, fuse_qkv, weight_q
+    )
 
 
 class GQAQKVLinearWithAsyncCommunication(torch.autograd.Function):
@@ -177,8 +141,8 @@ class GQAQKVLinearWithAsyncCommunication(torch.autograd.Function):
         weight_qkv: Optional[torch.Tensor] = None,
         bias_qkv: Optional[torch.Tensor] = None,
         fuse_qkv: bool = False,
-        output_size_q: int = None,
-        output_size_kv: int = None,
+        output_size_q: Optional[int] = None,
+        output_size_kv: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         ctx.use_bias = check_use_bias(weight_qkv, fuse_qkv, weight_q, bias_q, bias_qkv)
         ctx.async_grad_allreduce = async_grad_allreduce
@@ -202,19 +166,20 @@ class GQAQKVLinearWithAsyncCommunication(torch.autograd.Function):
             # `input` is supposed to be 3D and its order of dimension is [sequence, batch, hidden]
             total_input = xm.all_gather(
                 input,
-                groups=get_tensor_model_parallel_group(as_list=True),
+                groups=get_tensor_model_parallel_replica_groups(),
                 pin_layout=False,
             )
         else:
             total_input = input
 
-
         if ctx.fuse_qkv:
+            assert weight_qkv is not None and output_size_q is not None and output_size_kv is not None
             output_qkv = _linear_forward(total_input, weight_qkv, bias_qkv)
             # Split the outputs
             output_dimensions = [output_size_q, output_size_kv, output_size_kv]
             output_q, output_k, output_v = torch.split(output_qkv, output_dimensions, dim=-1)
         else:
+            assert weight_q is not None and weight_k is not None and weight_v is not None
             output_q = _linear_forward(total_input, weight_q, bias_q)
             output_k = _linear_forward(total_input, weight_k, bias_k)
             output_v = _linear_forward(total_input, weight_v, bias_v)
@@ -236,24 +201,33 @@ class GQAQKVLinearWithAsyncCommunication(torch.autograd.Function):
             input = None
 
         use_bias = ctx.use_bias
-
+        hardware_type = hardware(get_platform_target())
         if ctx.compute_weight_gradient:
             if ctx.sequence_parallel_enabled:
                 total_input = xm.all_gather(
                     input,
-                    groups=get_tensor_model_parallel_group(as_list=True),
+                    groups=get_tensor_model_parallel_replica_groups(),
                     pin_layout=False,
                 )
             else:
                 total_input = input
-
+        
         if ctx.kv_size_multiplier > 1:
             # Since we repeat the K and V by a factor of kv_size_multipler, we need to
             # sum up the gradients from the repeated portions. get_kv_shared_group()
             # returns the ranks which have the same K and V heads, and hence allows us to
             # sum up from the distributed ranks.
-            torch.distributed.all_reduce(grad_output_k, group=get_kv_shared_group())
-            torch.distributed.all_reduce(grad_output_v, group=get_kv_shared_group())
+
+            # Updating the reduction dtype to be FLOAT32 to reduce errors due to precision
+            original_dtype = grad_output_k.dtype
+            if os.getenv("XLA_DOWNCAST_BF16") == "1" and hardware_type == hardware.TRN2:
+                grad_output_k=grad_output_k.to(torch.float64)
+                grad_output_v=grad_output_v.to(torch.float64)
+            torch.distributed.all_reduce(grad_output_k, group=parallel_state.get_kv_shared_group())
+            torch.distributed.all_reduce(grad_output_v, group=parallel_state.get_kv_shared_group())
+            if os.getenv("XLA_DOWNCAST_BF16") == "1" and hardware_type == hardware.TRN2:
+                grad_output_k = grad_output_k.to(original_dtype)
+                grad_output_k = grad_output_v.to(original_dtype)
 
         if ctx.fuse_qkv:
             # Divide grad_output_k and grad_output_v by the kv replication factor
@@ -272,9 +246,14 @@ class GQAQKVLinearWithAsyncCommunication(torch.autograd.Function):
             # would cause the K and V duplicate factor to be counted twice.
             grad_input = grad_input_q + (grad_input_k + grad_input_v) / ctx.kv_size_multiplier
 
+        original_dtype=grad_input.dtype
+
         if ctx.async_grad_allreduce:
             # Asynchronous all-reduce
+            if os.getenv("XLA_DOWNCAST_BF16") == "1" and hardware_type == hardware.TRN2:
+                grad_input = grad_input.to(torch.float64)
             torch.distributed.all_reduce(grad_input, group=get_tensor_model_parallel_group())
+            grad_input=grad_input.to(original_dtype)
 
         # if no weight gradient, immediately return
         if not ctx.compute_weight_gradient:
@@ -284,52 +263,74 @@ class GQAQKVLinearWithAsyncCommunication(torch.autograd.Function):
                 shape = list(grad_input.shape)
                 shape[0] //= world_size
 
+                if os.getenv("XLA_DOWNCAST_BF16") == "1" and hardware_type == hardware.TRN2:
+                    grad_input = grad_input.to(torch.float64)
+
                 sub_grad_input = torch.empty(
                     torch.Size(shape),
                     dtype=grad_input.dtype,
                     device=grad_input.device,
                     requires_grad=False,
                 )
-                groups = get_tensor_model_parallel_group()._mesh
 
                 xm.reduce_scatter(
                     xm.REDUCE_SUM,
                     grad_input,
                     output=sub_grad_input,
-                    groups=groups,
-                    shard_count=len(groups[0]),
+                    groups=get_tensor_model_parallel_replica_groups(),
+                    shard_count=world_size,
                     scatter_dim=0,
                     scale=1,
                     pin_layout=False,
                 )
 
-                return sub_grad_input, None, None, None, None, None, None, None, None, None, None, None, None, None, None
-            return grad_input, None, None, None, None, None, None, None, None, None, None, None, None, None, None
+                sub_grad_input=sub_grad_input.to(original_dtype)
 
+                return (
+                    sub_grad_input,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            return grad_input, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
         # Convert the tensor shapes to 2D for execution compatibility
         total_input = total_input.view(total_input.shape[0] * total_input.shape[1], total_input.shape[2])
 
         if ctx.sequence_parallel_enabled:
             assert not ctx.async_grad_allreduce
-            sub_grad_input = torch.empty(input.shape, dtype=input.dtype, device=input.device, requires_grad=False)
-            groups = get_tensor_model_parallel_group()._mesh
+            if os.getenv("XLA_DOWNCAST_BF16") == "1" and hardware_type == hardware.TRN2:
+                grad_input = grad_input.to(torch.float64)
+            sub_grad_input = torch.empty(grad_input.shape, dtype=grad_input.dtype, device=grad_input.device, requires_grad=False)
             xm.reduce_scatter(
                 xm.REDUCE_SUM,
                 grad_input,
                 output=sub_grad_input,
-                groups=groups,
-                shard_count=len(groups[0]),
+                groups=get_tensor_model_parallel_replica_groups(),
+                shard_count=get_tensor_model_parallel_size(),
                 scatter_dim=0,
                 scale=1,
                 pin_layout=False,
             )
+            sub_grad_input=sub_grad_input.to(original_dtype)
 
         if ctx.fuse_qkv:
             # Use grad_output_qkv without scaling by the kv replication factor
             grad_output_qkv_not_scaled = torch.cat([grad_output_q, grad_output_k, grad_output_v], dim=-1)
-            grad_weight_qkv, grad_bias_qkv = _compute_gradients(total_input, weight_qkv, grad_output_qkv_not_scaled, use_bias)
-
+            grad_weight_qkv, grad_bias_qkv = _compute_gradients(
+                total_input, weight_qkv, grad_output_qkv_not_scaled, use_bias
+            )
 
             if ctx.sequence_parallel_enabled:
                 return (
@@ -412,6 +413,7 @@ class GQAQKVLinearWithAsyncCommunication(torch.autograd.Function):
             None,
         )
 
+
 def gqa_qkv_linear_with_async_allreduce(
     input: torch.Tensor,
     weight_q: Optional[torch.Tensor],
@@ -425,9 +427,9 @@ def gqa_qkv_linear_with_async_allreduce(
     kv_size_multiplier: int = 1,
     weight_qkv: Optional[torch.Tensor] = None,
     bias_qkv: Optional[torch.Tensor] = None,
-    fuse_qkv: bool=False,
-    output_size_q: int = None,
-    output_size_kv: int = None,
+    fuse_qkv: bool = False,
+    output_size_q: Optional[int] = None,
+    output_size_kv: Optional[int] = None,
 ) -> torch.Tensor:
     args = cast_if_autocast_enabled(
         input,
@@ -503,7 +505,7 @@ class GQAQKVColumnParallelLinear(BaseParallelLinear):
     def __init__(
         self,
         input_size: int,
-        output_sizes: int,
+        output_sizes: List[int],
         bias: bool = True,
         gather_output: bool = True,
         dtype: torch.dtype = torch.float32,
@@ -512,7 +514,7 @@ class GQAQKVColumnParallelLinear(BaseParallelLinear):
         sequence_parallel_enabled: bool = False,
         keep_master_weight: bool = False,
         kv_size_multiplier: int = 1,
-        fuse_qkv: bool = False,
+        fuse_qkv: bool = True,
     ):
         super().__init__()
 
@@ -527,7 +529,7 @@ class GQAQKVColumnParallelLinear(BaseParallelLinear):
         assert (
             output_sizes[1] * kv_size_multiplier
         ) % world_size == 0, "kv_output_dim*kv_size_multiplier should be divisible by tp_world_size"
-        _initialize_kv_group(kv_size_multiplier)
+        parallel_state.initialize_kv_group(kv_size_multiplier)
         self.q_output_size_per_partition = divide(output_sizes[0], world_size)
         self.kv_output_size_per_partition = divide(output_sizes[1] * kv_size_multiplier, world_size)
         self.dtype = dtype
@@ -554,12 +556,19 @@ class GQAQKVColumnParallelLinear(BaseParallelLinear):
     def _create_weights_biases(self):
         if self.fuse_qkv:
             self.weight_qkv = Parameter(
-                torch.empty(self.q_output_size_per_partition + 2*self.kv_output_size_per_partition, self.input_size, dtype=self.dtype, device=self.device)
+                torch.empty(
+                    self.q_output_size_per_partition + 2 * self.kv_output_size_per_partition,
+                    self.input_size,
+                    dtype=self.dtype,
+                    device=self.device,
+                )
             )
             if self.use_bias:
                 bias_size_q = self.output_sizes[0] if self.gather_output else self.q_output_size_per_partition
                 bias_size_kv = self.output_sizes[1] if self.gather_output else self.kv_output_size_per_partition
-                self.bias_qkv = Parameter(torch.empty(bias_size_q + 2*bias_size_kv, device=self.device, dtype=self.dtype))
+                self.bias_qkv = Parameter(
+                    torch.empty(bias_size_q + 2 * bias_size_kv, device=self.device, dtype=self.dtype)
+                )
             else:
                 self.register_parameter("bias_qkv", None)
 
@@ -591,7 +600,11 @@ class GQAQKVColumnParallelLinear(BaseParallelLinear):
         # Initialize weight.
         if self.fuse_qkv:
             # Split weight_qkv in to components for init
-            dimensions = [self.q_output_size_per_partition, self.kv_output_size_per_partition, self.kv_output_size_per_partition]
+            dimensions = [
+                self.q_output_size_per_partition,
+                self.kv_output_size_per_partition,
+                self.kv_output_size_per_partition,
+            ]
             weight_q, weight_k, weight_v = torch.split(self.weight_qkv, dimensions, dim=0)
         else:
             weight_q = self.weight_q
@@ -625,19 +638,22 @@ class GQAQKVColumnParallelLinear(BaseParallelLinear):
                 bias_k = self.bias_k
                 bias_v = self.bias_v
             self.master_bias_q = self._init_per_layer_bias(
-                bias_q, self.output_sizes[0],
+                bias_q,
+                self.output_sizes[0],
                 torch.nn.init._calculate_fan_in_and_fan_out(weight_q),
-                self.kv_size_multiplier
+                self.kv_size_multiplier,
             )
             self.master_bias_k = self._init_per_layer_bias(
-                bias_k, self.output_sizes[1],
+                bias_k,
+                self.output_sizes[1],
                 torch.nn.init._calculate_fan_in_and_fan_out(weight_k),
-                self.kv_size_multiplier
+                self.kv_size_multiplier,
             )
             self.master_bias_v = self._init_per_layer_bias(
-                bias_v, self.output_sizes[1],
+                bias_v,
+                self.output_sizes[1],
                 torch.nn.init._calculate_fan_in_and_fan_out(weight_q),
-                self.kv_size_multiplier
+                self.kv_size_multiplier,
             )
             if self.fuse_qkv:
                 # Concat and update self.bias_qkv
@@ -651,7 +667,9 @@ class GQAQKVColumnParallelLinear(BaseParallelLinear):
         if self.fuse_qkv:
             # Fuse weights and biases
             if self.master_weight_q is not None:
-                self.master_weight_qkv = torch.cat([self.master_weight_q, self.master_weight_k, self.master_weight_v], dim=0)
+                self.master_weight_qkv = torch.cat(
+                    [self.master_weight_q, self.master_weight_k, self.master_weight_v], dim=0
+                )
             else:
                 self.master_weight_qkv = None
             self.master_weight_q = None
@@ -659,7 +677,9 @@ class GQAQKVColumnParallelLinear(BaseParallelLinear):
             self.master_weight_v = None
             if self.use_bias:
                 if self.master_bias_q is not None:
-                    self.master_bias_qkv = torch.cat([self.master_bias_q, self.master_bias_k, self.master_bias_v], dim=0)
+                    self.master_bias_qkv = torch.cat(
+                        [self.master_bias_q, self.master_bias_k, self.master_bias_v], dim=0
+                    )
                 else:
                     self.master_bias_qkv = None
                 self.master_bias_q = None
@@ -695,7 +715,7 @@ class GQAQKVColumnParallelLinear(BaseParallelLinear):
             set_tensor_model_parallel_attributes(bias, True, 0, stride=1, shared_tp=kv_size_multiplier > 1)
         return master_bias if self.keep_master_weight else None
 
-    def forward(self, input: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def forward(self, input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Forward of ColumnParallelLinear
 
         Args:
@@ -709,6 +729,9 @@ class GQAQKVColumnParallelLinear(BaseParallelLinear):
             input_parallel = input
         else:
             input_parallel = copy_to_tensor_model_parallel_region(input)
+        output_q: torch.Tensor
+        output_k: torch.Tensor
+        output_v: torch.Tensor
 
         # Matrix multiply.
         if self.fuse_qkv:
@@ -762,9 +785,9 @@ class GQAQKVColumnParallelLinear(BaseParallelLinear):
                 bias_size_kv = self.output_sizes[1] if self.gather_output else self.kv_output_size_per_partition
                 dimensions = [bias_size_q, bias_size_kv, bias_size_kv]
                 bias_q, bias_k, bias_v = torch.split(self.bias_qkv, dimensions, dim=0)
-                output_q = (output_q + bias_q)
-                output_k = (output_k + bias_k)
-                output_v = (output_v + bias_v)
+                output_q = output_q + bias_q
+                output_k = output_k + bias_k
+                output_v = output_v + bias_v
         else:
             output_q = (output_q + self.bias_q) if self.bias_q is not None else output_q
             output_k = (output_k + self.bias_k) if self.bias_k is not None else output_k

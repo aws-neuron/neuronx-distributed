@@ -19,7 +19,6 @@ def cumsum(tensor, dim=0, tril_size=2048):
 
     Returns:
         cumsum_tensor: 2D output tensor containing the output of the cumsum operation.
-
     """
 
     if len(tensor.shape) != 2:
@@ -28,11 +27,7 @@ def cumsum(tensor, dim=0, tril_size=2048):
     if dim != 0:
         raise NotImplementedError(f"Only cumsum along dimension-0 is currently supported, unexpected dim={dim}")
 
-    # Cast tensor to float64 for performing matmul (to prevent auto-downcasting to bf16)
-    dtype = tensor.dtype
-
-    # Allocate lower triangular matrix
-    tril = torch.tril(torch.ones(tril_size, tril_size, dtype=torch.float64, device=tensor.device))
+    dtype = tensor.dtype    
 
     num_tokens = tensor.shape[0]
     if num_tokens % tril_size == 0:
@@ -42,21 +37,19 @@ def cumsum(tensor, dim=0, tril_size=2048):
         num_iters = num_tokens // tril_size + 1
         last_iter_tokens = num_tokens % tril_size
 
+    # For precision, perform matmul in float64 (to prevent auto-downcasting to bf16)
     results = []
-    rolling_sum = torch.zeros(1, tensor.shape[1], dtype=torch.float64, device=tril.device)
+    rolling_sum = torch.zeros(1, tensor.shape[1], dtype=torch.float64, device=tensor.device)
     for i in range(num_iters):
-        # Account for last iteration, where there may be less than tril_size tokens
+        # There may be less than tril_size tokens in the last iteration
         iter_tokens = tril_size if i < num_iters - 1 else last_iter_tokens
-        if iter_tokens < tril_size:
-            tril = tril[:iter_tokens, :iter_tokens]
+        tril = torch.tril(torch.ones(iter_tokens, iter_tokens, device=tensor.device)).to(dtype=torch.float64)
 
         input_slice = tensor.narrow(0, i * tril_size, iter_tokens).to(dtype=torch.float64)
         output_slice = rolling_sum + torch.matmul(tril, input_slice)
         results.append(output_slice)
         if i < num_iters - 1:
-            rolling_sum += torch.sum(input_slice, dim=0, keepdim=True)
-            # TODO: Replace with a view of the output_slice for better performance
-            # rolling_sum = output_slice.narrow(0, -1, 1)
+            rolling_sum = output_slice.narrow(0, -1, 1)
 
     # Concatenate results, and cast back to original dtype
     return torch.cat(results, dim=0).to(dtype)

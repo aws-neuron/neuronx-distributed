@@ -1,5 +1,5 @@
 import os
-from typing import Any, Callable, Mapping, Optional, TYPE_CHECKING
+from typing import Any, Callable, Mapping, Optional, TYPE_CHECKING, cast, Union, Tuple, Dict
 
 from lightning_fabric.utilities.cloud_io import _is_dir
 from lightning_fabric.utilities.logger import _add_prefix
@@ -26,6 +26,7 @@ class NeuronTensorBoardLogger(TensorBoardLogger):
         super().__init__(**kwargs)
         self._print_step = -1
         self.log_rank0 = log_rank0
+        self._experiment: Optional["tensorboard.SummaryWriter"]
 
     @property
     def print_step(self):
@@ -44,7 +45,7 @@ class NeuronTensorBoardLogger(TensorBoardLogger):
         """
         """Neuron change, log on the last PP rank"""
         if not self.should_print():
-            return _DummyExperiment()
+            return cast("tensorboard.SummaryWriter", _DummyExperiment())
         """End of Neuron change"""
 
         if self._experiment is not None:
@@ -99,7 +100,7 @@ class NeuronTensorBoardLogger(TensorBoardLogger):
 
     def log_graph(  # type: ignore[override]
         self, model: "pl.LightningModule",
-        input_array: Optional[Tensor] = None
+        input_array: Optional[Union[Tensor, Tuple, Dict]] = None
     ) -> None:
         """Neuron change, log on the last PP rank"""
         if not self.should_print():

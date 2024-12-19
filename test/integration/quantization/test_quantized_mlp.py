@@ -29,6 +29,9 @@ dim = 6
 torch.manual_seed(0)
 
 
+PT_SAVE_PATH = "quantized_model.pt"
+
+
 class QuantizedCpuLinear(torch.nn.Module):
     """
     CPU version of our Dequant logic . Used for testing.
@@ -42,9 +45,9 @@ class QuantizedCpuLinear(torch.nn.Module):
         device=None,
         dtype=None,
         quantization_type=QuantizationType.PER_TENSOR_SYMMETRIC,
-        per_channel_axis=0,
+        per_channel_axis=None,
     ) -> None:
-        super(QuantizedCpuLinear, self).__init__()
+        super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.weight = torch.nn.Parameter(
@@ -53,6 +56,7 @@ class QuantizedCpuLinear(torch.nn.Module):
         if quantization_type == QuantizationType.PER_TENSOR_SYMMETRIC:
             self.scale = torch.nn.Parameter(torch.tensor([1.0], dtype=dtype))
         else:
+            per_channel_axis = per_channel_axis if per_channel_axis is not None else 0
             weight_shape = self.weight.shape
             scale_shape = [1] * len(weight_shape)
             scale_shape[per_channel_axis] = weight_shape[per_channel_axis]
@@ -72,11 +76,6 @@ class QuantizedCpuLinear(torch.nn.Module):
         mod,
         q_config,
     ):
-        """Create a QuantizedRowParallel from a float module
-
-        Args:
-            mod: float module
-        """
         assert mod.__class__.__name__ == "Linear", "Linear expected"
         return QuantizedCpuLinear(
             in_features=mod.in_features,
@@ -85,62 +84,59 @@ class QuantizedCpuLinear(torch.nn.Module):
             device=mod.weight.device,
             dtype=mod.weight.dtype,
             quantization_type=q_config["quantization_type"],
+            per_channel_axis=q_config.get("quantization_per_channel_axis"),
         )
 
 
 class Model(torch.nn.Module):
-    def __init__(self):
+    def __init__(self, is_parallel):
         super().__init__()
-        self.lay1 = torch.nn.Linear(dim, dim, bias=False, dtype=torch.float32)
-        self.lay2 = torch.nn.Linear(dim, dim, bias=False, dtype=torch.float32)
-        self.lay3 = torch.nn.Linear(dim, dim, bias=False, dtype=torch.float32)
-        self.lay4 = torch.nn.Linear(dim, dim, bias=False, dtype=torch.float32)
+        self.is_parallel = is_parallel
+        self.layers = torch.nn.ModuleList()
+        for i in range(4):
+            if is_parallel:
+                if i % 2 == 0:
+                    self.layers.append(ColumnParallelLinear(
+                        input_size=dim, output_size=dim, bias=False, gather_output=False, dtype=torch.float32
+                    ))
+                else:
+                    self.layers.append(RowParallelLinear(
+                        input_size=dim, output_size=dim, bias=False, input_is_parallel=True, dtype=torch.float32
+                    ))
+            else:
+                self.layers.append(torch.nn.Linear(dim, dim, bias=False, dtype=torch.float32))
 
     def forward(self, x):
-        x = self.lay1(x)
-        x = self.lay2(x)
-        x = self.lay3(x)
-        x = self.lay4(x)
+        for layer in self.layers:
+            x = layer(x)
         return x
 
+    @classmethod
+    def _quantize_and_save_model(cls, model_fp32, q_config, save_path):
+        """
+        This function quantizes the non-parallel model (i.e. which uses nn.Linear) using pytorch APIs, and stores the
+        state dict at save_path in a format that can be loaded into the parallel (NxD) model.
 
-class Model_Parallel(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.lay1 = ColumnParallelLinear(
-            input_size=dim, output_size=dim, bias=False, gather_output=False, dtype=torch.float32
-        )
-        self.lay2 = RowParallelLinear(
-            input_size=dim, output_size=dim, bias=False, input_is_parallel=True, dtype=torch.float32
-        )
-        self.lay3 = ColumnParallelLinear(
-            input_size=dim, output_size=dim, bias=False, gather_output=False, dtype=torch.float32
-        )
-        self.lay4 = RowParallelLinear(
-            input_size=dim, output_size=dim, bias=False, input_is_parallel=True, dtype=torch.float32
-        )
-
-    def forward(self, x):
-        x = self.lay1(x)
-        x = self.lay2(x)
-        x = self.lay3(x)
-        x = self.lay4(x)
-        return x
+        Note that this is a helper function used only for testing.
+        """
+        assert not model_fp32.is_parallel
+        if q_config["quantization_type"] == QuantizationType.PER_CHANNEL_SYMMETRIC:
+            model_fp32_int8 = quantize_pytorch_model_per_channel_symmetric(model_fp32)
+        else:
+            model_fp32_int8 = quantize_pytorch_model_per_tensor_symmetric(model_fp32)
+        state_dict = model_fp32_int8.state_dict()
+        convert_qint8_to_int8_state_dict(state_dict=state_dict)
+        torch.save(state_dict, save_path)
+        return model_fp32_int8, state_dict
 
 
-def load_qunatize_model(q_config: BASE_QCONFIG_DICT_TYPE):
-    model_fp32 = Model()
-    input_fp32 = torch.randn((2, dim))
+def load_quantize_model(q_config: BASE_QCONFIG_DICT_TYPE, model_cls, input_shape):
+    model_fp32 = model_cls(is_parallel=False)
+    input_fp32 = torch.randn(input_shape)
 
     # Get Pytorch Quantized Model
     model_fp32.eval()
-    if q_config["quantization_type"] == QuantizationType.PER_CHANNEL_SYMMETRIC:
-        model_fp32_int8 = quantize_pytorch_model_per_channel_symmetric(model_fp32)
-    else:
-        model_fp32_int8 = quantize_pytorch_model_per_tensor_symmetric(model_fp32)
-
-    state_dict = model_fp32_int8.state_dict()
-    torch.save(state_dict, "fp32_qint8_model.pt")
+    model_fp32_int8, state_dict = model_cls._quantize_and_save_model(model_fp32, q_config, save_path=PT_SAVE_PATH)
 
     # Get NxD version of Quatization Model on CPU
     mapping = {torch.nn.Linear: QuantizedCpuLinear}
@@ -151,8 +147,8 @@ def load_qunatize_model(q_config: BASE_QCONFIG_DICT_TYPE):
     return model_fp32_int8, input_fp32, model_fp32, nxd_quantized_cpu_model
 
 
-def load_model(q_config: BASE_QCONFIG_DICT_TYPE):
-    model_parallel = Model_Parallel()
+def load_model(q_config: BASE_QCONFIG_DICT_TYPE, model_cls):
+    model_parallel = model_cls(is_parallel=True)
     model_quant = convert(model_parallel, q_config=q_config, inplace=True, mapping=None)
     print(model_quant)
     all_parameters_name = []
@@ -166,14 +162,14 @@ def load_model(q_config: BASE_QCONFIG_DICT_TYPE):
 
 
 def checkpoint_loader_fn():
-    return torch.load("fp32_qint8_model.pt")
+    return torch.load(PT_SAVE_PATH)
 
 
-def load_traced_model(input_fp32, qconfig):
+def load_traced_model(input_fp32, qconfig, model_cls):
     from neuronx_distributed.trace import parallel_model_trace
 
     sample_inputs = input_fp32
-    load_model_partial = partial(load_model, qconfig)
+    load_model_partial = partial(load_model, qconfig, model_cls)
     traced_model = parallel_model_trace(
         load_model_partial,  # This loads the parallel model
         sample_inputs,
@@ -252,24 +248,28 @@ def validate_scales_in_nxd_model(nxd_quantized_cpu_model, traced_model):
     print("scale verification successful")
 
 
-def main(q_config):
-    model_fp32_int8, input_fp32, model_fp32, nxd_quantized_cpu_model = load_qunatize_model(q_config=q_config)
-    traced_model = load_traced_model(input_fp32=input_fp32, qconfig=q_config)
+def run_quantization_test(q_config, model_cls, input_shape, validate_scales):
+    model_fp32_int8, input_fp32, model_fp32, nxd_quantized_cpu_model = load_quantize_model(
+        q_config=q_config, model_cls=model_cls, input_shape=input_shape
+    )
+    traced_model = load_traced_model(input_fp32=input_fp32, qconfig=q_config, model_cls=model_cls)
 
     # Validate the CPU version of our de-quant logic matches the pytorch dequant
     validate_against_pytorch_quantization(
         pytorch_quantized_cpu_model=model_fp32_int8, nxd_quantized_cpu_model=nxd_quantized_cpu_model
     )
 
-    # Validate that the scales in NxD model are correct
-    validate_scales_in_nxd_model(nxd_quantized_cpu_model, traced_model)
+    if validate_scales:
+        # Validate that the scales in NxD model are correct
+        validate_scales_in_nxd_model(nxd_quantized_cpu_model, traced_model)
 
     cpu_result = model_fp32_int8(input_fp32)
     nxd_result = traced_model(input_fp32)
     fp_32_result = model_fp32(input_fp32)
 
-    # CPU quantized result and NxD result to be exactly equal
-    assert torch.allclose(nxd_quantized_cpu_model(input_fp32), nxd_result)
+    if validate_scales:
+        # CPU quantized result and NxD result to be exactly equal if scales are equal
+        assert torch.allclose(nxd_quantized_cpu_model(input_fp32), nxd_result)
 
     # NxD result and Pytorch Quantized Result
     assert torch.allclose(cpu_result, nxd_result, atol=1e-2)
@@ -280,18 +280,24 @@ def main(q_config):
 
     print(f"Test successful for Quantized Layers with qconfig {q_config}")
 
-    if os.path.exists("fp32_qint8_model.pt"):
-        os.remove("fp32_qint8_model.pt")
+    if os.path.exists(PT_SAVE_PATH):
+        os.remove(PT_SAVE_PATH)
 
     if os.path.exists("compiler_workdir") and os.path.isdir("compiler_workdir"):
         shutil.rmtree("compiler_workdir")
 
 
 if __name__ == "__main__":
+    common_args = dict(
+        model_cls=Model,
+        input_shape=(2, dim),
+        validate_scales=True,
+    )
+
     try:
         q_config = get_default_custom_qconfig_dict()
         with ProcessPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(main, q_config)
+            future = executor.submit(run_quantization_test, q_config, **common_args)
             results = future.result()
     except Exception:
         print(traceback.format_exc())
@@ -299,7 +305,7 @@ if __name__ == "__main__":
     try:
         q_config = get_default_per_channel_custom_qconfig_dict()
         with ProcessPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(main, q_config)
+            future = executor.submit(run_quantization_test, q_config, **common_args)
             results = future.result()
     except Exception:
         print(traceback.format_exc())

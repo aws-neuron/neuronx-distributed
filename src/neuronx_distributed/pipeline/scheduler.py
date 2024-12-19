@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-
+from typing import List, Union
 
 class PipelineTask:
     def __init__(self, mb, model_chunk=0, graph_break=True):
@@ -147,7 +147,7 @@ class InferenceSchedule(PipeSchedule):
     def steps(self):
         total_steps = self.num_microbatches
         for micro_batch_id in range(total_steps):
-            cmds = []
+            cmds: List[PipelineTask] = []
             cmds.append(ForwardPreprocessTask(micro_batch_id))
             cmds.append(ForwardStepTask(micro_batch_id))
             cmds.append(ForwardPostprocessTask(micro_batch_id))
@@ -178,7 +178,7 @@ class Train1F1BSchedule(PipeSchedule):
 
     def get_microbatche_schedule(self):
         num_warmup_steps: int = self.stages - self.stage_id - 1
-        num_warmup_steps: int = min(num_warmup_steps, self.num_microbatches)
+        num_warmup_steps = min(num_warmup_steps, self.num_microbatches)
         self.num_warmup_steps = num_warmup_steps
         self.num_steady_state_microbatches = self.num_microbatches - num_warmup_steps
         self.num_remaining_microbatches = num_warmup_steps
@@ -210,7 +210,7 @@ class Train1F1BSchedule(PipeSchedule):
         prev_micro_batch_id = -1
         for step_id in range(total_steps):
             # Last step for grad reduction
-            cmds = []
+            cmds: List[Union[PipelineTask, ReduceGradsTask]] = []
             if step_id == total_steps - 1:
                 cmds.append(ReduceGradsTask())
                 yield cmds
@@ -567,7 +567,7 @@ class TrainSchedule(PipeSchedule):
             # Map the step of the pipeline to the micro-batch id and also whether it is a
             # forward or backward pass step.
             micro_batch_id, is_forward = self._step_to_micro_batch(step_id)
-            cmds = []
+            cmds: List[Union[PipelineTask, ReduceGradsTask]] = []
 
             # Exchange activations
             if is_forward:

@@ -321,8 +321,8 @@ def train_gpt_neox(flags):
         AdamW_FP32OptimParams,
         lr=flags.lr,
         pin_layout=False,
-        sharding_groups=parallel_state.get_data_parallel_group(as_list=True),
-        grad_norm_groups=parallel_state.get_tensor_model_parallel_group(as_list=True),
+        sharding_groups=parallel_state.get_data_parallel_replica_groups(),
+        grad_norm_groups=parallel_state.get_tensor_model_parallel_replica_groups(),
     )
     optimizer.zero_grad()
 
@@ -382,7 +382,7 @@ def train_gpt_neox(flags):
                 running_loss_reduced = xm.all_reduce(
                     xm.REDUCE_SUM,
                     running_loss_div,
-                    groups=parallel_state.get_data_parallel_group(as_list=True),
+                    groups=parallel_state.get_data_parallel_replica_groups(),
                 )
                 running_loss_reduced_detached = running_loss_reduced.detach()
                 running_loss.zero_()

@@ -11,9 +11,8 @@ import torch_xla.core.xla_model as xm
 
 from neuronx_distributed.parallel_layers import ColumnParallelLinear, RowParallelLinear
 from neuronx_distributed.modules.qkv_linear import GQAQKVColumnParallelLinear
-from neuronx_distributed.parallel_layers.parallel_state import (
-    model_parallel_is_initialized,
-)
+from neuronx_distributed.parallel_layers.parallel_state import model_parallel_is_initialized
+from neuronx_distributed.parallel_layers.mappings import _gather_along_first_dim, _gather_along_last_dim
 from neuronx_distributed.trainer.checkpoint import _get_path
 from neuronx_distributed.trainer.checkpoint_storage import create_checkpoint_storage
 from neuronx_distributed.utils.logger import get_logger
@@ -107,6 +106,9 @@ class LoraModel(torch.nn.Module):
     """
 
     prefix: str = "lora_"
+    GQAQKVParallelLinear_lora_type = "LoraGQAQKVParallelLinear"
+    ColumnParallelLinear_lora_type = "LoraColumnParallelLinear"
+    RowParallelLinear_lora_type = "LoraRowParallelLinear"
 
     def __init__(self, module: "transformers.PreTrainedModel", config: LoraConfig) -> None:
         assert config is not None
@@ -123,6 +125,8 @@ class LoraModel(torch.nn.Module):
         self.is_checkpoint_loaded = False
         self.lora_config = config
         self.is_base_model_loaded = False
+        self.lora_module_parallel_types: dict = {}
+        self.lora_kv_size_multiplier = 1
 
         if config.load_lora_from_ckpt:
             self.load_checkpoint(config)
@@ -241,6 +245,8 @@ class LoraModel(torch.nn.Module):
             None if no match found
         """
         config = self.lora_config
+        if not config.target_modules:
+            return False
         if isinstance(config.target_modules, str):
             target_module_found = re.fullmatch(config.target_modules, key)
         elif key in config.target_modules:
@@ -261,7 +267,7 @@ class LoraModel(torch.nn.Module):
         if current_key is None:
             raise ValueError("Current Key shouldn't be `None`")
 
-        new_module = self._create_new_module(target)
+        new_module = self._create_new_module(target, current_key)
         self._replace_module(parent, target_name, new_module, target)
 
     def _replace_module(self, parent, child_name: str, new_module, child) -> None:
@@ -314,7 +320,7 @@ class LoraModel(torch.nn.Module):
         else:
             raise NotImplementedError(f"Requested bias: {bias}, is not implemented.")
 
-    def _create_new_module(self, target):
+    def _create_new_module(self, target, current_key):
         r"""
         Create the corresponding LoraLayer according to its module type, such as torch.nn.Linear and torch.nn.Embedding.
         """
@@ -328,11 +334,16 @@ class LoraModel(torch.nn.Module):
             new_module = LoraConv2d(target, lora_config)
         elif isinstance(target, torch.nn.Linear):
             new_module = LoraLinear(target, lora_config)
-        elif isinstance(target, (ColumnParallelLinear, RowParallelLinear)):
-            # check NxD model
+        elif isinstance(target, ColumnParallelLinear):
             new_module = LoraParallelLinear(base_layer=target, lora_config=lora_config)
+            self.lora_module_parallel_types[current_key] = self.ColumnParallelLinear_lora_type
+        elif isinstance(target, RowParallelLinear):
+            new_module = LoraParallelLinear(base_layer=target, lora_config=lora_config)
+            self.lora_module_parallel_types[current_key] = self.RowParallelLinear_lora_type
         elif isinstance(target, GQAQKVColumnParallelLinear):
             new_module = LoraGQAQKVParallelLinear(base_layer=target, lora_config=lora_config)
+            self.lora_module_parallel_types[current_key] = self.GQAQKVParallelLinear_lora_type
+            self.lora_kv_size_multiplier = target.kv_size_multiplier
         elif is_hf_transformers_available():
             from transformers.pytorch_utils import Conv1D
 
@@ -441,7 +452,7 @@ class LoraModel(torch.nn.Module):
     def _get_lora_config_dict(self) -> dict:
         return self.lora_config.selected_fields_to_save()
 
-    def _save_config_to_json(self, filename: str = None) -> None:
+    def _save_config_to_json(self, filename: str) -> None:
         r"""save the LoRA configuration to a json file."""
         if not filename.endswith(".json"):
             logger.warn(f"{filename} is not a proper json file name.")
@@ -456,11 +467,10 @@ class LoraModel(torch.nn.Module):
             writer.write(json.dumps(output_dict, indent=2, sort_keys=True))
 
     def save_config(self, save_dir: Optional[str] = None) -> None:
-        if save_dir is None:
-            save_dir = self.lora_config.lora_save_dir
-
-        os.makedirs(save_dir, exist_ok=True)
-        config_filename = os.path.join(save_dir, CONFIG_NAME)
+        sd = self.lora_config.lora_save_dir if save_dir is None else save_dir
+        assert sd
+        os.makedirs(sd, exist_ok=True)
+        config_filename = os.path.join(sd, CONFIG_NAME)
         self._save_config_to_json(config_filename)
         self.is_config_saved = True
 
@@ -479,12 +489,12 @@ class LoraModel(torch.nn.Module):
         r"""
         Only the master device saves the checkpoint.
         """
-        if save_dir is None:
-            save_dir = self.lora_config.lora_save_dir
+        sd = self.lora_config.lora_save_dir if save_dir is None else save_dir
+        assert sd
 
         if xm.is_master_ordinal(local=True):
-            state_dict = self._get_lora_adapter_state_dict(save_dir)
-            output_dir = save_dir if adapter_tag is None else os.path.join(save_dir, adapter_tag)
+            state_dict = self._get_lora_adapter_state_dict(sd)
+            output_dir = sd if adapter_tag is None else os.path.join(sd, adapter_tag)
             os.makedirs(output_dir, exist_ok=True)
             torch.save(state_dict, os.path.join(output_dir, WEIGHTS_NAME))
 
@@ -498,6 +508,7 @@ class LoraModel(torch.nn.Module):
         We defer the real state dict loading to load_state_dict()
         """
         save_dir = lora_config.lora_save_dir
+        assert save_dir
         adapter_tag = lora_config.lora_load_tag
 
         if not model_parallel_is_initialized():
@@ -510,6 +521,7 @@ class LoraModel(torch.nn.Module):
         else:
             # lora adapter checkpoint saved with nxd.save_checkpoint()
             checkpoint_dir = create_checkpoint_storage(save_dir)
+            assert adapter_tag
             ckpt_path = os.path.join(save_dir, _get_path(adapter_tag))
             if not os.path.isfile(ckpt_path):
                 raise FileNotFoundError(f"{ckpt_path} is not found.")
@@ -557,7 +569,11 @@ class LoraModel(torch.nn.Module):
             return LoraConfig(**lora_config_dict)
 
     def load_lora(
-        self, save_dir: Optional[str] = None, adapter_tag: Optional[str] = None, ckpt_path: Optional[str] = None, adapter_only: bool = True
+        self,
+        save_dir: Optional[str] = None,
+        adapter_tag: Optional[str] = None,
+        ckpt_path: Optional[str] = None,
+        adapter_only: bool = True,
     ) -> None:
         r"""
         for single-device LoRA load only.
@@ -569,13 +585,17 @@ class LoraModel(torch.nn.Module):
             raise RuntimeError("Please use nxd.load_checkpoint() to load LoRA adapter when the base model is NxDModel.")
 
     def _load_single_device_lora(
-        self, save_dir: Optional[str] = None, adapter_tag: Optional[str] = None, ckpt_path: Optional[str] = None, adapter_only: bool = True
+        self,
+        save_dir: Optional[str] = None,
+        adapter_tag: Optional[str] = None,
+        ckpt_path: Optional[str] = None,
+        adapter_only: bool = True,
     ):
         if not adapter_only:
             if ckpt_path is None:
-                if save_dir is None:
-                    save_dir = self.lora_config.lora_save_dir
-                output_dir = save_dir if adapter_tag is None else os.path.join(save_dir, adapter_tag)
+                sd = self.lora_config.lora_save_dir if save_dir is None else save_dir
+                assert sd
+                output_dir = sd if adapter_tag is None else os.path.join(sd, adapter_tag)
                 ckpt_path = os.path.join(output_dir, WEIGHTS_NAME)
 
             if not os.path.exists(ckpt_path):
@@ -623,10 +643,47 @@ class LoraModel(torch.nn.Module):
     def module_state_dict(self) -> Dict[str, Any]:
         return self.module.state_dict()
 
-    def state_dict(self, *args, **kwargs):
-        return self._get_lora_adapter_state_dict()
+    def merge_sharded_lora_weights(self, state_dict):
+        def _get_base_module_name(name):
+            return name.split(".lora_")[0]
 
-    def load_state_dict(self, state_dict: Mapping[str, Any] = None, strict: bool = True, assign: bool = False):
+        for name, weights in state_dict.items():
+            if name == "lora_config":
+                continue
+            base_module_name = _get_base_module_name(name)
+            if base_module_name in self.lora_module_parallel_types:
+                lora_parallel_type = self.lora_module_parallel_types[base_module_name]
+                if lora_parallel_type == self.ColumnParallelLinear_lora_type:
+                    if ".lora_B" in name:
+                        state_dict[name] = _gather_along_first_dim(weights)
+                elif lora_parallel_type == self.RowParallelLinear_lora_type:
+                    if ".lora_A" in name:
+                        state_dict[name] = _gather_along_last_dim(weights)
+                elif lora_parallel_type == self.GQAQKVParallelLinear_lora_type:
+                    if ".lora_B" in name:
+                        merged_lora_weights = _gather_along_first_dim(weights)
+                        state_dict[name] = torch.chunk(merged_lora_weights, self.lora_kv_size_multiplier)[0]
+                else:
+                    raise ValueError("Unknown lora prallel type {lora_parallel_type}")
+
+        xm.mark_step()
+        # only the first rank need to save the merged LoRA adapter
+        return state_dict if xm.get_ordinal() == 0 else None
+
+    def state_dict(self, *args, **kwargs):
+        config = self.lora_config
+        if config.merge_sharded_lora and (config.save_lora_base or config.merge_lora):
+            config.save_lora_base = False
+            config.merge_lora = False
+            logger.info("Since merged_sharded_lora is enabled, we will disable save_lora_base and merge_lora to save merged LoRA adapter only.")
+        state_dict = self._get_lora_adapter_state_dict()
+        if config.merge_sharded_lora:
+            state_dict = self.merge_sharded_lora_weights(state_dict)
+        return state_dict
+
+    def load_state_dict(
+        self, state_dict: Optional[Mapping[str, Any]] = None, strict: bool = True, assign: bool = False
+    ):
         r"""
         There are two steps to load state dict for LoRA model.
         Step 1: load the state dict for the base model
@@ -635,7 +692,7 @@ class LoraModel(torch.nn.Module):
         lora_config = self.lora_config
         if state_dict is not None and (not lora_config.save_lora_base or not self.is_checkpoint_loaded):
             if self.is_lora_enabled:
-                self.update_state_dict_keys(state_dict)
+                self.update_state_dict_keys(dict(state_dict))
             # load the state dict to the base model
             load_result = self.module.load_state_dict(state_dict, strict=False)
             self.is_base_model_loaded = True

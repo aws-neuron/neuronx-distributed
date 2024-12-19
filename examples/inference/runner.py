@@ -1,19 +1,31 @@
+from enum import Enum
 import json
 import logging
 import os
 from contextlib import contextmanager
 from functools import partial
-from typing import List, Union
+from typing import List, Optional, Union, Type
 
 import torch
 from modules.benchmark import BENCHMARK_REPORT_FILENAME, Benchmark, LatencyCollector, generate_report
+from modules.config import NeuronConfig
+from modules.model_base import NeuronBaseModel
 from torch.profiler import ProfilerActivity, profile
-from transformers import AutoTokenizer, GenerationConfig, PreTrainedModel, set_seed
+from transformers import AutoConfig, AutoTokenizer, GenerationConfig, PretrainedConfig, PreTrainedModel, set_seed
 from transformers.generation import SampleDecoderOnlyOutput, SampleEncoderDecoderOutput
+from transformers.image_utils import ImageInput
 
 from torch_neuronx.testing.validation import logit_validation
 import neuronx_distributed as nxd
+from neuronx_distributed.quantization.quantization_config import QuantizationType
+from neuronx_distributed.quantization.quantization_utils import (
+    quantize_pytorch_model_per_channel_symmetric,
+    quantize_pytorch_model_per_tensor_symmetric,
+)
+from modules.lora_serving import LoraServingConfig
 
+
+IMAGE_ENCODING_MODEL = "image_encoding_model"
 END_TO_END_MODEL = "e2e_model"
 CONTEXT_ENCODING_MODEL = "context_encoding_model"
 TOKEN_GENERATION_MODEL = "token_generation_model"
@@ -33,6 +45,11 @@ SampleOutput = Union[SampleEncoderDecoderOutput, SampleDecoderOnlyOutput]
 TEST_PROMPT = "I believe the meaning of life is"
 
 
+class TaskType(Enum):
+    GENERATION = "generation_task"
+    IMAGE_ENC = "image_encoding_task"
+
+
 class InferenceRunner:
     """
     Use the runner class to trace the model and perform inference.
@@ -42,14 +59,22 @@ class InferenceRunner:
         infer - Runs the traced model on Neuron
         infer-on-cpu - Runs the neuron wrapper on CPU
         infer-with-hf - Runs inference with huggingface model on CPU
+
+    Arguments:
+        model_path (str) - The path to the pre-trained model.
+        tokenizer_path (str) - The path to the tokenizer associated with the model.
+        generation_config (GenerationConfig) - Configuration settings for text generation tasks.
+        task_type (TaskType) - The type of task the runner is configured for (default is TaskType.GENERATION).
+                              If task type is set as IMAGE_ENC.IMAGE_ENC, the generation_*() related functions
+                              will be disabled and the self.generation_config will be initialized as None.
     """
 
-    def __init__(self, model_path: str = None, tokenizer_path: str = None, generation_config: GenerationConfig = None):
+    def __init__(self, model_path: str = None, tokenizer_path: str = None, generation_config: GenerationConfig = None, task_type=TaskType.GENERATION):
         self.model_path = model_path
         self.tokenizer_path = tokenizer_path
         self._is_torch_profile_enabled = False
 
-        if generation_config is None:
+        if generation_config is None and task_type == TaskType.GENERATION:
             generation_config = GenerationConfig.from_pretrained(model_path)
             generation_config.top_k = 1
             generation_config.do_sample = True
@@ -66,25 +91,51 @@ class InferenceRunner:
         raise NotImplementedError
 
     def generate_quantized_hf_checkpoints_on_cpu(self, max_prompt_length, sequence_length, batch_size, **kwargs):
-        # Implement per model
-        """
-        This is a utility function that quantizes a HF model and returns the checkpoints
-        """
-        raise NotImplementedError
+        hf_config = self.get_hf_config(sequence_length=sequence_length, **kwargs)
+        neuron_config = self.get_config_for_nxd(
+            hf_config,
+            batch_size,
+            1,
+            max_prompt_length,
+            sequence_length,
+            enable_bucketing=False,
+            **kwargs)
+        neuron_config.hf_config.torch_dtype = torch.float32
+        quantized_state_dict = self.get_model_cls().generate_quantized_state_dict(
+            model_path=self.model_path, neuron_config=neuron_config
+        )
+        return quantized_state_dict
 
-    def load_quantized_neuron_model_on_cpu(self, max_prompt_length, sequence_length, batch_size, **kwargs):
-        # Implement per model
-        raise NotImplementedError
+    def load_quantized_neuron_model_on_cpu(self, max_prompt_length, sequence_length, batch_size, lora_config: LoraServingConfig=None, **kwargs):
+        model = self.load_neuron_model_on_cpu(max_prompt_length, sequence_length, batch_size, lora_config, **kwargs)
 
-    def load_neuron_model(self, traced_model_path):
-        # Implement per model
-        raise NotImplementedError
+        quantization_type = QuantizationType(kwargs.get("quantization_type", "per_tensor_symmetric"))
+        if quantization_type == QuantizationType.PER_TENSOR_SYMMETRIC:
+            return quantize_pytorch_model_per_tensor_symmetric(model, inplace=True)
+        elif quantization_type == QuantizationType.PER_CHANNEL_SYMMETRIC:
+            return quantize_pytorch_model_per_channel_symmetric(model, inplace=True)
+        else:
+            raise RuntimeError(f"quantization_type: {quantization_type} not supported")
+
+    def load_neuron_model(self, traced_model_path, start_rank_id=None, local_ranks_size=None):
+        neuron_config = self.get_config_cls().load(traced_model_path)
+        model = self.get_model_cls().from_pretrained("", neuron_config)
+        model.load(traced_model_path, start_rank_id=start_rank_id, local_ranks_size=local_ranks_size)
+        if neuron_config.hf_config.torch_dtype == torch.bfloat16:
+            model.bfloat16()
+        return model
 
     def load_tokenizer(self, padding_side=None):
         # Implement per model
         raise NotImplementedError
 
-    def get_config_cls(self):
+    def load_image_processor(self):
+        return None
+
+    def load_processor(self):
+        return None
+
+    def get_config_cls(self) -> Type[NeuronConfig]:
         # Implement per model
         raise NotImplementedError
 
@@ -135,79 +186,64 @@ class InferenceRunner:
         nxd.parallel_layers.parallel_state.destroy_model_parallel()
         nxd.parallel_layers.parallel_state.initialize_model_parallel(tensor_model_parallel_size=1)
 
+    def get_hf_config(self, sequence_length, **kwargs):
+        merged_kwargs = self.get_default_hf_generation_config_kwargs()
+        if kwargs is not None:
+            merged_kwargs.update(kwargs)
+
+        hf_config: PretrainedConfig = AutoConfig.from_pretrained(self.model_path, **merged_kwargs)
+        hf_config.max_length = sequence_length
+        if hasattr(hf_config, "max_position_embeddings") and hf_config.max_position_embeddings <= hf_config.max_length:
+            logging.warning(
+                "max_position_embeddings is less than or equal to max_length. Updating max_position_embeddings..."
+            )
+            hf_config.max_position_embeddings = hf_config.max_length + 1  # otherwise get error
+        hf_config.pad_token_id = kwargs.get("pad_token_id", hf_config.pad_token_id)
+
+        return hf_config
+
     def get_config_for_nxd(
         self,
+        hf_config,
         batch_size,
         tp_degree,
         max_prompt_length,
         sequence_length,
         enable_bucketing,
         **kwargs,
-    ):
+    ) -> NeuronConfig:
         """
         Set up the value for config attributes if needed.
 
         Please don't add new config attribute here. Instead, please add new
-        attributes in NeuronInferenceConfig or model-specific config class.
+        attributes in NeuronConfig or model-specific config class.
         """
         config_cls = self.get_config_cls()
-
-        merged_kwargs = self.get_default_hf_generation_config_kwargs()
-        if kwargs is not None:
-            merged_kwargs.update(kwargs)
-        config = config_cls.from_pretrained(self.model_path, **merged_kwargs)
-
-        config.tp_degree = tp_degree
-
-        config.max_context_length = max_prompt_length
-        config.max_new_tokens = sequence_length - max_prompt_length
-        if config.max_new_tokens == 0:
-            config.max_new_tokens = None
-        max_length = sequence_length
-        config.max_length = max_length
-        config.n_positions = max_length
-        config.n_active_tokens = max_length
-
-        if config.max_position_embeddings <= max_length:
-            logging.warning(
-                "max_position_embeddings is less than or equal to max_length. Updating max_position_embeddings..."
-            )
-            config.max_position_embeddings = max_length + 1  # otherwise get error
-
-        config.max_batch_size = batch_size
-        config.ctx_batch_size = batch_size
-        config.tkg_batch_size = batch_size
-        config.batch_size = batch_size
-
-        # bucketing specific
-        config.enable_bucketing = enable_bucketing
-        config.buckets = [max_length]
-
-        config.padding_side = self.get_padding_side()
-        config.on_device_sampling = kwargs.get("on_device_sampling", False)
-
-        config.spec_batch_size = batch_size
-        config.speculation_length = kwargs.get("speculation_length", 0)
-        config.trace_tokengen_model = kwargs.get("trace_tokengen_model", True)
-
-        config.quantized = kwargs.get("quantized", False)
-        config.quantized_checkpoints_path = kwargs.get("quantized_checkpoints_path", None)
-        if config.quantized is True:
-            assert config.quantized_checkpoints_path is not None, "quantized_checkpoints_path is required"
-        config.quantization_type = kwargs.get("quantization_type", "per_tensor_symmetric")
-        config.is_medusa = kwargs.get("is_medusa", False)
-        config.medusa_speculation_length = kwargs.get("medusa_speculation_length", 0)
-        config.num_medusa_heads = kwargs.get("num_medusa_heads", 0)
-        config.pad_token_id = kwargs.get("pad_token_id", None)
-
-        return config
+        try:
+            neuron_config = config_cls.load(self.model_path, skip_hf_config=True, **kwargs)
+            neuron_config.hf_config = hf_config
+            return neuron_config
+        except FileNotFoundError:
+            return config_cls(hf_config=hf_config,
+                              tp_degree=tp_degree,
+                              batch_size=batch_size,
+                              seq_len=sequence_length,
+                              padding_side=self.get_padding_side(),
+                              max_context_length=max_prompt_length,
+                              enable_bucketing=enable_bucketing,
+                              **kwargs)
 
     def generate_with_hf(self, prompts: List[str], max_length: int, **kwargs):
         """
         Use this to generate CPU goldens against which the trace is validated.
         """
         model = self.load_hf_model()
-        tokenizer = self.load_tokenizer(padding_side="left")
+        if kwargs.get("images") is not None:
+            processor = self.load_processor(padding_side="left")
+            tokenizer = processor.tokenizer
+            kwargs["image_processor"] = processor.image_processor
+        else:
+            tokenizer = self.load_tokenizer(padding_side="left")
         return self.generate(model, tokenizer, prompts, max_length, **kwargs)
 
     def generate_on_neuron(self, prompts: List[str], model: PreTrainedModel, draft_model: PreTrainedModel = None, **kwargs):
@@ -218,13 +254,19 @@ class InferenceRunner:
         if not isinstance(model, PreTrainedModel):
             raise ValueError(f"Model should be of type PreTrainedModel, got type {type(model)}")
 
-        tokenizer = self.load_tokenizer()
-        if len(prompts) != model.config.max_batch_size:
-            raise ValueError(f"Number of prompts should match batch size {model.config.max_batch_size}")
+        if kwargs.get("images") is not None:
+            processor = self.load_processor()
+            tokenizer = processor.tokenizer
+            kwargs["image_processor"] = processor.image_processor
+        else:
+            tokenizer = self.load_tokenizer()
 
-        max_length = kwargs.pop("max_length", model.config.max_length)
-        if (max_length > model.config.max_length):
-            ValueError(f"Found user supplied {max_length=} exceeds the compiled model sequence_length={model.config.max_length}")
+        if len(prompts) != model.neuron_config.max_batch_size:
+            raise ValueError(f"Number of prompts should match batch size {model.neuron_config.max_batch_size}")
+
+        max_length = kwargs.pop("max_length", model.neuron_config.max_length)
+        if (max_length > model.neuron_config.max_length):
+            ValueError(f"Found user supplied {max_length=} exceeds the compiled model sequence_length={model.neuron_config.max_length}")
 
         with self.torch_profile(chrome_trace_path="generate-on-neuron.torch-trace.json"):
             outputs, output_tokens = self.generate(
@@ -235,19 +277,24 @@ class InferenceRunner:
             draft_model.reset()
         return outputs, output_tokens
 
-    def generate_on_cpu(self, prompts: List[str], batch_size: int, max_prompt_length: int, sequence_length: int, **kwargs):
+    def generate_on_cpu(self, prompts: List[str], batch_size: int, max_prompt_length: int, sequence_length: int, lora_config: LoraServingConfig=None, **kwargs):
         """
         Use generate_on_cpu to confirm the neuron wrapper is correct. If the wrapper works
         on CPU, then the trace should work too. If it does not, it indicates a problem with
         the trace itself.
         """
         if kwargs.get("quantized", False) is False:
-            model = self.load_neuron_model_on_cpu(max_prompt_length, sequence_length, batch_size, **kwargs)
+            model = self.load_neuron_model_on_cpu(max_prompt_length, sequence_length, batch_size, lora_config, **kwargs)
         else:
-            model = self.load_quantized_neuron_model_on_cpu(max_prompt_length, sequence_length, batch_size)
+            model = self.load_quantized_neuron_model_on_cpu(max_prompt_length, sequence_length, batch_size, lora_config)
 
-        tokenizer = self.load_tokenizer()
-        outputs, output_tokens = self.generate(model, tokenizer, prompts, sequence_length)
+        if kwargs.get("images"):
+            processor = self.load_processor()
+            tokenizer = processor.tokenizer
+            kwargs["image_processor"] = processor.image_processor
+        else:
+            tokenizer = self.load_tokenizer()
+        outputs, output_tokens = self.generate(model, tokenizer, prompts, sequence_length, **kwargs)
         model.reset()
         return outputs, output_tokens
 
@@ -262,6 +309,17 @@ class InferenceRunner:
     ):
         set_seed(0)  # to avoid randomness in sampling if any
         inputs = tokenizer(prompts, padding=True, return_tensors="pt")
+
+        # If pixel_values is given, pass to the model
+        # Else generate pixel_values from given images
+        images = kwargs.pop("images", None)
+        pixel_values = kwargs.get("pixel_values")
+        if images is not None and pixel_values is None:
+            image_processor = kwargs.pop("image_processor", None)
+            assert image_processor is not None, "image_processor is required when passing images"
+            pixel_values = image_processor(images, return_tensors="pt")["pixel_values"]
+            kwargs["pixel_values"] = pixel_values
+
         for idx, input in enumerate(inputs["input_ids"]):
             logging.debug("tokenized input %s : %s", idx, tokenizer.decode(input))
 
@@ -292,17 +350,26 @@ class InferenceRunner:
         traced_model: PreTrainedModel,
         batch_size: int,
         max_length: int,
-        expected_token_ids: List = None,
+        expected_token_ids: Optional[List] = None,
         on_cpu: bool = False,
         do_sample: bool = True,
         traced_draft_model: PreTrainedModel = None,
         speculation_length: int = 0,
+        prompt: Optional[str] = None,
+        image: Optional[ImageInput] = None,
         **kwargs,
     ):
         """
         Function to compare outputs from huggingface model and neuronx NxD model
         """
-        prompts = [TEST_PROMPT] * batch_size
+        if prompt is None:
+            prompts = [TEST_PROMPT] * batch_size
+        else:
+            prompts = [prompt] * batch_size
+
+        if image is not None:
+            kwargs["images"] = [image] * batch_size
+
         tokenizer = self.load_tokenizer()
 
         if expected_token_ids is not None:
@@ -312,22 +379,24 @@ class InferenceRunner:
         else:
             # Generate goldens with HF on CPU
             expected_token_ids, outputs_expected = self.generate_with_hf(
-                prompts, max_length, do_sample=do_sample
+                prompts, max_length, do_sample=do_sample, **kwargs
             )
         print(f"Expected output: {outputs_expected}")
 
         # Generate outputs with NxD
+        print("Generating outputs with NxD")
         if on_cpu:
             max_prompt_length = kwargs.pop("max_prompt_length")
             output_token_ids, outputs_actual = self.generate_on_cpu(
                 prompts,
                 batch_size,
                 max_prompt_length=max_prompt_length,
-                sequence_length=max_length
+                sequence_length=max_length,
+                **kwargs
             )
         else:
             output_token_ids, outputs_actual = self.generate_on_neuron(
-                prompts, traced_model, traced_draft_model, do_sample=do_sample, max_length=max_length
+                prompts, traced_model, traced_draft_model, do_sample=do_sample, max_length=max_length,  **kwargs
             )
         print(f"Actual output  : {outputs_actual}")
 
@@ -359,7 +428,7 @@ class InferenceRunner:
         remove_shift: bool = True,
         tol_map: dict = None,
     ):
-        if traced_model.config.on_device_sampling:
+        if traced_model.neuron_config.on_device_sampling:
             raise ValueError("Logits validation is not supported with on-device sampling.")
 
         prompts = [TEST_PROMPT] * batch_size
@@ -416,15 +485,19 @@ class InferenceRunner:
         """
         Function to trace a model with neuronx NxD
         """
-        if (sequence_length <= max_prompt_length):
-            raise ValueError(f"Found {sequence_length=} which is less than or equal to {max_prompt_length=}. Please make sure sequence_length is strictly greater than max_prompt_length")
-
         if traced_model_path is not None:
             if not os.path.exists(traced_model_path):
                 os.makedirs(traced_model_path)
 
         # Write the model config into the traced_model_path
-        config = self.get_config_for_nxd(
+        hf_config = self.get_hf_config(sequence_length=sequence_length, **kwargs)
+        if hf_config.torch_dtype != torch.float32 and hf_config.torch_dtype != torch.bfloat16:
+            raise ValueError(
+                f"Type {hf_config.torch_dtype} is not supported for this model at this time. Please choose float32 or bfloat16."
+            )
+
+        self.neuron_config = self.get_config_for_nxd(
+            hf_config,
             batch_size,
             tp_degree,
             max_prompt_length,
@@ -432,27 +505,21 @@ class InferenceRunner:
             enable_bucketing,
             **kwargs,
         )
-        if config.torch_dtype != torch.float32 and config.torch_dtype != torch.bfloat16:
-            raise ValueError(
-                f"Type {config.torch_dtype} is not supported for this model at this time. Please choose float32 or bfloat16."
-            )
-        # We have the config in the trace_model_path
-        config.save_pretrained(traced_model_path)
 
-        # Save config to be used by checkpoint_loader
-        self.config = config
+        # Write the model config into the traced_model_path
+        self.neuron_config.save(traced_model_path)
 
         # Copy the tokenizer into the traced_model_path
         tokenizer = self.load_tokenizer()
         if tokenizer:
             tokenizer.save_pretrained(traced_model_path)
 
-        model = self.get_model_cls().from_pretrained(self.model_path, config)
+        model = self.get_model_cls().from_pretrained(self.model_path, self.neuron_config)
 
         model.compile(serialize_base_path=traced_model_path)
 
-    def benchmark_sampling(self, model: PreTrainedModel, draft_model: PreTrainedModel = None, target: str = None):
-        config = model.config
+    def benchmark_sampling(self, model: PreTrainedModel, draft_model: PreTrainedModel = None, target: str = None, **kwargs):
+        neuron_config = model.neuron_config
         tokenizer = self.load_tokenizer()
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -462,15 +529,21 @@ class InferenceRunner:
 
         # Benchmark E2E model
         if target in ["all", "e2e"]:
-            batch_encoding = self.get_sample_inputs(END_TO_END_MODEL, config, tokenizer)
+            if kwargs.get("image") is not None:
+                kwargs["image_processor"] = self.load_image_processor()
+            batch_encoding = self.get_sample_inputs(END_TO_END_MODEL, neuron_config, tokenizer, **kwargs)
             input_param = {
                 "input_ids": batch_encoding["input_ids"],
                 "attention_mask": batch_encoding["attention_mask"],
-                "max_new_tokens": config.max_new_tokens,
+                "max_new_tokens": neuron_config.max_new_tokens,
                 "top_k": 1,
                 "do_sample": draft_model is None,
                 "assistant_model": draft_model,
             }
+
+            pixel_values = batch_encoding.pop("pixel_values", None)
+            if pixel_values is not None:
+                input_param["pixel_values"] = pixel_values
 
             if target == "all":
                 latency_collectors = self.create_submodule_latency_collectors(model)
@@ -480,41 +553,41 @@ class InferenceRunner:
                 if target == "all":
                     self.register_latency_collectors(latency_collectors, model)
 
-            e2e_benchmark = Benchmark(model.generate, input_param, config, preprocess_func=model.reset,
+            e2e_benchmark = Benchmark(model.generate, input_param, preprocess_func=model.reset,
                                       post_warmup_func=register_latency_collectors)
             e2e_benchmark.run()
-            report[END_TO_END_MODEL] = generate_report(e2e_benchmark.latency_list, config)
+            report[END_TO_END_MODEL] = generate_report(e2e_benchmark.latency_list, neuron_config.max_length, neuron_config.max_batch_size)
 
             if target == "all":
-                report.update(self.generate_submodule_reports(latency_collectors, config))
+                report.update(self.generate_submodule_reports(latency_collectors, neuron_config.max_length, neuron_config.max_batch_size))
 
         # Benchmark context encoding model only
         if target == "context_encode":
-            input_param = self.get_sample_inputs(CONTEXT_ENCODING_MODEL, config)
-            ctx_enc_benchmark = Benchmark(model.context_encoding_model, input_param, config)
+            input_param = self.get_sample_inputs(CONTEXT_ENCODING_MODEL, neuron_config, **kwargs)
+            ctx_enc_benchmark = Benchmark(model.context_encoding_model, input_param, neuron_config)
             ctx_enc_benchmark.run()
-            report[CONTEXT_ENCODING_MODEL] = generate_report(ctx_enc_benchmark.latency_list, config)
+            report[CONTEXT_ENCODING_MODEL] = generate_report(ctx_enc_benchmark.latency_list, neuron_config.max_length, neuron_config.max_batch_size)
 
         # Benchmark token generation model only
         if hasattr(model, "token_generation_model") and target == "token_gen":
-            input_param = self.get_sample_inputs(TOKEN_GENERATION_MODEL, config)
-            tkn_gen_benchmark = Benchmark(model.token_generation_model, input_param, config)
+            input_param = self.get_sample_inputs(TOKEN_GENERATION_MODEL, neuron_config)
+            tkn_gen_benchmark = Benchmark(model.token_generation_model, input_param)
             tkn_gen_benchmark.run()
-            report[TOKEN_GENERATION_MODEL] = generate_report(tkn_gen_benchmark.latency_list, config)
+            report[TOKEN_GENERATION_MODEL] = generate_report(tkn_gen_benchmark.latency_list, neuron_config.max_length, neuron_config.max_batch_size)
 
         # Benchmark speculation model only
         if hasattr(model, "speculation_model") and target == "speculation":
-            input_param = self.get_sample_inputs(SPECULATION_MODEL, config)
-            spec_benchmark = Benchmark(model.speculation_model, input_param, config)
+            input_param = self.get_sample_inputs(SPECULATION_MODEL, neuron_config)
+            spec_benchmark = Benchmark(model.speculation_model, input_param)
             spec_benchmark.run()
-            report[SPECULATION_MODEL] = generate_report(spec_benchmark.latency_list, config)
+            report[SPECULATION_MODEL] = generate_report(spec_benchmark.latency_list, neuron_config.max_length, neuron_config.max_batch_size)
 
         # Benchmark Medusa speculation model
         if hasattr(model, "medusa_speculation_model") and target == "speculation":
-            input_param = self.get_sample_inputs(MEDUSA_MODEL, config)
-            spec_benchmark = Benchmark(model.medusa_speculation_model, input_param, config)
+            input_param = self.get_sample_inputs(MEDUSA_MODEL, neuron_config)
+            spec_benchmark = Benchmark(model.medusa_speculation_model, input_param)
             spec_benchmark.run()
-            report[MEDUSA_MODEL] = generate_report(spec_benchmark.latency_list, config)
+            report[MEDUSA_MODEL] = generate_report(spec_benchmark.latency_list, neuron_config.max_length, neuron_config.max_batch_size)
 
         model.reset()
         if draft_model is not None:
@@ -528,29 +601,38 @@ class InferenceRunner:
 
         return report
 
-    def get_sample_inputs(self, model_type, config, tokenizer=None):
-        max_length = config.max_length
-        batch_size = config.batch_size
-        num_medusa_heads = config.num_medusa_heads if config.num_medusa_heads else 4
-        medusa_speculation_length = config.medusa_speculation_length if config.medusa_speculation_length else 64
+    def get_sample_inputs(self, model_type, neuron_config: NeuronConfig, tokenizer=None, prompt=None, **kwargs):
+        max_length = neuron_config.max_length
+        batch_size = neuron_config.batch_size
+        num_medusa_heads = neuron_config.num_medusa_heads if neuron_config.num_medusa_heads else 4
+        medusa_speculation_length = neuron_config.medusa_speculation_length if neuron_config.medusa_speculation_length else 64
+
+        if prompt is None:
+            prompt = TEST_PROMPT
 
         sample_inputs = None
         if model_type == END_TO_END_MODEL:
             sample_inputs = tokenizer(
-                [TEST_PROMPT] * batch_size,
+                [prompt] * batch_size,
                 max_length=max_length,
                 truncation=True,
                 padding="max_length",
                 return_tensors="pt",
             )
 
+            image = kwargs.get("image")
+            if image is not None:
+                images = [image] * batch_size
+                sample_inputs["pixel_values"] = kwargs.get("image_processor")(images, return_tensors="pt")["pixel_values"]
+
         elif model_type == CONTEXT_ENCODING_MODEL:
+            batch_size = neuron_config.ctx_batch_size
             input_ids = torch.zeros((batch_size, max_length), dtype=torch.int64)
             attention_mask = torch.zeros((batch_size, max_length), dtype=torch.int64)
             position_ids = torch.zeros((batch_size, max_length), dtype=torch.int64)
             seq_ids = torch.zeros((batch_size), dtype=torch.int64)
 
-            if config.is_medusa:
+            if neuron_config.is_medusa:
                 accepted_indices = torch.zeros((batch_size, num_medusa_heads + 1), dtype=torch.int64)
                 current_length = torch.zeros((batch_size, num_medusa_heads + 1), dtype=torch.int64)
                 medusa_mask = torch.zeros(
@@ -567,6 +649,20 @@ class InferenceRunner:
                     medusa_mask,
                     scatter_index,
                 )
+            elif kwargs.get("image") is not None:
+                pixel_values = torch.zeros((batch_size, 3, neuron_config.hf_config.vision_config.image_size, neuron_config.hf_config.vision_config.image_size), dtype=neuron_config.hf_config.torch_dtype)
+                text_embedding_indices = torch.zeros((self.config.batch_size, max_length), dtype=torch.int64)
+                image_embedding_indices = torch.zeros((self.config.batch_size, max_length), dtype=torch.int64)
+
+                sample_inputs = (
+                    input_ids,
+                    attention_mask,
+                    position_ids,
+                    seq_ids,
+                    pixel_values,
+                    text_embedding_indices,
+                    image_embedding_indices
+                )
             else:
                 sample_inputs = (
                     input_ids,
@@ -575,6 +671,7 @@ class InferenceRunner:
                     seq_ids,
                 )
         elif model_type == TOKEN_GENERATION_MODEL:
+            batch_size = neuron_config.tkg_batch_size
             input_ids = torch.zeros((batch_size, 1), dtype=torch.int64)
             attention_mask = torch.zeros((batch_size, max_length), dtype=torch.int64)
             position_ids = torch.zeros((batch_size, 1), dtype=torch.int64)
@@ -586,7 +683,7 @@ class InferenceRunner:
                 seq_ids,
             )
         elif model_type == SPECULATION_MODEL:
-            spec_len = config.speculation_length
+            spec_len = neuron_config.speculation_length
             input_ids = torch.zeros((batch_size, spec_len), dtype=torch.int64)
             attention_mask = torch.zeros((batch_size, max_length), dtype=torch.int64)
             position_ids = torch.zeros((batch_size, spec_len), dtype=torch.int64)
@@ -599,7 +696,7 @@ class InferenceRunner:
             )
 
         elif model_type == MEDUSA_MODEL:
-            spec_len = config.medusa_speculation_length
+            spec_len = neuron_config.medusa_speculation_length
             input_ids = torch.zeros((batch_size, spec_len), dtype=torch.int64)
             attention_mask = torch.zeros((batch_size, max_length), dtype=torch.int64)
             position_ids = torch.zeros((batch_size, spec_len), dtype=torch.int64)
@@ -619,6 +716,26 @@ class InferenceRunner:
                 current_length,
                 medusa_mask,
                 scatter_index,
+            )
+
+        elif model_type == IMAGE_ENCODING_MODEL:
+            image = kwargs.get("image")
+            if image is not None:
+                images = [image] * batch_size
+                image_processor = self.load_processor()
+                pixel_values = image_processor(images, return_tensors="pt")["pixel_values"]
+            else:
+                pixel_values = torch.zeros(
+                    (
+                        batch_size,
+                        3,   # color images
+                        neuron_config.hf_config.image_size,
+                        neuron_config.hf_config.image_size
+                    ),
+                    dtype=neuron_config.hf_config.torch_dtype
+                )
+            sample_inputs = (
+                pixel_values,
             )
 
         return sample_inputs
@@ -645,5 +762,5 @@ class InferenceRunner:
         model.register_forward_pre_hook(latency_collector.pre_hook)
         model.register_forward_hook(latency_collector.hook)
 
-    def generate_submodule_reports(self, latency_collectors, config):
-        return {key : generate_report(collector.latency_list, config) for key, collector in latency_collectors.items()}
+    def generate_submodule_reports(self, latency_collectors, max_length, max_batch_size):
+        return {key : generate_report(collector.latency_list, max_length, max_batch_size) for key, collector in latency_collectors.items()}

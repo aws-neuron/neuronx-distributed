@@ -50,9 +50,11 @@ class NeuronLlamaLTModule(NeuronLTModule):
                 print(f"model config {model_config}")
             return model
 
+        include_buffers = True
         self.model = initialize_parallel_model(
             self.nxd_config,
             get_model,
+            include_buffers,
             *self.model_args,
             **self.model_kwargs,
         )
@@ -115,7 +117,7 @@ class NeuronLlamaLTModule(NeuronLTModule):
                 loss_reduced = xm.all_reduce(
                     xm.REDUCE_SUM,
                     loss_div,
-                    groups=parallel_state.get_data_parallel_group(as_list=True),
+                    groups=parallel_state.get_data_parallel_replica_groups(),
                 )
                 loss_detached = loss_reduced.detach()
                 self.averaged_loss.zero_()
@@ -183,9 +185,11 @@ class NeuronLlamaLTModule(NeuronLTModule):
             if self.should_print:
                 self.log(
                     "loss",
-                    self.loss.detach().cpu().item()
-                    if self.loss is not None
-                    else torch.zeros(1, device="cpu", requires_grad=False),
+                    (
+                        self.loss.detach().cpu().item()
+                        if self.loss is not None
+                        else torch.zeros(1, device="cpu", requires_grad=False)
+                    ),
                     prog_bar=True,
                 )
                 self.log(

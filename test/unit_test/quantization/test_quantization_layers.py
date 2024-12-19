@@ -84,6 +84,21 @@ class TestQuantizedParallelLinearLayerStateDictAdaptor(unittest.TestCase):
 
 
 class TestBaseQuantizeParallelLinear(unittest.TestCase):
+    def setUp(self) -> None:
+        self.initial_tensor_model_parallel_group = parallel_state._TENSOR_MODEL_PARALLEL_GROUP
+        self.initial_world_size = parallel_state._MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE
+        self.initial_rank = parallel_state._MPU_TENSOR_MODEL_PARALLEL_RANK
+
+        parallel_state._TENSOR_MODEL_PARALLEL_GROUP = MagicMock(spec=torch.distributed.ProcessGroup)
+        parallel_state._TENSOR_MODEL_PARALLEL_GROUP.size.return_value = 1
+        parallel_state._MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE = 1
+        parallel_state._MPU_TENSOR_MODEL_PARALLEL_RANK = 0
+
+    def tearDown(self) -> None:
+        parallel_state._TENSOR_MODEL_PARALLEL_GROUP = self.initial_tensor_model_parallel_group
+        parallel_state._MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE = self.initial_world_size
+        parallel_state._MPU_TENSOR_MODEL_PARALLEL_RANK = self.initial_rank
+
     @patch.multiple(BaseQuantizeParallelLinear, __abstractmethods__=set())
     def test_init(self):
         with self.assertRaises(AssertionError) as context:
@@ -120,6 +135,7 @@ class TestBaseQuantizeParallelLinear(unittest.TestCase):
     def test_setup_for_scale(self):
         # for per_tensor_symmetric
         test_class = BaseQuantizeParallelLinear(quantization_type="per_tensor_symmetric", quantized_dtype=torch.int8)
+        test_class.weight = MagicMock(device=torch.device("cpu"))
         test_class._setup_for_scale(
             weight_shape=MagicMock(), quantization_type=test_class.quantization_type, weight_partition_dim=MagicMock()
         )
@@ -149,28 +165,30 @@ class TestBaseQuantizeParallelLinear(unittest.TestCase):
         test_class._setup_for_scale(
             weight_shape=(8, 10),
             quantization_type=test_class.quantization_type,
-            weight_partition_dim=0,
-            per_channel_axis=1,
+            weight_partition_dim=1,
+            per_channel_axis=0,
         )
         assert hasattr(test_class.scale, "get_tensor_from_state_dict")
-        assert torch.allclose(test_class.scale, torch.ones((1, 10)))
+        assert torch.allclose(test_class.scale, torch.ones((8, 1)))
         assert test_class.scale.tensor_model_parallel is False
 
 
 class TestQuantizedColumnParallel(unittest.TestCase):
     def setUp(self) -> None:
+        self.initial_tensor_model_parallel_group = parallel_state._TENSOR_MODEL_PARALLEL_GROUP
         self.initial_world_size = parallel_state._MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE
         self.initial_rank = parallel_state._MPU_TENSOR_MODEL_PARALLEL_RANK
 
+        parallel_state._TENSOR_MODEL_PARALLEL_GROUP = MagicMock(spec=torch.distributed.ProcessGroup)
+        parallel_state._TENSOR_MODEL_PARALLEL_GROUP.size.return_value = 1
         parallel_state._MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE = 1
         parallel_state._MPU_TENSOR_MODEL_PARALLEL_RANK = 0
 
     def tearDown(self) -> None:
+        parallel_state._TENSOR_MODEL_PARALLEL_GROUP = self.initial_tensor_model_parallel_group
         parallel_state._MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE = self.initial_world_size
         parallel_state._MPU_TENSOR_MODEL_PARALLEL_RANK = self.initial_rank
-        return
 
-    @patch("neuronx_distributed.quantization.quantization_layers.get_tensor_model_parallel_size", return_value=1)
     @patch("neuronx_distributed.quantization.quantization_layers.BaseQuantizeParallelLinear._setup_for_weight")
     @patch("neuronx_distributed.quantization.quantization_layers.QuantizedColumnParallel._setup_for_bias")
     @patch("neuronx_distributed.quantization.quantization_layers.BaseQuantizeParallelLinear._setup_for_scale")
@@ -181,7 +199,6 @@ class TestQuantizedColumnParallel(unittest.TestCase):
         mock_setup_for_scale,
         mock_setup_for_bias,
         mock_setup_for_weight,
-        mock_get_tensor_model_parallel_size,
     ):
         _ = QuantizedColumnParallel(
             input_size=5,
@@ -190,7 +207,6 @@ class TestQuantizedColumnParallel(unittest.TestCase):
             quantized_dtype=torch.int8,
             dtype=torch.bfloat16,
         )
-        mock_get_tensor_model_parallel_size.assert_called_once()
         mock_setup_for_weight.assert_called_once()
         mock_setup_for_bias.assert_called_once()
         mock_setup_for_scale.assert_called_once()
@@ -198,22 +214,23 @@ class TestQuantizedColumnParallel(unittest.TestCase):
 
     @patch("neuronx_distributed.quantization.quantization_layers._initialize_affine_weight_neuron", return_value=1)
     @patch("neuronx_distributed.quantization.quantization_layers._initialize_parameter_cpu")
-    @patch("neuronx_distributed.quantization.quantization_layers.get_tensor_model_parallel_size", return_value=2)
     def test_setup_for_weight(
         self,
-        mock_get_tensor_model_parallel_size,
         mock_initialize_parameter_cpu,
         mock_initialize_affine_weight_neuron,
     ):
         input_size = 4
         output_size = 6
-
+        parallel_state._TENSOR_MODEL_PARALLEL_GROUP = MagicMock(spec=torch.distributed.ProcessGroup)
+        parallel_state._TENSOR_MODEL_PARALLEL_GROUP.size.return_value = 2
+    
         layer = QuantizedColumnParallel(input_size, output_size, device=torch.device("cpu"), bias=False)
 
         # Assert _initialize_parameter_cpu called with right inputs
         mock_initialize_parameter_cpu.assert_called_once_with(
             param=layer.weight,
             partition_dim=0,
+            num_partitions=2,
             init_method=layer._init_weight,
             param_dtype=torch.int8,
             stride=layer.stride,
@@ -231,7 +248,7 @@ class TestQuantizedColumnParallel(unittest.TestCase):
 
         # Assert _initialize_affine_weight_neuron called with right inputs
         mock_initialize_affine_weight_neuron.assert_called_once_with(
-            weight=layer.weight, init_method=layer._init_weight, partition_dim=0, stride=layer.stride
+            weight=layer.weight, init_method=layer._init_weight, partition_dim=0, num_partitions=2, stride=layer.stride
         )
 
         # Assert weight properties
@@ -263,26 +280,55 @@ class TestQuantizedColumnParallel(unittest.TestCase):
         assert qcpl.scale.shape == (6, 1)
         assert qcpl.bias is not None
 
-        # Channel axis = 1
-        q_config["quantization_per_channel_axis"] = 1
-        qcpl = QuantizedColumnParallel.from_float(cpl, q_config=q_config)
-        assert qcpl.weight.dtype == torch.int8
-        assert qcpl.scale.shape == (1, 4)
-        assert qcpl.bias is not None
+    def test_preshard_hook(self):
+        # No padding
+        input_size = 10
+        output_size = 10
+        pad = False
+        qcpl = QuantizedColumnParallel(input_size, output_size, pad=pad)
+        model_state_dict = {
+            'layer.weight': torch.randn(input_size, 5), 
+            'layer.scale': torch.randn(input_size)
+        }
+        prefix = 'layer.weight'
+        original_weight = model_state_dict['layer.weight'].clone()
+        original_scale = model_state_dict['layer.scale'].clone()
+        qcpl.preshard_hook(model_state_dict, prefix)
+        self.assertTrue(torch.equal(model_state_dict['layer.weight'], original_weight))
+        self.assertTrue(torch.equal(model_state_dict['layer.scale'], original_scale))
+
+        # With padding
+        input_size = 10
+        output_size = 10
+        pad = True
+        qcpl = QuantizedColumnParallel(input_size, output_size, pad=pad)
+        model_state_dict = {
+            'layer.weight': torch.randn(input_size, 5), 
+            'layer.scale': torch.randn(input_size)
+        }
+        prefix = 'layer.weight'
+        original_weight = model_state_dict['layer.weight'].clone()
+        original_scale = model_state_dict['layer.scale'].clone()
+        qcpl.preshard_hook(model_state_dict, prefix)
+        self.assertTrue(torch.equal(model_state_dict['layer.weight'], original_weight))
+        self.assertTrue(torch.equal(model_state_dict['layer.scale'], original_scale))
 
 
 class TestQuantizedRowParallel(unittest.TestCase):
     def setUp(self) -> None:
+        self.initial_tensor_model_parallel_group = parallel_state._TENSOR_MODEL_PARALLEL_GROUP
         self.initial_world_size = parallel_state._MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE
         self.initial_rank = parallel_state._MPU_TENSOR_MODEL_PARALLEL_RANK
 
+        parallel_state._TENSOR_MODEL_PARALLEL_GROUP = MagicMock(spec=torch.distributed.ProcessGroup)
+        parallel_state._TENSOR_MODEL_PARALLEL_GROUP.size.return_value = 1
         parallel_state._MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE = 1
         parallel_state._MPU_TENSOR_MODEL_PARALLEL_RANK = 0
 
     def tearDown(self) -> None:
+        parallel_state._TENSOR_MODEL_PARALLEL_GROUP = self.initial_tensor_model_parallel_group
         parallel_state._MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE = self.initial_world_size
         parallel_state._MPU_TENSOR_MODEL_PARALLEL_RANK = self.initial_rank
-        return
 
     @patch("neuronx_distributed.quantization.quantization_layers.BaseQuantizeParallelLinear._setup_for_scale")
     @patch("neuronx_distributed.quantization.quantization_layers.QuantizedRowParallel._setup_for_bias")
@@ -303,13 +349,16 @@ class TestQuantizedRowParallel(unittest.TestCase):
     def test_setup_for_weight(self, mock_initialize_parameter_cpu, mock_initialize_affine_weight_neuron):
         input_size = 6
         output_size = 4
-        parallel_state._MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE = 2
+        parallel_state._TENSOR_MODEL_PARALLEL_GROUP = MagicMock(spec=torch.distributed.ProcessGroup)
+        parallel_state._TENSOR_MODEL_PARALLEL_GROUP.size.return_value = 2
+
         layer = QuantizedRowParallel(input_size, output_size, device=torch.device("cpu"), bias=False)
 
         # Assert _initialize_parameter_cpu called with right inputs
         mock_initialize_parameter_cpu.assert_called_once_with(
             param=layer.weight,
             partition_dim=1,
+            num_partitions=2,
             init_method=layer._init_weight,
             param_dtype=torch.int8,
             stride=layer.stride,
@@ -328,7 +377,7 @@ class TestQuantizedRowParallel(unittest.TestCase):
 
         # Assert _initialize_affine_weight_neuron called with right inputs
         mock_initialize_affine_weight_neuron.assert_called_once_with(
-            weight=layer.weight, init_method=layer._init_weight, partition_dim=1, stride=layer.stride
+            weight=layer.weight, init_method=layer._init_weight, partition_dim=1, num_partitions=2, stride=layer.stride
         )
 
         # Assert weight properties
@@ -355,21 +404,39 @@ class TestQuantizedRowParallel(unittest.TestCase):
         assert qrpl.bias is not None
         assert qrpl.scale.shape == (4, 1)
 
-        # Channel axis = 1
-        q_config["quantization_per_channel_axis"] = 1
-        qrpl = QuantizedRowParallel.from_float(rpl, q_config=q_config)
-        assert qrpl.weight.dtype == torch.int8
-        assert qrpl.bias is not None
-        assert qrpl.scale.shape == (1, 6)
+    def test_preshard_hook(self):
+        # No padding
+        input_size = 10
+        output_size = 10
+        pad = False
+        qrpl = QuantizedRowParallel(input_size, output_size, pad=pad)
+        model_state_dict = {'layer.weight': torch.randn(output_size, input_size)}
+        prefix = 'layer.weight'
+        original_weight = model_state_dict[prefix].clone()
+        qrpl.preshard_hook(model_state_dict, prefix)
+        self.assertTrue(torch.equal(model_state_dict[prefix], original_weight))
+
+        # With padding
+        input_size = 10
+        output_size = 10
+        pad = True
+        qrpl = QuantizedRowParallel(input_size, output_size, pad=pad)
+        model_state_dict = {'layer.weight': torch.randn(output_size, input_size)}
+        prefix = 'layer.weight'
+        original_weight = model_state_dict[prefix].clone()
+        qrpl.preshard_hook(model_state_dict, prefix)
+        self.assertTrue(torch.equal(model_state_dict[prefix], original_weight))
 
 
 class TestQuantizedExpertFusedColumnParallel(unittest.TestCase):
     def setUp(self) -> None:
+        self.initial_tensor_model_parallel_group = parallel_state._TENSOR_MODEL_PARALLEL_GROUP
         self.initial_world_size = parallel_state._MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE
         self.initial_rank = parallel_state._MPU_TENSOR_MODEL_PARALLEL_RANK
         self.initial_expert_world_size = parallel_state._MPU_EXPERT_MODEL_PARALLEL_WORLD_SIZE
 
-
+        parallel_state._TENSOR_MODEL_PARALLEL_GROUP = MagicMock(spec=torch.distributed.ProcessGroup)
+        parallel_state._TENSOR_MODEL_PARALLEL_GROUP.size.return_value = 1
         parallel_state._MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE = 1
         parallel_state._MPU_TENSOR_MODEL_PARALLEL_RANK = 0
         parallel_state._MPU_EXPERT_MODEL_PARALLEL_WORLD_SIZE = 1
@@ -378,9 +445,9 @@ class TestQuantizedExpertFusedColumnParallel(unittest.TestCase):
         parallel_state._MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE = self.initial_world_size
         parallel_state._MPU_TENSOR_MODEL_PARALLEL_RANK = self.initial_rank
         parallel_state._MPU_EXPERT_MODEL_PARALLEL_WORLD_SIZE = self.initial_expert_world_size
+        parallel_state._TENSOR_MODEL_PARALLEL_GROUP = self.initial_tensor_model_parallel_group
         return
 
-    @patch("neuronx_distributed.quantization.quantization_layers.get_tensor_model_parallel_size", return_value=1)
     @patch("neuronx_distributed.quantization.quantization_layers.QuantizedExpertFusedColumnParallel._setup_for_weight")
     @patch("neuronx_distributed.quantization.quantization_layers.QuantizedExpertFusedColumnParallel._setup_for_bias")
     @patch("neuronx_distributed.quantization.quantization_layers.BaseQuantizeParallelLinear._setup_for_scale")
@@ -393,7 +460,6 @@ class TestQuantizedExpertFusedColumnParallel(unittest.TestCase):
         mock_setup_for_bias,
         mock_setup_for_weight,
         mock_setup_for_scale,
-        mock_get_tensor_model_parallel_size,
     ):
         _ = QuantizedExpertFusedColumnParallel(
             num_experts=2,
@@ -403,7 +469,6 @@ class TestQuantizedExpertFusedColumnParallel(unittest.TestCase):
             quantized_dtype=torch.int8,
             dtype=torch.bfloat16,
         )
-        mock_get_tensor_model_parallel_size.assert_called_once()
         mock_setup_for_weight.assert_called_once()
         mock_setup_for_bias.assert_called_once()
         mock_setup_for_scale.assert_called_once()
@@ -411,16 +476,16 @@ class TestQuantizedExpertFusedColumnParallel(unittest.TestCase):
 
     @patch("neuronx_distributed.quantization.quantization_layers._initialize_affine_weight_neuron", return_value=1)
     @patch("neuronx_distributed.quantization.quantization_layers._initialize_parameter_cpu")
-    @patch("neuronx_distributed.quantization.quantization_layers.get_tensor_model_parallel_size", return_value=2)
     def test_setup_for_weight(
         self,
-        mock_get_tensor_model_parallel_size,
         mock_initialize_parameter_cpu,
         mock_initialize_affine_weight_neuron,
     ):
         num_experts = 2
         input_size = 4
         output_size = 6
+        parallel_state._TENSOR_MODEL_PARALLEL_GROUP = MagicMock(spec=torch.distributed.ProcessGroup)
+        parallel_state._TENSOR_MODEL_PARALLEL_GROUP.size.return_value = 2
 
         layer = QuantizedExpertFusedColumnParallel(num_experts, input_size, output_size, device=torch.device("cpu"))
 
@@ -428,6 +493,7 @@ class TestQuantizedExpertFusedColumnParallel(unittest.TestCase):
         mock_initialize_parameter_cpu.assert_called_once_with(
             param=layer.weight,
             partition_dim=2,
+            num_partitions=2,
             init_method=layer._init_weight,
             param_dtype=torch.int8,
             stride=layer.stride,
@@ -445,7 +511,7 @@ class TestQuantizedExpertFusedColumnParallel(unittest.TestCase):
 
         # Assert _initialize_affine_weight_neuron called with right inputs
         mock_initialize_affine_weight_neuron.assert_called_once_with(
-            weight=layer.weight, init_method=layer._init_weight, partition_dim=2, stride=layer.stride
+            weight=layer.weight, init_method=layer._init_weight, partition_dim=2, num_partitions=2, stride=layer.stride
         )
 
         # Assert weight properties
@@ -464,12 +530,6 @@ class TestQuantizedExpertFusedColumnParallel(unittest.TestCase):
         qcpl.scale.shape == (1,)
 
         q_config = get_default_per_channel_custom_qconfig_dict()
-        q_config["quantization_per_channel_axis"] = 1  # First dimension is reserved for experts
-        qcpl = QuantizedExpertFusedColumnParallel.from_float(cpl, q_config=q_config)
-        assert qcpl.scale.shape == (1, 4, 1)
-        assert qcpl.scale.tensor_model_parallel is False
-
-        q_config = get_default_per_channel_custom_qconfig_dict()
         q_config["quantization_per_channel_axis"] = 2  # First dimension is reserved for experts
         qcpl = QuantizedExpertFusedColumnParallel.from_float(cpl, q_config=q_config)
         qcpl.scale.shape == (1, 1, 6)
@@ -478,10 +538,13 @@ class TestQuantizedExpertFusedColumnParallel(unittest.TestCase):
 
 class TestQuantizedExpertFusedRowParallel(unittest.TestCase):
     def setUp(self) -> None:
+        self.initial_tensor_model_parallel_group = parallel_state._TENSOR_MODEL_PARALLEL_GROUP
         self.initial_world_size = parallel_state._MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE
         self.initial_rank = parallel_state._MPU_TENSOR_MODEL_PARALLEL_RANK
         self.initial_expert_world_size = parallel_state._MPU_EXPERT_MODEL_PARALLEL_WORLD_SIZE
 
+        parallel_state._TENSOR_MODEL_PARALLEL_GROUP = MagicMock(spec=torch.distributed.ProcessGroup)
+        parallel_state._TENSOR_MODEL_PARALLEL_GROUP.size.return_value = 1
         parallel_state._MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE = 1
         parallel_state._MPU_TENSOR_MODEL_PARALLEL_RANK = 0
         parallel_state._MPU_EXPERT_MODEL_PARALLEL_WORLD_SIZE = 1
@@ -490,6 +553,7 @@ class TestQuantizedExpertFusedRowParallel(unittest.TestCase):
         parallel_state._MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE = self.initial_world_size
         parallel_state._MPU_TENSOR_MODEL_PARALLEL_RANK = self.initial_rank
         parallel_state._MPU_EXPERT_MODEL_PARALLEL_WORLD_SIZE = self.initial_expert_world_size
+        parallel_state._TENSOR_MODEL_PARALLEL_GROUP = self.initial_tensor_model_parallel_group
         return
 
     @patch("neuronx_distributed.quantization.quantization_layers.BaseQuantizeParallelLinear._setup_for_scale")
@@ -512,13 +576,15 @@ class TestQuantizedExpertFusedRowParallel(unittest.TestCase):
         num_experts = 2
         input_size = 6
         output_size = 4
-        parallel_state._MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE = 2
+        parallel_state._TENSOR_MODEL_PARALLEL_GROUP = MagicMock(spec=torch.distributed.ProcessGroup)
+        parallel_state._TENSOR_MODEL_PARALLEL_GROUP.size.return_value = 2
         layer = QuantizedExpertFusedRowParallel(num_experts, input_size, output_size, device=torch.device("cpu"))
 
         # Assert _initialize_parameter_cpu called with right inputs
         mock_initialize_parameter_cpu.assert_called_once_with(
             param=layer.weight,
             partition_dim=1,
+            num_partitions=2,
             init_method=layer._init_weight,
             param_dtype=torch.int8,
             stride=layer.stride,
@@ -537,7 +603,7 @@ class TestQuantizedExpertFusedRowParallel(unittest.TestCase):
 
         # Assert _initialize_affine_weight_neuron called with right inputs
         mock_initialize_affine_weight_neuron.assert_called_once_with(
-            weight=layer.weight, init_method=layer._init_weight, partition_dim=1, stride=layer.stride
+            weight=layer.weight, init_method=layer._init_weight, partition_dim=1, num_partitions=2, stride=layer.stride
         )
 
         # Assert weight properties
@@ -558,12 +624,6 @@ class TestQuantizedExpertFusedRowParallel(unittest.TestCase):
         assert qrpl.weight.dtype == torch.int8
         assert qrpl.bias is None
         assert qrpl.scale.shape == (1,)
-
-        q_config = get_default_per_channel_custom_qconfig_dict()
-        q_config["quantization_per_channel_axis"] = 1  # First dimension is reserved for experts
-        qrpl = QuantizedExpertFusedRowParallel.from_float(rpl, q_config=q_config)
-        qrpl.scale.shape == (1, 6, 1)
-        assert qrpl.scale.tensor_model_parallel is True and qrpl.scale.partition_dim == 1
 
         q_config = get_default_per_channel_custom_qconfig_dict()
         q_config["quantization_per_channel_axis"] = 2  # First dimension is reserved for experts

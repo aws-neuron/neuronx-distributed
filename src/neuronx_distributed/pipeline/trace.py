@@ -1,20 +1,13 @@
 import inspect
 import math
-from abc import ABC
 from collections import defaultdict
 from contextlib import contextmanager
 from types import ModuleType
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, TypedDict, Union
 
 import torch
 import torch_xla.core.xla_model as xm
 from torch import nn
-
-try:
-    # In case this is removed in the future
-    from torch.fx._symbolic_trace import _create_wrapped_func  # noqa
-except ImportError:
-    _create_wrapped_func = None
 
 import neuronx_distributed
 from neuronx_distributed import parallel_layers
@@ -26,15 +19,20 @@ from neuronx_distributed.utils.model_utils import (
     is_hf_transformers_available,
 )
 
+try:
+    # In case this is removed in the future
+    from torch.fx._symbolic_trace import _create_wrapped_func  # noqa
+except ImportError:
+    _create_wrapped_func: Optional[Callable[[Any], Any]] = None  # type: ignore[no-redef]
+
 logger = get_logger()
 
 
-class NxDTracer(ABC):
+class NxDTracer(torch.fx.Tracer):
     def is_leaf_module(self, m: nn.Module, module_qualified_name: str) -> bool:
         is_leaf = False
-        if any(t in type(m).__name__ for t in self.leaf_modules) or any(
-            t == module_qualified_name for t in self.leaf_modules
-        ):
+        leaf_modules: List[str] = getattr(self, "leaf_modules", [])
+        if any(t in type(m).__name__ for t in leaf_modules) or any(t == module_qualified_name for t in leaf_modules):
             is_leaf = True
         else:
             is_leaf = super().is_leaf_module(m, module_qualified_name)
@@ -78,29 +76,33 @@ def get_concrete_args(
     model: nn.Module,
     input_names: Optional[List[str]] = None,
     args: Optional[List[Any]] = None,
-    kwargs: Optional[Dict[Any, Any]] = None
+    kwargs: Optional[Dict[Any, Any]] = None,
 ):
-    sig = inspect.signature(model.forward)
+    sig: inspect.Signature = inspect.signature(model.forward)
     if input_names is None and (kwargs is not None or args is not None):
         input_names = []
         # Handle args given without keywords
-        for i in range(len(args)):
-            param_name = list(sig.parameters.keys())[i]
-            input_names.append(param_name)
+        if args is not None:
+            args_number: int = len(args)
+            for index_args, key in enumerate(sig.parameters.keys()):
+                if index_args == args_number:
+                    break
+                input_names.append(key)
 
         if kwargs is not None:
             for k, v in kwargs.items():
                 input_names.append(k)
                 # Get the names of all provided args from customer and pass those to input_names
 
-    if not (set(input_names) <= set(sig.parameters.keys())):
-        formatted_input_names = input_names[0] if len(input_names) == 1 else ", ".join(input_names)
-        formatted_allowed_input_names = ", ".join(sig.parameters.keys())
-        raise ValueError(
-            f"The model does not have input(s) named: {formatted_input_names}, expected a subset of the following:"
-            f" {formatted_allowed_input_names}"
-        )
-
+    if input_names is not None:
+        if not (set(input_names) <= set(sig.parameters.keys())):
+            formatted_input_names = input_names[0] if len(input_names) == 1 else ", ".join(input_names)
+            formatted_allowed_input_names = ", ".join(sig.parameters.keys())
+            raise ValueError(
+                f"The model does not have input(s) named: {formatted_input_names}, expected a subset of the following:"
+                f" {formatted_allowed_input_names}"
+            )
+    assert input_names is not None
     return {p.name: p.default for p in sig.parameters.values() if p.name not in input_names}
 
 
@@ -172,17 +174,17 @@ def trace_model(
     if leaf_modules is None:
         leaf_modules = []
     leaf_modules.extend([module.__name__ for module in PARALLEL_MODULES])
-    leaf_modules = tuple(set(leaf_modules))
+    leaf_modules = list(set(leaf_modules))
     # Leaf functions to skip
     if autowrap_functions is None:
         autowrap_functions = []
     autowrap_functions.extend(PARALLEL_FUNCTIONS)
-    autowrap_functions = tuple(set(autowrap_functions))
+    autowrap_functions = list(set(autowrap_functions))
     # Everything from these modules will be skipped for tracing
     if autowrap_modules is None:
         autowrap_modules = []
     autowrap_modules.extend([math, neuronx_distributed, parallel_layers, xm])
-    autowrap_modules = tuple(set(autowrap_modules))
+    autowrap_modules = list(set(autowrap_modules))
 
     logger.debug(rmsg(f"leaf_modules {leaf_modules}"))
     logger.debug(rmsg(f"autowrap_functions {autowrap_functions}"))

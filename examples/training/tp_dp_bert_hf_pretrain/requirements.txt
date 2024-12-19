@@ -1,5 +1,5 @@
 graphviz
-tensorboard==2.6
+tensorboard==2.14
 transformers==4.26.0
 evaluate
 pillow

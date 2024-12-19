@@ -1,7 +1,5 @@
 import argparse
 import atexit
-import json
-import os
 import traceback
 from datetime import datetime
 
@@ -45,8 +43,8 @@ def test_zero1_checkpoint():
             momentum=0.9,
             pin_layout=False,
             grad_clipping=False,
-            sharding_groups=parallel_state.get_data_parallel_group(as_list=True),
-            grad_norm_groups=parallel_state.get_tensor_model_parallel_group(as_list=True),
+            sharding_groups=parallel_state.get_data_parallel_replica_groups(),
+            grad_norm_groups=parallel_state.get_tensor_model_parallel_replica_groups(),
         )
         opt.step()
         s1 = opt.state_dict()

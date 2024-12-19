@@ -1,6 +1,6 @@
 import math
 from contextlib import contextmanager
-from typing import Optional, Set
+from typing import Dict, List, Optional, Set, Union, Callable, Any, Iterable, Iterator
 
 import torch
 import torch_xla.core.xla_model as xm
@@ -41,29 +41,32 @@ except ImportError:
     _NXDT_AVAIL = False
 
 
-def analyze_shared_parameters(module, shared_parameters=None, prefix=""):
+def analyze_shared_parameters(
+    module: torch.nn.Module,
+    shared_parameters: Optional[Dict[torch.nn.Parameter, List[str]]] = None,
+    prefix: str = "",
+) -> List[List[str]]:
     """
     Find the shared parameters names for a certain module
     [TODO] for PT 2.x we can use remove_duplicate=False from parameters/named_parameters
     """
-    if shared_parameters is None:
-        shared_parameters = {}
+    sp: Dict[torch.nn.Parameter, List[str]] = shared_parameters or {}
     for name, param in module._parameters.items():
-        param_prefix = prefix + ("." if prefix else "") + name
         if param is None:
             continue
-        if param not in shared_parameters:
-            shared_parameters[param] = []
-        shared_parameters[param].append(param_prefix)
+        param_prefix = prefix + ("." if prefix else "") + name
+        if param not in sp:
+            sp[param] = []
+        sp[param].append(param_prefix)
     for name, m in module._modules.items():
         if m is None:
             continue
         submodule_prefix = prefix + ("." if prefix else "") + name
-        analyze_shared_parameters(m, shared_parameters, submodule_prefix)
-    return [x for x in shared_parameters.values() if len(x) > 1]
+        analyze_shared_parameters(m, sp, submodule_prefix)
+    return [x for x in sp.values() if len(x) > 1]
 
 
-def retie_shared_weights(module, shared_weight_names):
+def retie_shared_weights(module: torch.nn.Module, shared_weight_names: List[List[str]]) -> None:
     """
     Iterate module by module to retie the shared weights
     referred from: https://github.com/Lightning-AI/lightning/blob/master/src/lightning/pytorch/utilities/parameter_tying.py#L47  # noqa: E501
@@ -74,39 +77,42 @@ def retie_shared_weights(module, shared_weight_names):
             _set_module_by_path(module, path, ref)
 
 
-def _get_module_by_path(module: torch.nn.Module, path: str):
-    path = path.split(".")
-    for name in path:
+def _get_module_by_path(module: torch.nn.Module, path: str) -> torch.nn.Module:
+    path_parts: List[str] = path.split(".")
+    for name in path_parts:
         module = getattr(module, name)
     return module
 
 
-def _set_module_by_path(module: torch.nn.Module, path: str, value: torch.nn.Module):
-    path = path.split(".")
-    for name in path[:-1]:
+def _set_module_by_path(module: torch.nn.Module, path: str, value: torch.nn.Module) -> None:
+    path_parts: List[str] = path.split(".")
+    for name in path_parts[:-1]:
         module = getattr(module, name)
-    setattr(module, path[-1], value)
+    setattr(module, path_parts[-1], value)
 
 
-def is_hf_pretrained_model(model):
+def is_hf_pretrained_model(model: torch.nn.Module) -> bool:
     return _TRANSFORMERS_AVAIL and isinstance(model, PreTrainedModel)
 
 
-def is_hf_transformers_available():
+def is_hf_transformers_available() -> bool:
     return _TRANSFORMERS_AVAIL
 
 
-def is_hf_accelerate_available():
+def is_hf_accelerate_available() -> bool:
     return _Accelerate_AVAIL
 
-def is_nxdt_pretrained_model(model):
+
+def is_nxdt_pretrained_model(model: torch.nn.Module) -> bool:
     return _NXDT_AVAIL and isinstance(model, MegatronModule)
 
-def is_nxdt_available():
+
+def is_nxdt_available() -> bool:
     return _NXDT_AVAIL
 
+
 def recursive_filter(item, predicate):
-    """ Filter a structure containing tensors based on the given predicate """
+    """Filter a structure containing tensors based on the given predicate"""
 
     def _is_tensor_or_parameter(obj):
         return isinstance(obj, (torch.Tensor, nn.Parameter))
@@ -114,17 +120,18 @@ def recursive_filter(item, predicate):
     def _augmented_predicate(obj):
         return predicate(obj) if _is_tensor_or_parameter(obj) else True
 
-    if isinstance(item, dict):
+    out: Union[dict, List, set, tuple, None]
+    if isinstance(item, Dict):
         out = {}
         for k, v in item.items():
             if _augmented_predicate(v):
                 out[k] = recursive_filter(v, predicate)
-    elif isinstance(item, (list, tuple, set)):
-        out = []
+    elif isinstance(item, (List, tuple, set)):
+        out_tmp: List = []
         for x in item:
             if _augmented_predicate(x):
-                out.append(recursive_filter(x, predicate))
-        out = type(item)(out)
+                out_tmp.append(recursive_filter(x, predicate))
+        out = type(item)(out_tmp)
     else:
         # under normal circumstances this should not return None, unless
         # there is an unexpected data structure involved
@@ -133,9 +140,8 @@ def recursive_filter(item, predicate):
     return out
 
 
-
 @contextmanager
-def preserve_shared_weights(model: torch.nn.Module, ignore_hf=False) -> None:
+def preserve_shared_weights(model: torch.nn.Module, ignore_hf: bool = False) -> Iterator[None]:
     """
     Retie the shared weights after exiting the context manager
     """
@@ -152,7 +158,7 @@ def preserve_shared_weights(model: torch.nn.Module, ignore_hf=False) -> None:
 
 
 @contextmanager
-def preserve_parallel_attributes(model: torch.nn.Module) -> None:
+def preserve_parallel_attributes(model: torch.nn.Module) -> Iterator[None]:
     """
     Preserve the following 3 attributes for the model parameters
         - tensor_model_parallel
@@ -168,8 +174,9 @@ def preserve_parallel_attributes(model: torch.nn.Module) -> None:
         if hasattr(param, "tensor_model_parallel"):
             tp_params[name] = {
                 "is_parallel": param.tensor_model_parallel,
-                "partition_dim": param.partition_dim,
-                "stride": param.partition_stride,
+                "partition_dim": getattr(param, "partition_dim"),
+                "stride": getattr(param, "partition_stride"),
+                "num_partitions": getattr(param, "num_partitions"),
             }
         if hasattr(param, "expert_model_parallel"):
             ep_params[name] = param.expert_model_parallel
@@ -191,7 +198,7 @@ def preserve_parallel_attributes(model: torch.nn.Module) -> None:
                 setattr(param, "shared", shared_parameters[name])
 
 
-def _set_module_param_to_empty(module: torch.nn.Module, device: torch.device, recurse: bool = False):
+def _set_module_param_to_empty(module: torch.nn.Module, device: torch.device, recurse: bool = False) -> None:
     """
     Set all parameters for input module to empty like tensors on provided device
     """
@@ -206,7 +213,7 @@ def _set_module_param_to_empty(module: torch.nn.Module, device: torch.device, re
             module._parameters[key] = out_param
 
 
-def reinit_model(model: torch.nn.Module, device: torch.device, param_init_fn):
+def reinit_model(model: torch.nn.Module, device: torch.device, param_init_fn: Callable[[torch.nn.Module, torch.device], Any]) -> None:
     """
     Re-initialize model with the param_init_fn on provided device
     """
@@ -215,7 +222,7 @@ def reinit_model(model: torch.nn.Module, device: torch.device, param_init_fn):
             with torch.no_grad():
                 for module in model.modules():
                     _set_module_param_to_empty(module, device)
-                    param_init_fn(module)
+                    param_init_fn(module, device)
 
 
 def move_model_to_device(model: torch.nn.Module, device: torch.device) -> None:
@@ -232,17 +239,20 @@ def maybe_materalize_model(model: torch.nn.Module) -> None:
 
 def has_fake_tensors(
     model: torch.nn.Module,
-    ignored_params: Optional[Set[torch.nn.Parameter]] = {},
+    ignored_params: Optional[Set[torch.nn.Parameter]] = None,
 ) -> bool:
     if not _TORCHDISTX_AVAIL:
         return False
     for param in model.parameters():
-        if param not in ignored_params and fake.is_fake(param):
+        if (not ignored_params or param not in ignored_params) and fake.is_fake(param):
             return True
+    return False
 
 
 @contextmanager
-def init_on_device(device: torch.device, include_buffers: bool = False, force_custom_init_on_device: bool = False):
+def init_on_device(
+    device: torch.device, include_buffers: bool = False, force_custom_init_on_device: bool = False
+) -> Iterator[None]:
     """
     A context manager under which models are initialized with all parameters on the specified device.
     Referred from: https://github.com/huggingface/accelerate/blob/main/src/accelerate/big_modeling.py#L82
@@ -278,8 +288,9 @@ def init_on_device(device: torch.device, include_buffers: bool = False, force_cu
             # previously when it was initialized. Hence, when resetting, you can
             # directly assign that tensor instead of re-init. If you re-init you would
             # lose the relationship.
-            module._parameters[name] = param if param.device == device else \
-                            param_cls(module._parameters[name].to(device), **kwargs)
+            module._parameters[name] = (
+                param if param.device == device else param_cls(module._parameters[name].to(device), **kwargs)
+            )
 
     def register_empty_buffer(module, name, buffer, persistent=True):
         old_register_buffer(module, name, buffer, persistent=persistent)
@@ -290,7 +301,7 @@ def init_on_device(device: torch.device, include_buffers: bool = False, force_cu
     if include_buffers:
         tensor_constructors_to_patch = {
             torch_function_name: getattr(torch, torch_function_name)
-            for torch_function_name in ["empty", "zeros", "ones", "full"]
+            for torch_function_name in ["empty", "zeros", "ones", "full", "arange", "zeros_like", "ones_like"]
         }
     else:
         tensor_constructors_to_patch = {}
@@ -303,21 +314,26 @@ def init_on_device(device: torch.device, include_buffers: bool = False, force_cu
         return wrapper
 
     try:
-        nn.Module.register_parameter = register_empty_parameter
+        setattr(nn.Module, "register_parameter", register_empty_parameter)
         if include_buffers:
-            nn.Module.register_buffer = register_empty_buffer
+            setattr(nn.Module, "register_buffer", register_empty_buffer)
         for torch_function_name in tensor_constructors_to_patch.keys():
             setattr(torch, torch_function_name, patch_tensor_constructor(getattr(torch, torch_function_name)))
         yield
     finally:
-        nn.Module.register_parameter = old_register_parameter
+        setattr(nn.Module, "register_parameter", old_register_parameter)
         if include_buffers:
-            nn.Module.register_buffer = old_register_buffer
+            setattr(nn.Module, "register_buffer", old_register_buffer)
         for torch_function_name, old_torch_function in tensor_constructors_to_patch.items():
             setattr(torch, torch_function_name, old_torch_function)
 
 
-def get_model_sequential(model, device, sequential_move_factor=11, param_init_fn=None):
+def get_model_sequential(
+    model: torch.nn.Module,
+    device: torch.device,
+    sequential_move_factor: int = 11,
+    param_init_fn: Optional[Callable[[torch.nn.Module, torch.device], Any]] = None,
+) -> torch.nn.Module:
     from ..pipeline import NxDPPModel
 
     local_rank = xm.get_local_ordinal()
@@ -336,13 +352,13 @@ def get_model_sequential(model, device, sequential_move_factor=11, param_init_fn
     return model
 
 
-def check_delay_tracing(nxd_config):
+def check_delay_tracing(nxd_config) -> bool:
     # Temporarily disabling delayed tracing while we investigate some issues
     # TODO re-enable once the issues with delayed tracing are resolved
     return False
 
 
-def get_delay_tracing(arg):
+def get_delay_tracing(arg) -> bool:
     # Temporarily disabling delayed tracing while we investigate some issues
     # TODO re-enable once the issues with delayed tracing are resolved
     return False

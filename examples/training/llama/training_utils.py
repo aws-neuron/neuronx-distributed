@@ -9,6 +9,10 @@ from itertools import chain
 from typing import Any, Dict, List
 
 import datasets
+from neuronx_distributed.parallel_layers import parallel_state
+from neuronx_distributed.parallel_layers.random import model_parallel_xla_manual_seed
+import numpy as np
+import random
 import torch
 from torch.utils.data import DistributedSampler
 from torch.utils.data.dataloader import DataLoader
@@ -39,6 +43,7 @@ def pack_dataset(dataset, chunk_length=2048):
         batch_total_length = len(concatenated_examples[list(sample.keys())[0]])
 
         # get max number of chunks for batch
+        batch_chunk_length = batch_total_length
         if batch_total_length >= chunk_length:
             batch_chunk_length = (batch_total_length // chunk_length) * chunk_length
 
@@ -128,7 +133,11 @@ def create_llama_pretraining_dataset(data_dir, mini_batch_size, dp_size, dp_rank
 
 
 def create_instruction_based_dataset(data_dir, mini_batch_size, dp_size, dp_rank, seed, tokenizer=None, task=None):
-    raw_datasets = datasets.load_dataset(data_dir, split="train")
+    if data_dir.startswith("s3://") or (os.path.isdir(data_dir) and os.path.exists(data_dir)):
+        # Pass FULL absolute path
+        raw_datasets = datasets.load_from_disk(data_dir)
+    else:
+        raw_datasets = datasets.load_dataset(data_dir, split="train")
     if task:
         raw_datasets = raw_datasets.filter(lambda example: example["category"] == task)
     train_and_test_dataset = raw_datasets.train_test_split(test_size=8)
@@ -357,3 +366,26 @@ def get_mixed_precision_config(use_gpu_compatible_precision):
         "use_fp32_grad_acc": bool(use_gpu_compatible_precision),
         "use_master_weights_in_ckpt": False,
     }
+
+def set_random_seed(seed, tp, pp, ep):
+    """Set random seed for reproducability."""
+    if not parallel_state.model_parallel_is_initialized():
+        parallel_state.initialize_model_parallel(
+            tensor_model_parallel_size=tp,
+            pipeline_model_parallel_size=pp,
+            expert_model_parallel_size=ep,
+        )
+    seed = 1234 if seed is None else seed
+    if seed > 0:
+        # Ensure that different pipeline stages get different seeds. Assuming 100 is the maximum
+        # number of pp stages you would have.
+        
+        # disable below 2 lines if pipeline rank based seed setting is not required
+        seed = seed + (100 * parallel_state.get_pipeline_model_parallel_rank())
+        model_parallel_xla_manual_seed(seed)
+        
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+    else:
+        raise ValueError("Seed ({}) should be a positive integer.".format(seed))

@@ -5,7 +5,7 @@ import copy
 import pickle
 from contextlib import contextmanager
 from enum import Enum
-from typing import Any, Dict, List, NamedTuple
+from typing import Any, Dict, List, NamedTuple, cast
 
 # Third Party
 import torch
@@ -105,8 +105,8 @@ class SerializationManager:
         obj: Any,
         return_stub_list: bool = True,
     ):
-        tx_list = []
-        stub_list = []
+        tx_list: List[torch.Tensor] = []
+        stub_list: List[TensorMeta] = []
         with self.catch_and_raise_for_large_object(obj):
             obj_stripped_of_tensors, seen_class_types = self._replace_tensors_with_stubs(obj, {}, tx_list, stub_list)
 
@@ -140,7 +140,7 @@ class SerializationManager:
             stub_list.append(obj)
             return obj
 
-        stub_list = []
+        stub_list: List[Any] = []
         with self.catch_and_raise_for_large_object(stubbed_obj):
             self._traverse_object(stubbed_obj, stub_list, add_stub_to_list)
         return stub_list
@@ -169,10 +169,11 @@ class SerializationManager:
             # type of obj, and insert keys in the
             # order present in obj
             # Works only for mutable dicts
-            instance_type = type(obj)
-            if instance_type == collections.defaultdict:
+            d: Dict[str, Any]
+            if isinstance(obj, collections.defaultdict):
                 d = collections.defaultdict(obj.default_factory)
             else:
+                instance_type = type(obj)
                 d = instance_type()
 
             # Iteration order is deterministic on/after python3.7 / cpython3.6
@@ -219,11 +220,11 @@ class SerializationManager:
             # of the instance type.
             # Insert keys in the order it is present in the obj
             # This approach only works for mutable dicts
-            instance_type = type(obj)
-            if instance_type == collections.defaultdict:
+            d: Any
+            if isinstance(obj, collections.defaultdict):
                 d = collections.defaultdict(obj.default_factory)
             else:
-                d = instance_type()
+                d = type(obj)()
             seen_class_type = False
             for k, v in obj.items():
                 stub_key, ret_seen_cls_type_key = self._replace_tensors_with_stubs(k, memo, tx_list, stub_list)

@@ -14,7 +14,7 @@ from device_correctness_test_configs import (
 )
 from checkpoint_test_runner import run_checkpoint_test
 
-from neuronx_distributed.parallel_layers.utils import is_pjrt_device
+from neuronx_distributed.parallel_layers.utils import requires_init_pg_override
 import torch_xla.core.xla_model as xm  # TRN enablement
 
 SEPARATOR = "-" * 70
@@ -114,7 +114,7 @@ def on_exit():
 
 
 if __name__ == "__main__":
-    if is_pjrt_device():
+    if requires_init_pg_override():
         import torch_xla.experimental.pjrt_backend  # noqa
 
         torch.distributed.init_process_group("xla", init_method="pjrt://")

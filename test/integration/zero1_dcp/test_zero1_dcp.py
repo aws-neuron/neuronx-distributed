@@ -14,7 +14,7 @@ import torch_xla.debug.metrics as met
 
 from neuronx_distributed.optimizer import NeuronZero1Optimizer
 from neuronx_distributed.parallel_layers import parallel_state
-from neuronx_distributed.parallel_layers.utils import is_pjrt_device
+from neuronx_distributed.parallel_layers.utils import requires_init_pg_override
 from neuronx_distributed.optimizer.zero_dcp_utils import get_dcp_aux_infos, save_optim_state_dict, load_optim_state_dict
 from neuronx_distributed.parallel_layers.utils import move_all_tensor_to_cpu
 
@@ -88,8 +88,8 @@ def test_zero1_dcp():
         torch.optim.AdamW,
         lr=0.01,
         pin_layout=False,
-        sharding_groups=parallel_state.get_data_parallel_group(as_list=True),
-        grad_norm_groups=parallel_state.get_tensor_model_parallel_group(as_list=True),
+        sharding_groups=parallel_state.get_data_parallel_replica_groups(),
+        grad_norm_groups=parallel_state.get_tensor_model_parallel_replica_groups(),
         max_norm=1.0,
         grad_clipping=True,
     )
@@ -131,7 +131,7 @@ def test_zero1_dcp():
 
 
 if __name__ == "__main__":
-    if is_pjrt_device():
+    if requires_init_pg_override():
         import torch_xla.experimental.pjrt_backend  # noqa
 
         torch.distributed.init_process_group("xla", init_method="pjrt://")

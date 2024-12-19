@@ -1,5 +1,8 @@
 # Python .gitignore template
 
+*.deb
+*.pt
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -78,6 +81,7 @@ target/
 
 # Jupyter Notebook
 .ipynb_checkpoints
+*.ipynb
 
 # IPython
 profile_default/
@@ -140,3 +144,8 @@ src/neuronx_distributed.egg-info/
 *.whl
 **/.DS_Store
 __pycache__
+.vscode
+/exp*
+/tmp*
+tmp.*
+pyproject.toml

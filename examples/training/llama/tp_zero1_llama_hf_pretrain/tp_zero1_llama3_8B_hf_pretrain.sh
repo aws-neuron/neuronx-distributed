@@ -91,13 +91,14 @@ if [ $NEURON_EXTRACT_GRAPHS_ONLY -gt 0 ]; then
     STEPS_THIS_RUN=2
     OUTPUT_LOG=log_compile-$NODE_ID.log
 elif [ -v PERF_TEST ] && [ $PERF_TEST -gt 0 ]; then
-    STEPS_THIS_RUN=100
+    STEPS_THIS_RUN=${EARLY_EXIT_STEPS:-100}
     OUTPUT_LOG=log_exe-$NODE_ID.log
 else
     STEPS_THIS_RUN=-1
     OUTPUT_LOG=log_exe-$NODE_ID.log
 fi
 
+echo EARLY_EXIT_STEPS=$EARLY_EXIT_STEPS
 echo TP_DEGREE=$TP_DEGREE
 echo USE_MIX_PRECISION=$USE_MIX_PRECISION
 echo USE_ZERO_1=$USE_ZERO_1
@@ -134,5 +135,6 @@ torchrun $DISTRIBUTED_ARGS \
     --qkv_linear \
     --kv_replicator 4 \
     --use_flash_attention 1 \
+    --use_gpu_compatible_precision 1 \
     $EXTRA_ARGS |& tee $OUTPUT_LOG
 exit ${PIPESTATUS[0]}

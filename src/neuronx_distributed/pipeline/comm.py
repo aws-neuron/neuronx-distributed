@@ -1,5 +1,6 @@
 import pickle
 from collections import defaultdict
+from typing import Dict, List
 
 import numpy as np
 import torch
@@ -9,6 +10,7 @@ from ..parallel_layers import parallel_state
 from ..parallel_layers.parallel_state import rmsg
 from ..utils.logger import get_logger
 from ..utils.serialization import compress_to_string, uncompress_from_string
+from ..utils import cpu_mode, get_device
 
 logger = get_logger()
 
@@ -16,8 +18,8 @@ logger = get_logger()
 MAX_LENGTH = 2**20  # 1M
 
 # global dict to store the number of send/recvs using tcp store
-kv_tag_send_count = defaultdict(int)
-kv_tag_recv_count = defaultdict(int)
+kv_tag_send_count: Dict[str, int] = defaultdict(int)
+kv_tag_recv_count: Dict[str, int] = defaultdict(int)
 
 # max retry when getting from tcp store
 # tested with 512 nodes cluster
@@ -36,16 +38,24 @@ whereas worker 1 which entered steady state 1 step later, would try to load its 
 
 
 def send(tensor, send_next=True, all_reduce_send_recv=False):
-    if send_next:
-        groups = parallel_state.get_next_rank_group(as_list=True)
-    else:
-        groups = parallel_state.get_prev_rank_group(as_list=True)
+    groups = (
+        parallel_state.get_next_rank_replica_groups() if send_next else parallel_state.get_prev_rank_replica_groups()
+    )
     logger.debug(rmsg(f"send with groups {groups}"))
 
-    if not all_reduce_send_recv:
+    if cpu_mode():
+        if send_next:
+            dst_rank = parallel_state.get_pipeline_model_parallel_next_rank()
+        else:
+            dst_rank = parallel_state.get_pipeline_model_parallel_prev_rank()
+        _ = torch.distributed.send(tensor, dst=dst_rank, group=groups)
+        # FIXME: do we need requires_grad here?
+        return tensor
+    elif not all_reduce_send_recv:
         # Use all_gather instead of all_reduce for send/recv
         rank = xm.get_ordinal()
         split_index = 0
+        assert isinstance(groups, List)
         for group in groups:
             if rank in group:
                 split_index = sorted(group).index(rank)
@@ -65,19 +75,22 @@ def recv_from(tensor_meta, recv_prev=True, tracing=False, all_reduce_send_recv=F
     tensor_recv_next = torch.zeros(
         tensor_meta.shape,
         requires_grad=tensor_meta.requires_grad,
-        device=xm.xla_device(),
+        device=get_device(),
         dtype=tensor_meta.dtype,
     )
-    if recv_prev:
-        groups = parallel_state.get_prev_rank_group(as_list=True)
-    else:
-        groups = parallel_state.get_next_rank_group(as_list=True)
+    groups = (
+        parallel_state.get_prev_rank_replica_groups() if recv_prev else parallel_state.get_next_rank_replica_groups()
+    )
     logger.debug(rmsg(f"recv with groups {groups}"))
 
-    if not all_reduce_send_recv:
+    if cpu_mode():
+        src_rank = parallel_state.get_pipeline_model_parallel_prev_rank() if recv_prev else parallel_state.get_pipeline_model_parallel_next_rank()
+        torch.distributed.recv(tensor_recv_next, src=src_rank, group=groups)
+    elif not all_reduce_send_recv:
         # Use all_gather instead of all_reduce for send/recv
         rank = xm.get_ordinal()
         split_index = 0
+        assert isinstance(groups, List)
         for group in groups:
             if rank in group:
                 split_index = sorted(group).index(rank)
@@ -121,9 +134,9 @@ def _send_with_gloo_group(obj, dst_rank):
     assert len(data) < MAX_LENGTH, "Sending python object larger than 1M is not supported"
     # Pad to MAX_LENGTH
     data += bytes(MAX_LENGTH - len(data))
-    data = np.frombuffer(data, dtype=np.uint8)
-    assert len(data) == MAX_LENGTH
-    tensor = torch.from_numpy(data).cpu()
+    data_array = np.frombuffer(data, dtype=np.uint8)
+    assert len(data_array) == MAX_LENGTH
+    tensor = torch.from_numpy(data_array).cpu()
     torch.distributed.send(tensor, dst_rank, group=gloo_group)
 
 
@@ -165,7 +178,7 @@ def _recv_with_gloo_group(src_rank):
     data = tensor.cpu().numpy().tobytes()
     # get original length
     length = int.from_bytes(data[:4], "big")
-    data = data[4: length + 4]
+    data = data[4 : length + 4]
     return pickle.loads(data)
 
 

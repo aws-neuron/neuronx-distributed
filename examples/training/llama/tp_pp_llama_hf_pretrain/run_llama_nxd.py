@@ -74,6 +74,7 @@ from training_utils import (
     get_param_groups_by_weight_decay,
     get_sin_cos_matrix,
     print_logs,
+    set_random_seed,
 )
 
 from neuronx_distributed.utils.adamw_fp32_optim_params import AdamW_FP32OptimParams
@@ -84,9 +85,7 @@ Metric = namedtuple("Metric", ["name", "value", "units", "additional_data"])
 def train_llama(args):
     if dist.get_rank() == 0:
         print(f"args {args}")
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
-    random.seed(args.seed)
+    set_random_seed(args.seed, args.tensor_parallel_size, args.pipeline_parallel_size, 1) # For pipeline rank based seed setting, please modify this function according to the comments in the function if required
 
     # Set up Llama config
     config = LlamaConfig.from_pretrained(args.training_config)
@@ -98,6 +97,7 @@ def train_llama(args):
     config.kv_shared_group_size = args.kv_replicator
     config.max_position_embeddings = max(config.max_position_embeddings, args.seq_len)
     config.use_flash_attention = args.use_flash_attention > 0
+    config.fuse_qkv = args.fuse_qkv > 0
     if args.num_layer != -1:
         config.num_hidden_layers = args.num_layer
     if args.hidden_size != -1:
@@ -167,7 +167,8 @@ def train_llama(args):
         return model
 
     # Create NxD model
-    model = nxd.initialize_parallel_model(nxd_config, get_model, config)
+    include_buffers = True
+    model = nxd.initialize_parallel_model(nxd_config, get_model, include_buffers, config)
 
     world_size = parallel_state.get_data_parallel_size()
 
@@ -450,6 +451,7 @@ if __name__ == "__main__":
         help="deallocate pipeline output tensors whenever possible",
     )
     opt_grp.add_argument("--qkv_linear", default=0, type=int, help="Use QKV Linear module")
+    opt_grp.add_argument("--fuse_qkv", type=int, default=1, help="Whether to enable fused qkv")
 
     # learning rate
     lr_grp = parser.add_argument_group(title="lr", description="arguments for learning rate schedule")

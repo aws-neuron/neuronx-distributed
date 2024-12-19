@@ -1,7 +1,7 @@
 ### Create Enum to define the type of quantization possible
 import enum
 from enum import Enum
-from typing import TypedDict
+from typing import TypedDict, Optional
 
 import torch
 
@@ -16,6 +16,26 @@ class MyEnumMeta(enum.EnumMeta):
             return True
 
 
+class DtypeBound(Enum):
+    """Enum representing the bounds for data types."""
+
+    # We need this check to be compatible with pytorch version < 2.1
+    if torch.__version__ >= '2.1':
+        F8E4M3_MAX = 240.0
+        F8E4M3_MIN = -240.0
+        F8E5M2_MAX = torch.finfo(torch.float8_e5m2).max
+        F8E5M2_MIN = torch.finfo(torch.float8_e5m2).min
+
+    @staticmethod
+    def from_torch_dtype(dtype):
+        """Map PyTorch data type to the corresponding DtypeBound."""
+        if dtype == torch.float8_e4m3fn:
+            return (DtypeBound.F8E4M3_MAX.value, DtypeBound.F8E4M3_MIN.value)
+        elif dtype == torch.float8_e5m2:
+            return (DtypeBound.F8E5M2_MAX.value, DtypeBound.F8E5M2_MIN.value)
+        else:
+            raise ValueError(f"Unsupported dtype: {dtype}")
+
 class QuantizationType(Enum, metaclass=MyEnumMeta):
     PER_TENSOR_SYMMETRIC = "per_tensor_symmetric"
     PER_CHANNEL_SYMMETRIC = "per_channel_symmetric"
@@ -23,6 +43,20 @@ class QuantizationType(Enum, metaclass=MyEnumMeta):
 
 class QuantizedDtype(Enum, metaclass=MyEnumMeta):
     INT8 = torch.int8
+    if torch.__version__ >= '2.1':
+        F8E4M3 = torch.float8_e4m3fn
+        F8E5M2 = torch.float8_e5m2
+
+    @classmethod
+    def has_dtype(cls, dtype_string: str) -> None:
+        """Check if the dtype string is a valid QuantizedDtype."""
+        assert dtype_string.upper() in cls.__members__, f"{dtype_string} is not a valid QuantizedDtype."
+
+    @classmethod
+    def get_dtype(cls, dtype_string: str) -> torch.dtype:
+        """Return the value for the given dtype string (in uppercase) if it exists."""
+        QuantizedDtype.has_dtype(dtype_string=dtype_string)
+        return cls[dtype_string.upper()].value
 
 
 class BASE_QCONFIG_DICT_TYPE(TypedDict):
@@ -31,7 +65,7 @@ class BASE_QCONFIG_DICT_TYPE(TypedDict):
 
 
 class PER_CHANNEL_QCONFIG_DICT_TYPE(BASE_QCONFIG_DICT_TYPE):
-    quantization_per_channel_axis: int
+    quantization_per_channel_axis: Optional[int]
 
 
 _DEFAULT_CUSTOM_QCONFIG_DICT: BASE_QCONFIG_DICT_TYPE = {
@@ -42,15 +76,16 @@ _DEFAULT_CUSTOM_QCONFIG_DICT: BASE_QCONFIG_DICT_TYPE = {
 _DEFAULT_PER_CHANNEL_QCONFIG_DICT: PER_CHANNEL_QCONFIG_DICT_TYPE = {
     "quantization_type": QuantizationType.PER_CHANNEL_SYMMETRIC,
     "quantized_dtype": QuantizedDtype.INT8,
-    "quantization_per_channel_axis": 0,
+    # Each quantized layer sets its own the default channel
+    "quantization_per_channel_axis": None,
 }
 
 
 def get_default_custom_qconfig_dict() -> BASE_QCONFIG_DICT_TYPE:
     r"""Defines the default custom config dict."""
-    return dict(_DEFAULT_CUSTOM_QCONFIG_DICT)
+    return BASE_QCONFIG_DICT_TYPE(**_DEFAULT_CUSTOM_QCONFIG_DICT)
 
 
 def get_default_per_channel_custom_qconfig_dict() -> PER_CHANNEL_QCONFIG_DICT_TYPE:
     """Defines the default custom per channel config dict"""
-    return dict(_DEFAULT_PER_CHANNEL_QCONFIG_DICT)
+    return PER_CHANNEL_QCONFIG_DICT_TYPE(**_DEFAULT_PER_CHANNEL_QCONFIG_DICT)

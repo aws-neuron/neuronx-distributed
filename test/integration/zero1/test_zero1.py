@@ -1,12 +1,8 @@
 import argparse
 import atexit
 import itertools
-import json
-import os
-import random
 from datetime import datetime
 
-import numpy as np
 import torch
 import torch_xla
 import torch_xla.core.xla_model as xm
@@ -17,11 +13,12 @@ from utils import (
     destroy_gloo_groups,
     get_test_params,
     initialize_gloo_groups,
+    set_seed,
 )
 
-from neuronx_distributed.optimizer import NeuronZero1Optimizer
+from neuronx_distributed.optimizer import NeuronZero1Optimizer, NeuronEPZero1Optimizer
 from neuronx_distributed.parallel_layers import parallel_state
-from neuronx_distributed.parallel_layers.utils import is_pjrt_device
+from neuronx_distributed.parallel_layers.utils import requires_init_pg_override
 
 datetime_str = str(datetime.now())
 
@@ -41,41 +38,40 @@ def parse_args():
 S3_BUCKET_NAME, args = parse_args()
 results = {"inference_success": 1}
 
+
 def on_exit():
     print(met.metrics_report())
 
-def get_test_result(opt, use_pp, model_dtype, optimizer_dtype, grad_clipping, max_norm, pin_layout, coalesce_cc):
-    seed = 1234
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    random.seed(seed)
 
-    use_zero1 = opt == NeuronZero1Optimizer
+def get_test_result(opt, use_ep, model_dtype, optimizer_dtype, grad_clipping, max_norm, pin_layout, coalesce_cc):
+    use_zero1 = issubclass(opt, NeuronZero1Optimizer)
     device = "xla" if use_zero1 else None
-    params = get_test_params(dtype=model_dtype, device=device)
+    params = get_test_params(use_ep=use_ep, dtype=model_dtype, device=device)
 
     optim_inputs = {
-        "params": params,
         "optimizer_class": torch.optim.AdamW,
         "optimizer_dtype": optimizer_dtype,
         "grad_clipping": grad_clipping,
         "max_norm": max_norm,
         "pin_layout": pin_layout,
-        "sharding_groups": parallel_state.get_data_parallel_group(as_list=True),
-        "grad_norm_groups": parallel_state.get_tensor_model_parallel_group(as_list=True),
+        "sharding_groups": parallel_state.get_data_parallel_replica_groups(),
+        "grad_norm_groups": parallel_state.get_tensor_model_parallel_replica_groups(),
         "lr": 1e-2,
     }
-    if version.parse(torch.__version__) >= version.parse("2.0"):
+    # coalesce_cc should not be passed for Torch 2.5
+    if version.parse(torch.__version__) == version.parse("2.1"):
         optim_inputs["coalesce_cc"] = coalesce_cc
-    optimizer = opt(**optim_inputs)
+    optimizer = opt(params, **optim_inputs)
 
     if use_zero1:
         xm.mark_step()
 
+    set_seed(1234 + parallel_state.get_data_parallel_rank())
     res = []
-    for _ in range(5):
+    for i in range(5):
         for p in params:
-            p.grad = torch.clone(p) / 100
+            grad = torch.randn_like(p, device="cpu") / 10
+            p.grad = grad.to(p.device)
         optimizer.step()
         optimizer.zero_grad()
         if use_zero1:
@@ -83,8 +79,8 @@ def get_test_result(opt, use_pp, model_dtype, optimizer_dtype, grad_clipping, ma
 
         param_norm = torch.tensor(0.0).to(torch.double)
         for p in params:
-            param_norm += p.detach().clone().cpu().to(torch.double).sum()
-        param_norm /= len(params)
+            param_norm += p.detach().clone().cpu().norm(2) ** 2
+        param_norm = torch.sqrt(param_norm)
         res.append(param_norm)
 
     return res
@@ -103,13 +99,14 @@ def test_zero1(parallel_config, model_dtype, optimizer_dtype, grad_clipping, max
     parallel_state.initialize_model_parallel(
         tensor_model_parallel_size=parallel_config["tp_degree"],
         pipeline_model_parallel_size=parallel_config["pp_degree"],
+        expert_model_parallel_size=parallel_config["ep_degree"],
     )
     initialize_gloo_groups()
 
-    use_pp = parallel_config["pp_degree"] > 1
+    use_ep = parallel_config["ep_degree"] > 1
     res_zero1 = get_test_result(
-        NeuronZero1Optimizer,
-        use_pp=use_pp,
+        NeuronEPZero1Optimizer if use_ep else NeuronZero1Optimizer,
+        use_ep=use_ep,
         model_dtype=model_dtype,
         optimizer_dtype=optimizer_dtype,
         grad_clipping=grad_clipping,
@@ -119,7 +116,7 @@ def test_zero1(parallel_config, model_dtype, optimizer_dtype, grad_clipping, max
     )
     res_ref = get_test_result(
         RefOptimizer,
-        use_pp=use_pp,
+        use_ep=use_ep,
         model_dtype=model_dtype,
         optimizer_dtype=optimizer_dtype,
         grad_clipping=grad_clipping,
@@ -128,13 +125,8 @@ def test_zero1(parallel_config, model_dtype, optimizer_dtype, grad_clipping, max
         coalesce_cc=coalesce_cc,
     )
     if torch.distributed.get_rank() == 0:
-        print(res_zero1)
-        print(res_ref)
-        for res0, res1 in zip(res_zero1, res_ref):
-            error = 5e-2
-            torch.testing.assert_close(res0, res1, rtol=error, atol=error)
         print(
-            "test passed with: ",
+            "test with config:",
             parallel_config,
             model_dtype,
             optimizer_dtype,
@@ -143,15 +135,20 @@ def test_zero1(parallel_config, model_dtype, optimizer_dtype, grad_clipping, max
             pin_layout,
             coalesce_cc,
         )
+        print(res_zero1)
+        print(res_ref)
+        for res0, res1 in zip(res_zero1, res_ref):
+            error = 2e-3
+            torch.testing.assert_close(res0, res1, rtol=error, atol=error)
+        print("test passed!")
 
     parallel_state.destroy_model_parallel()
     destroy_gloo_groups()
 
 
 if __name__ == "__main__":
-    if is_pjrt_device():
+    if requires_init_pg_override():
         import torch_xla.experimental.pjrt_backend  # noqa
-
         torch.distributed.init_process_group("xla", init_method="pjrt://")
     else:
         torch.distributed.init_process_group("xla")
@@ -165,7 +162,11 @@ if __name__ == "__main__":
         pin_layout,
         coalesce_cc,
     ) in itertools.product(
-        [{"tp_degree": 8, "pp_degree": 1}, {"tp_degree": 1, "pp_degree": 4}],
+        [
+            {"tp_degree": 8, "pp_degree": 1, "ep_degree": 1},
+            {"tp_degree": 1, "pp_degree": 4, "ep_degree": 1},
+            {"tp_degree": 1, "pp_degree": 1, "ep_degree": 8},
+        ],
         [torch.float32, torch.bfloat16],
         [torch.float32, torch.bfloat16],
         [True, False],

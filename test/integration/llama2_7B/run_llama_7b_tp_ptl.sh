@@ -161,6 +161,7 @@ torchrun $DISTRIBUTED_ARGS \
     --use_fp32_optimizer 1 \
     --use_zero1_optimizer 1 \
     --scheduler_type 'linear' \
+    --fuse_qkv 1 \
     --num_layers $n_layers \
     --use_flash_attention=$use_flash_attention |& tee $OUTPUT_LOG
 
@@ -188,3 +189,5 @@ else
       fi
   fi
 fi
+
+exit $ret_val

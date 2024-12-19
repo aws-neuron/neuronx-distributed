@@ -133,6 +133,6 @@ torchrun $DISTRIBUTED_ARGS \
     --grad_accum_usteps $ACC_STEPS \
     --seq_len $SEQ_LEN \
     --selective_checkpoint_enabled \
-    --separate_qkv \
+    --fuse_qkv 0 \
     $EXTRA_ARGS |& tee $OUTPUT_LOG
 exit ${PIPESTATUS[0]}

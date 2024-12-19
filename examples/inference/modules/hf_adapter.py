@@ -1,8 +1,18 @@
 import copy
-from typing import List, Optional, Union
-
 import torch
-from transformers.generation.stopping_criteria import StoppingCriteriaList
+
+from modules.config import NeuronConfig
+
+from typing import Any, Dict, List, Optional, Union
+
+from transformers import GenerationMixin
+from transformers.generation import SampleDecoderOnlyOutput, SampleEncoderDecoderOutput
+from transformers.generation.logits_process import LogitsProcessorList
+from transformers.generation.stopping_criteria import (
+    StoppingCriteriaList,
+    validate_stopping_criteria,
+)
+from transformers.modeling_outputs import ModelOutput
 
 from neuronx_distributed.utils.medusa_utils import (
     evaluate_posterior,
@@ -10,24 +20,230 @@ from neuronx_distributed.utils.medusa_utils import (
     generate_medusa_buffers,
     update_inference_inputs,
 )
+from neuronx_distributed.utils.sampling import Sampler
 
+SampleOutput = Union[SampleEncoderDecoderOutput, SampleDecoderOnlyOutput]
 
-class NeuronSpeculation:
+class HuggingFaceGenerationAdapter(GenerationMixin):
+    def __init__(self, neuron_config: NeuronConfig):
+        super().__init__(neuron_config.hf_config)
+        self.neuron_config = neuron_config
+        self.padding_side = neuron_config.padding_side
+        self.kv_cache_populated = False
+        self.prev_kv_cache_populated = False
+
+    def _sample(
+            self,
+            input_ids: torch.LongTensor,
+            logits_processor: Optional[LogitsProcessorList] = None,
+            stopping_criteria: Optional[StoppingCriteriaList] = None,
+            logits_warper: Optional[LogitsProcessorList] = None,
+            max_length: Optional[int] = None,
+            pad_token_id: Optional[int] = None,
+            eos_token_id: Optional[Union[int, List[int]]] = None,
+            output_scores: Optional[bool] = None,
+            output_logits: Optional[bool] = None,
+            return_dict_in_generate: Optional[bool] = None,
+            **model_kwargs,
+    ) -> Union[SampleOutput, torch.LongTensor]:
+        r"""
+        We override the GenerationMixin sample function (_sample for transformers>=4.39.0) to add support for right side padding.
+        """
+        # init values
+        logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList()
+        stopping_criteria = stopping_criteria if stopping_criteria is not None else StoppingCriteriaList()
+        if max_length is not None:
+            stopping_criteria = validate_stopping_criteria(stopping_criteria, max_length)
+        logits_warper = logits_warper if logits_warper is not None else LogitsProcessorList()
+        pad_token_id = pad_token_id if pad_token_id is not None else self.generation_config.pad_token_id
+        eos_token_id = eos_token_id if eos_token_id is not None else self.generation_config.eos_token_id
+        if isinstance(eos_token_id, int):
+            eos_token_id = [eos_token_id]
+
+        # init attention / hidden states / scores tuples
+        scores = () if (return_dict_in_generate and output_scores) else None
+        raw_logits = () if (return_dict_in_generate and output_logits) else None
+
+        # keep track of which sequences are already finished
+        unfinished_sequences = torch.ones(input_ids.shape[0], dtype=torch.long, device=input_ids.device)
+
+        this_peer_finished = False
+        # auto-regressive generation
+        while not this_peer_finished:
+            # prepare model inputs
+            model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
+            model_kwargs["attention_mask"] = model_inputs.get("attention_mask")
+
+            # forward pass to get next token
+            outputs = self(**model_inputs, return_dict=True)
+
+            if not self.neuron_config.on_device_sampling:
+                next_token_logits = outputs.logits[:, -1, :]
+
+                # pre-process distribution
+                next_token_scores = logits_processor(input_ids, next_token_logits)
+                next_token_scores = logits_warper(input_ids, next_token_scores)
+
+                if return_dict_in_generate:
+                    if output_scores:
+                        scores += (next_token_scores,)
+                    if output_logits:
+                        raw_logits += (next_token_logits,)
+
+            if not self.neuron_config.on_device_sampling:
+                if self.sampler is None:
+                    self.neuron_config.hf_config.do_sample = True
+                    self.sampler = Sampler(self.neuron_config)
+                next_tokens = self.sampler.sample(outputs.logits[:, -1, :])
+            else:
+                next_tokens = outputs.tokens
+
+            # finished sentences should have their next token be a padding token
+            if eos_token_id is not None:
+                if pad_token_id is None:
+                    raise ValueError("If `eos_token_id` is defined, make sure that `pad_token_id` is defined.")
+                next_tokens = next_tokens * unfinished_sequences + pad_token_id * (1 - unfinished_sequences)
+
+            # update generated ids, model inputs, and length for next step
+            input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
+
+            model_kwargs = self._update_model_kwargs_for_generation(
+                outputs,
+                model_kwargs,
+                is_encoder_decoder=self.neuron_config.hf_config.is_encoder_decoder,
+            )
+
+            unfinished_sequences = unfinished_sequences & ~stopping_criteria(input_ids, None)
+            this_peer_finished = unfinished_sequences.max() == 0
+
+        if return_dict_in_generate:
+            return SampleDecoderOnlyOutput(
+                sequences=input_ids,
+                scores=scores,
+                logits=raw_logits,
+            )
+        else:
+            return input_ids
+
+    def prepare_inputs_for_generation(
+            self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
+    ):
+        # Store KV cache flag before forward pass.
+        self.prev_kv_cache_populated = self.kv_cache_populated
+        if self.kv_cache_populated:
+            input_ids = input_ids[:, -1:]
+
+        accepted_indices = kwargs.get("accepted_indices", None)
+        current_length = kwargs.get("current_length", None)
+        medusa_mask = kwargs.get("medusa_mask", None)
+        scatter_index = kwargs.get("scatter_index", None)
+
+        position_ids = kwargs.get("position_ids", None)
+        if attention_mask is not None and position_ids is None:
+            # create position_ids on the fly for batch generation
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 1)
+            if self.kv_cache_populated:
+                position_ids = torch.amax(position_ids, 1, keepdim=True)
+                position_ids = position_ids + 1
+
+        # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
+        if inputs_embeds is not None and past_key_values is None:
+            model_inputs = {"inputs_embeds": inputs_embeds}
+        else:
+            model_inputs = {"input_ids": input_ids}
+
+        model_inputs.update(
+            {
+                "position_ids": position_ids,
+                "past_key_values": past_key_values,
+                "use_cache": kwargs.get("use_cache", False),
+                "attention_mask": attention_mask,
+                "medusa_args": (accepted_indices, current_length, medusa_mask, scatter_index),
+            }
+        )
+        return model_inputs
+
+    def prepare_medusa_inputs_for_generation(
+            self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
+    ):
+        if self.kv_cache_populated:
+            input_ids = input_ids[:, -self.neuron_config.medusa_speculation_length:]
+        position_ids = kwargs.get("position_ids")
+
+        # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
+        if inputs_embeds is not None and past_key_values is None:
+            model_inputs = {"inputs_embeds": inputs_embeds}
+        else:
+            model_inputs = {"input_ids": input_ids}
+
+        model_inputs.update(
+            {
+                "position_ids": position_ids,
+                "past_key_values": past_key_values,
+                "use_cache": kwargs.get("use_cache"),
+                "attention_mask": attention_mask,
+                "medusa_args": (
+                    kwargs.get("accepted_indices"),
+                    kwargs.get("current_length"),
+                    kwargs.get("medusa_mask"),
+                    kwargs.get("scatter_index"),
+                ),
+            }
+        )
+        return model_inputs
+
+    # We override this function because we want to change the way attention_mask
+    # is updated each iteration.
+    def _update_model_kwargs_for_generation(
+            self,
+            outputs: ModelOutput,
+            model_kwargs: Dict[str, Any],
+            is_for_token_generation: Optional[bool] = None,
+            is_encoder_decoder: bool = False,
+    ) -> Dict[str, Any]:
+        if is_for_token_generation is None:
+            is_for_token_generation = self.prev_kv_cache_populated
+
+        if getattr(outputs, "state", None) is not None:
+            model_kwargs["state"] = outputs.state
+
+        # update token_type_ids with last value
+        if "token_type_ids" in model_kwargs:
+            token_type_ids = model_kwargs["token_type_ids"]
+            model_kwargs["token_type_ids"] = torch.cat([token_type_ids, token_type_ids[:, -1].unsqueeze(-1)], dim=-1)
+
+        # update attention mask
+        if "attention_mask" in model_kwargs:
+            attention_mask = model_kwargs["attention_mask"]
+            if is_for_token_generation:
+                if self.padding_side == "left":
+                    attention_mask = torch.cat(
+                        [attention_mask, attention_mask.new_ones((attention_mask.shape[0], 1))], dim=-1
+                    )
+                    attention_mask = attention_mask[:, 1:]
+                else:
+                    attention_mask = torch.cat(
+                        [attention_mask.new_ones((attention_mask.shape[0], 1)), attention_mask], dim=-1
+                    )
+            model_kwargs["attention_mask"] = attention_mask
+        return model_kwargs
+
     def _assisted_decoding(
-        self,
-        input_ids: torch.LongTensor,
-        candidate_generator: "CandidateGenerator", #noqa
-        do_sample: bool = False,
-        stopping_criteria: Optional[StoppingCriteriaList] = None,
-        pad_token_id: Optional[int] = None,
-        eos_token_id: Optional[Union[int, List[int]]] = None,
-        **model_kwargs,
+            self,
+            input_ids: torch.LongTensor,
+            candidate_generator: "CandidateGenerator", #noqa
+            do_sample: bool = False,
+            stopping_criteria: Optional[StoppingCriteriaList] = None,
+            pad_token_id: Optional[int] = None,
+            eos_token_id: Optional[Union[int, List[int]]] = None,
+            **model_kwargs,
     ):
         if do_sample:
             raise ValueError("Sampling is unsupported as part of speculation. Only greedy speculation is supported.")
 
         assistant_model = candidate_generator.assistant_model
-        if self.config.is_medusa:
+        if self.neuron_config.is_medusa:
             # TODO: move this to sampling
             return self._medusa_assisted_decoding(
                 input_ids, assistant_model, stopping_criteria, pad_token_id, eos_token_id, **model_kwargs
@@ -38,7 +254,7 @@ class NeuronSpeculation:
             )
 
     def _standard_assisted_decoding(
-        self, input_ids, assistant_model, stopping_criteria, pad_token_id, eos_token_id, **model_kwargs
+            self, input_ids, assistant_model, stopping_criteria, pad_token_id, eos_token_id, **model_kwargs
     ):
         # Implementation of standard assisted decoding
 
@@ -64,7 +280,7 @@ class NeuronSpeculation:
         # Other auxiliary variables
         max_len = stopping_criteria[0].max_length
         cur_len = input_ids.shape[-1]
-        spec_len = self.config.speculation_length
+        spec_len = self.neuron_config.speculation_length
 
         # Run the target model once and get the first generated token
         model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
@@ -187,13 +403,13 @@ class NeuronSpeculation:
         return returned_ids
 
     def _medusa_assisted_decoding(
-        self, input_ids, assistant_model, stopping_criteria, pad_token_id, eos_token_id, **model_kwargs
+            self, input_ids, assistant_model, stopping_criteria, pad_token_id, eos_token_id, **model_kwargs
     ):
         medusa_kwargs = copy.deepcopy(model_kwargs)
 
         eos_token_id = eos_token_id if eos_token_id is not None else self.generation_config.eos_token_id
 
-        mc_sim_7b_63 = self.config.medusa_tree
+        mc_sim_7b_63 = self.neuron_config.medusa_tree
 
         medusa_buffers = generate_medusa_buffers(mc_sim_7b_63)
 
@@ -216,10 +432,10 @@ class NeuronSpeculation:
         accept_lengths_tree.append(1)
         count = 0
         select_indices = torch.arange(
-            cur_len[0].item(), cur_len[0].item() + self.config.num_medusa_heads + 1, dtype=torch.int64
+            cur_len[0].item(), cur_len[0].item() + self.neuron_config.num_medusa_heads + 1, dtype=torch.int64
         )
 
-        for i in range(self.config.max_new_tokens):
+        for i in range(self.neuron_config.max_new_tokens):
             count = count + 1
             candidates, tree_candidates = generate_candidates(
                 medusa_logits,
@@ -267,25 +483,25 @@ class NeuronSpeculation:
             cur_length = accept_length_tree + cur_length
             accept_lengths_tree.append(accept_length_tree)
             final_accept_length += accept_length + 1
-            if eos_token_id in new_token or final_accept_length > self.config.max_new_tokens:
+            if eos_token_id in new_token or final_accept_length > self.neuron_config.max_new_tokens:
                 break
         return input_ids
 
     def _prepare_medusa_kwargs(self, position_ids, cur_len, medusa_buffers, select_indices, medusa_kwargs):
         medusa_kwargs["position_ids"] = position_ids.unsqueeze(0)
         medusa_kwargs["accepted_indices"] = torch.arange(
-            cur_len[0].item(), cur_len[0].item() + self.config.num_medusa_heads + 1, dtype=torch.int64
+            cur_len[0].item(), cur_len[0].item() + self.neuron_config.num_medusa_heads + 1, dtype=torch.int64
         )
         for index, value in enumerate(select_indices):
             medusa_kwargs["accepted_indices"][index] = value
         medusa_kwargs["accepted_indices"] = medusa_kwargs["accepted_indices"].unsqueeze(0)
         medusa_kwargs["current_length"] = torch.arange(
-            cur_len[0].item(), cur_len[0].item() + self.config.num_medusa_heads + 1, dtype=torch.int64
+            cur_len[0].item(), cur_len[0].item() + self.neuron_config.num_medusa_heads + 1, dtype=torch.int64
         ).unsqueeze(0)
         medusa_mask = medusa_buffers["medusa_attn_mask"].unsqueeze(0)
         medusa_kwargs["medusa_mask"] = medusa_mask.type_as(torch.LongTensor())
         medusa_kwargs["scatter_index"] = torch.arange(
-            position_ids[0], position_ids[0] + self.config.medusa_speculation_length, dtype=torch.int64
+            position_ids[0], position_ids[0] + self.neuron_config.medusa_speculation_length, dtype=torch.int64
         ).unsqueeze(0)
         return medusa_kwargs
 

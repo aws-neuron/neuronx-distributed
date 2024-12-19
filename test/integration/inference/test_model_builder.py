@@ -136,7 +136,8 @@ def test_executing_loaded_model():
     del traced_model
 
     loaded_traced_model = torch.jit.load("test.pt")
-    loaded_traced_model.nxd_model.initialize_with_saved_weights()
+    start_rank_tensor = torch.tensor([0], dtype=torch.int32, device="cpu")
+    loaded_traced_model.nxd_model.initialize_with_saved_weights(start_rank_tensor)
 
     # Test multiple invocations
     for _ in range(5):
@@ -314,22 +315,22 @@ def test_weight_layout_optimization_with_serialization():
     )
     traced_model = builder.trace(initialize_model_weights=False)
 
-    # Save the traced model 
+    # Save the traced model
     torch.jit.save(traced_model, "traced_model.pt")
     del traced_model
 
-    # Shard weights from checkpoint 
+    # Shard weights from checkpoint
     shard_weights_path = "weights/"
     builder.shard_checkpoint(serialize_path=shard_weights_path)
     weights = []
     for rank in range(tp_degree):
         ckpt = torch.load(os.path.join(shard_weights_path, f"tp{rank}_sharded_checkpoint.pt"))
         weights.append(ckpt)
-        
+
     # Load the traced model
     traced_model = torch.jit.load("traced_model.pt")
     print("Done loading serialized model")
-    
+
     # Load new weights
     traced_model.nxd_model.initialize(weights)
 
@@ -454,27 +455,28 @@ def test_loading_checkpoint():
                 model_instance = BaseModelInstance(partial(CPLRPLModel, hidden_dim=hidden_dim, is_distributed=True), input_output_aliases={}),
                 example_inputs=[(x,)],
                 compiler_args="--auto-cast=none")
-    
+
     traced_model = builder.trace(initialize_model_weights=False) # stops weight sharding
 
-    # Save the traced model 
+    # Save the traced model
     torch.jit.save(traced_model, "traced_model.pt")
     del traced_model
 
-    # Shard weights from checkpoint 
+    # Shard weights from checkpoint
     shard_weights_path = "weights/"
     builder.shard_checkpoint(serialize_path=shard_weights_path)
     weights = []
     for rank in range(tp_degree):
         ckpt = torch.load(os.path.join(shard_weights_path, f"tp{rank}_sharded_checkpoint.pt"))
         weights.append(ckpt)
-        
+
     # Load the traced model
     traced_model = torch.jit.load("traced_model.pt")
-    
+
     # Load new weights
-    traced_model.nxd_model.initialize(weights)
-        
+    start_rank_tensor = torch.tensor([0], dtype=torch.int32, device="cpu")
+    traced_model.nxd_model.initialize(weights, start_rank_tensor)
+
     # Test multiple invocations
     for _ in range(5):
         x = torch.randn((batch_size, hidden_dim))
@@ -485,7 +487,7 @@ def test_loading_checkpoint():
 
 if __name__ == "__main__":
     test_list = [
-        test_saving_loading_model, 
+        test_saving_loading_model,
         test_CPL_only_model,
         test_executing_loaded_model,
         test_CPL_RPL_model,
@@ -507,4 +509,3 @@ if __name__ == "__main__":
         else:
             raise Exception(f"Test failed: {test.__name__}\n")
     print(f"All {len(test_list)} tests on ModelBuilder succeeded!")
-    

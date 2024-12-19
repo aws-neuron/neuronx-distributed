@@ -3,7 +3,7 @@ import logging
 import os
 import sys
 from functools import lru_cache, wraps
-from typing import Any, Optional, Callable, TypeVar
+from typing import Any, Optional, Callable, TypeVar, cast
 from typing_extensions import ParamSpec
 
 # Third Party
@@ -71,7 +71,7 @@ def get_logger(name: str = "neuronx_distributed", rank0_only: bool = True) -> lo
         if rank0_only:
             # this ensures all logging levels get marked with the rank zero decorator
             # otherwise logs would get multiplied for each GPU process in multi-GPU setup
-            for level in (
+            for _level in (
                 "debug",
                 "info",
                 "warning",
@@ -80,15 +80,15 @@ def get_logger(name: str = "neuronx_distributed", rank0_only: bool = True) -> lo
                 "fatal",
                 "critical",
             ):
-                setattr(logger, level, _rank0_only(getattr(logger, level)))
+                setattr(logger, _level, _rank0_only(getattr(logger, _level)))
     else:
         logger.disabled = True
     logger.propagate = False
-    logger.initialized = True
+    setattr(logger, "initialized", True)
     return logger
 
 
-def _rank0_only(fn: Callable[P, T], default: Optional[T] = None, **extra_kwargs: P.kwargs) -> Callable[P, Optional[T]]:
+def _rank0_only(fn: Callable[P, T], default: Optional[T] = None, *args: P.args, **extra_kwargs: P.kwargs) -> Callable[P, Optional[T]]:
     """Wrap a logging.Logger function to call internal function only in rank zero.
     Function that can be used as a decorator to enable a function/method being called only on global rank 0.
 
@@ -105,7 +105,7 @@ def _rank0_only(fn: Callable[P, T], default: Optional[T] = None, **extra_kwargs:
         if rank == 0:
             # excluding the wrapper from calling stack for logger to use
             # see https://docs.python.org/3/library/logging.html#logging.Logger.findCaller
-            kwargs["stacklevel"] = kwargs.get("stacklevel", 1) + 1
+            kwargs["stacklevel"] = cast(int, kwargs.get("stacklevel", 1)) + 1
             return fn(*args, **kwargs)
         return default
 

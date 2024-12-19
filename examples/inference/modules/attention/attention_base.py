@@ -4,6 +4,7 @@ from typing import Optional, Tuple
 
 import torch
 from torch import nn, Tensor
+from torch.distributed import ProcessGroup
 
 from modules.attention.utils import apply_rotary_pos_emb, repeat_kv, manual_softmax, move_heads_front
 
@@ -19,6 +20,7 @@ from modules.gqa import (  # noqa: E402
     GroupQueryAttention_QKV,  # noqa: E402
 )  # noqa: E402
 
+import neuronx_distributed as nxd
 from neuronx_distributed.parallel_layers import utils  # noqa: E402
 
 _flash_fwd_call = nki_jit()(attention_isa_kernel)
@@ -34,8 +36,16 @@ class NeuronAttentionBase(nn.Module):
     5. update forward() method to adjust to changes from self.num_head
     """
 
-    def __init__(self):
+    def __init__(self, tensor_model_parallel_group: Optional[ProcessGroup] = None):
         super().__init__()
+
+        if tensor_model_parallel_group is not None:
+            self.tensor_model_parallel_group = tensor_model_parallel_group
+        elif nxd.parallel_layers.parallel_state.model_parallel_is_initialized():
+            self.tensor_model_parallel_group = nxd.parallel_layers.parallel_state.get_tensor_model_parallel_group()
+        else:
+            self.tensor_model_parallel_group = None
+
         self.is_causal = True
         self.num_key_value_groups = None
         self.num_key_value_heads = None
@@ -43,6 +53,10 @@ class NeuronAttentionBase(nn.Module):
         self.rotary_emb = None
         self.o_proj = None
         self.qkv_proj = None
+        self.bias = False
+        self.tp_degree = self.tensor_model_parallel_group.size() if self.tensor_model_parallel_group else 1
+
+        self.o_proj_layer_name = "o_proj"
 
     def init_gqa_properties(self):
         if (self.head_dim * self.num_attention_heads) != self.hidden_size:
@@ -57,9 +71,11 @@ class NeuronAttentionBase(nn.Module):
             num_key_value_heads=self.num_key_value_heads,
             tp_degree=self.tp_degree,
             dtype=self.torch_dtype,
+            bias=self.bias,
             gather_output=False,
             fused_qkv=self.fused_qkv,
-            clip_qkv=self.clip_qkv
+            clip_qkv=self.clip_qkv,
+            tensor_model_parallel_group=self.tensor_model_parallel_group,
         )
         self.o_proj = GroupQueryAttention_O(
             hidden_size=self.hidden_size,
@@ -68,7 +84,10 @@ class NeuronAttentionBase(nn.Module):
             num_key_value_heads=self.num_key_value_heads,
             tp_degree=self.tp_degree,
             dtype=self.torch_dtype,
+            bias=self.bias,
             input_is_parallel=True,
+            layer_name=self.o_proj_layer_name,
+            tensor_model_parallel_group=self.tensor_model_parallel_group,
         )
         self.num_heads = utils.divide(self.qkv_proj.get_num_attention_heads(), self.tp_degree)
         self.num_key_value_heads = utils.divide(self.qkv_proj.get_num_key_value_heads(), self.tp_degree)
@@ -76,7 +95,8 @@ class NeuronAttentionBase(nn.Module):
 
     def scaled_qk(self, Q, K, attention_mask):
         QK = torch.matmul(Q, K.transpose(2, 3)) / math.sqrt(self.head_dim)
-        QK = torch.where(attention_mask, QK, torch.finfo(QK.dtype).min)
+        if attention_mask is not None:
+            QK = torch.where(attention_mask, QK, torch.finfo(QK.dtype).min)
         return QK
 
     def prep_qkv_tensors(self, position_ids, hidden_states, past_key_value):
@@ -91,8 +111,9 @@ class NeuronAttentionBase(nn.Module):
         V = move_heads_front(V, bsz, q_len, self.num_key_value_heads, self.head_dim)
 
         # Rotate Q and K
-        cos, sin = self.rotary_emb(V, position_ids)
-        Q, K = apply_rotary_pos_emb(Q, K, cos, sin)
+        if self.rotary_emb is not None:
+            cos, sin = self.rotary_emb(V, position_ids)
+            Q, K = apply_rotary_pos_emb(Q, K, cos, sin)
         return Q, K, V
 
     def perform_prefill(self, Q, K, V, q_len, bsz, attention_mask) -> Tensor:
@@ -112,20 +133,20 @@ class NeuronAttentionBase(nn.Module):
 
             # original shape of q, k, v is BHSD, and expected output is also BHSD.
             logging.debug(f"Using flash_fwd for Q.shape={Q.shape}")
-            # make sure to cast inputs to self.config.torch_dtype (this is needed because the downcast to bf16
+            # make sure to cast inputs to torch_dtype (this is needed because the downcast to bf16
             # might happen after the kernel hlo creation step). Also convert shapes as expected by the kernel.
             Q = (
                 Q.permute(0, 1, 3, 2)
                 .reshape((bsz * self.num_heads, self.head_dim, q_len))
-                .to(self.config.torch_dtype)
+                .to(self.neuron_config.hf_config.torch_dtype)
             )
             Q = Q / math.sqrt(self.head_dim)
             K_active = (
                 K_active.permute(0, 1, 3, 2)
                 .reshape((bsz * self.num_heads, self.head_dim, q_len))
-                .to(self.config.torch_dtype)
+                .to(self.neuron_config.hf_config.torch_dtype)
             )
-            V_active = V_active.reshape((bsz * self.num_heads, q_len, self.head_dim)).to(self.config.torch_dtype)
+            V_active = V_active.reshape((bsz * self.num_heads, q_len, self.head_dim)).to(self.neuron_config.hf_config.torch_dtype)
             attn_output = torch.zeros(bsz * self.num_heads, q_len, self.head_dim, dtype=Q.dtype, device=Q.device)
             _flash_fwd_call(
                 Q, K_active, V_active, 1.0, attn_output, kernel_name="CausalAttentionMMSoftmaxMMWithoutSwap"

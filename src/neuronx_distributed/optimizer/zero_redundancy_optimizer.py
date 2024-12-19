@@ -1,7 +1,7 @@
 import gc
 import math
 import os
-from typing import Union, Optional, Callable, List, Any, Dict
+from typing import Union, Optional, Callable, List, Any, Dict, Tuple
 
 import torch
 import torch_xla.core.xla_model as xm
@@ -11,12 +11,12 @@ from ..parallel_layers.checkpointing import ensure_directory_exists
 from ..parallel_layers.grads import get_grad_norm, clip_grads_with_norm
 from ..utils.model_utils import recursive_filter
 from ..parallel_layers.parallel_state import (
-    get_data_parallel_group,
+    get_data_parallel_replica_groups,
     get_data_parallel_rank,
-    get_expert_data_parallel_group,
+    get_expert_data_parallel_replica_groups,
     get_expert_data_parallel_size,
     get_expert_model_parallel_size,
-    get_expert_model_parallel_group,
+    get_expert_model_parallel_replica_groups,
     get_tensor_model_parallel_rank,
     model_parallel_is_initialized,
 )
@@ -33,7 +33,7 @@ class NeuronZero1Optimizer(ZeroRedundancyOptimizer):
 
         # Default to use DP groups for sharding
         if "sharding_groups" not in kwargs or kwargs["sharding_groups"] is None:
-            kwargs["sharding_groups"] = get_data_parallel_group(as_list=True)
+            kwargs["sharding_groups"] = get_data_parallel_replica_groups()
 
         # hard-code since use_world_for_grad_norm = True does not work with TP
         self._use_world_for_grad_norm = False
@@ -47,6 +47,9 @@ class NeuronZero1Optimizer(ZeroRedundancyOptimizer):
 
             hooks.register_post_partition_hook(filter_to_local_parameter_group, [self])
             hooks.register_post_partition_hook(self.init_zero)
+
+    def _set_grad_norm(self, grad_norm):
+        self._grad_norm = grad_norm.detach().clone()
 
     @property
     def grad_norm(self) -> Optional[torch.Tensor]:
@@ -95,8 +98,9 @@ class NeuronZero1Optimizer(ZeroRedundancyOptimizer):
         norm_type: Union[float, int] = 2.0,
     ) -> None:
 
-        all_parameters, self._grad_norm = self._get_params_and_grad_norm(norm_type)
-        clip_grads_with_norm(all_parameters, self._grad_norm, max_norm)
+        all_parameters, grad_norm = self._get_params_and_grad_norm(norm_type)
+        self._set_grad_norm(grad_norm)
+        clip_grads_with_norm(all_parameters, grad_norm, max_norm)
 
     # [TODO] Remove this method
     def save_sharded_state_dict(self, output_dir: str, num_workers_per_step: int = 8) -> None:
@@ -114,7 +118,7 @@ class NeuronZero1Optimizer(ZeroRedundancyOptimizer):
         chkpt_path = output_dir
         chkpt_path = os.path.join(
             chkpt_path,
-            "optim.dp_rank_{:02d}.tp_rank_{:02d}".format(get_data_parallel_rank(), get_tensor_model_parallel_rank()),
+            "optim.dp_rank_{:02d}.tp_rank_{:02d}".format(state_dict["dp_rank"], state_dict["tp_rank"]),
         )
         ensure_directory_exists(chkpt_path)
 
@@ -163,8 +167,8 @@ class NeuronEPZero1Optimizer(NeuronZero1Optimizer):
 
         # Default to use DP groups for sharding
         if "sharding_groups" not in kwargs or kwargs["sharding_groups"] is None:
-            kwargs["sharding_groups"] = get_data_parallel_group(as_list=True)
-        elif kwargs["sharding_groups"] != get_data_parallel_group(as_list=True):
+            kwargs["sharding_groups"] = get_data_parallel_replica_groups()
+        elif kwargs["sharding_groups"] != get_data_parallel_replica_groups():
             raise ValueError("Custom sharding group for Zero-1 with expert parallelism is not supported.")
 
         if "params" in kwargs:
@@ -172,7 +176,7 @@ class NeuronEPZero1Optimizer(NeuronZero1Optimizer):
 
         self.non_ep_zero_optimizer = NeuronZero1Optimizer(non_ep_parameters, *args[1:], **kwargs)
 
-        kwargs["sharding_groups"] = get_expert_data_parallel_group(as_list=True)
+        kwargs["sharding_groups"] = get_expert_data_parallel_replica_groups()
         self.ep_zero_optimizer = NeuronZero1Optimizer(ep_parameters, *args[1:], **kwargs)
 
         # Avoid this optimizer to create hooks for grad accumulation
@@ -181,16 +185,20 @@ class NeuronEPZero1Optimizer(NeuronZero1Optimizer):
         super(NeuronEPZero1Optimizer, self).__init__(*args, **kwargs)
 
     def zero_grad(self, set_to_none: bool = False) -> None:
-        """ Reset the gradients of the two optimizers and hooked grad accumulators
-            when GPU-compatible precision is enabled. """
+        """Reset the gradients of the two optimizers and hooked grad accumulators
+        when GPU-compatible precision is enabled."""
         self.ep_zero_optimizer.zero_grad(set_to_none=set_to_none)
         self.non_ep_zero_optimizer.zero_grad(set_to_none=set_to_none)
 
     def _is_ep_param(self, param):
         return hasattr(param, "expert_model_parallel") and param.expert_model_parallel
 
-    def _filter_param_groups(self, groups: List[Dict[str, List[Any]]], predicate: Callable[..., List[Any]]) -> List[Dict[str, List[Any]]]:
-        filtered = [{k: v if k != "params" else [p for p in filter(predicate, v)]} for group in groups for k, v in group.items()]
+    def _filter_param_groups(
+        self, groups: List[Dict[str, List[Any]]], predicate: Callable[..., List[Any]]
+    ) -> List[Dict[str, List[Any]]]:
+        filtered = [
+            {k: v if k != "params" else [p for p in filter(predicate, v)]} for group in groups for k, v in group.items()
+        ]
         return filtered
 
     @property
@@ -224,31 +232,35 @@ class NeuronEPZero1Optimizer(NeuronZero1Optimizer):
 
         ep_parameters, ep_grad_norm = self.ep_zero_optimizer._get_params_and_grad_norm(norm_type)
 
-        self._grad_norm = self._combine_grad_norms([non_ep_grad_norm, ep_grad_norm], norm_type)
+        grad_norm = self._combine_grad_norms([non_ep_grad_norm, ep_grad_norm], norm_type)
+        self._set_grad_norm(grad_norm)
 
-        clip_grads_with_norm(non_ep_parameters + ep_parameters, self._grad_norm, max_norm)
+        clip_grads_with_norm(non_ep_parameters + ep_parameters, grad_norm, max_norm)
 
-    def _get_sharding_schemes(self) -> Dict[str, Any]:
+    def _get_sharding_schemes(self) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         # sequentially reduce over expert-data-parallel and expert-model-parallel groups
+        edp_groups = get_expert_data_parallel_replica_groups()
+        edp_size = get_expert_data_parallel_size()
+        emp_size = get_expert_model_parallel_size()
         non_ep_sharding_scheme = [
             {
-                "sharding_group": get_expert_data_parallel_group(as_list=True),
-                "group_size": get_expert_data_parallel_size(),
+                "sharding_group": edp_groups,
+                "group_size": edp_size,
                 "scale_factor": 1.0,
             },
             {
-                "sharding_group": get_expert_model_parallel_group(as_list=True),
-                "group_size": get_expert_model_parallel_size(),
+                "sharding_group": get_expert_model_parallel_replica_groups(),
+                "group_size": emp_size,
                 "scale_factor": 1.0,
             },
         ]
 
         ep_sharding_scheme = [
             {
-                "sharding_group": get_expert_data_parallel_group(as_list=True),
-                "group_size": get_expert_data_parallel_size(),
+                "sharding_group": edp_groups,
+                "group_size": edp_size,
                 # EP grads further need to be scaled down by EP degree
-                "scale_factor": 1.0 / float(get_expert_model_parallel_size()),
+                "scale_factor": 1.0 / emp_size,
             },
         ]
 
@@ -279,7 +291,7 @@ class NeuronEPZero1Optimizer(NeuronZero1Optimizer):
         return 1
 
     def state_dict(self) -> Dict[str, Any]:
-        """ Combine the state_dicts of the two base optimizers """
+        """Combine the state_dicts of the two base optimizers"""
 
         non_ep_state_dict = self.non_ep_zero_optimizer.state_dict()
         ep_state_dict = self.ep_zero_optimizer.state_dict()
@@ -288,38 +300,43 @@ class NeuronEPZero1Optimizer(NeuronZero1Optimizer):
         ep_shape_info_offset = self._get_offset(non_ep_state_dict["shape_info"])
         ep_param_group_offset = len(non_ep_state_dict["param_groups"])
 
-        state_dict = {"ep_param_id_offset": ep_param_id_offset,
-                      "ep_param_group_offset": ep_param_group_offset,
-                      "ep_base_state_offset": ep_base_state_offset,
-                      "ep_shape_info_offset": ep_shape_info_offset,
-                      }
+        state_dict: Dict[str, Any] = {
+            "ep_param_id_offset": ep_param_id_offset,
+            "ep_param_group_offset": ep_param_group_offset,
+            "ep_base_state_offset": ep_base_state_offset,
+            "ep_shape_info_offset": ep_shape_info_offset,
+        }
 
         # combine param_groups
         state_dict["param_groups"] = non_ep_state_dict["param_groups"] + ep_state_dict["param_groups"]
 
         # combine state
-        state_dict["state"] = non_ep_state_dict["state"]
-        state_dict["base_state"] = non_ep_state_dict["base_state"]
-        state_dict["shape_info"] = non_ep_state_dict["shape_info"]
+        state: Dict[int, int] = non_ep_state_dict["state"]
+        state_dict["state"] = state
+        base_state: Dict[int, int] = non_ep_state_dict["base_state"]
+        state_dict["base_state"] = base_state
+        shape_info: Dict[int, int] = non_ep_state_dict["shape_info"]
+        state_dict["shape_info"] = shape_info
         for k, v in ep_state_dict["state"].items():
-            state_dict["state"][ep_param_id_offset + k] = v
+            state[ep_param_id_offset + k] = v
 
         for k, v in ep_state_dict["base_state"].items():
-            state_dict["base_state"][ep_base_state_offset + k] = v
+            base_state[ep_base_state_offset + k] = v
 
         for k, v in ep_state_dict["shape_info"].items():
-            state_dict["shape_info"][ep_shape_info_offset + k] = v
+            shape_info[ep_shape_info_offset + k] = v
 
         return state_dict
 
-
     def load_state_dict(self, state_dict):
-        """ Split the state_dict for the two base optimizers and load them individually """
+        """Split the state_dict for the two base optimizers and load them individually"""
 
-        if ("ep_param_id_offset" not in state_dict or
-           "ep_param_group_offset" not in state_dict or
-           "ep_base_state_offset" not in state_dict or
-           "ep_shape_info_offset" not in state_dict):
+        if (
+            "ep_param_id_offset" not in state_dict
+            or "ep_param_group_offset" not in state_dict
+            or "ep_base_state_offset" not in state_dict
+            or "ep_shape_info_offset" not in state_dict
+        ):
             raise ValueError("state_dict is not compatible with expert parallelism and Zero-1.")
 
         ep_param_id_offset = state_dict["ep_param_id_offset"]

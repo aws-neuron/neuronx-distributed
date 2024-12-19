@@ -1,6 +1,7 @@
 import collections
 import os
-from typing import List, Sequence, Any
+import warnings
+from typing import List, Any, Sequence, Optional
 
 import numpy as np
 import torch
@@ -10,6 +11,7 @@ import torch_xla.core.xla_model as xm
 
 from neuronx_distributed.parallel_layers.parallel_state import (
     get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_size,
 )
 from neuronx_distributed.utils.logger import get_logger
 
@@ -17,6 +19,7 @@ _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {
     "tensor_model_parallel": False,
     "partition_dim": -1,
     "partition_stride": 1,
+    "num_partitions": 1,
 }
 
 logger = get_logger()
@@ -45,37 +48,38 @@ def param_is_not_tensor_parallel_duplicate(param: torch.Tensor) -> bool:
     )
 
 
-def set_tensor_model_parallel_attributes(tensor: torch.Tensor, is_parallel: bool, dim: int, stride: int = 1) -> None:
+def set_tensor_model_parallel_attributes(tensor: torch.Tensor, is_parallel:bool, dim:int, stride:int, num_partitions:int = -1) -> None:
     # Make sure the attributes are not set.
     for attribute in _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS:
         assert not hasattr(tensor, attribute)
+
+    if num_partitions == -1:
+        warnings.warn("NeuronxDistributed: Please pass \"num_partitions\" argument to set_tensor_model_parallel_attributes() method. "
+                      "Default value may not work correctly and will be removed in later versions.")
+        num_partitions = get_tensor_model_parallel_size()
+
     # Set the attributes.
     setattr(tensor, "tensor_model_parallel", is_parallel)
     setattr(tensor, "partition_dim", dim)
     setattr(tensor, "partition_stride", stride)
+    setattr(tensor, "num_partitions", num_partitions)
 
 
 def set_defaults_if_not_set_tensor_model_parallel_attributes(
     tensor: torch.Tensor,
 ) -> None:
-    def maybe_set(attribute, value):
-        if not hasattr(tensor, attribute):
-            setattr(tensor, attribute, value)
-
     for attribute in _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS:
-        maybe_set(attribute, _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS[attribute])
+        if not hasattr(tensor, attribute):
+            setattr(tensor, attribute, _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS[attribute])
 
 
 def copy_tensor_model_parallel_attributes(destination_tensor: torch.Tensor, source_tensor: torch.Tensor) -> None:
-    def maybe_copy(attribute):
+    for attribute in _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS:
         if hasattr(source_tensor, attribute):
             setattr(destination_tensor, attribute, getattr(source_tensor, attribute))
 
-    for attribute in _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS:
-        maybe_copy(attribute)
 
-
-def ensure_divisibility(numerator: int, denominator: int) -> int:
+def ensure_divisibility(numerator: int, denominator: int) -> None:
     """Ensure that numerator is divisible by the denominator."""
     assert numerator % denominator == 0, "{} is not divisible by {}".format(numerator, denominator)
 
@@ -92,7 +96,7 @@ def split_tensor_along_dim(
     dim: int,
     num_partitions: int,
     contiguous_split_chunks: bool = False,
-) -> List[torch.Tensor]:
+) -> Sequence[torch.Tensor]:
     """Split a tensor along the dimension 'dim'.
     Arguments:
         tensor: input tensor.
@@ -104,7 +108,7 @@ def split_tensor_along_dim(
     # Get the size and dimension.
     dim_size = divide(tensor.size()[dim], num_partitions)
     # Split.
-    tensor_list = torch.split(tensor, dim_size, dim=dim)
+    tensor_list: List[torch.Tensor] = list(torch.split(tensor, dim_size, dim=dim))
     # Note: torch.split does not create contiguous tensors by default.
     if contiguous_split_chunks:
         return tuple(chunk.contiguous() for chunk in tensor_list)
@@ -125,7 +129,7 @@ def split_tensor_along_last_dim(
     tensor: torch.Tensor,
     num_partitions: int,
     contiguous_split_chunks: bool = False,
-) -> List[torch.Tensor]:
+) -> Sequence[torch.Tensor]:
     """Split a tensor along its last dimension.
     Arguments:
         tensor: input tensor.
@@ -135,11 +139,12 @@ def split_tensor_along_last_dim(
     """
     return split_tensor_along_dim(tensor, tensor.dim() - 1, num_partitions, contiguous_split_chunks)
 
+
 def split_tensor_along_second_dim(
     tensor: torch.Tensor,
     num_partitions: int,
     contiguous_split_chunks: bool = False,
-) -> List[torch.Tensor]:
+) -> Sequence[torch.Tensor]:
     """Split a tensor along its second dimension (numbered starting at 1)
     Arguments:
         tensor: input tensor.
@@ -148,6 +153,7 @@ def split_tensor_along_second_dim(
                                  in memory.
     """
     return split_tensor_along_dim(tensor, 1, num_partitions, contiguous_split_chunks)
+
 
 def is_torch_version_greater_than_2() -> bool:
     return torch.__version__.startswith("2")
@@ -161,7 +167,9 @@ def requires_init_pg_override() -> bool:
     return torch.__version__.startswith("2.0")
 
 
-def cast_tensor(tensor: torch.Tensor, from_dtype: torch.dtype = torch.float32, to_dtype: torch.dtype = torch.bfloat16) -> Any:
+def cast_tensor(
+    tensor: torch.Tensor, from_dtype: torch.dtype = torch.float32, to_dtype: torch.dtype = torch.bfloat16
+) -> Any:
     return tensor.to(dtype=to_dtype) if tensor.dtype == from_dtype else tensor
 
 
@@ -227,11 +235,13 @@ def move_all_tensor_to_cpu(data: Any, convert: bool = True) -> Any:
 
 
 def get_local_world_size() -> int:
-    if is_torch_version_greater_than_2():
+    if requires_init_pg_override():
         # With pjrt this only works after init_process_group()
         import torch_xla.experimental.pjrt as pjrt
-
         return pjrt.local_process_count()
+    elif is_pjrt_device():
+        import torch_xla.runtime as xr
+        return xr.local_process_count()
     else:
         return xm.xrt_world_size() // int(os.environ[xenv.HOST_WORLD_SIZE])
 
@@ -264,3 +274,4 @@ def verify_casted_dtype(value: Any) -> None:
                 verify_casted_dtype(v)
         else:
             return
+

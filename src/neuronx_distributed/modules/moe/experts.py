@@ -1,7 +1,8 @@
-from typing import Callable
+from typing import Callable, Optional
 
 import torch
 from torch import Tensor
+from torch.distributed import ProcessGroup
 from torch.nn import Module
 
 from neuronx_distributed.modules.moe.moe_parallel_layers import (
@@ -11,17 +12,15 @@ from neuronx_distributed.modules.moe.moe_parallel_layers import (
 from neuronx_distributed.parallel_layers.mappings import (
     enter_expert_parallel_region,
     exit_expert_parallel_region,
-    reduce_from_tensor_model_parallel_region,
-    reduce_scatter_to_tensor_model_parallel_region_with_dim,
 )
 from neuronx_distributed.parallel_layers.parallel_state import (
     get_expert_model_parallel_size,
-    get_tensor_model_parallel_size,
+    get_tensor_model_parallel_group,
 )
 
 
 class Experts(Module):
-    """ Module which performs the expert MLP computations for the given hidden states.
+    """Module which performs the expert MLP computations for the given hidden states.
     Expert Parallelism (EP), if enabled, is applied through scatter-gather optimization
     across TP ranks.
     """
@@ -37,13 +36,16 @@ class Experts(Module):
         device: torch.device,
         input_layer_init_method=None,
         output_layer_init_method=None,
+        tensor_model_parallel_group: Optional[ProcessGroup] = None,
     ) -> None:
         super().__init__()
 
         self._glu = glu
         self._activation_fn = activation_fn
-
         self.num_experts = num_experts
+        # todo: we can also generalize expert-parallel group
+        self.tensor_parallel_group = tensor_model_parallel_group if \
+            tensor_model_parallel_group is not None else get_tensor_model_parallel_group()
 
         if self._glu:
             self.gate_up_proj = ExpertFusedColumnParallelLinear(
@@ -58,6 +60,7 @@ class Experts(Module):
                 device=device,
                 stride=2,
                 init_method=input_layer_init_method,
+                tensor_model_parallel_group=self.tensor_parallel_group,
             )
         else:
             self.up_proj = ExpertFusedColumnParallelLinear(
@@ -69,6 +72,7 @@ class Experts(Module):
                 dtype=dtype,
                 device=device,
                 init_method=input_layer_init_method,
+                tensor_model_parallel_group=self.tensor_parallel_group,
             )
 
         self.down_proj = ExpertFusedRowParallelLinear(
@@ -81,9 +85,10 @@ class Experts(Module):
             dtype=dtype,
             device=device,
             init_method=output_layer_init_method,
+            tensor_model_parallel_group=self.tensor_parallel_group,
         )
 
-    def forward(self, hidden_states: Tensor, expert_indices: Tensor = None) -> Tensor:
+    def forward(self, hidden_states: Tensor, expert_indices: Optional[Tensor] = None) -> Tensor:
         """
         Common nomenclature:
             E: Total number of experts, C: Expert capacity, H: Hidden Size
@@ -124,7 +129,7 @@ class Experts(Module):
                 hidden_states,
                 # temporarily disable scatter_gather optimization
                 scatter_gather=False,
-                #scatter_gather=num_tokens_divisible_by_tp,
+                # scatter_gather=num_tokens_divisible_by_tp,
             )
         else:
             dispatched_hidden_states = hidden_states.view(e, 1, c, h)
@@ -148,7 +153,7 @@ class Experts(Module):
                 projected_states,
                 # temporarily disable scatter_gather optimization
                 scatter_gather=False,
-                #scatter_gather=num_tokens_divisible_by_tp,
+                # scatter_gather=num_tokens_divisible_by_tp,
             )
         else:
             output = projected_states.squeeze(1)

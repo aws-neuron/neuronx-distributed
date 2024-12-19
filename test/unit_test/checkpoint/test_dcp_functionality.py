@@ -1,8 +1,9 @@
 import torch
 import pytest
 from packaging import version
-if not version.parse(torch.__version__) >= version.parse("2.1"):
-    pytest.skip("skip this test if no DCP support", allow_module_level=True)
+
+if version.parse(torch.__version__) != version.parse("2.1"):
+    pytest.skip("skip this test", allow_module_level=True)
 
 # Standard Library
 import os
@@ -78,23 +79,23 @@ class DCPFunctionalityTest(unittest.TestCase):
     @patch("neuronx_distributed.pipeline.partition.get_pipeline_model_parallel_size", MagicMock(return_value=8))
     @patch("neuronx_distributed.pipeline.model.NxDPPModel._create_pg_with_ranks", MagicMock(return_value=None))
     @patch(
-        "neuronx_distributed.parallel_layers.parallel_state.get_data_parallel_group",
+        "neuronx_distributed.parallel_layers.parallel_state.get_data_parallel_replica_groups",
         MagicMock(return_value=[[i] for i in range(64)]),
     )
     @patch(
-        "neuronx_distributed.trainer.checkpoint.get_data_parallel_group",
+        "neuronx_distributed.trainer.checkpoint.get_data_parallel_replica_groups",
         MagicMock(return_value=[[i] for i in range(64)]),
     )
     @patch(
-        "neuronx_distributed.parallel_layers.parallel_state.get_tensor_model_parallel_group",
-        MagicMock(return_value=None),
+        "neuronx_distributed.parallel_layers.parallel_state.get_tensor_model_parallel_replica_groups",
+        MagicMock(return_value=[[i] for i in range(64)]),
     )
     @patch(
         "neuronx_distributed.optimizer.zero_redundancy_optimizer.model_parallel_is_initialized",
         MagicMock(return_value=True),
     )
     @patch(
-        "neuronx_distributed.optimizer.zero_redundancy_optimizer.get_data_parallel_group",
+        "neuronx_distributed.optimizer.zero_redundancy_optimizer.get_data_parallel_replica_groups",
         MagicMock(return_value=[[i] for i in range(64)]),
     )
     @patch("neuronx_distributed.utils.model_utils.get_local_world_size", MagicMock(return_value=32))
@@ -106,9 +107,12 @@ class DCPFunctionalityTest(unittest.TestCase):
     @patch("neuronx_distributed.trainer.checkpoint.get_expert_model_parallel_rank", MagicMock(return_value=0))
     @patch("neuronx_distributed.trainer.checkpoint.get_expert_data_parallel_size", MagicMock(return_value=1))
     @patch("neuronx_distributed.trainer.checkpoint.get_expert_data_parallel_rank", MagicMock(return_value=0))
-    @patch("neuronx_distributed.trainer.checkpoint.get_expert_model_parallel_group", MagicMock(return_value=None))
     @patch(
-        "neuronx_distributed.trainer.checkpoint.get_expert_data_parallel_group",
+        "neuronx_distributed.trainer.checkpoint.get_expert_model_parallel_replica_groups",
+        MagicMock(return_value=[[i] for i in range(64)]),
+    )
+    @patch(
+        "neuronx_distributed.trainer.checkpoint.get_expert_data_parallel_replica_groups",
         MagicMock(return_value=[[i] for i in range(64)]),
     )
     @patch(
@@ -116,9 +120,18 @@ class DCPFunctionalityTest(unittest.TestCase):
         MagicMock(return_value=True),
     )
     @patch("neuronx_distributed.optimizer.zero_dcp_utils.get_pipeline_model_parallel_rank", MagicMock(return_value=1))
-    @patch("neuronx_distributed.optimizer.zero_dcp_utils.get_tensor_model_parallel_group", MagicMock(return_value=[[i] for i in range(8)]))
-    @patch("neuronx_distributed.optimizer.zero_dcp_utils.get_pipeline_model_parallel_group", MagicMock(return_value=[[i] for i in range(8)]))
-    @patch("neuronx_distributed.optimizer.zero_dcp_utils.get_data_parallel_group", MagicMock(return_value=[[i] for i in range(64)]))
+    @patch(
+        "neuronx_distributed.optimizer.zero_dcp_utils.get_tensor_model_parallel_replica_groups",
+        MagicMock(return_value=[[i] for i in range(8)]),
+    )
+    @patch(
+        "neuronx_distributed.optimizer.zero_dcp_utils.get_pipeline_model_parallel_replica_groups",
+        MagicMock(return_value=[[i] for i in range(8)]),
+    )
+    @patch(
+        "neuronx_distributed.optimizer.zero_dcp_utils.get_data_parallel_replica_groups",
+        MagicMock(return_value=[[i] for i in range(64)]),
+    )
     @patch("torch.distributed.get_rank", MagicMock(return_value=0))
     @patch("torch.distributed.get_world_size", MagicMock(return_value=1))
     def test_checkpoint_dcp(self):

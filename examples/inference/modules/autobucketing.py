@@ -36,20 +36,26 @@ def token_generation_bk(tensors: List[torch.Tensor], buckets: torch.Tensor, padd
     2) buckets: A torch.tensor of the bucket sizes
     3) padding_side: A string specifying padding side, must be "left" or "right"
     """
-    attention_mask = tensors[1]
-    position_ids = tensors[2]
-
-    # Refer to the context_encoding_bk comments on selecting a bucket_idx
-    # The difference is that this single line of code is valid for all batch sizes
-    bucket_mask = (buckets <= position_ids).to(torch.int)
-    bucket_idx = torch.max(torch.argmin(bucket_mask, dim=1))
-    bucket = buckets[bucket_idx]
-
-    # slice the attention mask based on the selected bucket size
-    if padding_side == "right":
-        tensors[1] = slice_lhs(attention_mask, bucket, 1)
+    # The assumption here is the first three tensors are input, attention mask and position IDs. However,
+    # attention mask can be discarded by the XLA if we do not use the original attention mask and instead create new
+    # one within the graph. Hence, below logic is needed to figure out if attention mask is removed.
+    item = tensors[1]
+    attention_mask_is_removed = item.shape[1] == 1  # indicates item is position IDs
+    if attention_mask_is_removed:
+        position_ids = tensors[1]
+        bucket_mask = (buckets <= position_ids).to(torch.int)
+        bucket_idx = torch.max(torch.argmin(bucket_mask, dim=1))
     else:
-        tensors[1] = slice_rhs(attention_mask, bucket, buckets[-1], 1)
+        attention_mask = tensors[1]
+        position_ids = tensors[2]
+        bucket_mask = (buckets <= position_ids).to(torch.int)
+        bucket_idx = torch.max(torch.argmin(bucket_mask, dim=1))
+        bucket = buckets[bucket_idx]
+        # slice the attention mask based on the selected bucket size
+        if padding_side == "right":
+            tensors[1] = slice_lhs(attention_mask, bucket, 1)
+        else:
+            tensors[1] = slice_rhs(attention_mask, bucket, buckets[-1], 1)
 
     return tensors, bucket_idx.to(torch.int)
 

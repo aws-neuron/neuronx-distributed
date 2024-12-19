@@ -3,6 +3,8 @@ from typing import Tuple
 import torch
 from torch import Tensor
 from torch import nn
+import torch_xla.core.xla_model as xm
+from neuronx_distributed.parallel_layers.parallel_state import get_kv_shared_group
 
 torch.manual_seed(0)
 
@@ -55,6 +57,40 @@ def manual_softmax(prior_scores, active_scores, is_speculation) -> Tuple[Tensor,
 
     softmax_prior = exp_prior / denominator
     softmax_active = exp_active / denominator
+    return softmax_prior, softmax_active
+
+
+def distributed_softmax(prior_scores, active_scores) -> Tuple[Tensor, Tensor]:
+    """
+    compute partial softmax and then gather and correct final softmax.
+    """
+    # find local max
+    max_score = torch.max(prior_scores, dim=-1, keepdim=True)[0]
+    max_active_score = torch.max(active_scores, dim=-1, keepdim=True)[0]
+    local_max_score = torch.maximum(max_score, max_active_score)
+
+    exp_prior = torch.exp(prior_scores - local_max_score)
+    exp_active = torch.exp(active_scores - local_max_score)
+    denominator = exp_prior.sum(dim=-1, keepdim=True) + exp_active.sum(dim=-1, keepdim=True)
+
+    # collect for global max and exp sum (denominator)
+    groups = get_kv_shared_group(as_list=True)
+    gather_payload = torch.cat((local_max_score, denominator), dim=0)
+    gathered_res = xm.all_gather(gather_payload, dim=-1,
+                                 groups=groups, pin_layout=False)
+    gathered_max, gathered_denom = torch.chunk(gathered_res, 2, dim=0)
+    global_max = torch.max(gathered_max, dim=-1, keepdim=True)[0]
+
+    # softmax correction
+    scaling_factor = torch.exp(gathered_max - global_max.expand(gathered_max.shape))
+    corrected_denominator = torch.multiply(scaling_factor, gathered_denom)
+    corrected_denominator = torch.sum(corrected_denominator, dim=-1, keepdim=True)
+
+    corrected_exp_prior = torch.exp(prior_scores - global_max)
+    corrected_exp_active = torch.exp(active_scores - global_max)
+
+    softmax_prior = corrected_exp_prior / corrected_denominator
+    softmax_active = corrected_exp_active / corrected_denominator
     return softmax_prior, softmax_active
 
 

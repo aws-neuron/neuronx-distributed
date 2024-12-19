@@ -76,6 +76,7 @@ def train_llama(args):
     model_config.sequence_parallel_enabled = args.use_sequence_parallel > 0
     model_config.kv_shared_group_size = args.kv_replicator
     model_config.qkv_linear = args.qkv_linear
+    model_config.fuse_qkv = args.fuse_qkv > 0
     model_config.selective_checkpoint_enabled = args.use_selective_checkpoint > 0
     model_config.max_position_embeddings = max(model_config.max_position_embeddings, args.seq_len)
     model_config.use_flash_attention = args.use_flash_attention > 0
@@ -369,6 +370,7 @@ if __name__ == "__main__":
         type=int,
         help="KV replication number",
     )
+    parser.add_argument("--fuse_qkv", type=int, default=1, help="Whether to enable fused qkv")
     parser.add_argument(
         "--use_flash_attention",
         default=0,

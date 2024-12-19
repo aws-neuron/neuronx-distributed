@@ -92,8 +92,7 @@ def train_mixtral(flags):
 
     callbacks = []
     callbacks.append(NeuronTQDMProgressBar())
-    if flags.pipeline_parallel_size == 1:
-        callbacks.append(ModelSummary(max_depth=5))
+    callbacks.append(ModelSummary(max_depth=5))
     if flags.save_checkpoint:
         callbacks.append(
             ModelCheckpoint(

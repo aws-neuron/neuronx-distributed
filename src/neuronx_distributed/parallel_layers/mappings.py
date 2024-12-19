@@ -1,19 +1,21 @@
 import functools
-from typing import Callable, Tuple
+from typing import Any, Callable, Optional, Tuple, Sequence, cast
 
 import torch
 from torch import Tensor
 from torch.autograd import Function
 import torch.distributed
+from torch.distributed import ProcessGroup
 import torch_xla.core.xla_model as xm
+from . import parallel_state
 
 from .parallel_state import (
-    get_expert_model_parallel_group,
+    get_expert_model_parallel_replica_groups,
     get_tensor_model_parallel_group,
-    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_size,
 )
 from .utils import split_tensor_along_last_dim, split_tensor_along_dim
+from .comm import all_gather, reduce_scatter, all_reduce
 
 if "all_gather_into_tensor" not in dir(torch.distributed):
     torch.distributed.all_gather_into_tensor = torch.distributed._all_gather_base
@@ -21,17 +23,15 @@ if "reduce_scatter_tensor" not in dir(torch.distributed):
     torch.distributed.reduce_scatter_tensor = torch.distributed._reduce_scatter_base
 
 
-def nonzero_partition_dim_swap(
-    func: Callable[[Tensor, int], Tensor],
-) -> Callable[[Tensor, int], Tensor]:
-    """ Decorator that internally swaps the partition/gather dim with 0-dimension. To the
+def nonzero_partition_dim_swap(func: Callable[..., Any]) -> Callable[..., Any]:
+    """Decorator that internally swaps the partition/gather dim with 0-dimension. To the
     outside the partition_dim appears to be the (arbitrary) partition dimension. Internally,
-    partition/split dimension is always 0 - which is achieved by pre- and post-transpose. """
+    partition/split dimension is always 0 - which is achieved by pre- and post-transpose."""
 
     @functools.wraps(func)
-    def wrapped_fn(x: Tensor, partition_dim: int) -> Tensor:
+    def wrapped_fn(x: Tensor, partition_dim: int, *args, **kwargs) -> Tensor:
         x_t = x.transpose(0, partition_dim) if partition_dim != 0 else x
-        y_t: Tensor = func(x_t, partition_dim=0)
+        y_t: Tensor = func(x_t, 0, *args, **kwargs)
         y = y_t.transpose(0, partition_dim) if partition_dim != 0 else y_t
 
         return y
@@ -39,125 +39,135 @@ def nonzero_partition_dim_swap(
     return wrapped_fn
 
 
-def _reduce(input_: torch.Tensor) -> torch.Tensor:
+def _reduce(input_: torch.Tensor, computation=xm.REDUCE_SUM, process_group: Optional[ProcessGroup] = None) -> torch.Tensor:
     """All-reduce the input tensor across model parallel group."""
 
+    group: ProcessGroup = process_group if process_group is not None else get_tensor_model_parallel_group()
     # Bypass the function if we are using only 1 device.
-    if get_tensor_model_parallel_size() == 1:
+    if group.size() == 1:
         return input_
 
-    # All-reduce.
-    torch.distributed.all_reduce(input_, group=get_tensor_model_parallel_group())
-
-    return input_
+    tensor_bucket = all_reduce(computation, input_, groups=group)
+    return tensor_bucket[0]
 
 
-def _split_along_last_dim(input_: torch.Tensor) -> torch.Tensor:
+def _split_along_last_dim(
+    input_: torch.Tensor, process_group: Optional[ProcessGroup] = None,
+) -> torch.Tensor:
     """Split the tensor along its last dimension and keep the
     corresponding slice."""
+    return _split_along_dim(input_, len(input_.shape)-1, process_group=process_group)
 
-    return _split_along_dim(input_, len(input_.shape)-1)
 
-def _split_along_first_dim(input_: Tensor) -> Tensor:
+def _split_along_first_dim(input_: Tensor, process_group: Optional[ProcessGroup] = None) -> Tensor:
     """Split the tensor along its first dimension and keep the
     corresponding slice."""
 
-    return _split_along_dim(input_, 0)
+    return _split_along_dim(input_, 0, process_group=process_group)
 
-def _split_along_dim(input_: Tensor, partition_dim: int) -> Tensor:
+
+def _split_along_dim(input_: Tensor, partition_dim: int, process_group: Optional[ProcessGroup] = None) -> Tensor:
     """Split the tensor along its first dimension and keep the
     corresponding slice."""
 
-    world_size = get_tensor_model_parallel_size()
+    group: ProcessGroup = process_group if process_group is not None else get_tensor_model_parallel_group()
+    world_size = group.size()
     # Bypass the function if we are using only 1 device.
     if world_size == 1:
         return input_
 
     # Split along partition dimension.
-    input_list = split_tensor_along_dim(input_, partition_dim, world_size)
+    input_list: Sequence[Tensor] = split_tensor_along_dim(input_, partition_dim, world_size)
 
     # Note: torch.split does not create contiguous tensors by default.
-    rank = get_tensor_model_parallel_rank()
-    output = input_list[rank].contiguous()
-
+    rank = group.rank()
+    output: Tensor = input_list[rank].contiguous()
     return output
 
 
 @nonzero_partition_dim_swap
-def _gather_along_dim(x: Tensor, partition_dim: int) -> Tensor:
+def _gather_along_dim(x: Tensor, partition_dim: int, process_group: Optional[ProcessGroup] = None) -> Tensor:
     """Given a tensor partitioned across the specified dimension,
     gather and concatenate along partition dimension (using TP/SP group).
     """
-    tp_group = get_tensor_model_parallel_group()
+    tp_group = process_group if process_group is not None else get_tensor_model_parallel_group()
 
     # bpyass the function if we only have 1 TP rank.
-    if tp_group.size() == 1:
+    if get_tensor_model_parallel_size() == 1:
         return x
 
-    output = xm.all_gather(
+    output = all_gather(
         x,
         dim=partition_dim,
-        groups=get_tensor_model_parallel_group(as_list=True),
+        groups=tp_group,
         pin_layout=False,
     )
 
     return output.contiguous()
 
-def _gather_along_first_dim(x: Tensor) -> Tensor:
-    return _gather_along_dim(x, partition_dim=0)
 
-def _gather_along_last_dim(x: Tensor) -> Tensor:
-    return _gather_along_dim(x, partition_dim=len(x.shape)-1)
 
-def _reduce_scatter_along_first_dim(x: Tensor) -> Tensor:
-    return _reduce_scatter_along_dim(x, 0)
+def _gather_along_first_dim(x: Tensor, process_group: Optional[ProcessGroup] = None) -> Tensor:
+    return _gather_along_dim(x, partition_dim=0, process_group=process_group)
 
-def _reduce_scatter_along_last_dim(x: Tensor) -> Tensor:
-    return _reduce_scatter_along_dim(x, len(x.shape)-1)
+
+def _gather_along_last_dim(x: Tensor, process_group: Optional[ProcessGroup] = None) -> Tensor:
+    return _gather_along_dim(x, partition_dim=len(x.shape)-1, process_group=process_group)
+
+
+def _reduce_scatter_along_first_dim(x: Tensor, computation=xm.REDUCE_SUM, process_group: Optional[ProcessGroup] = None) -> Tensor:
+    return _reduce_scatter_along_dim(x, partition_dim=0, computation=computation, process_group=process_group)
+
+
+def _reduce_scatter_along_last_dim(x: Tensor, computation=xm.REDUCE_SUM, process_group: Optional[ProcessGroup] = None) -> Tensor:
+    return _reduce_scatter_along_dim(x, partition_dim=len(x.shape)-1, computation=computation, process_group=process_group)
+
 
 @nonzero_partition_dim_swap
-def _reduce_scatter_along_dim(x: Tensor, partition_dim: int) -> Tensor:
+def _reduce_scatter_along_dim(
+    x: Tensor, partition_dim: int, computation=xm.REDUCE_SUM, process_group: Optional[ProcessGroup] = None,
+) -> Tensor:
     """Reduce-scatter the input tensor across model parallel group."""
-    tp_group = get_tensor_model_parallel_group()
+    tp_group = process_group if process_group is not None else cast(ProcessGroup, get_tensor_model_parallel_group())
+    tp_size = tp_group.size()
 
     # bypass the function if we only have 1 TP/SP rank
-    if tp_group.size() == 1:
+    if tp_size == 1:
         return x
 
     shape = list(x.shape)
-    if shape[partition_dim] % tp_group.size() != 0:
+    if shape[partition_dim] % tp_size != 0:
         raise RuntimeError(
-            f"unable to create {tp_group.size()} partitions along dim {partition_dim} "
+            f"unable to create {tp_size} partitions along dim {partition_dim} "
             f"of tensor of shape {tuple(x.shape)} due to not being evenly divisible."
         )
-    shape[partition_dim] //= tp_group.size()
+    shape[partition_dim] //= tp_size
     output = torch.empty(shape, dtype=x.dtype, device=x.device)
 
-    xm.reduce_scatter(
-        xm.REDUCE_SUM,
+    reduce_scatter(
+        computation,
         x.contiguous(),
         scatter_dim=partition_dim,
-        shard_count=tp_group.size(),
+        shard_count=tp_size,
         scale=1,
         output=output,
-        groups=get_tensor_model_parallel_group(as_list=True),
+        groups=tp_group,
         pin_layout=False,
     )
-
     return output
 
-def _all_to_all_in_expert_parallel_region(x: Tensor, split_dim: int, concat_dim: int) -> Tensor:
-    ep_group = get_expert_model_parallel_group()
 
-    if ep_group.size() == 1:  # bypass if there's no EP.
+def _all_to_all_in_expert_parallel_region(x: Tensor, split_dim: int, concat_dim: int) -> Tensor:
+    emp_size = parallel_state.get_expert_model_parallel_size()
+    if emp_size == 1:  # bypass if there's no EP.
         return x
 
     return xm.all_to_all(
         x,
         split_dimension=split_dim,
         concat_dimension=concat_dim,
-        split_count=ep_group.size(),
-        groups=get_expert_model_parallel_group(as_list=True),
+        split_count=emp_size,
+        groups=get_expert_model_parallel_replica_groups(),
         pin_layout=False,
     )
 
@@ -168,16 +178,19 @@ class _CopyToModelParallelRegion(torch.autograd.Function):
     # FIXME(mkozuki): Definition of static symbolic methods don't look correct according to
     # https://pytorch.org/docs/stable/onnx.html#static-symbolic-method
     @staticmethod
-    def symbolic(graph, input_):
+    def symbolic(graph, input_, process_group):
         return input_
 
     @staticmethod
-    def forward(ctx, input_):
+    def forward(ctx, input_, process_group: Optional[ProcessGroup] = None):
+        ctx.process_group = process_group if process_group is not None \
+            else get_tensor_model_parallel_group()
         return input_
 
     @staticmethod
     def backward(ctx, grad_output):
-        return _reduce(grad_output)
+        process_group = ctx.process_group
+        return _reduce(grad_output, process_group=process_group), None
 
 
 class _ReduceFromModelParallelRegion(torch.autograd.Function):
@@ -186,16 +199,16 @@ class _ReduceFromModelParallelRegion(torch.autograd.Function):
     # FIXME(mkozuki): Definition of static symbolic methods don't look correct according to
     # https://pytorch.org/docs/stable/onnx.html#static-symbolic-method
     @staticmethod
-    def symbolic(graph, input_):
-        return _reduce(input_)
+    def symbolic(graph, input_, process_group):
+        return _reduce(input_, process_group)
 
     @staticmethod
-    def forward(ctx, input_):
-        return _reduce(input_)
+    def forward(ctx, input_, process_group: Optional[ProcessGroup] = None):
+        return _reduce(input_, process_group=process_group)
 
     @staticmethod
     def backward(ctx, grad_output):
-        return grad_output
+        return grad_output, None
 
 
 class _ScatterToModelParallelRegion(torch.autograd.Function):
@@ -204,16 +217,19 @@ class _ScatterToModelParallelRegion(torch.autograd.Function):
     # FIXME(mkozuki): Definition of static symbolic methods don't look correct according to
     # https://pytorch.org/docs/stable/onnx.html#static-symbolic-method
     @staticmethod
-    def symbolic(graph, input_):
-        return _split_along_last_dim(input_)
+    def symbolic(graph, input_, process_group):
+        return _split_along_last_dim(input_, process_group)
 
     @staticmethod
-    def forward(ctx, input_):
-        return _split_along_last_dim(input_)
+    def forward(ctx, input_, process_group: Optional[ProcessGroup] = None):
+        process_group = process_group if process_group is not None \
+            else get_tensor_model_parallel_group()
+        ctx.process_group = process_group
+        return _split_along_last_dim(input_, process_group=process_group)
 
     @staticmethod
     def backward(ctx, grad_output):
-        return _gather_along_last_dim(grad_output)
+        return _gather_along_last_dim(grad_output, process_group=ctx.process_group), None
 
 
 class _GatherFromModelParallelRegion(torch.autograd.Function):
@@ -222,16 +238,19 @@ class _GatherFromModelParallelRegion(torch.autograd.Function):
     # FIXME(mkozuki): Definition of static symbolic methods don't look correct according to
     # https://pytorch.org/docs/stable/onnx.html#static-symbolic-method
     @staticmethod
-    def symbolic(graph, input_):
-        return _gather_along_last_dim(input_)
+    def symbolic(ctx, input_, process_group):
+        return _gather_along_last_dim(input_, process_group=process_group)
 
     @staticmethod
-    def forward(ctx, input_):
-        return _gather_along_last_dim(input_)
+    def forward(ctx, input_, process_group: Optional[ProcessGroup] = None):
+        process_group = process_group if process_group is not None \
+            else get_tensor_model_parallel_group()
+        ctx.process_group = process_group
+        return _gather_along_last_dim(input_, process_group=process_group)
 
     @staticmethod
     def backward(ctx, grad_output):
-        return _split_along_last_dim(grad_output)
+        return _split_along_last_dim(grad_output, process_group=ctx.process_group), None
 
 
 class _ScatterToSequenceParallelRegion(torch.autograd.Function):
@@ -239,17 +258,23 @@ class _ScatterToSequenceParallelRegion(torch.autograd.Function):
     only keep the corresponding chunk for the current TP rank."""
 
     @staticmethod
-    def symbolic(graph, input_: Tensor, partition_dim: int) -> Tensor:
-        return _split_along_dim(input_, partition_dim=partition_dim)
+    def symbolic(
+        graph, input_: Tensor, partition_dim: int, process_group: Optional[ProcessGroup] = None,
+    ) -> Tensor:
+        return _split_along_dim(input_, partition_dim=partition_dim, process_group=process_group)
 
     @staticmethod
-    def forward(ctx, input_: Tensor, partition_dim: int) -> Tensor:
+    def forward(
+        ctx, input_: Tensor, partition_dim: int, process_group: Optional[ProcessGroup] = None,
+    ) -> Tensor:
         ctx.partition_dim = partition_dim
-        return _split_along_dim(input_, partition_dim=partition_dim)
+        process_group = process_group if process_group is not None else get_tensor_model_parallel_group()
+        ctx.process_group = process_group
+        return _split_along_dim(input_, partition_dim=partition_dim, process_group=process_group)
 
     @staticmethod
-    def backward(ctx, grad_output: Tensor) -> Tuple[Tensor, None]:
-        return _gather_along_dim(grad_output, partition_dim=ctx.partition_dim), None
+    def backward(ctx: Any, *grad_outputs: Any) -> Any:
+        return _gather_along_dim(grad_outputs[0], ctx.partition_dim, process_group=ctx.process_group,), None, None
 
 
 class _GatherFromSequenceParallelRegion(torch.autograd.Function):
@@ -264,8 +289,9 @@ class _GatherFromSequenceParallelRegion(torch.autograd.Function):
         input_: Tensor,
         partition_dim: int,
         to_model_parallel: bool = True,
+        process_group: Optional[ProcessGroup] = None,
     ) -> Tensor:
-        return _gather_along_dim(input_, partition_dim=partition_dim)
+        return _gather_along_dim(input_, partition_dim=partition_dim, process_group=process_group)
 
     @staticmethod
     def forward(
@@ -273,20 +299,22 @@ class _GatherFromSequenceParallelRegion(torch.autograd.Function):
         input_: Tensor,
         partition_dim: int,
         to_model_parallel: bool = True,
+        process_group: Optional[ProcessGroup] = None,
     ) -> Tensor:
         ctx.partition_dim = partition_dim
         ctx.to_model_parallel = to_model_parallel
-        return _gather_along_dim(input_, partition_dim=partition_dim)
+        ctx.process_group = process_group if process_group is not None else get_tensor_model_parallel_group()
+        return _gather_along_dim(input_, partition_dim=partition_dim, process_group=ctx.process_group)
 
     @staticmethod
-    def backward(ctx, grad_output: Tensor) -> Tuple[Tensor, None, None]:
+    def backward(ctx, *grad_outputs: Any) -> Any:
         partition_dim: int = ctx.partition_dim
         grad_input = (
-            _reduce_scatter_along_dim(grad_output, partition_dim=partition_dim)
+            _reduce_scatter_along_dim(grad_outputs[0], partition_dim=partition_dim, process_group=ctx.process_group)
             if ctx.to_model_parallel
-            else _split_along_dim(grad_output, partition_dim=partition_dim)
+            else _split_along_dim(grad_outputs[0], partition_dim)
         )
-        return grad_input, None, None
+        return grad_input, None, None, None
 
 
 class _ReduceScatterToSequenceParallelRegion(torch.autograd.Function):
@@ -295,17 +323,26 @@ class _ReduceScatterToSequenceParallelRegion(torch.autograd.Function):
     # FIXME(mkozuki): Definition of static symbolic methods don't look correct according to
     # https://pytorch.org/docs/stable/onnx.html#static-symbolic-method
     @staticmethod
-    def symbolic(graph, input_: Tensor, partition_dim: int) -> Tensor:
-        return _reduce_scatter_along_dim(input_, partition_dim=partition_dim)
+    def symbolic(
+        graph, input_: Tensor, partition_dim: int, process_group: Optional[ProcessGroup] = None,
+    ) -> Tensor:
+        process_group = process_group if process_group is not None else get_tensor_model_parallel_group()
+        return _reduce_scatter_along_dim(input_, partition_dim=partition_dim, process_group=process_group)
 
     @staticmethod
-    def forward(ctx, input_: Tensor, partition_dim: int) -> Tensor:
+    def forward(
+        ctx, input_: Tensor, partition_dim: int, process_group: Optional[ProcessGroup] = None,
+    ) -> Tensor:
         ctx.partition_dim = partition_dim
-        return _reduce_scatter_along_dim(input_, partition_dim=partition_dim)
+        process_group if process_group is not None else get_tensor_model_parallel_group()
+        ctx.process_group = process_group
+        return _reduce_scatter_along_dim(input_, partition_dim=partition_dim, process_group=process_group)
 
     @staticmethod
-    def backward(ctx, grad_output: Tensor) -> Tuple[Tensor, None]:
-        return _gather_along_dim(grad_output, partition_dim=ctx.partition_dim), None
+    def backward(ctx, *grad_outputs: Any) -> Any:
+        return _gather_along_dim(
+            grad_outputs[0], partition_dim=ctx.partition_dim, process_group=ctx.process_group,
+        ), None, None
 
 
 class _AllToAllInExpertParallelRegion(Function):
@@ -328,10 +365,10 @@ class _AllToAllInExpertParallelRegion(Function):
         )
 
     @staticmethod
-    def backward(ctx, grad_output: Tensor) -> Tuple[Tensor, None, None]:
+    def backward(ctx, *grad_outputs: Any) -> Any:
         # all2all as before but with concat/split dims inverted.
         grad_input = _all_to_all_in_expert_parallel_region(
-            grad_output,
+            grad_outputs[0],
             split_dim=ctx.concat_dim,
             concat_dim=ctx.split_dim,
         )
@@ -359,54 +396,75 @@ class _ScatterInputChannelsToModelParallelRegion(torch.autograd.Function):
 # -----------------
 
 
-def copy_to_tensor_model_parallel_region(input_):
-    return _CopyToModelParallelRegion.apply(input_)
+def copy_to_tensor_model_parallel_region(input_, process_group: Optional[ProcessGroup] = None):
+    return _CopyToModelParallelRegion.apply(input_, process_group)
 
 
-def reduce_from_tensor_model_parallel_region(input_):
-    return _ReduceFromModelParallelRegion.apply(input_)
+def reduce_from_tensor_model_parallel_region(input_, process_group: Optional[ProcessGroup] = None):
+    return _ReduceFromModelParallelRegion.apply(input_, process_group)
 
 
 def scatter_input_channels_to_tensor_model_parallel_region(input_):
     return _ScatterInputChannelsToModelParallelRegion.apply(input_)
 
 
-def scatter_to_tensor_model_parallel_region(input_):
-    return _ScatterToModelParallelRegion.apply(input_)
+def scatter_to_tensor_model_parallel_region(input_, process_group: Optional[ProcessGroup] = None):
+    return _ScatterToModelParallelRegion.apply(input_, process_group)
 
 
-def gather_from_tensor_model_parallel_region(input_):
-    return _GatherFromModelParallelRegion.apply(input_)
+def gather_from_tensor_model_parallel_region(
+    input_, process_group: Optional[ProcessGroup] = None,
+) -> torch.Tensor:
+    return _GatherFromModelParallelRegion.apply(input_, process_group)
 
 
-def scatter_to_sequence_parallel_region(input_: torch.Tensor) -> torch.Tensor:
-    return _ScatterToSequenceParallelRegion.apply(input_, 0)
+def scatter_to_sequence_parallel_region(
+    input_: torch.Tensor,
+    sequence_dimension: int = 0,
+    process_group: Optional[ProcessGroup] = None,
+) -> torch.Tensor:
+    return _ScatterToSequenceParallelRegion.apply(input_, sequence_dimension, process_group)
 
 
-def gather_from_sequence_parallel_region(input_, to_model_parallel=True) -> Tensor:
-    return _GatherFromSequenceParallelRegion.apply(input_, 0, to_model_parallel)
+def gather_from_sequence_parallel_region(
+    input_: torch.Tensor,
+    sequence_dimension: int = 0,
+    to_model_parallel: bool = True,
+    process_group: Optional[ProcessGroup] = None,
+) -> Tensor:
+    return _GatherFromSequenceParallelRegion.apply(
+        input_, sequence_dimension, to_model_parallel, process_group,
+    ) # type: ignore
 
 
-def reduce_scatter_to_sequence_parallel_region(input_: Tensor) -> Tensor:
-    return _ReduceScatterToSequenceParallelRegion.apply(input_, 0)
+def reduce_scatter_to_sequence_parallel_region(
+    input_: Tensor, sequence_dimension: int = 0, process_group: Optional[ProcessGroup] = None,
+) -> Tensor:
+    return _ReduceScatterToSequenceParallelRegion.apply(
+        input_, sequence_dimension, process_group,
+    ) # type: ignore
 
 
 def reduce_scatter_to_tensor_model_parallel_region_with_dim(
     input_: Tensor,
     partition_dim: int,
+    process_group: Optional[ProcessGroup] = None
 ) -> Tensor:
     """performs a reduce-scatter within TP group, with the scatter happening across
     the user-specified dimension."""
-    return _ReduceScatterToSequenceParallelRegion.apply(input_, partition_dim)
+    return _ReduceScatterToSequenceParallelRegion.apply(
+        input_, partition_dim, process_group,
+    ) # type: ignore
 
 
 def gather_from_tensor_model_parallel_region_with_dim(
     input_: Tensor,
     gather_dim: int,
+    process_group: Optional[ProcessGroup] = None
 ) -> Tensor:
     """performs a all-gather within TP group, with the gather happening across
     the user-specified dimension."""
-    return _GatherFromSequenceParallelRegion.apply(input_, gather_dim, False)
+    return _GatherFromSequenceParallelRegion.apply(input_, gather_dim, False, process_group)
 
 
 def enter_expert_parallel_region(x: Tensor, scatter_gather: bool) -> Tensor:
@@ -484,3 +542,127 @@ def exit_expert_parallel_region(x: Tensor, scatter_gather: bool) -> Tensor:
     x = x.squeeze(1)
 
     return x
+
+
+
+class _ScatterToProcessGroupSPMD(torch.autograd.Function):
+    """
+        This is a SPMD compatible implementation of Scatter op, where each process will
+        get i'th chunk based on input rank. This is used mainly in inference.
+
+        This is same as _ScatterToModelParallelRegion but with rank passed as input.
+    """
+    @staticmethod
+    def forward(
+        ctx,
+        input_: torch.Tensor,
+        partition_dim: int,
+        rank: torch.Tensor,
+        process_group: Optional[ProcessGroup] = None,
+    ) -> torch.Tensor:
+        ctx.partition_dim = partition_dim
+        ctx.process_group = process_group if process_group is not None \
+            else cast(ProcessGroup, get_tensor_model_parallel_group())
+        ctx.save_for_backward(rank)
+
+        assert input_.size(partition_dim) % ctx.process_group.size() == 0, \
+            f"tensor dim to scatter ({input_.size(partition_dim)}) must be "\
+            f"multiple of group size ({ctx.process_group.size()})"
+
+        numel_per_partition = input_.size(partition_dim) // ctx.process_group.size()
+        # indices = [0, 1, 2, ..., numel_per_partition]
+        indices = torch.arange(0, numel_per_partition, device=input_.device)
+
+        # rank0 = [0, 1, 2, ...]
+        # rank1 = [8, 9, 10, ...]
+        indices = indices + (rank * numel_per_partition)
+
+        input_ = torch.index_select(
+            input_,
+            dim=partition_dim,
+            index=indices
+        )
+        return input_
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> Tuple[torch.Tensor, None, None]:
+        # we should be using _ScatterToModelParallelRegion
+        raise NotImplementedError("backward pass for ScatterToProcessGroupSPMD not implemented")
+
+
+class _RoundRobinScatterToProcessGroupSPMD(torch.autograd.Function):
+    """
+        This is a SPMD compatible implementation of Scatter op, where each process will
+        get a chunk in which each entry will be offseted by process-group size.
+
+        e.g.
+        > input: [1, 2, 3, 4, 5, 6, 7, 8]
+        > process_group_size = 2
+        > rank 0: [1, 3, 5, 7]
+        > rank 1: [2, 4, 6, 8]
+    """
+    @staticmethod
+    def forward(ctx, input_: torch.Tensor, partition_dim: int, rank: torch.Tensor, process_group: Optional[ProcessGroup] = None) -> torch.Tensor:
+        ctx.partition_dim = partition_dim
+        ctx.process_group = process_group if process_group is not None \
+            else cast(ProcessGroup, get_tensor_model_parallel_group())
+        ctx.save_for_backward(rank)
+
+        assert input_.size(partition_dim) % ctx.process_group.size() == 0, \
+            f"tensor dim to scatter ({input_.size(partition_dim)}) must be "\
+            f"multiple of group size ({ctx.process_group.size()})"
+
+        # indices = [0, 2, 4, ..., seq_len]
+        indices = torch.arange(0,
+                               input_.size(1),       # seq_length
+                               ctx.process_group.size(), # stride = process group size
+                               device=input_.device)
+
+        # rank0 = [0, 2, 4, ...]
+        # rank1 = [1, 3, 5, ...]
+        indices = indices + rank
+
+        repeat_shape = []
+        for i, s in enumerate(input_.shape):
+            if i == partition_dim:
+                repeat_shape.append(1)
+            else:
+                repeat_shape.append(s)
+
+        input_ = torch.gather(
+            input_, partition_dim, indices.unsqueeze(-1).repeat(*repeat_shape),
+        )
+        return input_
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> Tuple[torch.Tensor, None, None]:
+        raise NotImplementedError("backward pass for RoundRobinScatterToProcessGroupSPMD not implemented")
+
+
+
+def scatter_to_process_group_spmd(
+    input_: torch.Tensor,
+    partition_dim: int,
+    rank: torch.Tensor,
+    process_group: Optional[ProcessGroup] = None,
+) -> torch.Tensor:
+    return _ScatterToProcessGroupSPMD.apply(
+        input_,
+        partition_dim,
+        rank,
+        process_group,
+    ) # type: ignore
+
+
+def round_robin_scatter_to_process_group_spmd(
+    input_: torch.Tensor,
+    partition_dim: int,
+    rank: torch.Tensor,
+    process_group: Optional[ProcessGroup] = None,
+) -> torch.Tensor:
+    return _RoundRobinScatterToProcessGroupSPMD.apply(
+        input_,
+        partition_dim,
+        rank,
+        process_group,
+    ) # type: ignore

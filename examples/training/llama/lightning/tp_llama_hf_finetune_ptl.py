@@ -58,16 +58,17 @@ def train_llama(flags):
     print(f"Namespace: {flags}")
     set_seed(flags.seed)
 
-    target_modules = ["q_proj", "v_proj", "k_proj"] if flags.qkv_linear == 0 else ["qkv_proj"]
-    lora_config = LoraConfig(
-        enable_lora=flags.enable_lora,
-        lora_rank=16,
-        lora_alpha=32,
-        lora_dropout=0.05,
-        bias="none",
-        lora_verbose=True,
-        target_modules=target_modules,
-    )
+    lora_config = None
+    if flags.enable_lora:
+        target_modules = ["q_proj", "v_proj", "k_proj"] if flags.qkv_linear == 0 else ["qkv_proj"]
+        lora_config = LoraConfig(
+            lora_rank=16,
+            lora_alpha=32,
+            lora_dropout=0.05,
+            bias="none",
+            lora_verbose=True,
+            target_modules=target_modules,
+        )
 
     mixed_precision_config = get_mixed_precision_config(flags.use_gpu_compatible_precision > 0)
 
@@ -83,7 +84,7 @@ def train_llama(flags):
     model_config = LlamaConfig.from_pretrained(flags.model_path)
     model_config.pretrained_ckpt = flags.pretrained_ckpt
     model_config.use_cache = False
-    model_config.separate_qkv = flags.separate_qkv
+    model_config.fuse_qkv = flags.fuse_qkv > 0
     model_config.kv_shared_group_size = flags.kv_replicator
     model_config.qkv_linear = flags.qkv_linear
     model_config.max_position_embeddings = max(model_config.max_position_embeddings, flags.seq_len)
@@ -175,6 +176,9 @@ def train_llama(flags):
         trainer.fit(model=model, datamodule=dm)
 
     xm.master_print("Training finished!")
+
+    if flags.enable_lora:
+        nxd.save_checkpoint(checkpoint_dir_str="lora_adapter", tag="lora", model=model)
 
     if flags.do_eval and not os.environ.get("NEURON_EXTRACT_GRAPHS_ONLY", None):
         evaluate(model, tokenizer, dm.test_dataloader(), args.golden_rouge_score_path)
@@ -366,12 +370,8 @@ if __name__ == "__main__":
         type=int,
         help="KV replication number",
     )
-    parser.add_argument(
-        "--separate_qkv",
-        default=False,
-        action="store_true",
-        help="Use separate q,k,v proj weight tensors when saving/loading Llama model.",
-    )
+    parser.add_argument("--fuse_qkv", type=int, default=1, help="Whether to enable fused qkv")
+
     parser.add_argument("--do_eval", action="store_true", help="Do evaluation after fine-tuning.")
     parser.add_argument(
         "--golden_rouge_score_path", default=None, type=str, help="Path to golden eval rouge score file."

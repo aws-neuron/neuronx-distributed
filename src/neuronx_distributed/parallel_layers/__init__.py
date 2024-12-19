@@ -1,5 +1,9 @@
 """Model parallel utility interface."""
 
+from typing import Callable, List, Type
+
+import torch
+
 from . import parallel_state
 from .checkpointing import load, save
 from .grads import clip_grad_norm
@@ -22,8 +26,9 @@ from .utils import (
 )
 
 # Specify parallel modules and functions so that we can skip tracing them during PP partition
-PARALLEL_MODULES = [ColumnParallelLinear, RowParallelLinear, ParallelEmbedding]
-PARALLEL_FUNCTIONS = [
+# ColumnParallelLinear, RowParallelLinear, ParallelEmbedding inherint from torch.nn.Module
+PARALLEL_MODULES: List[Type[torch.nn.Module]] = [ColumnParallelLinear, RowParallelLinear, ParallelEmbedding]
+PARALLEL_FUNCTIONS: List[Callable] = [
     parallel_cross_entropy,
     copy_to_tensor_model_parallel_region,
     gather_from_tensor_model_parallel_region,

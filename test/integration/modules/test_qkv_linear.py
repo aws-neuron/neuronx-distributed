@@ -1,10 +1,9 @@
 import argparse
-import atexit
-import json
 import os
 import random
 import traceback
 from datetime import datetime
+import regex as re
 
 import numpy as np
 import torch
@@ -14,6 +13,8 @@ from neuronx_distributed.modules import qkv_linear
 from neuronx_distributed.parallel_layers import layers, parallel_state
 from neuronx_distributed.parallel_layers.random import model_parallel_xla_manual_seed
 from neuronx_distributed.parallel_layers.utils import requires_init_pg_override
+from neuronx_distributed.utils.utils import hardware
+from torch_neuronx.utils import get_platform_target
 
 datetime_str = str(datetime.now())
 
@@ -227,7 +228,7 @@ def test_qkv_linear_with_kv_multipler_1(tensor_model_parallel_size, fuse_qkv=Fal
 
         # Reset groups
         parallel_state.destroy_model_parallel()
-        qkv_linear.destroy_kv_group()
+        parallel_state.destroy_kv_group()
 
         torch.distributed.barrier()
         if torch.distributed.get_rank() == 0:
@@ -421,7 +422,7 @@ def test_qkv_linear_with_kv_multipler_4(tensor_model_parallel_size, fuse_qkv=Fal
 
         # Reset groups
         parallel_state.destroy_model_parallel()
-        qkv_linear.destroy_kv_group()
+        parallel_state.destroy_kv_group()
 
         torch.distributed.barrier()
         if torch.distributed.get_rank() == 0:
@@ -432,6 +433,81 @@ def test_qkv_linear_with_kv_multipler_4(tensor_model_parallel_size, fuse_qkv=Fal
     global results
     try:
         _test_qkv_linear_with_kv_multipler_4()
+    except Exception:
+        results["inference_success"] = 0
+        print(traceback.format_exc())
+        raise
+
+def test_qkv_linear_with_kv_multipler_4_HLO_test(tensor_model_parallel_size, fuse_qkv=False):
+    os.environ["XLA_DOWNCAST_BF16"] = "1"
+    def _test_qkv_linear_with_kv_multipler_4_hlo_test():
+        batch_size = 8
+        seq_length = 128
+        hidden_size = 256
+        tensor_shape = (seq_length, batch_size, hidden_size)
+        seed = 1234
+        kv_shared_group_size = 4
+
+        device = xm.xla_device()
+        tensor_model_parallel_size_ = tensor_model_parallel_size
+        parallel_state.initialize_model_parallel(tensor_model_parallel_size=tensor_model_parallel_size_)
+        tensor_model_parallel_size_ = parallel_state.get_tensor_model_parallel_size()
+
+        set_random_seed(seed)
+        xm.set_rng_state(seed)
+        model_parallel_xla_manual_seed(seed)
+
+        col_linear = qkv_linear.GQAQKVColumnParallelLinear(
+            hidden_size,
+            [
+                tensor_model_parallel_size * hidden_size,
+                tensor_model_parallel_size * hidden_size // kv_shared_group_size,
+            ],
+            bias=False,
+            gather_output=False,
+            sequence_parallel_enabled=True,
+            keep_master_weight=True,
+            kv_size_multiplier=kv_shared_group_size,
+            fuse_qkv=fuse_qkv
+        ).to(device)
+
+        row_linear = layers.RowParallelLinear(
+            tensor_model_parallel_size * hidden_size,
+            hidden_size,
+            bias=False,
+            input_is_parallel=True,
+            sequence_parallel_enabled=False,
+            keep_master_weight=True,
+        ).to(device)
+
+        with torch.no_grad():
+            orig_input_tensor = torch.randn(tensor_shape, requires_grad=True).to(device)
+            orig_loss_weight = torch.randn(tensor_shape).transpose(0, 1).to(device)
+            input_tensor = list(orig_input_tensor.chunk(tensor_model_parallel_size_, dim=0))[
+                parallel_state.get_tensor_model_parallel_rank()
+            ]
+        input_tensor.requires_grad_()
+        output_q, output_k, output_v = col_linear(input_tensor)
+        q, k, v = (
+            output_q.view(seq_length, batch_size, 1, hidden_size).permute(1, 2, 0, 3),
+            output_k.view(seq_length, batch_size, 1, hidden_size).permute(1, 2, 0, 3),
+            output_v.view(seq_length, batch_size, 1, hidden_size).permute(1, 2, 0, 3),
+        )
+        intermediate_tensor = torch.matmul(q, k.transpose(2, 3))
+        intermediate_tensor = torch.matmul(intermediate_tensor, v)
+        intermediate_tensor = intermediate_tensor.transpose(1, 2)
+        intermediate_tensor = intermediate_tensor.reshape(batch_size, seq_length, -1)
+        output = row_linear(intermediate_tensor)
+
+        loss = torch.mul(output, orig_loss_weight).sum()
+        loss.backward()
+        hlo_text = torch_xla._XLAC._get_xla_tensors_text([col_linear.weight_k.grad])
+        if tensor_model_parallel_size_ > 1:
+            assert re.search(r".*f32.*f32.*xla::cross_replica_sum.*f32.*f32.*", hlo_text) is not None, "dtype mismatch for reduce scatter, not all F32 detected"
+
+    global results
+    try:
+        _test_qkv_linear_with_kv_multipler_4_hlo_test()
     except Exception:
         results["inference_success"] = 0
         print(traceback.format_exc())
@@ -453,3 +529,5 @@ if __name__ == "__main__":
     test_qkv_linear_with_kv_multipler_1(tensor_model_parallel_size, fuse_qkv=True)
     test_qkv_linear_with_kv_multipler_4(tensor_model_parallel_size)
     test_qkv_linear_with_kv_multipler_4(tensor_model_parallel_size, fuse_qkv=True)
+    if hardware(get_platform_target()) == hardware.TRN2:
+        test_qkv_linear_with_kv_multipler_4_HLO_test(tensor_model_parallel_size)

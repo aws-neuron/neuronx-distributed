@@ -137,6 +137,7 @@ def get_model(flags):
     config.qkv_linear = flags.qkv_linear
     config.max_position_embeddings = max(config.max_position_embeddings, seq_len)
     config.use_flash_attention = args.use_flash_attention > 0
+    config.fuse_qkv = args.fuse_qkv > 0
     if flags.num_layers > 0:
         config.num_hidden_layers = flags.num_layers
     if flags.sequence_parallel_enabled:
@@ -198,7 +199,8 @@ def train_llama(flags):
     )
 
     # Creating NxD model
-    model = nxd.initialize_parallel_model(nxd_config, get_model, flags)
+    include_buffers = True
+    model = nxd.initialize_parallel_model(nxd_config, get_model, include_buffers, flags)
 
     world_size = parallel_state.get_data_parallel_size()
     is_root = xm.is_master_ordinal(local=False)
@@ -297,7 +299,7 @@ def train_llama(flags):
                 running_loss_reduced = xm.all_reduce(
                     xm.REDUCE_SUM,
                     running_loss_div,
-                    groups=parallel_state.get_data_parallel_group(as_list=True),
+                    groups=parallel_state.get_data_parallel_replica_groups(),
                 )
                 running_loss_reduced_detached = running_loss_reduced.detach()
                 running_loss.zero_()
@@ -658,6 +660,9 @@ if __name__ == "__main__":
         type=int,
         help="Use neuron kernel",
     )
+    parser.add_argument("--fuse_qkv", type=int, default=1, help="Whether to enable fused qkv")
+
+
 
     args = parser.parse_args(sys.argv[1:])
 
@@ -665,10 +670,11 @@ if __name__ == "__main__":
         args.steps_this_run = args.max_steps
 
     os.environ["NEURON_RT_STOCHASTIC_ROUNDING_EN"] = "0" if args.use_gpu_compatible_precision > 0 else "1"
-    if args.use_mix_precision:
-        os.environ["XLA_DOWNCAST_BF16"] = "1"
-    else:
-        os.environ["XLA_USE_BF16"] = "1"
+    if not args.use_gpu_compatible_precision:
+        if args.use_mix_precision: 
+            os.environ["XLA_DOWNCAST_BF16"] = "1"
+        else:
+            os.environ["XLA_USE_BF16"] = "1"
 
     # WORLD_SIZE is set by torchrun
     if os.environ.get("WORLD_SIZE"):

@@ -1,10 +1,13 @@
 from abc import ABC, abstractmethod
+from typing import Optional
 
 import torch
+from torch.distributed import ProcessGroup
 import torch.nn.functional as F
 
 from neuronx_distributed.modules.moe.moe_parallel_layers import LinearRouter
-from neuronx_distributed.parallel_layers.parallel_state import get_expert_model_parallel_size
+from neuronx_distributed.parallel_layers import mappings
+
 
 class RouterBase(torch.nn.Module, ABC):
     """Base class for various routing strategies used in MoE.
@@ -24,8 +27,11 @@ class RouterBase(torch.nn.Module, ABC):
         top_k: int,
         hidden_size: int,
         act_fn: str,
+        sequence_parallel_enabled: bool,
+        sequence_dimension: Optional[int],
         dtype: torch.dtype,
         device: torch.device,
+        tensor_model_parallel_group: Optional[ProcessGroup] = None,
     ):
         super().__init__()
         self.num_experts = num_experts
@@ -36,6 +42,13 @@ class RouterBase(torch.nn.Module, ABC):
         if act_fn not in {"sigmoid", "softmax"}:
             raise ValueError("act_fn must be either 'sigmoid' or 'softmax'")
         self.act_fn = act_fn
+
+        self.sequence_parallel_enabled = sequence_parallel_enabled
+        if self.sequence_parallel_enabled and sequence_dimension is None:
+            # Default to 0
+            sequence_dimension = 0
+        self.sequence_dimension = sequence_dimension
+
         self.dtype = dtype
         self.device = device
 
@@ -45,13 +58,30 @@ class RouterBase(torch.nn.Module, ABC):
             output_size=num_experts,
             dtype=dtype,
             device=device,
+            tensor_model_parallel_group=tensor_model_parallel_group,
         )
 
     def get_router_logits_and_expert_affinities(self, hidden_states):
-        """Returns the router logits and expert affinities from the given hidden_states."""
+        """
+        Returns the router logits and expert affinities.
+        Note that this function always returns the logits and affinities corresponding to the full hidden states, by handling 
+        sequence parallelism internally.
+        """
 
-        # router_logits: (T, H) @ (H, E) -> (T, E)
+        # router_logits: (*, H) @ (H, E) -> (*, E)            
         router_logits = self.linear_router(hidden_states)
+
+        if self.sequence_parallel_enabled:
+            assert not self.training, "Router in SP is currently supported only for inference"
+            # Gather the router_logits across ranks
+            router_logits = mappings.gather_from_sequence_parallel_region(
+                router_logits,
+                sequence_dimension=self.sequence_dimension,
+                to_model_parallel=False,
+            )
+
+        # Flatten S and B to T dimension
+        router_logits = router_logits.view(-1, self.num_experts)
 
         # Perform activation in fp64 to prevent auto-downcasting of operation to bf16, for numerical accuracy
         # expert_affinities: (T, E)
@@ -75,7 +105,8 @@ class RouterBase(torch.nn.Module, ABC):
             T: Tokens = S * B (token dimension obtained by flattening S and B)
 
         Arguments:
-            hidden_states: Input tensor of shape (T, H).
+            hidden_states: Input tensor of shape (S, B, H) or (B, S, H)
+                           If self.sequence_parallel_enabled is True, then hidden_states is assumed to be sharded in SP. 
 
         Returns:
             router_logits: Tensor of shape (T, E) containing the router logits for each token for each expert.
@@ -96,16 +127,22 @@ class RouterTopK(RouterBase):
         num_experts: int,
         top_k: int,
         hidden_size: int,
+        sequence_parallel_enabled: bool = False,
+        sequence_dimension: Optional[int] = None,
         dtype: torch.dtype = torch.float32,
         device: torch.device = torch.device("cpu"),
+        tensor_model_parallel_group: Optional[ProcessGroup] = None,
     ):
         super().__init__(
             num_experts=num_experts,
             top_k=top_k,
             hidden_size=hidden_size,
             act_fn="softmax",  # Always use softmax activation for TopK router
+            sequence_parallel_enabled=sequence_parallel_enabled,
+            sequence_dimension=sequence_dimension,
             dtype=dtype,
             device=device,
+            tensor_model_parallel_group=tensor_model_parallel_group,
         )
 
     def forward(self, hidden_states):
@@ -139,10 +176,12 @@ class RouterSinkhorn(RouterBase):
         top_k: int,
         hidden_size: int,
         act_fn: str = "sigmoid",
+        sequence_parallel_enabled: bool = False,
+        sequence_dimension: Optional[int] = None,
         dtype: torch.dtype = torch.float32,
         device: torch.device = torch.device("cpu"),
-        sinkhorn_iterations: int = None,
-        sinkhorn_tol: float = None,
+        sinkhorn_iterations: Optional[int] = None,
+        sinkhorn_tol: Optional[float] = None,
     ):
         if top_k != 1:
             raise NotImplementedError("RouterSinkhorn only supports Top-1 routing")
@@ -152,11 +191,12 @@ class RouterSinkhorn(RouterBase):
             top_k=top_k,
             hidden_size=hidden_size,
             act_fn=act_fn,
+            sequence_parallel_enabled=sequence_parallel_enabled,
+            sequence_dimension=sequence_dimension,
             dtype=dtype,
             device=device,
         )
 
-        # Create router
         self.sinkhorn_iterations = (
             sinkhorn_iterations if sinkhorn_iterations is not None else self.DEFAULT_SINKHORN_ITERS
         )

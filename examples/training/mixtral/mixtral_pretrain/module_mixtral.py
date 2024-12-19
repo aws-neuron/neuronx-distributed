@@ -15,7 +15,7 @@ Metric = namedtuple("Metric", ["name", "value", "units", "additional_data"])
 
 
 class NeuronMixtralLTModule(NeuronLTModule):
-    def setup(self, stage=None):
+    def setup(self, stage=None, include_buffers=False):
         super().setup()
 
         self.throughput = Throughput(
@@ -72,7 +72,7 @@ class NeuronMixtralLTModule(NeuronLTModule):
             loss_reduced = xm.all_reduce(
                 xm.REDUCE_SUM,
                 loss_div,
-                groups=parallel_state.get_data_parallel_group(as_list=True),
+                groups=parallel_state.get_data_parallel_replica_groups(),
             )
             loss_reduced_detached = loss_reduced.detach()
             self.averaged_loss.zero_()
@@ -127,9 +127,11 @@ class NeuronMixtralLTModule(NeuronLTModule):
             if not self.automatic_optimization:
                 self.log(
                     "loss",
-                    self.loss.detach().cpu().item()
-                    if self.loss is not None
-                    else torch.zeros(1, device="cpu", requires_grad=False),
+                    (
+                        self.loss.detach().cpu().item()
+                        if self.loss is not None
+                        else torch.zeros(1, device="cpu", requires_grad=False)
+                    ),
                     prog_bar=True,
                 )
                 self.log(

@@ -23,6 +23,7 @@ except ImportError:
 
 if TYPE_CHECKING:
     from mypy_boto3_s3 import S3ServiceResource, S3Client
+    from mypy_boto3_s3.type_defs import ListObjectsV2OutputTypeDef
 
 
 class BaseCheckpointStorage:
@@ -240,10 +241,7 @@ class S3CheckpointStorage(BaseCheckpointStorage):
     def file_exists(self, filename: str) -> bool:
         subdir = os.path.dirname(filename)
         basename = os.path.basename(filename)
-        if subdir == "":
-            subdir = None
-
-        paths = self._list_with_retry(subdir)
+        paths = self._list_with_retry(subdir or None)
         for path in paths:
             if path["name"] == basename and path["type"] == "file":
                 return True
@@ -253,11 +251,9 @@ class S3CheckpointStorage(BaseCheckpointStorage):
     def _list(self, prefix: Optional[str] = None) -> List[Dict[str, Any]]:
         s3 = S3CheckpointStorage.get_client()
 
-        if self._base_key and prefix:
-            list_prefix = os.path.join(self._base_key, prefix)
-        else:
-            list_prefix = self._base_key if self._base_key else prefix
+        list_prefix = os.path.join(self._base_key, prefix) if self._base_key and prefix else (self._base_key or prefix)
 
+        response: "ListObjectsV2OutputTypeDef"
         if list_prefix:
             if list_prefix[-1] != "/":
                 list_prefix += "/"  # list_object_v2 require prefix to be end with '/'
@@ -268,18 +264,18 @@ class S3CheckpointStorage(BaseCheckpointStorage):
         results = []
         prefix_len = len(list_prefix) if list_prefix else 0
         if "Contents" in response:
-            for obj in response["Contents"]:
-                results.append({"type": "file", "name": obj["Key"][prefix_len:], "mdate": obj["LastModified"]})
+            for item in response["Contents"]:
+                results.append({"type": "file", "name": item["Key"][prefix_len:], "mdate": item["LastModified"]})
 
         if "CommonPrefixes" in response:
-            for obj in response["CommonPrefixes"]:
-                results.append({"type": "dir", "name": obj["Prefix"][prefix_len:-1]})
+            for common_prefix in response["CommonPrefixes"]:
+                results.append({"type": "dir", "name": common_prefix["Prefix"][prefix_len:-1]})
 
         return results
 
     def _list_with_retry(self, prefix: Optional[str] = None) -> List[Dict[str, Any]]:
         max_try = 4
-        sleep_second = 60
+        sleep_second = 60.0
         for try_idx in range(max_try):
             try:
                 return self._list(prefix)
@@ -301,7 +297,7 @@ class S3CheckpointStorage(BaseCheckpointStorage):
                     raise e
         assert False, "unreachable"
 
-    def _find_files_impl(self, pattern: str, search_depth: int, search_root: str, max_count: int):
+    def _find_files_impl(self, pattern: str, search_depth: int, search_root: Optional[str], max_count: Optional[int]):
         search_dirs = [search_root]
         search_bgn = 0
         search_end = 1
@@ -314,8 +310,9 @@ class S3CheckpointStorage(BaseCheckpointStorage):
                 for path in paths:
                     if fnmatch.fnmatch(path["name"], pattern):
                         mdate = path.get("mdate", None)
+                        assert dirname
                         file_mdate_pairs.append((os.path.join(dirname, path["name"]), mdate))
-                        if isinstance(max_count, int) and max_count > 0 and len(file_mdate_pairs) == max_count:
+                        if max_count and max_count > 0 and len(file_mdate_pairs) == max_count:
                             return file_mdate_pairs
                     elif path["type"] == "dir":
                         subdir = os.path.join(dirname, path["name"]) if dirname else path["name"]
@@ -326,7 +323,14 @@ class S3CheckpointStorage(BaseCheckpointStorage):
             level += 1
         return file_mdate_pairs
 
-    def find_files(self, pattern: str, search_depth: int, search_root: Optional[str] = None, max_count: Optional[int] = None, sort_by_mdate: bool = True) -> List[str]:
+    def find_files(
+        self,
+        pattern: str,
+        search_depth: int,
+        search_root: Optional[str] = None,
+        max_count: Optional[int] = None,
+        sort_by_mdate: bool = True,
+    ) -> List[str]:
         file_mdate_pairs = self._find_files_impl(pattern, search_depth, search_root, max_count)
         if len(file_mdate_pairs) > 1 and sort_by_mdate:
             file_mdate_pairs.sort(key=lambda x: x[1])
@@ -334,7 +338,7 @@ class S3CheckpointStorage(BaseCheckpointStorage):
         files = [x[0] for x in file_mdate_pairs]
         return files
 
-    def save_text(self, text: str, filename: str) -> None:
+    def save_text(self, text: str, filename: str, use_threads: bool = True) -> None:
         class TextStreamCreator:
             def __init__(self, text: str):
                 self._text = text
@@ -344,7 +348,7 @@ class S3CheckpointStorage(BaseCheckpointStorage):
                 stream.write(bytes(self._text, "utf-8"))
                 return stream
 
-        self.upload_stream_to_file(TextStreamCreator(text), filename)
+        self.upload_stream_to_file(TextStreamCreator(text), filename, 64, 10, use_threads)
 
     def save_object(self, obj: object, filename: str) -> None:
         class ObjectStreamCreator:
@@ -379,23 +383,19 @@ class S3CheckpointStorage(BaseCheckpointStorage):
     def remove_dir(self, dirname: str) -> None:
         key = self.convert_path_to_key(dirname)
         client = S3CheckpointStorage.get_client()
-        S3CheckpointStorage.s3_action_with_retry(
-            S3CheckpointStorage.REMOVE_DIR, client, self._bucket, key, None
-        )
+        S3CheckpointStorage.s3_action_with_retry(S3CheckpointStorage.REMOVE_DIR, client, self._bucket, key, None)
 
     def remove_file(self, filename: str) -> None:
         key = self.convert_path_to_key(filename)
         client = S3CheckpointStorage.get_client()
-        S3CheckpointStorage.s3_action_with_retry(
-            S3CheckpointStorage.REMOVE_FILE, client, self._bucket, key, None
-        )
+        S3CheckpointStorage.s3_action_with_retry(S3CheckpointStorage.REMOVE_FILE, client, self._bucket, key, None)
 
     def upload_stream_to_file(
-        self, stream_creator, filename: str, chunk_size_MB: int = 64, max_concurrency: int = 10
+            self, stream_creator, filename: str, chunk_size_MB: int = 64, max_concurrency: int = 10, use_threads: bool = True
     ) -> None:
         client = S3CheckpointStorage.get_client()
         chunk_size = chunk_size_MB * 1048576
-        config = boto3.s3.transfer.TransferConfig(multipart_chunksize=chunk_size, max_concurrency=max_concurrency)
+        config = boto3.s3.transfer.TransferConfig(use_threads=use_threads, multipart_chunksize=chunk_size, max_concurrency=max_concurrency)
         key = self.convert_path_to_key(filename)
         S3CheckpointStorage.s3_action_with_retry(
             S3CheckpointStorage.UPLOAD, client, self._bucket, key, config, upload_stream_creator=stream_creator
@@ -412,12 +412,12 @@ class S3CheckpointStorage(BaseCheckpointStorage):
         return S3CheckpointStorage.s3_action_with_retry(S3CheckpointStorage.DOWNLOAD, client, self._bucket, key, config)
 
     @staticmethod
-    def parse_path(s3_path: str) -> Tuple[str, str]:
+    def parse_path(s3_path: str) -> Tuple[str, Optional[str]]:
         head = "s3://"
         if not s3_path.startswith(head):
             raise RuntimeError(f"Error: invalid s3 path: {s3_path} because it does not start with {head}")
 
-        s3_path = s3_path[len(head):]
+        s3_path = s3_path[len(head) :]
         if len(s3_path) == 0:
             raise RuntimeError("Error: invalid s3 path: {s3_path} that is empty")
 
@@ -428,7 +428,7 @@ class S3CheckpointStorage(BaseCheckpointStorage):
         if first_slash == len(s3_path) - 1:
             return s3_path[0:-1], None
 
-        return s3_path[0:first_slash], s3_path[first_slash + 1:]
+        return s3_path[0:first_slash], s3_path[first_slash + 1 :]
 
     @staticmethod
     def get_resource(
@@ -458,7 +458,12 @@ class S3CheckpointStorage(BaseCheckpointStorage):
         return s3
 
     @staticmethod
-    def get_client(profile: Optional[str] = None, creds: Optional[botocore.credentials.Credentials] = None, session: Optional[boto3.Session] = None, config: Optional[Dict[str, Any]] = None) -> "S3Client":
+    def get_client(
+        profile: Optional[str] = None,
+        creds: Optional[botocore.credentials.Credentials] = None,
+        session: Optional[boto3.Session] = None,
+        config: Optional[Dict[str, Any]] = None,
+    ) -> "S3Client":
         return S3CheckpointStorage.get_resource(profile, creds, session, config).meta.client
 
     @staticmethod
@@ -488,7 +493,8 @@ class S3CheckpointStorage(BaseCheckpointStorage):
 
         if isinstance(exception, botocore.exceptions.ConnectionClosedError):
             if (
-                "Connection was closed before we received a valid response from endpoint" in message and ".s3." in message
+                "Connection was closed before we received a valid response from endpoint" in message
+                and ".s3." in message
             ):
                 return True
 
@@ -506,7 +512,7 @@ class S3CheckpointStorage(BaseCheckpointStorage):
     @staticmethod
     def s3_action_with_retry(action, client, bucket, key, config, upload_stream_creator=None):
         max_try = 12
-        sleep_second = 60
+        sleep_second: float = 60.0
         for try_idx in range(max_try):
             try:
                 if action == S3CheckpointStorage.DOWNLOAD:
@@ -529,7 +535,7 @@ class S3CheckpointStorage(BaseCheckpointStorage):
                     while "Contents" in response:
                         objects = response["Contents"]
                         assert len(objects) > 0
-                        delete = {"Objects": []}
+                        delete: Dict[str, List[Any]] = {"Objects": []}
                         for obj in objects:
                             delete["Objects"].append({"Key": obj["Key"]})
                         client.delete_objects(Bucket=bucket, Delete=delete)

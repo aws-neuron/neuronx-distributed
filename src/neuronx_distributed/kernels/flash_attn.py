@@ -1,84 +1,85 @@
 import os
-
-import neuronxcc.nki.language as nl
 import numpy as np
 import torch
 import torch_xla.core.xla_model as xm
+from collections import defaultdict
+from neuronx_distributed.utils.utils import hardware
+from torch_neuronx.utils import get_platform_target
+from neuronxcc.nki.kernels.attention import FlashConfig
 
 from ..utils.logger import get_logger
 
 logger = get_logger()
 
-def _flash_attn_placeholder(*args, **kwargs):
-    raise RuntimeError(
-        "Flash Attention initialization failed!\n"
-        "Please check and upgrade neuronx-cc and torch_neuronx.\n"
-        "python3 -m pip install --extra-index-url=https://pip.repos.neuron.amazonaws.com neuronx-cc torch_neuronx"
-    )
+def check_xla_bf16_flags():
+    if os.getenv("XLA_USE_BF16") == '1' or os.getenv("XLA_DOWNCAST_BF16") == '1':
+        return True
+    return False
 
-try:
-    from neuronxcc.nki.kernels.attention import flash_attn_bwd, flash_fwd
-    from torch_neuronx.xla_impl.ops import nki_jit
+def get_flash_attn_kernels(use_sharded=False):
+    try:
+        # for trn1 default usage set to legacy unsharded flash attn kernel
+        from neuronxcc.nki.kernels import flash_fwd, flash_attn_bwd
+        if use_sharded:
+            import neuronxcc.nki.language as nl
+            return flash_fwd, flash_attn_bwd, nl
+        return flash_fwd, flash_attn_bwd, None
+    except ImportError:
+        raise RuntimeError(
+            "Flash Attention initialization failed!\n"
+            "Please check and upgrade neuronx-cc and torch_neuronx.\n"
+            "python3 -m pip install --extra-index-url=https://pip.repos.neuron.amazonaws.com neuronx-cc torch_neuronx"
+        )
 
-    _flash_fwd_nki_call = nki_jit()(flash_fwd)
-    _flash_bwd_nki_call = nki_jit()(flash_attn_bwd)
-except Exception as e:
-    _flash_fwd_nki_call = _flash_attn_placeholder
-    _flash_bwd_nki_call = _flash_attn_placeholder
-    logger.warning(f"Flash Attention initialization failed with {e}. Proceed without Flash Attention support")
-
-
-
-def _flash_attn_forward(q, k, v, causal, mixed_precision, seed, dropout_p, softmax_scale):
+def _flash_attn_forward(q, k, v, causal, mixed_precision, seed, dropout_p, softmax_scale, use_sharded=False):
+    flash_fwd, _, nl = get_flash_attn_kernels(use_sharded)
     bs, num_heads, head_dim, seq = q.shape
-    attn_output = torch.zeros(size=(bs, num_heads, seq, head_dim), dtype=q.dtype, device=q.device)
-    if mixed_precision:
-        if os.environ.get("XLA_DOWNCAST_BF16"):
-            lse_dtype = torch.float64
-        else:
-            lse_dtype = torch.float32
+
+    config = None
+    if check_xla_bf16_flags():
+        config = FlashConfig(lse_dtype="bfloat16")
+
+    # support for both legacy and sharded flash attn kernels
+    if use_sharded:
+        # nl.nc usage to create a logical neuron core dimension in launch grid
+        attn_output, lse = flash_fwd[bs, nl.nc(2)](q, k, v, seed,
+                                                 use_causal_mask=causal,
+                                                 mixed_precision=mixed_precision,
+                                                 dropout_p=dropout_p,
+                                                 softmax_scale=softmax_scale,
+                                                 config=config)
     else:
-        lse_dtype = q.dtype
-    lse = torch.zeros(
-        size=(bs, num_heads, nl.tile_size.pmax, seq // nl.tile_size.pmax),
-        dtype=lse_dtype, device=q.device,
-    )
-    _flash_fwd_nki_call[bs, num_heads](
-        q,
-        k,
-        v,
-        seed,
-        attn_output,
-        lse,
-        use_causal_mask=causal,
-        mixed_precision=mixed_precision,
-        dropout_p=dropout_p,
-        softmax_scale=softmax_scale,
-    )
+        attn_output, lse = flash_fwd[bs, num_heads](q, k, v, seed,
+                                                    use_causal_mask=causal,
+                                                    mixed_precision=mixed_precision,
+                                                    dropout_p=dropout_p,
+                                                    softmax_scale=softmax_scale,
+                                                    config=config)
+    
+    if check_xla_bf16_flags():
+        attn_output = attn_output.to(torch.bfloat16)
+
     return attn_output, lse
 
-
-def _flash_attn_backward(q, k, v, o, dout, lse, seed, causal, mixed_precision, dropout_p, softmax_scale):
+def _flash_attn_backward(q, k, v, o, dout, lse, seed, causal, mixed_precision, dropout_p, softmax_scale, use_sharded=False):
+    _, flash_attn_bwd, nl = get_flash_attn_kernels(use_sharded)
     bs, num_heads, _, _ = q.shape
-    dq = torch.zeros_like(q)
-    dk = torch.zeros_like(k)
-    dv = torch.zeros_like(v)
-    _flash_bwd_nki_call[bs, num_heads](
-        q,
-        k,
-        v,
-        o,
-        dout,
-        lse,
-        seed,
-        dq,
-        dk,
-        dv,
-        use_causal_mask=causal,
-        mixed_precision=mixed_precision,
-        dropout_p=dropout_p,
-        softmax_scale=softmax_scale,
-    )
+
+    if use_sharded:
+        # nl.nc usage to create a logical neuron core dimension in launch grid
+        dq, dk, dv = flash_attn_bwd[bs, nl.nc(2)](q, k, v, o,
+                                                dout, lse, seed,
+                                                use_causal_mask=causal,
+                                                mixed_precision=mixed_precision,
+                                                dropout_p=dropout_p,
+                                                softmax_scale=softmax_scale)
+    else:
+        dq, dk, dv = flash_attn_bwd[bs, num_heads](q, k, v, o,
+                                                   dout, lse, seed,
+                                                   use_causal_mask=causal,
+                                                   mixed_precision=mixed_precision,
+                                                   dropout_p=dropout_p,
+                                                   softmax_scale=softmax_scale)
     return dq, dk, dv
 
 
@@ -94,6 +95,7 @@ class NKIAttnFunc(torch.autograd.Function):
         mixed_precision: bool,
         seed,
         dropout_p: float,
+        use_sharded: bool = False,
     ):
         if softmax_scale is None:
             softmax_scale = q.shape[-2] ** (-0.5)
@@ -112,12 +114,14 @@ class NKIAttnFunc(torch.autograd.Function):
             seed=seed,
             dropout_p=dropout_p,
             softmax_scale=softmax_scale,
+            use_sharded=use_sharded,
         )
         ctx.save_for_backward(q, k, v, attn_output, lse, seed)
         ctx.causal = causal
         ctx.mixed_precision = mixed_precision
         ctx.dropout_p = dropout_p
         ctx.softmax_scale = softmax_scale
+        ctx.use_sharded = use_sharded
 
         # Move seed manually if the dropout is used
         # https://github.com/pytorch/xla/blob/v1.13.0/torch_xla/csrc/tensor.cpp#L323
@@ -144,19 +148,22 @@ class NKIAttnFunc(torch.autograd.Function):
             mixed_precision=ctx.mixed_precision,
             dropout_p=ctx.dropout_p,
             softmax_scale=ctx.softmax_scale,
+            use_sharded=ctx.use_sharded,
         )
-        return dq, dk, dv, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None
 
 
 def nki_flash_attn_func(
     q,
     k,
     v,
+    lnc=1,
     dropout_p=0.0,
     softmax_scale=None,
     causal=True,
     mixed_precision=True,
     seed=None,
+    hardware_type=None
 ):
     """
     Arguments:
@@ -169,6 +176,7 @@ def nki_flash_attn_func(
         causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
         mixed_precision: bool. Whether to enable the higher precisions on the softmax.
         seed: int32 torch.Tensor. The seed for the dropout.
+        hardware_type: str. The type of hardware being used.
 
     Return:
         out: (batch_size, seqlen, nheads, headdim).
@@ -183,9 +191,18 @@ def nki_flash_attn_func(
     k = k.permute(0, 1, 3, 2)
     v = v.permute(0, 1, 3, 2)
 
-    if os.environ.get("XLA_USE_BF16") or os.environ.get("XLA_DOWNCAST_BF16"):
+    if check_xla_bf16_flags():
         q = q.to(torch.bfloat16)
         k = k.to(torch.bfloat16)
         v = v.to(torch.bfloat16)
 
-    return NKIAttnFunc.apply(q, k, v, softmax_scale, causal, mixed_precision, seed, dropout_p)
+    # currently for trn2 default usage set to sharded kernel with lnc2
+    if hardware_type is None:
+        hardware_type = hardware(get_platform_target())
+
+    if hardware_type==hardware.TRN1:
+        assert lnc==1, "ERROR: lnc > 1 is not supported on trn1 architecture"
+    
+    use_sharded = lnc == 2
+
+    return NKIAttnFunc.apply(q, k, v, softmax_scale, causal, mixed_precision, seed, dropout_p, use_sharded)

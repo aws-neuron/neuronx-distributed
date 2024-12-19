@@ -134,3 +134,5 @@ else
       fi
   fi
 fi
+
+exit $ret_val

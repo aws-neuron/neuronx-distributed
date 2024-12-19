@@ -1,17 +1,26 @@
-import os
-import shutil
+import torch
+import traceback
 from concurrent.futures import ProcessPoolExecutor
 
-import torch
-from torch.ao.nn.quantized.dynamic.modules.linear import _quantize_weight
-from torch.ao.quantization.qconfig import default_dynamic_qconfig
-
-import neuronx_distributed.parallel_layers.parallel_state as p_state
 from neuronx_distributed.modules.moe.moe_parallel_layers import (
     ExpertFusedColumnParallelLinear,
     ExpertFusedRowParallelLinear,
 )
+from neuronx_distributed.quantization.quantization_config import (
+    BASE_QCONFIG_DICT_TYPE,
+    QuantizationType,
+    get_default_custom_qconfig_dict,
+    get_default_per_channel_custom_qconfig_dict,
+)
+from neuronx_distributed.quantization.quantization_utils import (
+    convert_qint8_to_int8_state_dict,
+    quantize_pytorch_model_per_channel_symmetric,
+    quantize_pytorch_model_per_tensor_symmetric,
+)
 from neuronx_distributed.quantization.quantize import convert
+
+from test_quantized_mlp import QuantizedCpuLinear, run_quantization_test
+
 
 num_experts = 3
 intermediate_size = 4
@@ -19,171 +28,210 @@ hidden_size = 5
 capacity = 2
 torch.manual_seed(0)
 
-TEMP_COMPILER_WORK_DIR = "compiler_workdir"
-TEMP_STATE_DICT_NAME = "quantized_state_dict.pt"
 
-SCALE = 0.123
+class ExpertFusedLinear(torch.nn.Module):
+    def __init__(self, num_experts, in_features, out_features, dtype):
+        super().__init__()
+        self.num_experts = num_experts
+        self.in_features = in_features
+        self.out_features = out_features
+        self.experts = torch.nn.ModuleList([
+            torch.nn.Linear(in_features, out_features, bias=False, dtype=dtype)
+            for e in range(num_experts)
+        ])
+
+    def forward(self, input_):
+        assert len(input_.shape) == 3 and input_.shape[0] == self.num_experts
+        output = torch.stack([self.experts[e](input_[e]) for e in range(num_experts)], dim=0)
+        return output
 
 
-class Model(torch.nn.Module):
-    def __init__(self):
+class QuantizedExpertFusedCpuLinear(torch.nn.Module):
+
+    def __init__(
+        self,
+        num_experts: int,
+        in_features: int,
+        out_features: int,
+        bias: bool,
+        device=None,
+        dtype=None,
+        quantization_type=QuantizationType.PER_TENSOR_SYMMETRIC,
+        per_channel_axis=None,
+    ) -> None:
+        super().__init__()
+        self.num_experts = num_experts
+        self.in_features = in_features
+        self.out_features = out_features
+        per_channel_axis = per_channel_axis if per_channel_axis is not None else 0
+        self.experts = torch.nn.ModuleList([
+            QuantizedCpuLinear(
+                in_features=in_features,
+                out_features=out_features,
+                bias=False,
+                device=device,
+                dtype=dtype,
+                quantization_type=quantization_type,
+                per_channel_axis=per_channel_axis,
+            )
+            for e in range(num_experts)
+        ])
+
+    def forward(self, input_):
+        assert len(input_.shape) == 3 and input_.shape[0] == self.num_experts
+        output = torch.stack([self.experts[e](input_[e]) for e in range(num_experts)], dim=0)
+        return output
+
+    @classmethod
+    def from_float(
+        cls,
+        mod,
+        q_config,
+    ):
+        assert mod.__class__.__name__ == "ExpertFusedLinear", "ExpertFusedLinear expected"
+        return QuantizedExpertFusedCpuLinear(
+            num_experts=mod.num_experts,
+            in_features=mod.in_features,
+            out_features=mod.out_features,
+            bias=mod.bias,
+            device=mod.weight.device,
+            dtype=mod.weight.dtype,
+            quantization_type=q_config["quantization_type"],
+            per_channel_axis=q_config.get("quantization_per_channel_axis"),
+        )
+
+
+class ExpertFusedModel(torch.nn.Module):
+
+    NUM_LAYERS = 4
+
+    def __init__(self, is_parallel):
         torch.manual_seed(0)  # to ensure the weight is the same on every initialization
         super().__init__()
-        self.lay1 = ExpertFusedColumnParallelLinear(
-            num_experts=num_experts,
-            input_size=hidden_size,
-            output_size=intermediate_size,
-            dtype=torch.float32,
-        )
-        self.lay2 = ExpertFusedRowParallelLinear(
-            num_experts=num_experts,
-            input_size=intermediate_size,
-            output_size=hidden_size,
-            reduce_output=True,
-            dtype=torch.float32,
-        )
-        self.lay3 = ExpertFusedColumnParallelLinear(
-            num_experts=num_experts,
-            input_size=hidden_size,
-            output_size=intermediate_size,
-            dtype=torch.float32,
-        )
-        self.lay4 = ExpertFusedRowParallelLinear(
-            num_experts=num_experts,
-            input_size=intermediate_size,
-            output_size=hidden_size,
-            reduce_output=True,
-            dtype=torch.float32,
-        )
+        self.num_experts = num_experts
+        self.is_parallel = is_parallel
+
+        self.layers = torch.nn.ModuleList()
+        assert self.NUM_LAYERS % 2 == 0
+        for i in range(self.NUM_LAYERS):
+            if is_parallel:
+                if i % 2 == 0:
+                    self.layers.append(ExpertFusedColumnParallelLinear(
+                        num_experts=num_experts,
+                        input_size=hidden_size,
+                        output_size=intermediate_size,
+                        dtype=torch.float32,
+                    ))
+                else:
+                    self.layers.append(ExpertFusedRowParallelLinear(
+                        num_experts=num_experts,
+                        input_size=intermediate_size,
+                        output_size=hidden_size,
+                        reduce_output=True,
+                        dtype=torch.float32,
+                    ))
+            else:
+                if i % 2 == 0:
+                    self.layers.append(ExpertFusedLinear(num_experts, hidden_size, intermediate_size, dtype=torch.float32))
+                else:
+                    self.layers.append(ExpertFusedLinear(num_experts, intermediate_size, hidden_size, dtype=torch.float32))
 
     def forward(self, x):
-        x = self.lay1(x)
-        x = self.lay2(x)
-        x = self.lay3(x)
-        x = self.lay4(x)
+        for layer in self.layers:
+            x = layer(x)
         return x
 
+    @classmethod
+    def requantize_weights_across_experts(cls, state_dict, num_experts):
+        """
+        Re-quantize the expert weights (corresponding to the given prefix) after fusing the
+        weights along the expert dimension. This is necessary as each linear layer is quantized individually.
+        Whereas in NxD we fuse the weights together across experts, and want a single scale which is independent of the
+        expert dimension.
+        """
+        expert_fused_state_dict = {}
 
-def quantize_weight(float_state_dict):
-    int8_state_dict = {}
-    for name, weight in float_state_dict.items():
-        weight_observer = default_dynamic_qconfig.weight()
-        weight_observer(weight)
-        qint8_weight = _quantize_weight(weight, weight_observer)
-        int8_state_dict[name] = qint8_weight.int_repr()
-        int8_state_dict[name.replace("weight", "scale")] = torch.tensor([qint8_weight.q_scale()])
-    return int8_state_dict
+        for layer_idx in range(cls.NUM_LAYERS):
+            expert_weights = []
+            scales = []
+            prefix = f"layers.{layer_idx}"
+            for e in range(num_experts):
+                # (I, H)
+                expert_weights.append(state_dict[f"{prefix}.experts.{e}.weight"])
+                # (1, ) for per_tensor or (I, 1) for per_channel
+                scales.append(state_dict[f"{prefix}.experts.{e}.scale"])
 
+            # Re-quantize the weights after fusing the weights along the expert dimension
 
-def get_input():
-    return torch.randn((num_experts, capacity, hidden_size))
+            # (E, H, I)
+            weight = torch.stack(expert_weights, dim=0).transpose(1, 2)
+            # (E, 1) for per_tensor or (E, I, 1) for per_channel
+            scale = torch.stack(scales, dim=0)
 
+            is_per_channel = (len(scale.shape) == 3)
+            if is_per_channel:
+                scale = scale.transpose(1, 2)
 
-def init_ditributed_env():
-    os.environ["RANK"] = str(0)
-    os.environ["WORLD_SIZE"] = str(1)
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "2024"
+            # combined_scale: (1, ) for per_tensor or (1, 1, I) for per_channel
+            combined_scale = torch.max(scale, dim=0, keepdim=is_per_channel).values
 
-    if not torch.distributed.is_initialized():
-        torch.distributed.init_process_group(backend="xla")
+            dtype = weight.dtype
+            if is_per_channel:
+                # (E, H, I) * (E, 1, I) -> (E, H, I)
+                dequantized_weight = weight.to(dtype=torch.float32) * scale
+            else:
+                # (E, H, I) * (E, 1, 1) -> (E, H, I)
+                dequantized_weight = weight.to(dtype=torch.float32) * scale.unsqueeze(2)
 
-    p_state.destroy_model_parallel()
-    p_state.initialize_model_parallel(tensor_model_parallel_size=1)
+            # (E, H, I) / (1, ) for per_tensor or (E, H, I) / (1, 1, I) for per_channel -> (E, H, I)
+            quantized_weight = (dequantized_weight / combined_scale).to(dtype)
 
+            expert_fused_state_dict[f"{prefix}.weight"] = quantized_weight
+            expert_fused_state_dict[f"{prefix}.scale"] = combined_scale
 
-def _prepare_state_dict():
-    init_ditributed_env()
-    with torch.no_grad():
-        model = Model()
-        float_sd = model.state_dict()
-        q_sd = quantize_weight(float_sd)
-    torch.save(q_sd, TEMP_STATE_DICT_NAME)
-    p_state.destroy_model_parallel()
+        return expert_fused_state_dict
 
+    @classmethod
+    def _quantize_and_save_model(cls, model_fp32, q_config, save_path):
+        """
+        This function quantizes the non-parallel model (i.e. which uses nn.Linear) using pytorch APIs, and stores the
+        state dict at save_path in a format that can be loaded into the parallel (NxD) model.
 
-def prepare_state_dict():
-    with ProcessPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(_prepare_state_dict)
-        future.result()
-
-
-def load_model():
-    model = Model()
-    model_quant = convert(model, q_config=None, inplace=True, mapping=None)
-    print(model_quant)
-    all_parameters_name = []
-    for name, _ in model_quant.named_parameters():
-        all_parameters_name.append(name)
-    print(all_parameters_name)
-
-    alias = {}
-
-    return model_quant, alias
-
-
-def checkpoint_loader_fn():
-    return torch.load(TEMP_STATE_DICT_NAME)
-
-
-def load_traced_model(input_fp32):
-    from neuronx_distributed.trace import parallel_model_trace
-
-    sample_inputs = input_fp32
-    traced_model = parallel_model_trace(
-        load_model,  # This loads the parallel model
-        sample_inputs,
-        tp_degree=2,
-        compiler_workdir=TEMP_COMPILER_WORK_DIR,  # This is where you will find the hlo & neff
-        compiler_args="--auto-cast=none",  # Pass your compiler flags here,
-        inline_weights_to_neff=False,
-        spmd_mode=True,
-        checkpoint_loader_callable=checkpoint_loader_fn,
-        force_custom_init_on_device=True,
-    )
-    return traced_model
-
-
-def get_output_from_traced_quantized_model(input_fp32):
-    prepare_state_dict()
-    traced_quantized_model = load_traced_model(input_fp32)
-    return traced_quantized_model(input_fp32)
-
-
-def _get_output_from_cpu_model(input_fp32):
-    init_ditributed_env()
-    with torch.no_grad():
-        model = Model()
-        output = model(input_fp32)
-    p_state.destroy_model_parallel()
-    return output
-
-
-def get_output_from_cpu_model(input_fp32):
-    """Put execution in another process to avoid neuron device not available error"""
-    with ProcessPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(_get_output_from_cpu_model, input_fp32)
-        output = future.result()
-    return output
-
-
-def main():
-    input_fp32 = get_input()
-    cpu_float_result = get_output_from_cpu_model(input_fp32)
-    traced_quantized_result = get_output_from_traced_quantized_model(input_fp32)
-
-    print(f"cpu result: {cpu_float_result}")
-    print(f"traced quantized result: {traced_quantized_result}")
-    assert torch.allclose(cpu_float_result, traced_quantized_result, atol=1e-2)
-
-    print("Test succeeded for Quantized Expert-fused Parallel Linear Layers!")
-
-    if os.path.exists(TEMP_STATE_DICT_NAME):
-        os.remove(TEMP_STATE_DICT_NAME)
-
-    if os.path.exists(TEMP_COMPILER_WORK_DIR) and os.path.isdir(TEMP_COMPILER_WORK_DIR):
-        shutil.rmtree(TEMP_COMPILER_WORK_DIR)
+        Note that this is a helper function used only for testing.
+        """
+        assert not model_fp32.is_parallel
+        if q_config["quantization_type"] == QuantizationType.PER_CHANNEL_SYMMETRIC:
+            model_fp32_int8 = quantize_pytorch_model_per_channel_symmetric(model_fp32)
+        else:
+            model_fp32_int8 = quantize_pytorch_model_per_tensor_symmetric(model_fp32)
+        state_dict = model_fp32_int8.state_dict()
+        convert_qint8_to_int8_state_dict(state_dict=state_dict)
+        expert_fused_state_dict = cls.requantize_weights_across_experts(state_dict, model_fp32.num_experts)
+        torch.save(expert_fused_state_dict, save_path)
+        return model_fp32_int8, state_dict
 
 
 if __name__ == "__main__":
-    main()
+
+    common_args = dict(
+        model_cls=ExpertFusedModel,
+        input_shape=(num_experts, capacity, hidden_size),
+        # Skip scales validation since the MoE layer scales are combined across experts
+        validate_scales=False,
+    )
+
+    try:
+        q_config = get_default_custom_qconfig_dict()
+        with ProcessPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(run_quantization_test, q_config, **common_args)
+            results = future.result()
+    except Exception:
+        print(traceback.format_exc())
+
+    try:
+        q_config = get_default_per_channel_custom_qconfig_dict()
+        with ProcessPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(run_quantization_test, q_config, **common_args)
+            results = future.result()
+    except Exception:
+        print(traceback.format_exc())
