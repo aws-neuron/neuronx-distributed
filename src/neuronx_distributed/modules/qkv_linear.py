@@ -143,6 +143,7 @@ class GQAQKVLinearWithAsyncCommunication(torch.autograd.Function):
         fuse_qkv: bool = False,
         output_size_q: Optional[int] = None,
         output_size_kv: Optional[int] = None,
+        reduce_dtype: torch.dtype = torch.float32,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         ctx.use_bias = check_use_bias(weight_qkv, fuse_qkv, weight_q, bias_q, bias_qkv)
         ctx.async_grad_allreduce = async_grad_allreduce
@@ -150,6 +151,7 @@ class GQAQKVLinearWithAsyncCommunication(torch.autograd.Function):
         ctx.compute_weight_gradient = check_requires_grad(weight_qkv, fuse_qkv, weight_q)
         ctx.kv_size_multiplier = kv_size_multiplier
         ctx.fuse_qkv = fuse_qkv
+        ctx.reduce_dtype = reduce_dtype
 
         if ctx.compute_weight_gradient:
             if ctx.fuse_qkv:
@@ -201,7 +203,6 @@ class GQAQKVLinearWithAsyncCommunication(torch.autograd.Function):
             input = None
 
         use_bias = ctx.use_bias
-        hardware_type = hardware(get_platform_target())
         if ctx.compute_weight_gradient:
             if ctx.sequence_parallel_enabled:
                 total_input = xm.all_gather(
@@ -217,17 +218,18 @@ class GQAQKVLinearWithAsyncCommunication(torch.autograd.Function):
             # sum up the gradients from the repeated portions. get_kv_shared_group()
             # returns the ranks which have the same K and V heads, and hence allows us to
             # sum up from the distributed ranks.
-
-            # Updating the reduction dtype to be FLOAT32 to reduce errors due to precision
             original_dtype = grad_output_k.dtype
-            if os.getenv("XLA_DOWNCAST_BF16") == "1" and hardware_type == hardware.TRN2:
-                grad_output_k=grad_output_k.to(torch.float64)
-                grad_output_v=grad_output_v.to(torch.float64)
-            torch.distributed.all_reduce(grad_output_k, group=parallel_state.get_kv_shared_group())
-            torch.distributed.all_reduce(grad_output_v, group=parallel_state.get_kv_shared_group())
-            if os.getenv("XLA_DOWNCAST_BF16") == "1" and hardware_type == hardware.TRN2:
-                grad_output_k = grad_output_k.to(original_dtype)
-                grad_output_k = grad_output_v.to(original_dtype)
+            grad_output_k = grad_output_k.to(ctx.reduce_dtype)
+            grad_output_v = grad_output_v.to(ctx.reduce_dtype)
+
+            outs = xm.all_reduce(
+                xm.REDUCE_SUM,
+                [grad_output_k, grad_output_v],
+                scale=1.0,
+                groups=parallel_state.get_kv_shared_replica_groups(),
+                pin_layout=False
+            )
+            grad_output_k, grad_output_v = outs[0].to(original_dtype), outs[1].to(original_dtype)
 
         if ctx.fuse_qkv:
             # Divide grad_output_k and grad_output_v by the kv replication factor
@@ -246,12 +248,11 @@ class GQAQKVLinearWithAsyncCommunication(torch.autograd.Function):
             # would cause the K and V duplicate factor to be counted twice.
             grad_input = grad_input_q + (grad_input_k + grad_input_v) / ctx.kv_size_multiplier
 
-        original_dtype=grad_input.dtype
+        original_dtype = grad_input.dtype
 
         if ctx.async_grad_allreduce:
             # Asynchronous all-reduce
-            if os.getenv("XLA_DOWNCAST_BF16") == "1" and hardware_type == hardware.TRN2:
-                grad_input = grad_input.to(torch.float64)
+            grad_input = grad_input.to(ctx.reduce_dtype)
             torch.distributed.all_reduce(grad_input, group=get_tensor_model_parallel_group())
             grad_input=grad_input.to(original_dtype)
 
@@ -263,8 +264,7 @@ class GQAQKVLinearWithAsyncCommunication(torch.autograd.Function):
                 shape = list(grad_input.shape)
                 shape[0] //= world_size
 
-                if os.getenv("XLA_DOWNCAST_BF16") == "1" and hardware_type == hardware.TRN2:
-                    grad_input = grad_input.to(torch.float64)
+                grad_input = grad_input.to(ctx.reduce_dtype)
 
                 sub_grad_input = torch.empty(
                     torch.Size(shape),
@@ -302,16 +302,16 @@ class GQAQKVLinearWithAsyncCommunication(torch.autograd.Function):
                     None,
                     None,
                     None,
+                    None,
                 )
-            return grad_input, None, None, None, None, None, None, None, None, None, None, None, None, None, None
+            return grad_input, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
         # Convert the tensor shapes to 2D for execution compatibility
         total_input = total_input.view(total_input.shape[0] * total_input.shape[1], total_input.shape[2])
 
         if ctx.sequence_parallel_enabled:
             assert not ctx.async_grad_allreduce
-            if os.getenv("XLA_DOWNCAST_BF16") == "1" and hardware_type == hardware.TRN2:
-                grad_input = grad_input.to(torch.float64)
+            grad_input = grad_input.to(ctx.reduce_dtype)
             sub_grad_input = torch.empty(grad_input.shape, dtype=grad_input.dtype, device=grad_input.device, requires_grad=False)
             xm.reduce_scatter(
                 xm.REDUCE_SUM,
@@ -349,6 +349,7 @@ class GQAQKVLinearWithAsyncCommunication(torch.autograd.Function):
                     None,
                     None,
                     None,
+                    None,
                 )
 
             return (
@@ -364,6 +365,7 @@ class GQAQKVLinearWithAsyncCommunication(torch.autograd.Function):
                 None,
                 grad_weight_qkv,
                 grad_bias_qkv,
+                None,
                 None,
                 None,
                 None,
@@ -392,6 +394,7 @@ class GQAQKVLinearWithAsyncCommunication(torch.autograd.Function):
                 None,
                 None,
                 None,
+                None,
             )
 
         return (
@@ -402,6 +405,7 @@ class GQAQKVLinearWithAsyncCommunication(torch.autograd.Function):
             grad_bias_q,
             grad_bias_k,
             grad_bias_v,
+            None,
             None,
             None,
             None,
@@ -430,6 +434,7 @@ def gqa_qkv_linear_with_async_allreduce(
     fuse_qkv: bool = False,
     output_size_q: Optional[int] = None,
     output_size_kv: Optional[int] = None,
+    reduce_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     args = cast_if_autocast_enabled(
         input,
@@ -447,6 +452,7 @@ def gqa_qkv_linear_with_async_allreduce(
         fuse_qkv,
         output_size_q,
         output_size_kv,
+        reduce_dtype,
     )
     verify_casted_dtype(args)
     with torch.cuda.amp.autocast(enabled=False):
@@ -515,6 +521,7 @@ class GQAQKVColumnParallelLinear(BaseParallelLinear):
         keep_master_weight: bool = False,
         kv_size_multiplier: int = 1,
         fuse_qkv: bool = True,
+        reduce_dtype: torch.dtype = torch.float32,
     ):
         super().__init__()
 
@@ -550,7 +557,7 @@ class GQAQKVColumnParallelLinear(BaseParallelLinear):
             raise RuntimeError(
                 "`async_tensor_model_parallel_allreduce` and `sequence_parallel_enabled` cannot be enabled at the same time."
             )
-
+        self.reduce_dtype = reduce_dtype
         self._forward_impl = gqa_qkv_linear_with_async_allreduce
 
     def _create_weights_biases(self):
@@ -751,6 +758,7 @@ class GQAQKVColumnParallelLinear(BaseParallelLinear):
                 fuse_qkv=self.fuse_qkv,
                 output_size_q=self.q_output_size_per_partition,
                 output_size_kv=self.kv_output_size_per_partition,
+                reduce_dtype=self.reduce_dtype,
             )
         else:
             output_parallel_q, output_parallel_k, output_parallel_v = self._forward_impl(
@@ -769,6 +777,7 @@ class GQAQKVColumnParallelLinear(BaseParallelLinear):
                 fuse_qkv=self.fuse_qkv,
                 output_size_q=self.output_sizes[0] if self.gather_output else self.q_output_size_per_partition,
                 output_size_kv=self.output_sizes[1] if self.gather_output else self.kv_output_size_per_partition,
+                reduce_dtype=self.reduce_dtype,
             )
         if self.gather_output:
             # All-gather across the partitions.

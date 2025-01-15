@@ -13,7 +13,6 @@ import torch.nn.init as init
 import torch_xla.core.xla_model as xm
 from torch.distributed import ProcessGroup
 from torch.nn.parameter import Parameter
-
 from .mappings import (
     _gather_along_dim,
     _reduce_scatter_along_dim,
@@ -42,8 +41,6 @@ from .utils import (
     verify_casted_dtype,
 )
 from .utils import param_is_not_tensor_parallel_duplicate  # noqa: F401 # pylint: disable=W0611
-from neuronx_distributed.utils.utils import hardware
-from torch_neuronx.utils import get_platform_target
 
 if "reduce_scatter_tensor" not in dir(torch.distributed):
     torch.distributed.reduce_scatter_tensor = torch.distributed._reduce_scatter_base
@@ -383,6 +380,7 @@ class LinearWithAsyncCommunication(torch.autograd.Function):
         sequence_dimension: Optional[int] = 0,
         save_for_backward: bool = True,
         process_group: Optional[ProcessGroup] = None,
+        reduce_dtype: torch.dtype = torch.float32,
     ) -> torch.Tensor:
         ctx.use_bias = bias is not None and weight.requires_grad
         ctx.async_grad_allreduce = async_grad_allreduce
@@ -392,6 +390,7 @@ class LinearWithAsyncCommunication(torch.autograd.Function):
         if process_group is None:
             process_group = get_tensor_model_parallel_group(as_list=True)
         ctx.process_group = process_group
+        ctx.reduce_dtype = reduce_dtype
 
         if ctx.sequence_parallel_enabled:
             assert (
@@ -432,7 +431,6 @@ class LinearWithAsyncCommunication(torch.autograd.Function):
 
         use_bias = ctx.use_bias
         process_group = ctx.process_group
-        hardware_type = hardware(get_platform_target())
 
         handle = None
         if ctx.compute_weight_gradient:
@@ -451,26 +449,24 @@ class LinearWithAsyncCommunication(torch.autograd.Function):
 
         if ctx.async_grad_allreduce:
             # Asynchronous all-reduce
-            if os.getenv("XLA_DOWNCAST_BF16") == "1" and hardware_type == hardware.TRN2:
-                grad_input = grad_input.to(torch.float64)
+            grad_input = grad_input.to(ctx.reduce_dtype)
             handle = torch.distributed.all_reduce(grad_input, group=process_group, async_op=True)
+            grad_input = grad_input.to(original_dtype)
 
         # if no weight gradient, immediately return
         if not ctx.compute_weight_gradient:
             if ctx.sequence_parallel_enabled:
                 assert not ctx.async_grad_allreduce
                 # Optimal layout is SBH, but if not, transposes are added
-                if os.getenv("XLA_DOWNCAST_BF16") == "1" and hardware_type == hardware.TRN2:
-                    grad_input = grad_input.to(torch.float64)
-                sub_grad_input = _reduce_scatter_along_dim(grad_input, ctx.sequence_dimension, process_group=process_group)
+                sub_grad_input = _reduce_scatter_along_dim(grad_input.to(ctx.reduce_dtype), ctx.sequence_dimension, process_group=process_group)
                 sub_grad_input = sub_grad_input.to(original_dtype)
-                return sub_grad_input, None, None, None, None, None, None, None
+                return sub_grad_input, None, None, None, None, None, None, None, None
 
             if ctx.async_grad_allreduce:
                 assert handle
                 handle.wait()
                 grad_input = grad_input.to(original_dtype)
-            return grad_input, None, None, None, None, None, None, None
+            return grad_input, None, None, None, None, None, None, None, None
 
         # Convert the tensor shapes to 2D for execution compatibility
         grad_output = grad_output.view(grad_output.shape[0] * grad_output.shape[1], grad_output.shape[2])
@@ -479,22 +475,20 @@ class LinearWithAsyncCommunication(torch.autograd.Function):
         if ctx.sequence_parallel_enabled:
             assert not ctx.async_grad_allreduce
             # optimal layout is SBH, but if not, transposes will be added
-            if os.getenv("XLA_DOWNCAST_BF16") == "1" and hardware_type == hardware.TRN2:
-                grad_input = grad_input.to(torch.float64)
-            sub_grad_input = _reduce_scatter_along_dim(grad_input, ctx.sequence_dimension, process_group=process_group)
+            sub_grad_input = _reduce_scatter_along_dim(grad_input.to(ctx.reduce_dtype), ctx.sequence_dimension, process_group=process_group)
             sub_grad_input=sub_grad_input.to(original_dtype)
 
         grad_weight = grad_output.t().matmul(total_input)
         grad_bias = grad_output.sum(dim=0) if use_bias else None
 
         if ctx.sequence_parallel_enabled:
-            return sub_grad_input, grad_weight, grad_bias, None, None, None, None, None
+            return sub_grad_input, grad_weight, grad_bias, None, None, None, None, None, None
 
         if ctx.async_grad_allreduce:
             assert handle
             handle.wait()
             grad_input=grad_input.to(original_dtype)
-        return grad_input, grad_weight, grad_bias, None, None, None, None, None
+        return grad_input, grad_weight, grad_bias, None, None, None, None, None, None
 
 
 def linear_with_async_allreduce(
@@ -507,6 +501,7 @@ def linear_with_async_allreduce(
     autograd_func_class: Type[torch.autograd.Function] = LinearWithAsyncCommunication,
     save_for_backward: bool = True,
     process_group: Optional[ProcessGroup] = None,
+    reduce_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     args = cast_if_autocast_enabled(
         input,
@@ -517,6 +512,7 @@ def linear_with_async_allreduce(
         sequence_dimension,
         save_for_backward,
         process_group,
+        reduce_dtype,
     )
     verify_casted_dtype(args)
     with torch.cuda.amp.autocast(enabled=False):
@@ -579,6 +575,7 @@ class ColumnParallelLinear(BaseParallelLinear):
         skip_bias_add: bool = False,
         pad: bool = False,
         tensor_model_parallel_group: Optional[ProcessGroup] = None,
+        reduce_dtype: torch.dtype = torch.float32,
     ):
         super().__init__()
 
@@ -627,7 +624,7 @@ class ColumnParallelLinear(BaseParallelLinear):
             raise RuntimeError(
                 "`async_tensor_model_parallel_allreduce` and `sequence_parallel_enabled` cannot be enabled at the same time."
             )
-
+        self.reduce_dtype = reduce_dtype
         self._forward_impl = linear_with_async_allreduce
 
     def set_weight_and_bias_config(self) -> None:
@@ -718,7 +715,8 @@ class ColumnParallelLinear(BaseParallelLinear):
             sequence_parallel_enabled=self.sequence_parallel_enabled,
             sequence_dimension=self.sequence_dimension,
             autograd_func_class=self.autograd_func_class,
-            process_group=self.tensor_parallel_group
+            process_group=self.tensor_parallel_group,
+            reduce_dtype = self.reduce_dtype,
         )
         if self.gather_output:
             # All-gather across the partitions.
@@ -788,7 +786,7 @@ class RowParallelLinear(BaseParallelLinear):
         pad: bool = False,
         reduce_output: bool = True,
         tensor_model_parallel_group: Optional[ProcessGroup] = None,
-        reduce_dtype: torch.dtype = None,
+        reduce_dtype: torch.dtype = torch.float32,
     ):
         super().__init__()
 
@@ -801,16 +799,6 @@ class RowParallelLinear(BaseParallelLinear):
         self.reduce_output = reduce_output
         self.tensor_parallel_group = tensor_model_parallel_group if \
             tensor_model_parallel_group is not None else cast(ProcessGroup, get_tensor_model_parallel_group())
-
-        if reduce_dtype is None:
-            reduce_dtype = dtype
-            
-        hardware_type = hardware(get_platform_target())
-        # Updating the reduction dtype to be FLOAT32 to reduce errors due to precision
-        if os.getenv("XLA_DOWNCAST_BF16") == "1" and hardware_type == hardware.TRN2:
-            if reduce_dtype==torch.float32:
-                reduce_dtype=torch.float64
-
         self.reduce_dtype = reduce_dtype
 
         world_size = self.tensor_parallel_group.size()
@@ -838,7 +826,7 @@ class RowParallelLinear(BaseParallelLinear):
         self.skip_bias_add = skip_bias_add
         self.bias_shape: Optional[Tuple[int]]
         self.initialize_weight_and_bias()
-
+        self.reduce_dtype = reduce_dtype
         self._forward_impl = linear_with_async_allreduce
 
     def set_weight_and_bias_config(self) -> None:
@@ -933,6 +921,7 @@ class RowParallelLinear(BaseParallelLinear):
             sequence_dimension=self.sequence_dimension,
             autograd_func_class=self.autograd_func_class,
             process_group=self.tensor_parallel_group,
+            reduce_dtype = self.reduce_dtype,
         )
 
         if self.reduce_output:

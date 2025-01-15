@@ -9,6 +9,7 @@ import regex as re
 import torch
 import torch.distributed
 import torch.nn.init as init
+import torch_xla
 import torch_xla.core.xla_model as xm
 import torch_xla.debug.metrics as met
 from commons import print_separator, set_random_seed
