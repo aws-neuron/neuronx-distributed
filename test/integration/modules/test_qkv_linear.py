@@ -7,14 +7,13 @@ import regex as re
 
 import numpy as np
 import torch
+import torch_xla
 import torch_xla.core.xla_model as xm
 
 from neuronx_distributed.modules import qkv_linear
 from neuronx_distributed.parallel_layers import layers, parallel_state
 from neuronx_distributed.parallel_layers.random import model_parallel_xla_manual_seed
 from neuronx_distributed.parallel_layers.utils import requires_init_pg_override
-from neuronx_distributed.utils.utils import hardware
-from torch_neuronx.utils import get_platform_target
 
 datetime_str = str(datetime.now())
 
@@ -529,5 +528,4 @@ if __name__ == "__main__":
     test_qkv_linear_with_kv_multipler_1(tensor_model_parallel_size, fuse_qkv=True)
     test_qkv_linear_with_kv_multipler_4(tensor_model_parallel_size)
     test_qkv_linear_with_kv_multipler_4(tensor_model_parallel_size, fuse_qkv=True)
-    if hardware(get_platform_target()) == hardware.TRN2:
-        test_qkv_linear_with_kv_multipler_4_HLO_test(tensor_model_parallel_size)
+    test_qkv_linear_with_kv_multipler_4_HLO_test(tensor_model_parallel_size)

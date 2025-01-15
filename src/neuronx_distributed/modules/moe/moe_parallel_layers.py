@@ -54,6 +54,7 @@ class ExpertFusedLinearWithAsyncCommunication(torch.autograd.Function):
         sequence_dimension: Optional[int] = 0,
         save_for_backward: bool = True,
         process_group: Optional[ProcessGroup] = None,
+        reduce_dtype: torch.dtype = torch.float32,
     ):
         if bias is not None:
             raise NotImplementedError("Bias is not currently supported for MoE")
@@ -72,6 +73,9 @@ class ExpertFusedLinearWithAsyncCommunication(torch.autograd.Function):
 
         ctx.async_grad_allreduce = async_grad_allreduce
         ctx.compute_weight_gradient = weight.requires_grad
+        # TODO: Currently reduced_dtype is not used for upcasting the
+        # all-reduce collective in backward, add a change to upcast
+        ctx.reduce_dtype = reduce_dtype
         if process_group is None:
             process_group = get_tensor_model_parallel_group()
         ctx.process_group = process_group
@@ -93,6 +97,7 @@ class ExpertFusedLinearWithAsyncCommunication(torch.autograd.Function):
     @staticmethod
     def backward(ctx: Any, *grad_outputs: Sequence[Tensor]) -> Tuple[
         Tensor,
+        Optional[Tensor],
         Optional[Tensor],
         Optional[Tensor],
         Optional[Tensor],
@@ -122,12 +127,12 @@ class ExpertFusedLinearWithAsyncCommunication(torch.autograd.Function):
 
         # if no weight gradient, immediately return
         if not ctx.compute_weight_gradient:
-            return grad_input, None, None, None, None, None, None, None
+            return grad_input, None, None, None, None, None, None, None, None
 
         # grad_weight: (E, H, I)
         grad_weight = torch.einsum("e...h,e...i->ehi", input, grad_output)
 
-        return grad_input, grad_weight, None, None, None, None, None, None
+        return grad_input, grad_weight, None, None, None, None, None, None, None
 
 
 class ExpertFusedLinear(nn.Module):
