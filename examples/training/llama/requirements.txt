@@ -1,5 +1,5 @@
 transformers==4.31.0
 regex
 tensorboard
-datasets
+datasets==3.0.2
 sentencepiece
