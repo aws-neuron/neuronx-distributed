@@ -35,6 +35,7 @@ from neuronx_distributed.lightning import (
     NeuronTQDMProgressBar,
     NeuronXLAPrecisionPlugin,
     NeuronXLAStrategy,
+    NeuronHooksCallback
 )
 from neuronx_distributed.parallel_layers import mappings
 from neuronx_distributed.utils.adamw_fp32_optim_params import AdamW_FP32OptimParams
@@ -204,6 +205,9 @@ def train_llama(args):
                 dirpath=args.checkpoint_dir,
             )
         )
+
+    if args.hooks:
+        callbacks.append(NeuronHooksCallback(args))
 
     trainer = Trainer(
         strategy=strategy,
@@ -388,6 +392,75 @@ if __name__ == "__main__":
         type=int,
         default=0,
         help="Fuse microbatches into a single graph"
+    )
+
+    # Accuracy Lens related configs
+    parser.add_argument(
+        "--hooks",
+        action='store_true',
+        default=False,
+        help="Whether to enable Accuracy Lens to inspect intermediates"
+    )
+
+    parser.add_argument(
+        "--hooks_dump_base_directory",
+        type=str,
+        default=f"./hooks_outputs/{os.environ.get('SLURM_JOB_ID')}/hooks_dumps",
+        help="Directory to dump the captured intermediates"
+    )
+    parser.add_argument(
+        "--master_print_model_layers",
+        action='store_true',
+        default=False,
+        help="Printing the model layers from master rank"
+    )
+    parser.add_argument(
+        "--target_layers",
+        type=str,
+        default="",
+        help="Which layers to monitor/hook onto"
+    )
+    parser.add_argument(
+        "--dump_only_master_rank",
+        action='store_true',
+        default=False,
+        help="Dump tensors/norms only from master rank"
+    )
+    parser.add_argument(
+        "--dump_only_norms",
+        action='store_true',
+        default=False,
+        help="Dump L2 norms of tensors instead of raw"
+    )
+    parser.add_argument(
+        "--hooks_interval",
+        type=int,
+        default=0,
+        help="At what divisibles of epoch shall the intermediates be dumped"
+    )
+    parser.add_argument(
+        "--enable_activation_dumps",
+        action='store_true',
+        default=False,
+        help="Enable dumping Activation Inputs/Outputs"
+    )
+    parser.add_argument(
+        "--enable_grad_dumps",
+        action='store_true',
+        default=False,
+        help="Enable dumping Gradient Inputs/Outputs"
+    )
+    parser.add_argument(
+        "--enable_tb_logging_master_rank_activation_norms",
+        action='store_true',
+        default=False,
+        help="Enable activation norms logging in TensorBoard"
+    )
+    parser.add_argument(
+        "--enable_tb_logging_master_rank_grad_norms",
+        action='store_true',
+        default=False,
+        help="Enable gradient norms logging in TensorBoard"
     )
 
     args = parser.parse_args(sys.argv[1:])

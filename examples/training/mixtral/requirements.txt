@@ -1,6 +1,9 @@
-transformers==4.36.2
+transformers==4.48.0
 pytorch-lightning==2.4.0 
 regex
 tensorboard
 datasets
 sentencepiece
+tenacity
+s3transfer
+awscrt

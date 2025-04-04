@@ -41,6 +41,13 @@ from .utils import (
     verify_casted_dtype,
 )
 from .utils import param_is_not_tensor_parallel_duplicate  # noqa: F401 # pylint: disable=W0611
+from .layers_utils import (
+    _linear_autograd_base_setup_fwd,
+    _linear_autograd_base_setup_bwd,
+    _linear_autograd_bwd_grad_reduce,
+    _linear_autograd_bwd_no_weight_grad,
+    _linear_autograd_bwd_input_grad,
+)
 
 if "reduce_scatter_tensor" not in dir(torch.distributed):
     torch.distributed.reduce_scatter_tensor = torch.distributed._reduce_scatter_base
@@ -173,7 +180,8 @@ class ParallelEmbedding(torch.nn.Module):
         pad: bool = False,
         sequence_parallel_enabled: bool = False,
         tensor_model_parallel_group: Optional[ProcessGroup] = None,
-        use_spmd_rank: bool = False
+        use_spmd_rank: bool = False,
+        sequence_dimension: Optional[int] = None,
     ):
         super().__init__()
         # Keep the input dimensions.
@@ -190,6 +198,7 @@ class ParallelEmbedding(torch.nn.Module):
         self.stride = 1
         self.pad = pad
         self.sequence_parallel_enabled = sequence_parallel_enabled
+        self.sequence_dim = sequence_dimension
 
         self.rank_util: Optional[SPMDRank] = None
         if use_spmd_rank:
@@ -307,6 +316,9 @@ class ParallelEmbedding(torch.nn.Module):
             output_parallel = torch.mul(output_parallel, torch.unsqueeze(input_mask.float(), dim=-1)).to(self.dtype)
 
         if self.sequence_parallel_enabled:
+            if self.sequence_dim:
+                return _reduce_scatter_along_dim(output_parallel, self.sequence_dim,
+                                    process_group=self.tensor_model_parallel_group)
             # TODO: use sequence dimension instead of a manual transpose which assumes a layout
             return reduce_scatter_to_sequence_parallel_region(
                 output_parallel.transpose(0, 1).contiguous(), process_group=self.tensor_model_parallel_group,
@@ -382,34 +394,17 @@ class LinearWithAsyncCommunication(torch.autograd.Function):
         process_group: Optional[ProcessGroup] = None,
         reduce_dtype: torch.dtype = torch.float32,
     ) -> torch.Tensor:
-        ctx.use_bias = bias is not None and weight.requires_grad
-        ctx.async_grad_allreduce = async_grad_allreduce
-        ctx.sequence_parallel_enabled = sequence_parallel_enabled
-        ctx.sequence_dimension = sequence_dimension
-        ctx.compute_weight_gradient = weight.requires_grad
-        if process_group is None:
-            process_group = get_tensor_model_parallel_group(as_list=True)
-        ctx.process_group = process_group
-        ctx.reduce_dtype = reduce_dtype
-
-        if ctx.sequence_parallel_enabled:
-            assert (
-                ctx.sequence_dimension is not None
-            ), "Found `sequence_parallel_enabled` set to True, but `sequence_dimension` was None, and this occured in an unexpected area"
-
-        if save_for_backward:
-            if ctx.compute_weight_gradient:
-                ctx.save_for_backward(input, weight)
-            else:
-                ctx.save_for_backward(weight)
-
-        if ctx.sequence_parallel_enabled:
-            # `input` is supposed to be 3D and the optimal order of dimension is [sequence, batch, hidden]
-            # If not SBH, the necessary transposes will be added
-            total_input = _gather_along_dim(input, ctx.sequence_dimension, process_group=ctx.process_group)
-        else:
-            total_input = input
-
+        total_input= _linear_autograd_base_setup_fwd(
+            ctx,
+            input,
+            weight,
+            bias,
+            async_grad_allreduce,
+            sequence_parallel_enabled,
+            sequence_dimension, save_for_backward,
+            process_group,
+            reduce_dtype
+        )
         output = torch.einsum('...m,mn->...n', total_input, weight.t())
         if bias is not None:
             output = output + bias
@@ -417,77 +412,40 @@ class LinearWithAsyncCommunication(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx: Any, *grad_outputs: Any) -> Any:
-        grad_output = grad_outputs[0]
-        if ctx.sequence_parallel_enabled:
-            assert (
-                ctx.sequence_dimension is not None
-            ), "Found `sequence_parallel_enabled` set to True, but `sequence_dimension` was None, and this occured in an unexpected area"
 
-        if ctx.compute_weight_gradient:
-            input, weight = ctx.saved_tensors
-        else:
-            weight = ctx.saved_tensors[0]
-            input = None
-
-        use_bias = ctx.use_bias
-        process_group = ctx.process_group
-
-        handle = None
-        if ctx.compute_weight_gradient:
-            if ctx.sequence_parallel_enabled:
-                # Optimal layout is SBH, but if not, transposes are added
-                total_input = _gather_along_dim(input, ctx.sequence_dimension, process_group=process_group)
-            else:
-                total_input = input
+        total_input, weight, grad_output = _linear_autograd_base_setup_bwd(ctx, grad_outputs)
 
         grad_input = grad_output.matmul(weight)
 
-        if handle is not None:
-            handle.wait()
-
         original_dtype = grad_input.dtype
 
-        if ctx.async_grad_allreduce:
-            # Asynchronous all-reduce
-            grad_input = grad_input.to(ctx.reduce_dtype)
-            handle = torch.distributed.all_reduce(grad_input, group=process_group, async_op=True)
-            grad_input = grad_input.to(original_dtype)
+        handle = _linear_autograd_bwd_grad_reduce(ctx, grad_input, original_dtype)
 
         # if no weight gradient, immediately return
         if not ctx.compute_weight_gradient:
             if ctx.sequence_parallel_enabled:
-                assert not ctx.async_grad_allreduce
-                # Optimal layout is SBH, but if not, transposes are added
-                sub_grad_input = _reduce_scatter_along_dim(grad_input.to(ctx.reduce_dtype), ctx.sequence_dimension, process_group=process_group)
-                sub_grad_input = sub_grad_input.to(original_dtype)
+                sub_grad_input = _linear_autograd_bwd_no_weight_grad(ctx, grad_input, original_dtype)
                 return sub_grad_input, None, None, None, None, None, None, None, None
 
             if ctx.async_grad_allreduce:
                 assert handle
                 handle.wait()
                 grad_input = grad_input.to(original_dtype)
+                
             return grad_input, None, None, None, None, None, None, None, None
 
         # Convert the tensor shapes to 2D for execution compatibility
         grad_output = grad_output.view(grad_output.shape[0] * grad_output.shape[1], grad_output.shape[2])
         total_input = total_input.view(total_input.shape[0] * total_input.shape[1], total_input.shape[2])
 
-        if ctx.sequence_parallel_enabled:
-            assert not ctx.async_grad_allreduce
-            # optimal layout is SBH, but if not, transposes will be added
-            sub_grad_input = _reduce_scatter_along_dim(grad_input.to(ctx.reduce_dtype), ctx.sequence_dimension, process_group=process_group)
-            sub_grad_input=sub_grad_input.to(original_dtype)
-
         grad_weight = grad_output.t().matmul(total_input)
-        grad_bias = grad_output.sum(dim=0) if use_bias else None
+        grad_bias = grad_output.sum(dim=0) if ctx.use_bias else None
+
+        sub_grad_input, grad_input = _linear_autograd_bwd_input_grad(ctx, grad_input, handle, original_dtype)
 
         if ctx.sequence_parallel_enabled:
             return sub_grad_input, grad_weight, grad_bias, None, None, None, None, None, None
 
-        if ctx.async_grad_allreduce:
-            assert handle
-            handle.wait()
-            grad_input=grad_input.to(original_dtype)
         return grad_input, grad_weight, grad_bias, None, None, None, None, None, None
 
 
@@ -536,7 +494,15 @@ class BaseParallelLinear(torch.nn.Module):
         bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
         torch.nn.init.uniform_(self.bias, -bound, bound)
 
+    def _check_pad_false_for_training(
+        self,
+    ):
+        """ This function contains the common runtime assertions needed by inherited layers"""
 
+        if self.pad and self.training:
+            raise RuntimeError("`pad=True` is only supported for inference. Set model.eval()")
+
+    
 class ColumnParallelLinear(BaseParallelLinear):
     """Linear layer with column parallelism.
 
@@ -698,13 +664,10 @@ class ColumnParallelLinear(BaseParallelLinear):
         Returns:
             - output
         """
-        if self.pad and self.training:
-            raise RuntimeError("`pad=True` is only supported for inference. Set model.eval()")
+        
+        self._check_pad_false_for_training()
 
-        if self.async_tensor_model_parallel_allreduce or self.sequence_parallel_enabled:
-            input_parallel = input
-        else:
-            input_parallel = copy_to_tensor_model_parallel_region(input, process_group=self.tensor_parallel_group)
+        input_parallel = self._cpl_maybe_input_copy_to_tp_region(input)
 
         # Matrix multiply.
         output_parallel = self._forward_impl(
@@ -718,17 +681,13 @@ class ColumnParallelLinear(BaseParallelLinear):
             process_group=self.tensor_parallel_group,
             reduce_dtype = self.reduce_dtype,
         )
-        if self.gather_output:
-            # All-gather across the partitions.
-            assert not self.sequence_parallel_enabled
-            output = gather_from_tensor_model_parallel_region(output_parallel, process_group=self.tensor_parallel_group)
-            if self.pad and self.pad_size > 0:
-                output = torch.narrow(output, -1, 0, self.output_size - self.pad_size)
-        else:
-            output = output_parallel
+        
+        output = self._cpl_maybe_gather_output(output_parallel)
+        
         if self.skip_bias_add:
             return output, self.bias
         output = (output + self.bias) if self.bias is not None else output
+
         return output
 
     def preshard_hook(self, model_state_dict: Dict[str, Any], prefix: str) -> None:
@@ -739,6 +698,35 @@ class ColumnParallelLinear(BaseParallelLinear):
             raise RuntimeError(f"State dict {prefix} is of an unexpected size {size} expected {size - self.pad_size}")
         model_state_dict[prefix] = torch.nn.functional.pad(model_state_dict[prefix], (0, 0, 0, self.pad_size))
 
+    def _cpl_maybe_gather_output(
+        self,
+        output_parallel: torch.tensor,
+    ) -> torch.Tensor:
+        """This function will gather the output based on the value of gather_output """
+
+        if self.gather_output:
+            # All-gather across the partitions.
+            assert not self.sequence_parallel_enabled
+            output = gather_from_tensor_model_parallel_region(output_parallel, process_group=self.tensor_parallel_group)
+            if self.pad and self.pad_size > 0:
+                output = torch.narrow(output, -1, 0, self.output_size - self.pad_size)
+        else:
+            output = output_parallel
+
+        return output
+
+    def _cpl_maybe_input_copy_to_tp_region(
+        self,
+        input: torch.tensor
+    ) -> torch.Tensor:
+        """This function copies the input to the tensor model parallel region conditionally"""
+
+        if self.async_tensor_model_parallel_allreduce or self.sequence_parallel_enabled:
+            input_parallel = input
+        else:
+            input_parallel = copy_to_tensor_model_parallel_region(input, process_group=self.tensor_parallel_group)
+
+        return input_parallel
 
 class RowParallelLinear(BaseParallelLinear):
     """Linear layer with row parallelism.
@@ -899,17 +887,11 @@ class RowParallelLinear(BaseParallelLinear):
         Returns:
             - output
         """
-        if self.pad and self.training:
-            raise RuntimeError("`pad=True` is only supported for inference. Set model.eval()")
+
+        self._check_pad_false_for_training()
 
         # Set up backprop all-reduce.
-        if self.input_is_parallel:
-            input_parallel = input_
-        else:
-            if self.pad and self.pad_size > 0:
-                input_ = torch.nn.functional.pad(input_, (0, self.pad_size))
-            assert not self.sequence_parallel_enabled
-            input_parallel = scatter_to_tensor_model_parallel_region(input_, process_group=self.tensor_parallel_group)
+        input_parallel = self._rpl_maybe_scatter_input(input_)
 
         # Matrix multiply.
         output_ = self._forward_impl(
@@ -923,6 +905,27 @@ class RowParallelLinear(BaseParallelLinear):
             process_group=self.tensor_parallel_group,
             reduce_dtype = self.reduce_dtype,
         )
+
+        output_ = self._rpl_maybe_reduce_output(output_)
+
+        if self.skip_bias_add:
+            return output_, self.bias
+        output = (output_ + self.bias) if self.bias is not None else output_
+        return output
+
+    def preshard_hook(self, model_state_dict: dict, prefix: str) -> None:
+        if not self.pad or self.pad_size == 0:
+            return
+        if self.input_size != model_state_dict[prefix].shape[1] + self.pad_size:
+            size = model_state_dict[prefix].shape[1]
+            raise RuntimeError(f"State dict {prefix} is of an unexpected size {size} expected {size - self.pad_size}")
+        model_state_dict[prefix] = torch.nn.functional.pad(model_state_dict[prefix], (0, self.pad_size))
+
+    def _rpl_maybe_reduce_output(
+        self,
+        output_: torch.Tensor
+    ) -> torch.Tensor:
+        """This function conditionally reduces the output of the RPL layer"""
 
         if self.reduce_output:
             # All-reduce across all the partitions.
@@ -940,19 +943,24 @@ class RowParallelLinear(BaseParallelLinear):
                 )
 
             output_ = output_.to(original_dtype)
-
-        if self.skip_bias_add:
-            return output_, self.bias
-        output = (output_ + self.bias) if self.bias is not None else output_
-        return output
-
-    def preshard_hook(self, model_state_dict: dict, prefix: str) -> None:
-        if not self.pad or self.pad_size == 0:
-            return
-        if self.input_size != model_state_dict[prefix].shape[1] + self.pad_size:
-            size = model_state_dict[prefix].shape[1]
-            raise RuntimeError(f"State dict {prefix} is of an unexpected size {size} expected {size - self.pad_size}")
-        model_state_dict[prefix] = torch.nn.functional.pad(model_state_dict[prefix], (0, self.pad_size))
+        
+        return output_
+    
+    def _rpl_maybe_scatter_input(
+        self,
+        input_
+    ) -> torch.Tensor:
+        """This function scatters the input to the tensor model parallel region conditionally"""
+        
+        if self.input_is_parallel:
+                input_parallel = input_
+        else:
+            if self.pad and self.pad_size > 0:
+                input_ = torch.nn.functional.pad(input_, (0, self.pad_size))
+            assert not self.sequence_parallel_enabled
+            input_parallel = scatter_to_tensor_model_parallel_region(input_, process_group=self.tensor_parallel_group)
+        
+        return input_parallel
 
 
 class Conv2dWithInputGradAllReduce(torch.autograd.Function):

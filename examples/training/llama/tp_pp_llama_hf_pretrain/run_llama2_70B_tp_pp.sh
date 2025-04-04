@@ -23,7 +23,7 @@ export NEURON_FUSE_SOFTMAX=1
 export NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS=7
 export MALLOC_ARENA_MAX=128
 export XLA_DOWNCAST_BF16=1
-export NEURON_CC_FLAGS="--model-type=transformer --distribution-strategy=llm-training --cache_dir=$HOME/cache_dir_neuron/"
+export NEURON_CC_FLAGS="--model-type=transformer --cache_dir=$HOME/cache_dir_neuron/"
 
 PROCESSES_PER_NODE=32
 WORLD_SIZE=1

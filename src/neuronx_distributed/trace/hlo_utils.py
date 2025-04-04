@@ -539,15 +539,13 @@ def is_nki_kernel_called(id_to_computation: Dict[int, hlo_pb2.HloComputationProt
     computations and looks for the call to AWS_NEURON_CUSTOM_NATIVE_KERNEL.
     """
     cpt = id_to_computation[cpt_id]
-    root_inst_id = cpt.root_id
     for inst in cpt.instructions:
-        if inst.id == root_inst_id:
+        # Iterate over all the instructions which are making calls to another computation or custom calls
+        if inst.opcode == "custom-call":
             if inst.custom_call_target and inst.custom_call_target == AWS_NEURON_CUSTOM_NATIVE_KERNEL:
                 return True
-            elif inst.called_computation_ids:
-                return is_nki_kernel_called(id_to_computation, inst.called_computation_ids[0])
-            else:
-                break
+        elif inst.opcode == "call" and inst.called_computation_ids:
+            return is_nki_kernel_called(id_to_computation, inst.called_computation_ids[0])
 
     return False
 

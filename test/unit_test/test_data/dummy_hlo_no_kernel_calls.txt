@@ -1,0 +1,26 @@
+HloModule PyLoweringContext.22, entry_computation_layout={(f32[2,4]{1,0}, f32[4,2]{1,0}, f32[2,4]{1,0})->(f32[2,4]{1,0})}
+
+%AddComputation.14 (x.15: f32[], y.16: f32[]) -> f32[] {
+  %x.15 = f32[] parameter(0)
+  %y.16 = f32[] parameter(1)
+  ROOT %add.17 = f32[] add(f32[] %x.15, f32[] %y.16)
+}
+
+ENTRY %PyLoweringContext.22 (p0: f32[2,4], p1: f32[4,2], p2: f32[2,4]) -> (f32[2,4]) {
+  %p0 = f32[2,4]{1,0} parameter(0)
+  %p2 = f32[2,4]{1,0} parameter(2)
+  %transpose.5 = f32[4,2]{0,1} transpose(f32[2,4]{1,0} %p2), dimensions={1,0}
+  %dot.7 = f32[2,2]{1,0} dot(f32[2,4]{1,0} %p0, f32[4,2]{0,1} %transpose.5), lhs_contracting_dims={1}, rhs_contracting_dims={0}
+  %transpose.8 = f32[2,2]{1,0} transpose(f32[2,2]{1,0} %dot.7), dimensions={0,1}
+  %p1 = f32[4,2]{1,0} parameter(1)
+  %transpose.3 = f32[2,4]{0,1} transpose(f32[4,2]{1,0} %p1), dimensions={1,0}
+  %dot.9 = f32[2,4]{1,0} dot(f32[2,2]{1,0} %transpose.8, f32[2,4]{0,1} %transpose.3), lhs_contracting_dims={1}, rhs_contracting_dims={0}
+  %transpose.10 = f32[2,4]{1,0} transpose(f32[2,4]{1,0} %dot.9), dimensions={0,1}
+  %xlaconst0 = f32[] constant(0)
+  %tuple.11 = (f32[2,4]{1,0}, f32[]) tuple(f32[2,4]{1,0} %transpose.10, f32[] %xlaconst0)
+  %get-tuple-element.12 = f32[2,4]{1,0} get-tuple-element((f32[2,4]{1,0}, f32[]) %tuple.11), index=0
+  %get-tuple-element.13 = f32[] get-tuple-element((f32[2,4]{1,0}, f32[]) %tuple.11), index=1
+  %all-reduce.18 = (f32[2,4]{1,0}, f32[]) all-reduce(f32[2,4]{1,0} %get-tuple-element.12, f32[] %get-tuple-element.13), replica_groups={{0,1}}, constrain_layout=true, to_apply=%AddComputation.14
+  %get-tuple-element.19 = f32[2,4]{1,0} get-tuple-element((f32[2,4]{1,0}, f32[]) %all-reduce.18), index=0
+  ROOT %tuple.21 = (f32[2,4]{1,0}) tuple(f32[2,4]{1,0} %get-tuple-element.19)
+}

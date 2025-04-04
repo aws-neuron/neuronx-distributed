@@ -68,7 +68,7 @@ class TestLoraSaveLoad(unittest.TestCase):
         for key in state_dict:
             assert "lora_" in key
 
-        model.lora_config = get_lora_config(save_lora_base=False, merge_lora=False, load_lora_from_ckpt=True)
+        model.lora_config = get_lora_config(save_lora_base=False, merge_lora=False, load_lora_from_ckpt=False)
         model.lora_ckpt = state_dict
         model.is_checkpoint_loaded = True
 
@@ -127,7 +127,7 @@ class TestLoraSaveLoad(unittest.TestCase):
         for key in state_dict:
             assert "lora_" in key
 
-        model.lora_config = get_nxd_lora_config(save_lora_base=False, merge_lora=False, load_lora_from_ckpt=True)
+        model.lora_config = get_nxd_lora_config(save_lora_base=False, merge_lora=False, load_lora_from_ckpt=False)
         model.lora_ckpt = state_dict
         model.is_checkpoint_loaded = True
 

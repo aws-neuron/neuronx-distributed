@@ -69,6 +69,7 @@ from transformers.utils import (
 
 import neuronx_distributed.parallel_layers.utils as neuronx_dist_utils
 from neuronx_distributed.kernels.flash_attn import nki_flash_attn_func
+from neuronx_distributed.kernels.ring_attention_kernel import nki_ring_attn_func
 from neuronx_distributed.modules.qkv_linear import GQAQKVColumnParallelLinear
 from neuronx_distributed.parallel_layers import mappings
 from neuronx_distributed.parallel_layers.layers import (
@@ -79,9 +80,11 @@ from neuronx_distributed.parallel_layers.layers import (
 from neuronx_distributed.parallel_layers.loss_functions import parallel_cross_entropy
 from neuronx_distributed.parallel_layers.parallel_state import (
     get_tensor_model_parallel_size,
+    get_context_model_parallel_size,
+    get_context_model_parallel_rank,
+    get_context_model_parallel_src_tgt_pairs,
+    get_context_model_parallel_group,
 )
-from neuronx_distributed.utils.model_utils import move_model_to_device
-
 
 def _init_normal(std, w):
     return nn.init.normal_(w, mean=0.0, std=std)
@@ -184,8 +187,6 @@ class LlamaMLP(LlamaMLPHF):
             dtype=self.config.torch_dtype,
         )
         self.split_size = self.intermediate_size // get_tensor_model_parallel_size()
-        if config.move_model_to_device:
-            move_model_to_device(self, xm.xla_device())
 
     def forward(self, x):
         if self.pretraining_tp > 1:
@@ -272,6 +273,11 @@ class LlamaAttention(LlamaAttentionHF):
         else:
             self.use_flash_attention = config.use_flash_attention
 
+        if get_context_model_parallel_size() > 1:
+            self.use_ring_attention = True
+        else:
+            self.use_ring_attention = False
+
         if (self.head_dim * self.num_heads) != self.hidden_size:
             raise ValueError(
                 f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
@@ -349,9 +355,6 @@ class LlamaAttention(LlamaAttentionHF):
 
         self.core_attn = CoreAttention()
 
-        if config.move_model_to_device:
-            move_model_to_device(self, xm.xla_device())
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -410,7 +413,10 @@ class LlamaAttention(LlamaAttentionHF):
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
             kv_seq_len += past_key_value[0].shape[-2]
+        kv_seq_len *= get_context_model_parallel_size()
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+        cos = self.get_position_embedding_on_this_context_parallel_rank(cos, 2)
+        sin = self.get_position_embedding_on_this_context_parallel_rank(sin, 2)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
         if past_key_value is not None:
@@ -424,11 +430,13 @@ class LlamaAttention(LlamaAttentionHF):
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-        attn_output = (
-            nki_flash_attn_func(query_states, key_states, value_states)
-            if self.use_flash_attention
-            else self.core_attn(query_states, key_states, value_states)
-        )
+        # Use Ring attention for CP
+        if self.use_ring_attention:
+            attn_output = nki_ring_attn_func(query_states, key_states, value_states, torch.distributed.get_rank(), get_context_model_parallel_src_tgt_pairs())
+        elif self.use_flash_attention:
+            attn_output = nki_flash_attn_func(query_states, key_states, value_states)
+        else:
+            attn_output = self.core_attn(query_states, key_states, value_states)
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
             raise ValueError(
@@ -454,6 +462,21 @@ class LlamaAttention(LlamaAttentionHF):
             attn_weights = None
 
         return attn_output, attn_weights, past_key_value
+    
+    def get_position_embedding_on_this_context_parallel_rank(self, position_embedding, seq_dim):
+        cp_size = get_context_model_parallel_size()
+        cp_rank = get_context_model_parallel_rank()
+        seq_len = position_embedding.shape[seq_dim]
+        assert seq_len%cp_size==0, f"seq_len {seq_len} is not divisible by CP size {cp_size}"        
+        position_embedding = position_embedding.view(
+            *position_embedding.shape[:seq_dim], cp_size, seq_len // cp_size, *position_embedding.shape[(seq_dim + 1) :]
+        )
+        cp_idx = torch.tensor([cp_rank], device=position_embedding.device)
+        position_embedding = position_embedding.index_select(seq_dim, cp_idx)
+        position_embedding = position_embedding.view(
+            *position_embedding.shape[:seq_dim], -1, *position_embedding.shape[(seq_dim + 2) :]
+        )
+        return position_embedding
 
 
 class LlamaDecoderLayer(LlamaDecoderLayerHF):
@@ -749,9 +772,13 @@ class LlamaForCausalLM(LlamaForCausalLMHF):
 
         loss = None
         if labels is not None:
-            # Shift so that tokens < n predict n
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
+            if get_context_model_parallel_size() > 1:
+                shift_logits = logits.clone().contiguous()
+                shift_labels = labels.contiguous()
+            else:
+                # Shift so that tokens < n predict n
+                shift_logits = logits[..., :-1, :].clone().contiguous()
+                shift_labels = labels[..., 1:].contiguous()
             # Flatten the tokens
             loss_fct = parallel_cross_entropy
             shift_logits = shift_logits.view(-1, shift_logits.size(-1))

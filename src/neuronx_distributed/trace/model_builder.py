@@ -5,6 +5,7 @@ import time
 import logging
 import contextlib
 from typing import Dict, List, Optional, Tuple, Union
+import warnings
 
 import torch
 import torch_xla
@@ -27,15 +28,15 @@ from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.trace.spmd import (
     NxDModel,
     NxDModelExecutor,
-    SPMDBucketModel,
     SPMDBucketModelScript,
     default_bucket_kernel,
     StateInitializer,
 )
-from neuronx_distributed.trace.trace import _mock_parallel_state, get_sharded_checkpoint
+from neuronx_distributed.trace.trace import _mock_parallel_state, get_sharded_checkpoint, preprocess_checkpoint
 from neuronx_distributed.trace.mock_torchdist import mock_distributed
-from neuronx_distributed.utils.model_utils import init_on_device
 import neuronx_distributed.trace.hlo_utils as hlo_utils
+from neuronx_distributed.utils.model_utils import init_on_device
+from neuronx_distributed.utils.safetensors_utils import remove_duplicate_tensors
 
 ModelInputType = List[Union[Tuple[Union[torch.Tensor, List[torch.Tensor]]], torch.Tensor]]
 logger = logging.getLogger("Neuron")
@@ -72,7 +73,7 @@ class ModelContainer:
         self.model_instance: BaseModelInstance = model_instance
         self.example_inputs = example_inputs
         self.compiler_args = compiler_args
-        self.bucket_config: BucketModelConfig = bucket_config
+        self.bucket_config: Optional[BucketModelConfig] = bucket_config
         self.priority_model_idx = priority_model_idx
         self.hlo_artifact_collection = None
         self.neff_artifact_collection = None
@@ -118,7 +119,7 @@ class ModelBuilder:
             debug=False,
             num_cores_per_group=1,
             init_custom_process_group_fn=None,
-            logical_neuron_cores=1,
+            logical_nc_config=1,
             weights_to_skip_layout_optimization=set()
     ):
         if not torch_neuronx.__version__.startswith("2"):
@@ -151,7 +152,7 @@ class ModelBuilder:
         self.debug = debug
         self.num_cores_per_group = num_cores_per_group
         self.init_custom_process_group_fn = init_custom_process_group_fn
-        self.logical_neuron_cores = logical_neuron_cores
+        self.logical_nc_config = logical_nc_config
         self.weights_to_skip_layout_optimization = weights_to_skip_layout_optimization
 
     def add(
@@ -172,6 +173,11 @@ class ModelBuilder:
         # This does not validate if the HLOs are same across all ranks.
         # _validate_traceable(model_instance.module, self.tp_degree, force_custom_init_on_device=True)
 
+        warnings.warn(
+            "'bucket_config' will be deprecated in a future release."
+            "Bucket routing will be automatically determined by inputs.",
+            category=DeprecationWarning
+        )
         if bucket_config:
             bucket_config.store_example_inputs(example_inputs)
 
@@ -207,7 +213,7 @@ class ModelBuilder:
             backend = 'xla'
             torch.distributed.init_process_group(backend, rank=0, world_size=self.world_size)
             parallel_state.initialize_model_parallel(self.tp_degree, self.pp_degree, self.ep_degree,
-                                                     skip_collective_init=True, lnc_size=self.logical_neuron_cores)
+                                                     skip_collective_init=True, lnc_size=self.logical_nc_config)
             parallel_state.set_aot_mode(True)
 
             flash_decoding_enabled = self.num_cores_per_group > 1
@@ -221,7 +227,7 @@ class ModelBuilder:
             for key in self.model_collection:
                 model_artifacts = self.model_collection[key]
 
-                bucket_degree = 1 if not model_artifacts.bucket_config else model_artifacts.bucket_config.bucket_degree
+                bucket_degree = len(model_artifacts.example_inputs)
                 num_hlos += bucket_degree
 
                 logger.info(f"Generating {bucket_degree} hlos for key: {key}")
@@ -247,7 +253,7 @@ class ModelBuilder:
             parallel_state.set_aot_mode(False)
             parallel_state.destroy_model_parallel()
             torch.distributed.destroy_process_group()
-                            
+
         self._mark_weight_in_priority_hlo(weight_names_to_skip)
 
         def submit_compilation_job(key, bucket_rank, args):
@@ -287,7 +293,7 @@ class ModelBuilder:
                 if bucket_rank == model_artifacts.priority_model_idx:
                     # no need to compile the priority model again
                     continue
-                        
+
                 compiler_args = model_artifacts.compiler_args
                 if '--logfile' not in compiler_args:
                     compiler_args += f" --logfile={os.path.join(self.compiler_workdir, key, f'_tp0_bk{bucket_rank}', 'log-neuron-cc.txt')}"
@@ -347,11 +353,40 @@ class ModelBuilder:
             os.makedirs(serialize_path)
 
         source_model_key = list(self.model_collection.keys())[0]
+        model_container = self.model_collection[source_model_key]
         logger.info(
             f"Sharding Weights for ranks: {self.start_rank_id}...{self.start_rank_id + self.local_ranks_size - 1}")
-        for rank in range(self.start_rank_id, self.start_rank_id + self.local_ranks_size):
-            self.shard_weights(rank, self.model_collection[source_model_key], serialize_path)
-        logger.info("Done Sharding weights")
+        start_time_shard = time.monotonic()
+
+        with mock_distributed(world_size=self.world_size), init_on_device(torch.device("meta"),
+                                                                          force_custom_init_on_device=True):
+            torch.distributed.init_process_group(backend="xla", rank=0, world_size=self.world_size)
+            parallel_state.initialize_model_parallel(self.tp_degree,
+                                                     self.pp_degree,
+                                                     self.ep_degree,
+                                                     skip_collective_init=True,
+                                                     lnc_size=self.logical_nc_config)
+            if self.init_custom_process_group_fn:
+                self.init_custom_process_group_fn()
+
+            model_container.model_instance.load_module()
+            func_kwargs = (
+                {}
+                if model_container.bucket_config is None
+                else model_container.bucket_config.get_func_kwargs_for_bucket_rank(0)
+            )
+            if "bucket_rank" in func_kwargs:
+                func_kwargs.pop("bucket_rank")  # to avoid multiple definition of bucket_rank
+            model, io_aliases = model_container.model_instance.get(0, **func_kwargs)
+            checkpoint = self.checkpoint_loader()
+            preprocess_checkpoint(model, checkpoint)
+
+            for rank in range(self.start_rank_id, self.start_rank_id + self.local_ranks_size):
+                self.shard_weights_with_cache(rank, model, checkpoint, serialize_path)
+
+            parallel_state.destroy_model_parallel()
+            torch.distributed.destroy_process_group()
+        logger.info(f"Done Sharding weights in {time.monotonic() - start_time_shard}")
 
     def _generate_hlo(
             self,
@@ -374,10 +409,7 @@ class ModelBuilder:
             logger.info(f"Finished loading module {key} in {time.time() - start_time} seconds")
             example_input_collection = model_input_container.example_inputs
             bucket_config = model_input_container.bucket_config
-
-            bucket_degree = 1
-            if bucket_config is not None:
-                bucket_degree = bucket_config.bucket_degree
+            bucket_degree = len(example_input_collection)
 
             hlo_artifact_collection = []
 
@@ -419,11 +451,11 @@ class ModelBuilder:
         with mock_distributed(world_size=self.world_size), init_on_device(torch.device("meta"),
                                                                           force_custom_init_on_device=True):
             torch.distributed.init_process_group(backend="xla", rank=0, world_size=self.world_size)
-            parallel_state.initialize_model_parallel(self.tp_degree, 
-                                                     self.pp_degree, 
+            parallel_state.initialize_model_parallel(self.tp_degree,
+                                                     self.pp_degree,
                                                      self.ep_degree,
-                                                     skip_collective_init=True, 
-                                                     lnc_size=self.logical_neuron_cores)
+                                                     skip_collective_init=True,
+                                                     lnc_size=self.logical_nc_config)
             if self.init_custom_process_group_fn:
                 self.init_custom_process_group_fn()
 
@@ -438,12 +470,31 @@ class ModelBuilder:
             model, io_aliases = model_container.model_instance.get(0, **func_kwargs)
 
             get_sharded_checkpoint(checkpoint, model, rank, self.tp_degree)
+
+            # to overcome tensors sharing memory issue
+            checkpoint = remove_duplicate_tensors(checkpoint)
+
             if serialize_path is not None:
-                save_file(checkpoint, os.path.join(serialize_path, f"tp{rank}_sharded_checkpoint.safetensors"))
+                try:
+                    save_file(checkpoint, os.path.join(serialize_path, f"tp{rank}_sharded_checkpoint.safetensors"))
+                except ValueError as e:
+                    logging.warning(f"Failed to save checkpoint: {e}. Trying converting checkpoint to contiguous tensors...")
+                    save_file({ k: v.contiguous() for k, v in checkpoint.items() }, os.path.join(serialize_path, f"tp{rank}_sharded_checkpoint.safetensors"))
 
             parallel_state.destroy_model_parallel()
             torch.distributed.destroy_process_group()
         return checkpoint
+
+    def shard_weights_with_cache(self, rank, model, checkpoint, serialize_path: Optional[str] = None) -> None:
+        sharded_checkpoint = checkpoint.copy()
+        get_sharded_checkpoint(sharded_checkpoint, model, rank, self.tp_degree, is_cached=True)
+
+        if serialize_path is not None:
+            try:
+                save_file(sharded_checkpoint, os.path.join(serialize_path, f"tp{rank}_sharded_checkpoint.safetensors"))
+            except ValueError as e:
+                logging.warning(f"Failed to save checkpoint: {e}. Trying converting checkpoint to contiguous tensors...")
+                save_file({ k: v.contiguous() for k, v in sharded_checkpoint.items() }, os.path.join(serialize_path, f"tp{rank}_sharded_checkpoint.safetensors"))
 
     def build_state_initializer(self):
         shapes = {}
@@ -511,21 +562,10 @@ class ModelBuilder:
             spmd_bucket_model_executor = SPMDBucketModelScript(compiled_models=buckets)
             with torch_neuronx.contexts.disable_nrt_load():
                 spmd_bucket_model_executor = torch.jit.script(spmd_bucket_model_executor)
-            if model_container.bucket_config is None:
-                bucket_kernel = torch.jit.script(default_bucket_kernel)
-                bucket_kernel_constant_args = ()
-            else:
-                bucket_kernel = model_container.bucket_config.bucket_kernel()
-                bucket_kernel_constant_args = model_container.bucket_config.bucket_kernel_constant_args
-            spmd_bucket_model = SPMDBucketModel(bucket_kernel, bucket_kernel_constant_args, spmd_bucket_model_executor)
-            with torch_neuronx.contexts.disable_nrt_load():
-                spmd_bucket_model = torch.jit.script(spmd_bucket_model)
-            model_map_input.append((key, spmd_bucket_model))
+            model_map_input.append((key, spmd_bucket_model_executor))
 
         state_initializer = self.build_state_initializer()
-
         model_map = torch.nn.ModuleDict(model_map_input)
-
         flattener_map = self.build_flattener_map()
 
         input_shape_map = {}
@@ -534,9 +574,9 @@ class ModelBuilder:
         for key, model_container in self.model_collection.items():
             # example_inputs is of type List[Tuple[Tensor, Tensor, ...]]
             example_inputs = model_container.example_inputs
-            for example_input in example_inputs:
+            for i, example_input in enumerate(example_inputs):
                 # torch.Size type is not a concept in a jit model, it's just List[int]
-                input_shape_map[str([list(tensor.shape) for tensor in example_input])] = key
+                input_shape_map[str([list(tensor.shape) for tensor in example_input])] = (key, i)
 
         packer = next(iter(self.model_collection.values())).hlo_artifact_collection[0].packer
         traced_packer = self.build_packer(packer)
@@ -713,6 +753,7 @@ class ModelBuilder:
             compiler_workdir=layout_dir,
             compiler_args=(
                 "--model-type=transformer -O1" +
+                f" --lnc={self.logical_nc_config}" +
                 " --internal-hlo2tensorizer-options=--experimental-unsafe-fp8e4m3fn-as-fp8e4m3" +
                 f" --logfile={os.path.join(layout_dir, 'log-neuron-cc.txt')}"
             ),

@@ -10,7 +10,7 @@ pip install --no-warn-conflicts transformers==4.32.1 nltk
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 
-export NEURON_CC_FLAGS="--model-type=transformer --distribution-strategy=llm-training "
+export NEURON_CC_FLAGS="--model-type=transformer "
 export NEURON_FUSE_SOFTMAX=1
 
 # Async Runtime

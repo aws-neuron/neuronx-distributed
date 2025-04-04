@@ -5,9 +5,10 @@ from typing import List, Union, Optional, Iterable
 import torch
 import torch_xla.core.xla_model as xm
 
+from ..utils import cpu_mode
 from ..utils.logger import get_logger
 from .layers import param_is_not_tensor_parallel_duplicate
-from .mappings import reduce_from_tensor_model_parallel_region
+from .mappings import reduce_from_tensor_model_parallel_region, reduce_from_context_model_parallel_region
 from .parallel_state import (
     get_data_parallel_group,
     get_data_parallel_size,
@@ -21,6 +22,8 @@ from .parallel_state import (
     get_pipeline_model_parallel_size,
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_size,
+    get_context_model_parallel_size,
+    get_context_model_parallel_group,
     rmsg,
 )
 from .comm import all_reduce
@@ -284,9 +287,9 @@ def bucket_allreduce_gradients(grads_list, reduce_over_ep_group=False):
         # otherwise, non-expert-parallel gradients will go through an additional allreduce
         # with reduce_over_ep_group == True, so that they are reduced over the full dp group.
         groups = (
-            get_expert_model_parallel_replica_groups()
+            get_expert_model_parallel_group(as_list=not cpu_mode())
             if reduce_over_ep_group
-            else get_expert_data_parallel_replica_groups()
+            else get_expert_data_parallel_group(as_list=not cpu_mode())
         )
 
         # the assumption is that if we are reducing over ep group, then we
@@ -341,3 +344,24 @@ def allreduce_sequence_parallel_gradients(optimizer):
                             grads.append(p.main_grad.data)
     for grad in grads:
         reduce_from_tensor_model_parallel_region(grad)
+        
+def allreduce_context_parallel_gradients(optimizer):
+    """All-reduce layernorm parameters across model parallel nodes when context parallelism is used.
+    """
+    if not get_context_model_parallel_size() > 1:
+        return
+    grads = []
+    for param_group in optimizer.__getstate__()["param_groups"]:
+        for group, params in param_group.items():
+            if group == "params":
+                for p in params:
+                    if isinstance(p, torch.Tensor) and get_context_model_parallel_size() > 1:
+                        if p.grad is not None:
+                            grads.append(p.grad.data)
+                        elif hasattr(p, "main_grad"):
+                            grads.append(p.main_grad.data)
+    for grad in grads:
+        # Scale down by the context parallel size and allreduce the grads from the context parallel regions
+        grad = grad / get_context_model_parallel_size()
+        reduce_from_context_model_parallel_region(grad, get_context_model_parallel_group())
+    

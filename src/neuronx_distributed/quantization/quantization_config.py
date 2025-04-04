@@ -40,6 +40,10 @@ class QuantizationType(Enum, metaclass=MyEnumMeta):
     PER_TENSOR_SYMMETRIC = "per_tensor_symmetric"
     PER_CHANNEL_SYMMETRIC = "per_channel_symmetric"
 
+class ActivationQuantizationType(Enum, metaclass=MyEnumMeta):
+    DYNAMIC = "dynamic"
+    NONE = None
+
 
 class QuantizedDtype(Enum, metaclass=MyEnumMeta):
     INT8 = torch.int8
@@ -62,6 +66,8 @@ class QuantizedDtype(Enum, metaclass=MyEnumMeta):
 class BASE_QCONFIG_DICT_TYPE(TypedDict):
     quantization_type: QuantizationType
     quantized_dtype: QuantizedDtype
+    activation_quantization_type: ActivationQuantizationType
+    clamp_bound: float
 
 
 class PER_CHANNEL_QCONFIG_DICT_TYPE(BASE_QCONFIG_DICT_TYPE):
@@ -71,6 +77,8 @@ class PER_CHANNEL_QCONFIG_DICT_TYPE(BASE_QCONFIG_DICT_TYPE):
 _DEFAULT_CUSTOM_QCONFIG_DICT: BASE_QCONFIG_DICT_TYPE = {
     "quantization_type": QuantizationType.PER_TENSOR_SYMMETRIC,
     "quantized_dtype": QuantizedDtype.INT8,
+    "activation_quantization_type": ActivationQuantizationType.NONE,
+    "clamp_bound": float('inf'),
 }
 
 _DEFAULT_PER_CHANNEL_QCONFIG_DICT: PER_CHANNEL_QCONFIG_DICT_TYPE = {
@@ -78,6 +86,8 @@ _DEFAULT_PER_CHANNEL_QCONFIG_DICT: PER_CHANNEL_QCONFIG_DICT_TYPE = {
     "quantized_dtype": QuantizedDtype.INT8,
     # Each quantized layer sets its own the default channel
     "quantization_per_channel_axis": None,
+    "activation_quantization_type": ActivationQuantizationType.NONE,
+    "clamp_bound": float('inf'),
 }
 
 

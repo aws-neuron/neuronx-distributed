@@ -9,8 +9,8 @@ from torch.distributed import ProcessGroup
 from neuronx_distributed.modules.moe.experts import Experts
 from neuronx_distributed.modules.moe.model_utils import ACT2FN
 from neuronx_distributed.modules.moe.blockwise import (
+    BlockwiseMatmulNKIFunc,
     can_use_blockwise_matmul_nki,
-    blockwise_matmul_nki_func,
     TorchBlockwiseTraining,
 )
 from neuronx_distributed.parallel_layers import mappings
@@ -72,6 +72,7 @@ class ExpertMLPs(torch.nn.Module):
         device: torch.device = torch.device("cpu"),
         tensor_model_parallel_group: Optional[ProcessGroup] = None,
         enable_spmd_rank: bool = False,  # spmd_rank will be removed once we support ReplicaID (P87857655)
+        blockwise_nki_autograd_cls=None,
     ):
         super().__init__()
 
@@ -108,6 +109,8 @@ class ExpertMLPs(torch.nn.Module):
             # spmd_rank will be removed once we support ReplicaID (P87857655)
             self.spmd_rank = SPMDRank(world_size=parallel_state.get_world_group().size())
 
+        self.blockwise_nki_autograd_cls = blockwise_nki_autograd_cls if blockwise_nki_autograd_cls else BlockwiseMatmulNKIFunc
+
         self.mlp_op = Experts(
             num_experts=num_experts,
             hidden_size=hidden_size,
@@ -124,7 +127,8 @@ class ExpertMLPs(torch.nn.Module):
         self.dtype = dtype
         self.device = device
 
-    def get_expert_mask(self, expert_index):
+    @staticmethod
+    def get_expert_mask(expert_index, num_experts):
         """Helper function which computes top_k-hot encoded expert_mask from the given expert_index.
 
         Arguments:
@@ -139,15 +143,17 @@ class ExpertMLPs(torch.nn.Module):
         # (Use float dtype to perform computations in the vector engine for efficiency)
         # expert_mask: top_k-hot encoded expert assignment per token -> (T, E)
         expert_mask = torch.zeros(
-            expert_index.shape[0], self.num_experts, device=expert_index.device, dtype=torch.float64
+            expert_index.shape[0], num_experts, device=expert_index.device, dtype=torch.float64
         )
-        expert_num_idx_arr = torch.arange(self.num_experts, device=expert_index.device, dtype=torch.float64)
-        for e in range(self.top_k):
+        expert_num_idx_arr = torch.arange(num_experts, device=expert_index.device, dtype=torch.float64)
+        top_k = expert_index.shape[1]
+        for e in range(top_k):
             expert_mask += (expert_index[:, e].unsqueeze(1) == expert_num_idx_arr).to(torch.float64)
 
         return expert_mask
 
-    def get_expert_affinities_masked(self, expert_affinities, expert_mask):
+    @staticmethod
+    def get_expert_affinities_masked(expert_affinities, expert_mask, normalize_top_k_affinities):
         """Helper function which computes the masked expert_affinities by selecting the chosen experts for each token,
         and normalizes the affinities if needed.
 
@@ -155,6 +161,7 @@ class ExpertMLPs(torch.nn.Module):
             expert_affinities: Tensor of shape (T, E), containing the normalized affinities of each token for each expert.
             expert_mask: Tensor of shape (T, E), containing top_k-hot encoded experts for each token derived from
                          expert_index.
+            normalize_top_k_affinities: Whether to normalize the affinities of the chosen experts before combining with the MLP outputs.
         Returns:
             expert_affinities_masked: Tensor of shape (T, E) containing the affinities of just the chosen experts for
                                       each token (after normalization if required).
@@ -163,13 +170,13 @@ class ExpertMLPs(torch.nn.Module):
         # Apply expert_mask obtain the affinities for the chosen experts
         # expert_affinities_masked -> (T, E)
         expert_affinities_masked = expert_affinities.masked_fill(torch.eq(expert_mask, 0), 0)
-        if self.normalize_top_k_affinities:
+        if normalize_top_k_affinities:
             # Normalize the affinities across the chosen experts
             expert_affinities_masked = F.normalize(expert_affinities_masked, p=1.0, dim=1)
 
         return expert_affinities_masked
 
-    def forward_all_experts(self, hidden_states, expert_affinities, expert_index):
+    def forward_all_experts(self, hidden_states, expert_affinities, expert_index, chosen_expert_indices=None):
         """Forward pass where all tokens are computed by all experts.
         This is equivalent to running forward_capacity_factor with full capacity (i.e. no token dropping), but
         by avoiding the permute/unpermute overhead.
@@ -178,21 +185,31 @@ class ExpertMLPs(torch.nn.Module):
         if get_expert_model_parallel_size() > 1:
             raise NotImplementedError("Expert parallelism is not supported without capacity factor.")
 
+        num_experts = expert_affinities.shape[1]
+        if chosen_expert_indices is None:
+            assert num_experts == self.num_experts
+        else:
+            assert num_experts == chosen_expert_indices.shape[0]
+
         # expert_mask: (T, E)
-        expert_mask = self.get_expert_mask(expert_index)
+        expert_mask = self.get_expert_mask(expert_index, num_experts)
         # expert_affinities_masked: (T, E)
-        expert_affinities_masked = self.get_expert_affinities_masked(expert_affinities, expert_mask)
+        expert_affinities_masked = self.get_expert_affinities_masked(
+            expert_affinities, 
+            expert_mask, 
+            self.normalize_top_k_affinities
+        )
 
         # Pass all tokens through all experts
         # gate_up_proj: (1, T, H) @ (E, H, I) -> (E, T, I)
         # down_proj: (E, T, I) @ (E, I, H) -> (E, T, H)
-        mlp_output = self.mlp_op(hidden_states.unsqueeze(0))
+        mlp_output = self.mlp_op(hidden_states.unsqueeze(0), expert_indices=chosen_expert_indices)
 
         # Scale by expert affinity and combine output
         output = torch.zeros(
             hidden_states.shape[0], hidden_states.shape[1], device=hidden_states.device, dtype=hidden_states.dtype
         )
-        for e in range(self.num_experts):
+        for e in range(num_experts):
             # TH * T1 -> TH
             output += mlp_output[e] * expert_affinities_masked[:, e].unsqueeze(1)
 
@@ -217,7 +234,7 @@ class ExpertMLPs(torch.nn.Module):
         expert_capacity = min(expert_capacity, total_tokens)
 
         # expert_mask: (T, E)
-        expert_mask = self.get_expert_mask(expert_index)
+        expert_mask = self.get_expert_mask(expert_index, self.num_experts)
 
         # Compute the position of each token in experts, by a cumulative sum over the T dimension
         # position_in_expert: (T, E)
@@ -227,7 +244,11 @@ class ExpertMLPs(torch.nn.Module):
         expert_mask.masked_fill_(torch.gt(position_in_expert, expert_capacity), 0)
 
         # expert_affinities_masked: (T, E)
-        expert_affinities_masked = self.get_expert_affinities_masked(expert_affinities, expert_mask)
+        expert_affinities_masked = self.get_expert_affinities_masked(
+            expert_affinities, 
+            expert_mask, 
+            self.normalize_top_k_affinities
+        )
 
         # Add expert offset to the position_in_expert
         # Perform operation in float64 to prevent precision issues due to auto-downcasting to bf16
@@ -346,87 +367,24 @@ class ExpertMLPs(torch.nn.Module):
         num_blocks = min(num_blocks, total_tokens * self.top_k)
 
         # expert_mask: (T, E)
-        expert_mask = self.get_expert_mask(expert_index)
+        expert_mask = self.get_expert_mask(expert_index, self.num_experts)
         # expert_affinities_masked: (T, E)
-        expert_affinities_masked = self.get_expert_affinities_masked(expert_affinities, expert_mask)
+        expert_affinities_masked = self.get_expert_affinities_masked(
+            expert_affinities, 
+            expert_mask, 
+            self.normalize_top_k_affinities
+        )
 
-        # tokens_per_expert: (E, )
-        tokens_per_expert = torch.sum(expert_mask, dim=0)
-        # blocks_per_expert: (E, )
-        blocks_per_expert = ((tokens_per_expert + self.block_size - 1) // self.block_size).to(dtype=torch.long)
-        # block_to_expert_idx: (N, 1)
-        # The simplest way to do this is to use repeat_interleave after padding blocks_per_expert with unassigned blocks.
-        # But this op is not lowered to xla with vector 'repeats', so we use the equivalent implementation below.
-        num_blocks_idx = torch.arange(num_blocks, device=hidden_states.device, dtype=torch.long)  # (N, )
-        cumulative_blocks_per_expert = cumsum(blocks_per_expert.unsqueeze(1)).squeeze(1)  # (E, )
-        block_to_expert_idx = torch.sum(num_blocks_idx.unsqueeze(1) >= cumulative_blocks_per_expert[:-1], dim=1).to(torch.long).unsqueeze(1)
-
-        # Imagine all the tokens in blocks laid out in a linear array: b0t0, b0t1,..., b1t0, b1t1,...
-        # For each (token, expert) pair that needs to be computed, calculate the block position (index) in this array
-        # block_position_indices: (T, E)
-        block_position_indices = cumsum(expert_mask)
-        # Tokens assigned to a given expert are assembled in consecutive blocks (and will have consecutive positions)
-        # The block position for a token for an expert depends on the number of blocks assigned to all previous experts.
-        # Compute and add this offset for each expert
-        expert_block_offsets = cumulative_blocks_per_expert * self.block_size
-        block_position_indices[:, 1:] += expert_block_offsets[:-1]
-        # Apply expert_mask
-        block_position_indices = block_position_indices.masked_fill(torch.eq(expert_mask, 0), 0).to(dtype=torch.long)
-
-        # Invert block_position_indices to obtain block_position_to_token_idx
-        # block_position_to_token_idx: (N*B+1,)
-        # Initialize with -1 indices (which will remain as the indices of padding tokens)
-        # block_position_indices is 1-indexed, add extra row to account for this
-        block_position_to_token_idx = -1 * torch.ones(num_blocks * self.block_size + 1, device=hidden_states.device, dtype=torch.long)
-
-        if total_tokens % get_tensor_model_parallel_size() != 0:
-            # Pad block_position_indices
-            num_pad = (-total_tokens) % get_tensor_model_parallel_size()
-            block_position_indices = F.pad(block_position_indices, (0, 0, 0, num_pad))
-            tokens_idx = torch.arange(total_tokens + num_pad, device=hidden_states.device, dtype=torch.long)
-        else:
-            tokens_idx = torch.arange(total_tokens, device=hidden_states.device, dtype=torch.long)
-
-        # Distribute computation by splitting block_position_indices and tokens_idx across TP ranks
-        # The same block_position_indices and tokens_idx is present at all ranks, so we can use any of MIN/MAX/AVG to as the reduce operation
-        if self.enable_spmd_rank:
-            # use rank information is available at runtime in inference
-            # get tp_rank from global rank
-            # note: we use `get_tensor_model_parallel_group()` here to parallelize within a single node
-            #       but may get replicated in multi-node case
-            tp_rank = torch.remainder(self.spmd_rank.get_rank(), get_tensor_model_parallel_size())
-            block_position_indices = mappings.scatter_to_process_group_spmd(
-                block_position_indices, partition_dim=0, rank=tp_rank, process_group=get_tensor_model_parallel_group(),
-            )
-            tokens_idx = mappings.scatter_to_process_group_spmd(
-                tokens_idx, partition_dim=0, rank=tp_rank, process_group=get_tensor_model_parallel_group(),
-            )
-            # Assemble block_position_to_token_idx using chunk of block_position_indices and tokens_idx at each TP rank
-            # This generates small DMA transfers because of discontinuous writes, and benefits from distributing across TP ranks
-            block_position_to_token_idx[block_position_indices] = tokens_idx.unsqueeze(1)
-            # Accumulate results across TP ranks (use MAX to correctly account for the -1 index initialization)
-            block_position_to_token_idx = mappings._reduce(
-                block_position_to_token_idx, computation=xm.REDUCE_MAX, process_group=get_tensor_model_parallel_group(),
-            )
-        else:
-            # To avoid rank-specific computations, we do a reduce-scatter instead of a simple split
-            block_position_indices = mappings._reduce_scatter_along_first_dim(
-                block_position_indices, computation=xm.REDUCE_MIN, process_group=self.tensor_parallel_group,
-            )
-            tokens_idx = mappings._reduce_scatter_along_first_dim(
-                tokens_idx, computation=xm.REDUCE_MIN, process_group=self.tensor_parallel_group,
-            )
-            # Assemble block_position_to_token_idx using chunk of block_position_indices and tokens_idx at each TP rank
-            # This generates small DMA transfers because of discontinuous writes, and benefits from distributing across TP ranks
-            block_position_to_token_idx[block_position_indices] = tokens_idx.unsqueeze(1)
-            # Accumulate results across TP ranks (use MAX to correctly account for the -1 index initialization)
-            block_position_to_token_idx = mappings._reduce(
-                block_position_to_token_idx, computation=xm.REDUCE_MAX, process_group=self.tensor_parallel_group,
-            )
-
-        # block_position_to_token_idx is a flattened array that contains the mapping of token indices for each block
-        # block_position_to_token_idx[0] accounts for the 1-indexed block_position_indices, and can be disregarded.
-        # block_position_to_token_idx contains -1 as the index of 'padding' tokens
+        block_to_expert, token_position_to_id = self.get_blockwise_expert_and_token_mapping(
+            total_tokens=total_tokens, 
+            num_blocks=num_blocks, 
+            expert_mask=expert_mask,
+            block_size=self.block_size,
+            device=hidden_states.device,
+            enable_spmd_rank=self.enable_spmd_rank,
+            spmd_rank=self.spmd_rank if self.enable_spmd_rank else None,
+            tensor_parallel_group=self.tensor_parallel_group,
+        )
 
         if can_use_blockwise_matmul_nki(
             hidden_size=hidden_size,
@@ -435,24 +393,25 @@ class ExpertMLPs(torch.nn.Module):
             glu_mlp=self.glu_mlp,
             device=hidden_states.device,
         ):
-            return blockwise_matmul_nki_func(
-                hidden_states=hidden_states,
-                expert_affinities_masked=expert_affinities_masked,
-                gate_up_proj_weight=self.mlp_op.gate_up_proj.weight,
-                down_proj_weight=self.mlp_op.down_proj.weight,
-                block_size=self.block_size,
-                block_position_to_token_idx=block_position_to_token_idx,
-                block_to_expert_idx=block_to_expert_idx,
-                gate_up_proj_scale=getattr(self.mlp_op.gate_up_proj, "scale", None),
-                down_proj_scale=getattr(self.mlp_op.down_proj, "scale", None),
+            return self.blockwise_nki_autograd_cls.apply(
+                hidden_states,
+                expert_affinities_masked,
+                self.mlp_op.gate_up_proj.weight,
+                self.mlp_op.down_proj.weight,
+                self.block_size,
+                token_position_to_id,
+                block_to_expert,
+                getattr(self.mlp_op.gate_up_proj, "scale", None),
+                getattr(self.mlp_op.down_proj, "scale", None),
+                self.training,
             )
         elif self.training:
             # we split training/inference torch blockwise because training backward pass implements a simplified version of mlp_op.
             return TorchBlockwiseTraining.apply(
                 hidden_states,
                 expert_affinities_masked,
-                block_position_to_token_idx,
-                block_to_expert_idx.squeeze(-1),
+                token_position_to_id,
+                block_to_expert,
                 self.mlp_op.gate_up_proj.weight,
                 self.mlp_op.down_proj.weight,
             )
@@ -461,17 +420,142 @@ class ExpertMLPs(torch.nn.Module):
                 num_blocks=num_blocks,
                 hidden_states=hidden_states,
                 expert_affinities_masked=expert_affinities_masked,
-                block_position_to_token_idx=block_position_to_token_idx,
-                block_to_expert_idx=block_to_expert_idx,
+                token_position_to_id=token_position_to_id,
+                block_to_expert=block_to_expert,
             )
+
+    @staticmethod
+    def get_blockwise_expert_and_token_mapping(
+        total_tokens,
+        num_blocks, 
+        expert_mask, 
+        block_size, 
+        device, 
+        enable_spmd_rank, 
+        spmd_rank, 
+        tensor_parallel_group
+        ):
+        """
+        Token position: position in blocks.
+        E.g. given block_size=2, num_token=6. The following expert_mask
+            [1, 0, 0],  # First token for expert 0
+            [0, 1, 0],  # First token for expert 1
+            [1, 0, 0],  # Second token for expert 0
+            [0, 0, 1],  # First token for expert 2
+            [1, 0, 0],  # Third token for expert 0
+            [0, 1, 0],  # Second token for expert 1
+        would put tokens into blocks as follows:
+            Block 0 (expert 0)
+                0
+                2
+            Block 1 (expert 0)
+                4
+                -1
+            Block 2 (expert 1)
+                1
+                5
+            Block 3 (expert 2)
+                3
+                -1
+        This would result in block to expert mappping:
+            0 -> 0
+            1 -> 0
+            2 -> 1
+            3 -> 2
+        and token position to id mapping:
+            0 -> 0
+            1 -> 2
+            2 -> 4
+            3 -> -1
+            4 -> 1
+            5 -> 5
+            6 -> 3
+            7 -> -1
+        """
+
+        # tokens_per_expert: (E, )
+        tokens_per_expert = torch.sum(expert_mask, dim=0)
+        # blocks_per_expert: (E, )
+        blocks_per_expert = ((tokens_per_expert + block_size - 1) // block_size).to(dtype=torch.long)
+        # block_to_expert: (N, ). Block id to expert id mapping.
+        # The simplest way to do this is to use repeat_interleave after padding blocks_per_expert with unassigned blocks.
+        # But this op is not lowered to xla with vector 'repeats', so we use the equivalent implementation below.
+        block_ids = torch.arange(num_blocks, device=device, dtype=torch.long)  # (N, )
+        cumulative_blocks_per_expert = cumsum(blocks_per_expert.unsqueeze(1)).squeeze(1)  # (E, )
+        block_to_expert = torch.sum(block_ids.unsqueeze(1) >= cumulative_blocks_per_expert[:-1], dim=1).to(torch.long)
+
+        # token_position_by_id_and_expert: (T, E)
+        token_position_by_id_and_expert = cumsum(expert_mask)
+        # Tokens assigned to a given expert are assembled in consecutive blocks (and will have consecutive positions)
+        # The block position for a token for an expert depends on the number of blocks assigned to all previous experts.
+        # Compute and add this offset for each expert
+        expert_block_offsets = cumulative_blocks_per_expert * block_size
+        token_position_by_id_and_expert[:, 1:] += expert_block_offsets[:-1]
+        # Apply expert_mask
+        token_position_by_id_and_expert = token_position_by_id_and_expert.masked_fill(torch.eq(expert_mask, 0), 0).to(dtype=torch.long)
+
+        # Invert token_position_by_id_and_expert to obtain token_position_to_id
+        # token_position_to_id: (N*B+1,)
+        # Initialize with -1 indices (which will remain as the indices of padding tokens)
+        token_position_to_id = -1 * torch.ones(num_blocks * block_size + 1, device=device, dtype=torch.long)
+
+        if total_tokens % get_tensor_model_parallel_size() != 0:
+            # Pad token_position_by_id_and_expert
+            num_pad = (-total_tokens) % get_tensor_model_parallel_size()
+            token_position_by_id_and_expert = F.pad(token_position_by_id_and_expert, (0, 0, 0, num_pad))
+            tokens_idx = torch.arange(total_tokens + num_pad, device=device, dtype=torch.long)
+        else:
+            tokens_idx = torch.arange(total_tokens, device=device, dtype=torch.long)
+
+        # Distribute computation by splitting token_position_by_id_and_expert and tokens_idx across TP ranks
+        # The same token_position_by_id_and_expert and tokens_idx is present at all ranks, so we can use any of MIN/MAX/AVG to as the reduce operation
+        if enable_spmd_rank:
+            # use rank information is available at runtime in inference
+            # get tp_rank from global rank
+            # note: we use `get_tensor_model_parallel_group()` here to parallelize within a single node
+            #       but may get replicated in multi-node case
+            tp_rank = torch.remainder(spmd_rank.get_rank(), get_tensor_model_parallel_size())
+            token_position_by_id_and_expert = mappings.scatter_to_process_group_spmd(
+                token_position_by_id_and_expert, partition_dim=0, rank=tp_rank, process_group=get_tensor_model_parallel_group(),
+            )
+            tokens_idx = mappings.scatter_to_process_group_spmd(
+                tokens_idx, partition_dim=0, rank=tp_rank, process_group=get_tensor_model_parallel_group(),
+            )
+            # Assemble token_position_to_id using chunk of token_position_by_id_and_expert and tokens_idx at each TP rank
+            # This generates small DMA transfers because of discontinuous writes, and benefits from distributing across TP ranks
+            token_position_to_id[token_position_by_id_and_expert] = tokens_idx.unsqueeze(1)
+            # Accumulate results across TP ranks (use MAX to correctly account for the -1 index initialization)
+            token_position_to_id = mappings._reduce(
+                token_position_to_id, computation=xm.REDUCE_MAX, process_group=get_tensor_model_parallel_group(),
+            )
+        else:
+            # To avoid rank-specific computations, we do a reduce-scatter instead of a simple split
+            token_position_by_id_and_expert = mappings._reduce_scatter_along_first_dim(
+                token_position_by_id_and_expert, computation=xm.REDUCE_MIN, process_group=tensor_parallel_group,
+            )
+            tokens_idx = mappings._reduce_scatter_along_first_dim(
+                tokens_idx, computation=xm.REDUCE_MIN, process_group=tensor_parallel_group,
+            )
+            # Assemble token_position_to_id using chunk of token_position_by_id_and_expert and tokens_idx at each TP rank
+            # This generates small DMA transfers because of discontinuous writes, and benefits from distributing across TP ranks
+            token_position_to_id[token_position_by_id_and_expert] = tokens_idx.unsqueeze(1)
+            # Accumulate results across TP ranks (use MAX to correctly account for the -1 index initialization)
+            token_position_to_id = mappings._reduce(
+                token_position_to_id, computation=xm.REDUCE_MAX, process_group=tensor_parallel_group,
+            )
+
+        # token_position_to_id is a flattened array that contains the mapping of token indices for each block
+        # token_position_to_id contains -1 as the index of 'padding' tokens
+        token_position_to_id = token_position_to_id[1:]
+        return block_to_expert,token_position_to_id
 
     def torch_blockwise_matmul_inference(
         self,
         num_blocks,
         hidden_states,
         expert_affinities_masked,
-        block_position_to_token_idx,
-        block_to_expert_idx,
+        token_position_to_id,
+        block_to_expert,
     ):
         """
         PyTorch implementation of the blockwise matmul.
@@ -485,18 +569,19 @@ class ExpertMLPs(torch.nn.Module):
         output = torch.zeros(total_tokens + 1, hidden_size, device=hidden_states.device, dtype=hidden_states.dtype)
 
         # block_to_token_indices: (N, B)
-        block_to_token_indices = block_position_to_token_idx[1:].view(num_blocks, self.block_size)
+        block_to_token_indices = token_position_to_id.view(num_blocks, self.block_size)
 
         for block_idx in range(num_blocks):
             block_token_indices = block_to_token_indices[block_idx]
-            block_expert_idx = block_to_expert_idx[block_idx]
+            block_expert_idx = block_to_expert[block_idx]
 
             # block_hidden_states: (1, B, H)
             block_hidden_states = hidden_states[block_token_indices].unsqueeze(0)
             # block_mlp_output: (B, H)
-            block_mlp_output = self.mlp_op(block_hidden_states, expert_indices=block_expert_idx).squeeze(0)
+            block_mlp_output = self.mlp_op(block_hidden_states, expert_indices=block_expert_idx.unsqueeze(0)).squeeze(0)
             # block_output: (B, H)
-            block_output = block_mlp_output * expert_affinities_masked[block_token_indices, block_expert_idx].unsqueeze(
+            # FIXME: remove unsqueeze(0) from block_expert_idx.unsqueeze(0) would OOM
+            block_output = block_mlp_output * expert_affinities_masked[block_token_indices, block_expert_idx.unsqueeze(0)].unsqueeze(
                 1
             )
             # Update the tokens computed by the block

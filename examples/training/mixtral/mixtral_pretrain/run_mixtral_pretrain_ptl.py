@@ -31,6 +31,7 @@ from modeling_mixtral_moe_nxd import (  # noqa: E402
     MixtralDecoderLayer,  # noqa: E402
     MixtralForCausalLM,  # noqa: E402
     MixtralRMSNorm,  # noqa: E402
+    MixtralRotaryEmbedding,  # noqa: E402
     init_weights,  # noqa: E402
 )  # noqa: E402
 from module_mixtral import NeuronMixtralLTModule, NeuronMixtralPPLTModule  # noqa: E402
@@ -162,7 +163,7 @@ def _setup_nxd_config(flags):
             "auto_partition": True,
             "trace_file_path": None,
             "param_init_fn": None,
-            "leaf_module_cls": [MixtralRMSNorm.__name__],
+            "leaf_module_cls": [MixtralRMSNorm.__name__, MixtralRotaryEmbedding.__name__],
             "autowrap_modules": [mappings],
             "autowrap_functions": [load_balancing_loss_func],
             "use_zero1_optimizer": flags.use_zero_1,

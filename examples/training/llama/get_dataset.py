@@ -4,6 +4,22 @@ from itertools import chain
 
 from datasets import load_dataset
 from transformers import AutoTokenizer
+from functools import wraps
+from huggingface_hub.hf_api import DatasetInfo
+
+def handle_missing_keys(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except KeyError as e:
+            missing_key = str(e).strip("'")
+            kwargs[missing_key] = None
+            return func(*args, **kwargs)
+    return wrapper
+
+# Monkey patch the DatasetInfo.__init__ method
+DatasetInfo.__init__ = handle_missing_keys(DatasetInfo.__init__)
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--llama-version', type=int, default=3, help='LLaMA version (default: 3)')
@@ -27,7 +43,7 @@ tokenizer_path = os.path.expanduser(tokenizer_path)
 if not os.path.exists(save_path):
     os.makedirs(save_path)
 
-raw_datasets = load_dataset(dataset_name, dataset_config_name)
+raw_datasets = load_dataset(dataset_name, dataset_config_name, trust_remote_code=True)
 
 tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
 

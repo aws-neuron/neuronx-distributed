@@ -5,8 +5,8 @@ import torch
 from torch.distributed import ProcessGroup
 import torch.nn.functional as F
 
-from neuronx_distributed.modules.moe.moe_parallel_layers import LinearRouter
 from neuronx_distributed.parallel_layers import mappings
+from neuronx_distributed.parallel_layers.parallel_state import get_tensor_model_parallel_group
 
 
 class RouterBase(torch.nn.Module, ABC):
@@ -19,6 +19,7 @@ class RouterBase(torch.nn.Module, ABC):
         act_fn: Activation used to obtain expert affinities from router logits. One of 'sigmoid' or 'softmax'.
         dtype: Datatype for the layer weights.
         device: Device for the layer weights.
+        jitter_eps: Random noise factor for input perturbation.
     """
 
     def __init__(
@@ -32,6 +33,7 @@ class RouterBase(torch.nn.Module, ABC):
         dtype: torch.dtype,
         device: torch.device,
         tensor_model_parallel_group: Optional[ProcessGroup] = None,
+        jitter_eps: float = 0.0,
     ):
         super().__init__()
         self.num_experts = num_experts
@@ -51,15 +53,14 @@ class RouterBase(torch.nn.Module, ABC):
 
         self.dtype = dtype
         self.device = device
+        self.jitter_eps = jitter_eps
+
+        self.tensor_parallel_group = tensor_model_parallel_group if \
+            tensor_model_parallel_group is not None else get_tensor_model_parallel_group()
 
         # Create router
-        self.linear_router = LinearRouter(
-            input_size=hidden_size,
-            output_size=num_experts,
-            dtype=dtype,
-            device=device,
-            tensor_model_parallel_group=tensor_model_parallel_group,
-        )
+        self.linear_router = torch.nn.Linear(hidden_size, num_experts, dtype=dtype, device=device, bias=False)
+        setattr(self.linear_router.weight, "sequence_parallel_enabled", sequence_parallel_enabled)
 
     def get_router_logits_and_expert_affinities(self, hidden_states):
         """
@@ -68,16 +69,22 @@ class RouterBase(torch.nn.Module, ABC):
         sequence parallelism internally.
         """
 
+        # Add noise to the input tensor by applying jitter.
+        if self.jitter_eps != 0.0 and self.training:
+            hidden_states *= torch.empty_like(hidden_states).uniform_(
+                1.0 - self.jitter_eps, 1.0 + self.jitter_eps
+            )
+
         # router_logits: (*, H) @ (H, E) -> (*, E)            
         router_logits = self.linear_router(hidden_states)
 
         if self.sequence_parallel_enabled:
-            assert not self.training, "Router in SP is currently supported only for inference"
             # Gather the router_logits across ranks
             router_logits = mappings.gather_from_sequence_parallel_region(
                 router_logits,
                 sequence_dimension=self.sequence_dimension,
                 to_model_parallel=False,
+                process_group=self.tensor_parallel_group,
             )
 
         # Flatten S and B to T dimension
@@ -132,6 +139,7 @@ class RouterTopK(RouterBase):
         dtype: torch.dtype = torch.float32,
         device: torch.device = torch.device("cpu"),
         tensor_model_parallel_group: Optional[ProcessGroup] = None,
+        jitter_eps: float = 0.0,
     ):
         super().__init__(
             num_experts=num_experts,
@@ -143,6 +151,7 @@ class RouterTopK(RouterBase):
             dtype=dtype,
             device=device,
             tensor_model_parallel_group=tensor_model_parallel_group,
+            jitter_eps=jitter_eps,
         )
 
     def forward(self, hidden_states):

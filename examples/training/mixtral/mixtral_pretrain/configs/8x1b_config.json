@@ -25,6 +25,5 @@
     "use_cache": false,
     "vocab_size": 32000,
     "pretraining_tp": 1,
-    "move_model_to_device": false,
     "use_flash_attention": true
 }

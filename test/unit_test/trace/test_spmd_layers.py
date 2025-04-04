@@ -16,7 +16,7 @@ class TestSPMDLayers(unittest.TestCase):
     @unittest.skipIf(not is_torch_version_greater_than_2(),
                         "ModelBuilder only works for torch-neuronx>=2.*")
     def test_spmd_rank(self):
-        world_size = 8
+        world_size = 2
 
         class Model(torch.nn.Module):
             def __init__(self):
@@ -56,7 +56,7 @@ class TestSPMDLayers(unittest.TestCase):
     @unittest.skipIf(not is_torch_version_greater_than_2(),
                         "ModelBuilder only works for torch-neuronx>=2.*")
     def test_spmd_scatter(self):
-        world_size = 8
+        world_size = 2
 
         class Model(torch.nn.Module):
             def __init__(self):

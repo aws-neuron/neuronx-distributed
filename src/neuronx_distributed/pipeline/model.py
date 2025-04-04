@@ -1,11 +1,12 @@
 import copy
 import logging
 import time
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 from types import MethodType, ModuleType
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import torch
+import torch.distributed as dist
 import torch_xla.core.xla_model as xm
 from torch import nn
 from torch.autograd.variable import Variable
@@ -42,7 +43,7 @@ from neuronx_distributed.pipeline.scheduler import (
 )
 from neuronx_distributed.pipeline.timeline import PPTimeline
 from neuronx_distributed.pipeline.trace import trace_model
-from neuronx_distributed.utils.logger import get_logger
+from neuronx_distributed.utils.logger import get_logger, get_log_level
 from neuronx_distributed.utils.model_utils import (
     maybe_materalize_model,
     move_model_to_device,
@@ -54,18 +55,36 @@ from neuronx_distributed.utils.serialization import (
     TensorMeta,
     find_loss_from_output_and_spec,
 )
+from neuronx_distributed.pipeline.manual_pipe_stage import PipelineStageModule
+from neuronx_distributed.pipeline.partition import PipelineIO
+from neuronx_distributed.utils import cpu_mode
 
-logger = get_logger()
+from contextlib import contextmanager
+
+logger = get_logger(rank0_only=(get_log_level() == logging.INFO))
+
+
+@contextmanager
+def mark_timeline(timeline, msg):
+    try:
+        timeline.mark_event_start(msg)
+        yield
+    finally:
+        timeline.mark_event_end(msg)
+
+
+INPUTS_ARG_NAME = "inputs"
+LABLES_ARG_NAME = "labels"
 
 
 class NxDPPModel(nn.Module):
     def __init__(
         self,
-        module: torch.nn.Module,
+        module: Union[torch.nn.Module, list, tuple],
         transformer_layer_cls: Optional[Any] = None,
         num_microbatches: int = 1,
         virtual_pipeline_size: int = 1,
-        output_loss_value_spec: Optional[Union[Dict, Tuple]] = None,
+        output_loss_value_spec: Optional[Union[Dict, Tuple, bool]] = None,
         return_mb_loss: bool = False,
         broadcast_and_average_loss: bool = False,
         use_zero1_optimizer: bool = False,
@@ -84,6 +103,9 @@ class NxDPPModel(nn.Module):
         deallocate_pipeline_outputs: bool = False,
         auto_partition: Optional[bool] = False,
         fuse_microbatches: Optional[bool] = False,
+        manual_pp_partition: Optional[bool] = False,
+        manual_pp_stage_partition_fn: Optional[Callable] = None,
+        manual_pp_loss_fn: Optional[Callable] = None,
         _delay_tracing: Optional[bool] = False,
         _turn_off_odd_even_scheduler: Optional[bool] = False,
         _all_reduce_send_recv: Optional[bool] = False,
@@ -216,7 +238,7 @@ class NxDPPModel(nn.Module):
                 "Model parallelism needs to be initialzed before applying NxDPPModel wrapper. Please call neuronx_distributed.parallel_layers.initialize_model_parallel(pipeline_model_parallel_size, tensor_model_parallel_size)"
                 # noqa: E501
             )
-        if transformer_layer_cls is None:
+        if transformer_layer_cls is None and manual_pp_partition is False:
             raise ValueError("NxDPPModel requires transformer_layer_cls as input")
         self.original_torch_module = module
 
@@ -225,6 +247,7 @@ class NxDPPModel(nn.Module):
 
         # Public configs
         self.output_loss_value_spec = output_loss_value_spec
+        self.output_loss = True
         self.transformer_layer_cls = transformer_layer_cls
         self.num_microbatches = num_microbatches
         self.return_mb_loss = return_mb_loss
@@ -238,10 +261,15 @@ class NxDPPModel(nn.Module):
         self.param_init_fn = param_init_fn
         self._all_reduce_send_recv = _all_reduce_send_recv
         self.fuse_microbatches = fuse_microbatches
+        self.manual_pp_partition = manual_pp_partition
+        self.manual_pp_loss_fn = manual_pp_loss_fn
         if self.fuse_microbatches:
             if self.return_loss_on_cpu:
                 logger.warning("return_loss_on_cpu will be set to False when fuse_microbatches is set to True.")
             self.return_loss_on_cpu = False
+        if self.output_loss_value_spec is None:
+            self.output_loss_value_spec = False
+            self.output_loss = False
 
         # Non-public config
         self._mark_step_before_pp_runtime = _mark_step_before_pp_runtime
@@ -288,12 +316,13 @@ class NxDPPModel(nn.Module):
         self.shape_traced = False
         self.input_names: Optional[List[str]] = None
         # Outputs from analyze_pipeline_module
-        self.stage_id_to_IO_input_names = None
+        self.stage_id_to_IO_input_names: Optional[Dict] = None
         self.stage_id_to_model_input_names = None
         self.stage_id_to_input_count = None
         self.stage_id_to_output_count = None
         # Static states of pipeline
-        self.shared_weights_name_to_pg: Dict[str, torch.distributed.ProcessGroup] = {}
+        self.shared_weights_name_to_pg: Dict[str, dist.ProcessGroup] = {}
+        self.manually_shared_weights: Dict[str, List[Any]] = {}
         self.local_name_to_original_name: Dict[str, str] = {}
         self.original_name_to_local_name: Dict[str, str] = {}
         self.local_stage_modules: List[Any] = []
@@ -352,6 +381,16 @@ class NxDPPModel(nn.Module):
                 self.cut_pipeline_stage(pp_cut)
             self.partition()
 
+        if manual_pp_partition:
+            self._create_manual_partition(module, manual_pp_stage_partition_fn) # type: ignore
+            logger.debug(
+                rmsg(
+                    f"running manual PP with output_loss {self.output_loss}"
+                    f" return_mb_loss {self.return_mb_loss}, "
+                    f"broadcast_and_average_loss {self.broadcast_and_average_loss}"
+                )
+            )
+
     def __getattr__(self, name: str) -> Any:
         """Forward missing attributes to wrapped module."""
         try:
@@ -359,14 +398,116 @@ class NxDPPModel(nn.Module):
         except AttributeError:
             return getattr(self.original_torch_module, name)
 
+    def __repr__(self):
+        """ This is for pretty printing the model for debugging"""
+        res = super().__repr__()
+        outputs = [
+            res,
+            f"local_stage_modules: {self.local_stage_modules}",
+            f"traced_model: {self.traced_model}",
+        ]
+        return "\n".join(outputs)
+
+    def _create_manual_partition(
+        self, module: Union[List[torch.nn.Module], Tuple[torch.nn.Module]], partition_fn: Optional[Callable]
+    ):
+
+        # disable the tracing step for shape inference
+        self.tracing = False
+        self.model_labels_iter = {model_chunk_id: None for model_chunk_id in range(self.virtual_pipeline_size)}
+        if self.manual_pp_loss_fn is not None:
+            self.output_loss = True
+
+        assert type(module) is list, "module should be a list of layers"
+        pp_stage = PipelineStageModule(
+            layers=module,
+            num_stages=self.pipeline_parallel_size,
+            stage_index=self.pipeline_parallel_rank,
+            partition_fn=partition_fn,
+        )
+
+        self.local_stage_modules.append(pp_stage)
+        logger.debug(
+            rmsg(f'pipeline_parallel_rank {self.pipeline_parallel_rank} '
+                    f'local_modules {[mod for mod in self.local_stage_modules]}')
+        )
+        self._create_pg_for_shared_weights(self.local_stage_modules)
+
+        # ==== Post partition
+        self.partitioned = True
+
+        # This is for handling the stage to stage IO
+        self.stage_id_to_IO_input_names = defaultdict()
+        for stage_id in range(self.pipeline_parallel_size):
+            self.stage_id_to_IO_input_names[stage_id] = OrderedDict()
+            if stage_id > 0:
+                # other than the first stage
+                # it receives data from other pipeline stages
+                # the key name is dummy for
+                self.stage_id_to_IO_input_names[stage_id][f'stage_{stage_id}_input'] = PipelineIO(
+                    name="stage_io_dummy_name",
+                    input_idx=0,
+                    output_idx=0,
+                    metadata=None,
+                    obj=list(),
+                )
+
+        # This handles the model inputs loaded from data loader
+        self.stage_id_to_model_input_names = defaultdict() # type: ignore
+        for stage_id in range(self.pipeline_parallel_size):
+            if stage_id == 0: 
+                # first stage loads inputs
+                self.stage_id_to_model_input_names[stage_id] = {INPUTS_ARG_NAME: 0} # type: ignore
+            elif stage_id == self.pipeline_parallel_size - 1:
+                # last stage load the labels
+                self.stage_id_to_model_input_names[stage_id] = {LABLES_ARG_NAME: 1} # type: ignore
+            else:
+                self.stage_id_to_model_input_names[stage_id] = {} # type: ignore
+
+        # NOTE: output and input always a tuple/list
+        self.stage_id_to_input_count = { # type: ignore
+            self.pipeline_parallel_rank: 1
+        }
+
+        self.stage_id_to_output_count = { # type: ignore
+            self.pipeline_parallel_rank: 1
+        }
+
+        # TODO: Locate shared weights between stages
+        # self.register_shared_weights()
+
+        # Create pipeline schedule
+        self.create_schedule()
+        self.move_model_to_device()
+    
+    def _create_pg_for_shared_weights(self, local_stage_modules: List[PipelineStageModule]):
+        """ This is for creating ProcessGroup in manual PP mode. 
+        Enumerate local_stage_modules, for each module check the 
+        shared_weights_on_pp_stages and create the ProcessGroup
+        """
+        for module in local_stage_modules:
+            for shared_group_name in module.shared_weights_on_pp_stages:
+                sharing_info = module.shared_weights_on_pp_stages[shared_group_name]
+                shared_pp_stages, shared_layer_weight_path = sharing_info
+                pg = self._create_pg_with_ranks(shared_pp_stages)
+                if self.pipeline_parallel_rank in shared_pp_stages:
+                    assert pg is not None, f"ProcessGroup is None for shared weight group {shared_group_name}"
+                    self.manually_shared_weights[shared_group_name] = [pg, shared_layer_weight_path]
+                    logger.debug(
+                        rmsg(f'Created ProcessGroup for shared weight group {shared_group_name} with pp ranks {shared_pp_stages}'
+                    ))
+
     def clear_minibatch_state(self):
         """
         Initialize/clear the runtime placeholders
         """
         self.training = None
         self.losses = []
+        self.last_stage_outputs = [] # allow raw outputs without loss compute
         self.losses_for_printing = []
         self.model_inputs_iter = {model_chunk_id: None for model_chunk_id in range(self.virtual_pipeline_size)}
+        # Introduce the labels iterator for manual pipeline parallel case
+        self.model_labels_iter = {model_chunk_id: None for model_chunk_id in range(self.virtual_pipeline_size)}
         self.input_name_to_iter_idx = {model_chunk_id: None for model_chunk_id in range(self.virtual_pipeline_size)}
         self.current_mb = -1
         self.current_model_chunk = -1
@@ -402,9 +543,17 @@ class NxDPPModel(nn.Module):
 
     def _empty_send_tensor_buffer(self):
         """
-        Empty the send tensor buffers, mainly used as callbacks in step closure
+        Empty the send tensor buffers. when in xla mode, 
+        it puts the reset op in a callback, so that the caller of this function 
+        don't need to wrap this function in a callback closure
         """
-        self.send_tensors = []
+        def _clear_send_tensors():
+            self.send_tensors = []
+
+        if not cpu_mode():
+            xm.add_step_closure(_clear_send_tensors)
+        else:
+            _clear_send_tensors()
 
     def trace(
         self,
@@ -442,7 +591,10 @@ class NxDPPModel(nn.Module):
         self.input_names = input_names
         if leaf_modules is None:
             leaf_modules = []
-        leaf_modules.append(self.transformer_layer_cls.__name__)
+        if self.transformer_layer_cls is not None:
+            leaf_modules.append(self.transformer_layer_cls.__name__)
+        else:
+            raise RuntimeError('Expected to have transformer_layer_cls specified, but got None')
         self.traced_model = trace_model(
             self.original_torch_module,
             args=args,
@@ -633,7 +785,22 @@ class NxDPPModel(nn.Module):
                     )
                 )
 
+    def _reduce_manually_shared_weights(self):
+        for shared_name, pg_and_weight in self.manually_shared_weights.items():
+            pg, layer_and_weight_path = pg_and_weight
+            layer, weight_path = layer_and_weight_path
+            weight = getattr(layer, weight_path)
+
+            logger.debug(rmsg(f"Reduce shared weight {shared_name}"))
+            if weight.grad is not None:
+                torch.distributed.all_reduce(weight.grad, group=pg)
+            elif hasattr(weight, "main_grad"):
+                torch.distributed.all_reduce(weight.main_grad, group=pg)
+
     def _reduce_shared_weights(self):
+        if self.manual_pp_partition:
+            return self._reduce_manually_shared_weights()
+
         for shared_name, pg in self.shared_weights_name_to_pg.items():
             for local_module in self.local_stage_modules:
                 for n, p in local_module.named_parameters():
@@ -646,7 +813,21 @@ class NxDPPModel(nn.Module):
                             torch.distributed.all_reduce(p.main_grad, group=pg)
                         break
 
+    def _sync_manually_shared_weights(self):
+        for shared_name, pg_and_weight in self.manually_shared_weights.items():
+            pg, layer_and_weight_path = pg_and_weight
+            layer, weight_path = layer_and_weight_path
+            weight = getattr(layer, weight_path)
+            logger.info(rmsg(f"Sync shared weight {shared_name}"))
+            with torch.no_grad():
+                if torch.distributed.get_rank(group=pg) != 0:
+                    weight.data.zero_()
+                torch.distributed.all_reduce(weight.data, group=pg)
+
     def _sync_shared_weights(self):
+        if self.manual_pp_partition:
+            return self._sync_manually_shared_weights()
+
         for shared_name, pg in self.shared_weights_name_to_pg.items():
             for local_module in self.local_stage_modules:
                 for n, p in local_module.named_parameters():
@@ -722,7 +903,10 @@ class NxDPPModel(nn.Module):
     def _prepare_run(self, kwargs, train=True):
         self._validate_partitioned()
         self.move_model_to_device()
-        self._prepare_inputs_and_infer_shape(kwargs)
+        if not self.manual_pp_partition:
+            self._prepare_inputs_and_infer_shape(kwargs)
+        else:
+            self._create_model_inputs_iter(kwargs)
 
     def _prepare_inputs_and_infer_shape(self, kwargs):
         """
@@ -807,7 +991,7 @@ class NxDPPModel(nn.Module):
             self._mark_step()
         return loss
 
-    def run_eval(self, **kwargs):
+    def run_eval(self, *args, **kwargs):
         if self._mark_step_before_pp_runtime:
             self._mark_step()
         self._autocast_enabled = torch.is_autocast_enabled()
@@ -817,12 +1001,19 @@ class NxDPPModel(nn.Module):
             self.perform_delayed_tracing_and_partition({}, kwargs)
 
         with torch.cuda.amp.autocast(enabled=False):
-            loss = self._run_eval(**kwargs)
+            loss_or_outputs = self._run_eval(**kwargs)
         self._autocast_enabled = False
         self._autocast_dtype = None
         if self._mark_step_after_pp_runtime:
             self._mark_step()
-        return loss
+        return loss_or_outputs
+
+    def _get_last_stage_outputs(self):
+        """"""
+        if len(self.last_stage_outputs) == 0:
+            return None
+        else:
+            return self.last_stage_outputs
 
     def _run_train(self, **kwargs):
         self._prepare_run(kwargs)
@@ -845,9 +1036,19 @@ class NxDPPModel(nn.Module):
         with torch.no_grad():
             self._exec_schedule(self.eval_scheduler)
             loss = self._process_loss()
+            outputs = self._get_last_stage_outputs()
             self.clear_minibatch_state()
             self.timeline.mark_step_end()
-            return loss
+
+            if self.output_loss:
+                return loss
+            else:
+                if outputs is not None:
+                    assert(len(outputs) == 1), "outputs should have only one element in eval mode"
+                    return outputs[0]
+                else:
+                    logger.warning(rmsg("No outputs found in eval mode"))
+                    return None
 
     def get_current_stage(self, model_chunk_id):
         """
@@ -903,6 +1104,11 @@ class NxDPPModel(nn.Module):
         Create a data iterator for microbatches if current PP rank requires any model input
         """
         self._verify_inputs(input_kwargs)
+        if self.manual_pp_partition:
+            # The modification is to minimize the diff to traced based implementation
+            self._create_model_inputs_and_labels_iter(input_kwargs)
+            return
+
         for model_chunk_id in range(self.virtual_pipeline_size):
             inputs_: List[torch.Tensor] = []
             input_name_to_iter_idx = {}
@@ -924,6 +1130,31 @@ class NxDPPModel(nn.Module):
             if len(inputs_) > 0:
                 self.model_inputs_iter[model_chunk_id] = iter(self.get_batch_iterator(inputs_))
                 self.input_name_to_iter_idx[model_chunk_id] = input_name_to_iter_idx
+
+    def _create_model_inputs_and_labels_iter(self, input_kwargs):
+        # for first stage and last stage to get the input data
+        # NOTE: not care about the input kwargs' key, as we assume the
+        # input is a single list/tuple of tensors
+        assert len(input_kwargs) == 2, f"input_kwargs needs to be a dict with 2 keys: {INPUTS_ARG_NAME} and {LABLES_ARG_NAME}"
+        assert INPUTS_ARG_NAME in input_kwargs and LABLES_ARG_NAME in input_kwargs, "inputs and labels are required"
+        inputs_ = input_kwargs[INPUTS_ARG_NAME]
+        labels_ = input_kwargs[LABLES_ARG_NAME]
+        model_chunk_id = 0
+
+        if isinstance(inputs_, torch.Tensor):
+            inputs_ = [inputs_]
+        if isinstance(labels_, torch.Tensor):
+            labels_ = [labels_]
+
+        # NOTE: no virtual pipeline support yet, alway model_chunk_id = 0
+        self.model_inputs_iter[model_chunk_id] = iter(self.get_batch_iterator(inputs_))
+
+        if labels_ is not None:
+            self.model_labels_iter[model_chunk_id] = iter(self.get_batch_iterator(labels_))
+        else:
+            self.model_labels_iter[model_chunk_id] = None
+        logger.debug(rmsg(f'setting up the model inputs and labels for model chunk {self.current_model_chunk}'))
+        self.input_name_to_iter_idx[model_chunk_id] = {INPUTS_ARG_NAME: 0, LABLES_ARG_NAME: 1}
 
     def _handle_stage_outputs(self, outputs, stage):
         # If there is only a single output from graph
@@ -1036,14 +1267,31 @@ class NxDPPModel(nn.Module):
         self.timeline.mark_event_end(f"mb_{self.current_mb}_ForwardStep")
 
         if self.is_last_pp_rank_last_model_chunk(self.current_model_chunk):
-            # [TODO] Add inference support
-            current_mb_loss = find_loss_from_output_and_spec(outputs, self.output_loss_value_spec)
-            if current_mb_loss is None:
-                raise RuntimeError(
-                    f"User provided output_loss_value_spec {self.output_loss_value_spec} failed to fetch the loss"
+            if self.output_loss and self.output_loss_value_spec:
+                # when self.output_loss_value_spec is provided,
+                # it falls into the case of using tracing based approach
+                current_mb_loss = find_loss_from_output_and_spec(
+                    outputs, self.output_loss_value_spec
                 )
-            self.losses.append(current_mb_loss)
-            self.losses_for_printing.append(current_mb_loss.detach().clone())
+                if current_mb_loss is None:
+                    raise RuntimeError(
+                        f"User provided output_loss_value_spec "
+                        f"{self.output_loss_value_spec} failed to fetch the loss"
+                    )
+                self.losses.append(current_mb_loss)
+                self.losses_for_printing.append(current_mb_loss.detach().clone())
+            elif self.output_loss:
+                # require the loss_fn to compute the loss
+                loss_fn = self.manual_pp_loss_fn
+                labels = self.current_mb_stage_label[0][0]
+                self.current_mb_stage_label = None
+                current_mb_loss = loss_fn(outputs[0], labels[0])
+                self.losses.append(current_mb_loss)
+                self.losses_for_printing.append(current_mb_loss.detach().clone())
+            else:
+                # if no loss outputs, get the last outputs and store it.
+                # useful to get raw outputs in inference/evaluation
+                self.last_stage_outputs.append(outputs)
         else:
             current_stage = self.get_current_stage(self.current_model_chunk)
             outputs = self._handle_stage_outputs(outputs, current_stage)
@@ -1137,6 +1385,82 @@ class NxDPPModel(nn.Module):
         self.timeline.mark_event_end(f"mb_{self.current_mb}_BackwardStep")
         self.timeline.mark_event_end(f"mb_{self.current_mb}_BackwardStepTask")
 
+    def _manual_pp_preprocess_stage_io(self):
+        self.timeline.mark_event_start(f"mb_{self.current_mb}_ForwardPreprocessTask")
+        current_stage = self.get_current_stage(self.current_model_chunk)
+        is_last_stage = self.is_last_pp_rank_last_model_chunk(self.current_model_chunk)
+        is_first_stage = current_stage == 0
+        inputs = [None]
+        labels = [None]
+
+        # load data from input data iterator
+        if is_first_stage:
+            # first stage and last load input data
+            with mark_timeline(self.timeline, f"mb_{self.current_mb}_ForwardFetchInput"):
+                assert self.model_inputs_iter[self.current_model_chunk] is not None, "model_inputs_iter is None"
+                model_inputs = next(self.model_inputs_iter[self.current_model_chunk])
+                inputs = [model_inputs]
+        if is_last_stage:
+            with mark_timeline(self.timeline, f"mb_{self.current_mb}_ForwardFetchLabels"):
+                if self.manual_pp_loss_fn is not None:
+                    assert self.model_labels_iter[self.current_model_chunk] is not None, "model_labels_iter is None"
+                    model_labels = next(self.model_labels_iter[self.current_model_chunk])
+                    labels = [model_labels]
+                else:
+                    labels = [None]
+
+        if not is_first_stage:
+            # recv activations from previous stage
+            for name, inp in self.stage_id_to_IO_input_names[current_stage].items():
+                if not self.shape_traced:
+                    tensor_meta, py_obj = recv_python_object(method=self._metadata_comm_type)
+                    logger.debug(rmsg(f"recv for name {name} tensor_meta {tensor_meta} py_obj {py_obj}"))
+                    inp.metadata = tensor_meta
+                    inp.obj = py_obj
+
+                self._receive_stage_input_to_buffer(inputs, current_stage, name, inp.input_idx, inp.obj, inp.metadata)
+
+        # the last stage need to use the labels as inputs
+        self.current_mb_stage_input = (tuple(inputs), self.current_mb, self.current_model_chunk)
+        self.current_mb_stage_label = (tuple(labels), self.current_mb, self.current_model_chunk)
+
+        if self.should_graph_break:
+            # NOTE: this mark_step call is important to avoid
+            # incorrect HLO graph tracing:
+            # if mark_step is not called, there will be redundant recv CC op
+            self._mark_step()
+
+        self.timeline.mark_event_end(f"mb_{self.current_mb}_ForwardPreprocessTask")
+
+    def _receive_stage_input_to_buffer(self, 
+                                       inputs_buffer: list, 
+                                       current_stage: int,
+                                       input_name: str, 
+                                       input_idx: int, 
+                                       py_obj, 
+                                       metadata):
+        recvd = []
+        # Receive the current stage inputs from previous stage
+        for idx, meta in enumerate(metadata):
+            logger.debug(
+                rmsg(
+                    f"fwd mb {self.current_mb} model chunk "
+                    f"{self.current_model_chunk} "
+                    f"recv {input_name}'s {idx}th tensor meta {meta}"
+                )
+            )
+            recvd_tensor = self.recv_op(meta, all_reduce_send_recv=self._all_reduce_send_recv)
+            recvd.append(recvd_tensor)
+            # Collect the inputs that require grad for bwd
+            if self.training and meta.requires_grad:
+                self.mb_to_inputs_for_grads[self.current_model_chunk][self.current_mb].append(recvd_tensor)
+
+        inp_reconstructed = self.serialization_manager.deserialize(copy.deepcopy(py_obj), recvd)
+        if input_idx is not None:
+            # Current stage inputs
+            assert inputs_buffer[input_idx] is None
+            inputs_buffer[input_idx] = inp_reconstructed
+
     def _fwd_preprocess_task(self):
         """
         Major duties of for this task:
@@ -1147,6 +1471,9 @@ class NxDPPModel(nn.Module):
         - Collect the inputs that require grad for bwd
         - Collect the inputs that will pass along this stage
         """
+        if self.manual_pp_partition:
+            return self._manual_pp_preprocess_stage_io()
+
         self.timeline.mark_event_start(f"mb_{self.current_mb}_ForwardPreprocessTask")
         if not self.tracing:
             if self.current_mb_stage_input is not None:
@@ -1278,7 +1605,7 @@ class NxDPPModel(nn.Module):
                         tensor = torch.sum(tensor)
                 self.send_tensors.append(tensor)
             self.timeline.mark_event_end(f"mb_{self.current_mb}_ForwardSend_{name}")
-        xm.add_step_closure(self._empty_send_tensor_buffer)
+        self._empty_send_tensor_buffer()
         # deallocate the stage output tensor once the send is finished
         self.maybe_deallocate_output_tensor(self.current_model_chunk, self.current_mb)
         if self.should_graph_break:
@@ -1352,7 +1679,7 @@ class NxDPPModel(nn.Module):
                 tensor = torch.sum(tensor)
             self.send_tensors.append(tensor)
             self.timeline.mark_event_end(f"mb_{self.current_mb}_BackwardSend_{idx}")
-        xm.add_step_closure(self._empty_send_tensor_buffer)
+        self._empty_send_tensor_buffer()
         if self.should_graph_break:
             self._mark_step()
         self.timeline.mark_event_end(f"mb_{self.current_mb}_BackwardPostprocessTask")
@@ -1386,6 +1713,11 @@ class NxDPPModel(nn.Module):
                 bucket_allreduce_gradients(grads)
 
         self._reduce_shared_weights()
+
+        if self.manual_pp_partition:
+            # at the grad reduction stage, the shape info is recorded
+            self.shape_traced = True
+
         if self.should_graph_break:
             self._mark_step()
         self.timeline.mark_event_end(f"mb_{self.current_mb}_ReduceGradsTask")
@@ -1413,7 +1745,7 @@ class NxDPPModel(nn.Module):
                 logger.debug(rmsg(f"Run task {task}"))
                 self.current_mb = task.mb
                 self.current_model_chunk = task.model_chunk
-                self.should_graph_break = task.graph_break and (not self.fuse_microbatches)
+                self.should_graph_break = task.graph_break and (not self.fuse_microbatches) and (not cpu_mode())
                 # Equivalent to: self._fwd_step_task()
                 self._exec_instr = MethodType(self._INSTRUCTION_MAP[type(task)], self)
                 self._exec_instr()
@@ -1500,10 +1832,13 @@ class NxDPPModel(nn.Module):
         self._validate_partitioned()
         for local_module in self.local_stage_modules:
             for n, p in local_module.named_parameters(recurse=recurse):
-                # remove wrapper prefix for checkpointing RMSNorm to avoid mapping key error
-                updated_name = n.replace(_CHECKPOINT_PREFIX, "")
-                original_name = self.local_name_to_original_name[updated_name]
-                yield original_name, p
+                if not self.manual_pp_partition:
+                    # remove wrapper prefix for checkpointing RMSNorm to avoid mapping key error
+                    updated_name = n.replace(_CHECKPOINT_PREFIX, "")
+                    original_name = self.local_name_to_original_name[updated_name]
+                    yield original_name, p
+                else:
+                    yield n, p
 
     def local_buffers(self, recurse=True):
         self._validate_partitioned()
@@ -1606,14 +1941,24 @@ class NxDPPModel(nn.Module):
         self.recv_op = recv_from
 
     def _mark_step(self) -> None:
-        xm.mark_step()
+        if not cpu_mode():
+            xm.mark_step()
 
     def _create_pg_with_ranks(self, ranks: List[int]) -> torch.distributed.ProcessGroup:
+        """
+        Args: 
+            ranks: pp stage ranks
+        """
         pg = parallel_state.create_pg_with_ranks(ranks)
         return pg
 
     def _get_microbatch_dataloader(self, all_batches):
-        return MpDeviceLoader(all_batches, xm.xla_device(), batches_per_execution=self.num_microbatches + 1)
+        if not cpu_mode():
+            # NOTE: the `self.num_microbatches + 1` is to
+            # trick the MpDeviceLoader to avoid adding mark_step in the last microbatch
+            return MpDeviceLoader(all_batches, self._get_device(), batches_per_execution=self.num_microbatches + 1)
+        else:
+            return all_batches
 
     def maybe_materialize_local_module(self):
         """
@@ -1628,7 +1973,7 @@ class NxDPPModel(nn.Module):
         if not self.model_moved_to_device:
             for local_module in self.local_stage_modules:
                 # Casting local module to xla device
-                move_model_to_device(local_module, xm.xla_device())
+                move_model_to_device(local_module, self._get_device())
                 self._sync_shared_weights()
                 # We no longer need this mark_step as we are guarding
                 # the fwd-bwd inside its own
@@ -1639,6 +1984,8 @@ class NxDPPModel(nn.Module):
         """
         Average the losses of microbatches if not self.return_mb_loss
         """
+        if not self.output_loss:
+            return None
         if self.pipeline_parallel_rank == self.pipeline_parallel_size - 1:
             loss_all = []
             for loss in self.losses_for_printing:
@@ -1649,20 +1996,44 @@ class NxDPPModel(nn.Module):
                     loss_all = [loss.detach().cpu() if self.return_loss_on_cpu else loss.detach() for loss in loss_all]
                 loss = torch.sum(torch.stack(loss_all), dim=0) / len(loss_all)
                 if self.broadcast_and_average_loss:
-                    loss /= parallel_state.get_data_parallel_size()
-                    torch.distributed.all_reduce(loss, group=parallel_state.get_data_parallel_group())
-                    torch.distributed.broadcast(
-                        loss, torch.distributed.get_rank(), group=parallel_state.get_pipeline_model_parallel_group()
-                    )
-                    self._mark_step()
+                    loss = self._average_loss_across_dp_ranks(loss)
+                    loss = self._bcast_loss_across_pp_ranks(loss)
                 return loss.detach().cpu() if self.return_loss_on_cpu else loss.detach()
             else:
                 return loss_all
         elif self.broadcast_and_average_loss:
-            loss = torch.tensor(0.0, device=xm.xla_device())
-            pp_group = parallel_state.get_pipeline_model_parallel_group()
-            src_rank = torch.distributed.distributed_c10d.get_global_rank(pp_group, self.pipeline_parallel_size - 1)
-            torch.distributed.broadcast(loss, src_rank, group=pp_group)
-            self._mark_step()
+            loss = torch.tensor(0.0, device=self._get_device())
+            loss = self._bcast_loss_across_pp_ranks(loss)
             return loss.detach().cpu()
         return None
+
+    def _average_loss_across_dp_ranks(self, loss):
+        loss /= parallel_state.get_data_parallel_size()
+        torch.distributed.all_reduce(loss, group=parallel_state.get_data_parallel_group())
+        return loss
+
+    def _bcast_loss_across_pp_ranks(self, loss):
+        pp_group = parallel_state.get_pipeline_model_parallel_group()
+        # NOTE: the broadcast is not working in xla mode, it will return 0.0
+        if cpu_mode():
+            src_rank = torch.distributed.distributed_c10d.get_global_rank(
+                pp_group, self.pipeline_parallel_size - 1)
+            torch.distributed.broadcast(
+                loss, src_rank, group=parallel_state.get_pipeline_model_parallel_group()
+            )
+        else:
+            torch.distributed.all_reduce(loss, group=pp_group)
+
+        if self.should_graph_break:
+            self._mark_step()
+        return loss
+
+    def _get_device(self,):
+        if cpu_mode():
+            return torch.device("cpu")
+        else:
+            return xm.xla_device()
+
+    def is_last_stage(self):
+        rst = self.is_last_pp_rank_last_model_chunk(self.virtual_pipeline_size - 1)
+        return rst

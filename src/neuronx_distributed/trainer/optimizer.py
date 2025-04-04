@@ -120,6 +120,9 @@ class NxDOptimizer(torch.optim.Optimizer):
         return gradients, ep_gradients
 
     def step(self, closure=None):
+        # context parallel all-reduce
+        grads.allreduce_context_parallel_gradients(self)
+        
         # sequence parallel all-reduce
         if self.nxd_config["sequence_parallel"]:
             grads.allreduce_sequence_parallel_gradients(self)

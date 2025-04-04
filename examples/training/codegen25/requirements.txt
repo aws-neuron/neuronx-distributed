@@ -4,3 +4,6 @@ tensorboard
 datasets
 sentencepiece
 tiktoken
+tenacity
+s3transfer
+awscrt

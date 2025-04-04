@@ -70,11 +70,11 @@ class CheckpointConverterBase:
         return keys_hf_to_nxd, keys_nxd_to_hf
 
 
-    def download_and_save_hf_model(self, model_identifier, output_path="/home/ubuntu/hf_single_ckpt"):
+    def download_and_save_hf_model(self, model_identifier, config_path=None):
         from getpass import getpass
         from huggingface_hub import login
 
-        from transformers import AutoModelForCausalLM
+        from transformers import AutoModelForCausalLM, AutoConfig
 
         token = getpass("Enter your Hugging Face API token: (If you don't have one, create it at https://huggingface.co/settings/tokens): ")
         login(token=token)
@@ -82,7 +82,10 @@ class CheckpointConverterBase:
         print(f"Downloading model: {model_identifier}")
         try:
             # Download the model
-            model = AutoModelForCausalLM.from_pretrained(model_identifier, token=token)
+            config = None
+            if config_path:
+                config = AutoConfig.from_pretrained(config_path)
+            model = AutoModelForCausalLM.from_pretrained(model_identifier, token=token, config=config)
             return model.state_dict()
         except Exception as e:
             print(f"An error occurred: {str(e)}")
@@ -618,9 +621,11 @@ class CheckpointConverterBase:
     # Helper functions for save/load
     def load_full_state(self, args):
         if args.hf_model_name and not args.input_dir:
-            full_state = self.download_and_save_hf_model(args.hf_model_name)
-        else:
+            full_state = self.download_and_save_hf_model(args.hf_model_name, args.config)
+        elif args.input_dir:
             full_state = torch.load(args.input_dir, map_location='cpu')
+        else:
+            raise ValueError("Error: Please provide either HuggingFace model name or input path to consolidated statedict")
         return full_state
 
     def get_input_filename(self, args, tp_rank, pp_rank, ep_rank, xser):
@@ -765,7 +770,7 @@ class CheckpointConverterBase:
         """Child classes can override this to add new arguments."""
 
         parser = argparse.ArgumentParser()
-        parser.add_argument("--input_dir", type=str, required=True, help="Path to input model/weights (merged checkpoint file)")
+        parser.add_argument("--input_dir", type=str, default=None, help="Path to input model/weights (merged checkpoint file)")
         parser.add_argument("--hf_model_name", type=str, default=None, help="HuggingFace model identifier")
         parser.add_argument("--output_dir", type=str, required=True, help="Path to save converted model/weights")
         parser.add_argument("--hw_backend", type=str, required=True, help="Specify the hardware backend (trn1/trn2)")

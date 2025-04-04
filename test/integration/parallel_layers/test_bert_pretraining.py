@@ -442,7 +442,7 @@ def train_bert_hdf5(flags):
     running_loss = torch.zeros(1, dtype=torch.double).to(device)
 
     param_optimizer = list(model.named_parameters())
-    no_decay = ["bias", "LayerNorm"]  # gamma/beta are in LayerNorm.weight
+    no_decay = ["bias", "norm"]  # gamma/beta are in LayerNorm.weight
 
     optimizer_grouped_parameters = [
         {

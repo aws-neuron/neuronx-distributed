@@ -124,7 +124,7 @@ class NeuronLTModule(LightningModule):
             param_optimizer = list(self.model.local_named_parameters())
         else:
             param_optimizer = list(self.model.named_parameters())
-        no_decay = ["bias", "LayerNorm"]  # gamma/beta are in LayerNorm.weight
+        no_decay = ["bias", "norm"]  # gamma/beta are in LayerNorm.weight
 
         optimizer_grouped_parameters = [
             {

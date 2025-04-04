@@ -2,6 +2,7 @@ import os
 import shutil
 import torch
 import multiprocessing
+import safetensors.torch
 from functools import partial
 
 from neuronx_distributed.trace.model_builder import ModelBuilder, BaseModelInstance
@@ -324,7 +325,7 @@ def test_weight_layout_optimization_with_serialization():
     builder.shard_checkpoint(serialize_path=shard_weights_path)
     weights = []
     for rank in range(tp_degree):
-        ckpt = torch.load(os.path.join(shard_weights_path, f"tp{rank}_sharded_checkpoint.pt"))
+        ckpt = safetensors.torch.load_file(os.path.join(shard_weights_path, f"tp{rank}_sharded_checkpoint.safetensors"))
         weights.append(ckpt)
 
     # Load the traced model
@@ -332,7 +333,8 @@ def test_weight_layout_optimization_with_serialization():
     print("Done loading serialized model")
 
     # Load new weights
-    traced_model.nxd_model.initialize(weights)
+    start_rank_tensor = torch.tensor([0], dtype=torch.int32, device="cpu")
+    traced_model.nxd_model.initialize(weights, start_rank_tensor)
 
     # Test multiple invocations
     for _ in range(5):
@@ -467,7 +469,7 @@ def test_loading_checkpoint():
     builder.shard_checkpoint(serialize_path=shard_weights_path)
     weights = []
     for rank in range(tp_degree):
-        ckpt = torch.load(os.path.join(shard_weights_path, f"tp{rank}_sharded_checkpoint.pt"))
+        ckpt = safetensors.torch.load_file(os.path.join(shard_weights_path, f"tp{rank}_sharded_checkpoint.safetensors"))
         weights.append(ckpt)
 
     # Load the traced model

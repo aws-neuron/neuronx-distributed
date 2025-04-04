@@ -55,7 +55,7 @@ from transformers.models.mixtral.modeling_mixtral import (
     MixtralRMSNorm as MixtralRMSNormHF,
 )
 from transformers.models.mixtral.modeling_mixtral import (
-    MixtralRotaryEmbedding,
+    MixtralRotaryEmbedding as MixtralRotaryEmbeddingHF,
     apply_rotary_pos_emb,
     repeat_kv,
     rotate_half,
@@ -72,7 +72,6 @@ from neuronx_distributed.kernels.flash_attn import nki_flash_attn_func
 from neuronx_distributed.modules.moe.expert_mlps import ExpertMLPs
 from neuronx_distributed.modules.moe.loss_function import load_balancing_loss_func
 from neuronx_distributed.modules.moe.model import MoE
-from neuronx_distributed.modules.moe.moe_parallel_layers import LinearRouter
 from neuronx_distributed.modules.moe.routing import RouterTopK
 from neuronx_distributed.modules.qkv_linear import GQAQKVColumnParallelLinear
 from neuronx_distributed.parallel_layers import mappings
@@ -85,9 +84,6 @@ from neuronx_distributed.parallel_layers.loss_functions import parallel_cross_en
 from neuronx_distributed.parallel_layers.parallel_state import (
     get_tensor_model_parallel_size,
 )
-from neuronx_distributed.utils.model_utils import move_model_to_device
-
-
 
 
 def _init_normal(std, w):
@@ -173,8 +169,6 @@ class MixtralAttention(MixtralAttentionHF):
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.pretraining_tp = config.pretraining_tp
-        self.max_position_embeddings = config.max_position_embeddings
-        self.rope_theta = config.rope_theta
 
         if not hasattr(config, "kv_shared_group_size"):
             config.kv_shared_group_size = 1
@@ -256,20 +250,11 @@ class MixtralAttention(MixtralAttentionHF):
 
         self.core_attn = CoreAttention(sliding_window=config.sliding_window)
 
-        self.rotary_emb = MixtralRotaryEmbedding(
-            self.head_dim,
-            max_position_embeddings=self.max_position_embeddings,
-            base=self.rope_theta,
-        )
-
-        if config.move_model_to_device:
-            move_model_to_device(self, xm.xla_device())
-
     def forward(
         self,
         hidden_states: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
@@ -319,9 +304,8 @@ class MixtralAttention(MixtralAttentionHF):
             key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
             value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-        kv_seq_len = key_states.shape[-2]
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         # repeat k/v heads if n_kv_heads < n_heads
         key_states = repeat_kv(key_states, self.num_key_value_groups)
@@ -365,6 +349,8 @@ def initialize_mixtral_moe_layer(config):
         num_experts=config.num_local_experts,
         top_k=config.num_experts_per_tok,
         hidden_size=config.hidden_size,
+        sequence_parallel_enabled=True,
+        sequence_dimension=0,
     )
 
     init_method = partial(_init_normal, config.initializer_range)
@@ -388,6 +374,7 @@ def initialize_mixtral_moe_layer(config):
         expert_mlps=expert_mlps,
         return_router_logits=True,
         sequence_parallel_enabled=config.sequence_parallel_enabled,
+        sequence_dimension=0,
     )
 
     return moe_layer
@@ -423,8 +410,6 @@ class LlamaMLP(LlamaMLPHF):
             sequence_parallel_enabled=self.config.sequence_parallel_enabled,
         )
         self.split_size = self.intermediate_size // get_tensor_model_parallel_size()
-        if config.move_model_to_device:
-            move_model_to_device(self, xm.xla_device())
 
     def forward(self, x):
         if self.pretraining_tp > 1:
@@ -482,6 +467,7 @@ class MixtralDecoderLayer(MixtralDecoderLayerHF):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
         past_router_logits: Optional[torch.Tensor],
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
@@ -498,6 +484,7 @@ class MixtralDecoderLayer(MixtralDecoderLayerHF):
         """
         Args:
             hidden_states (`torch.FloatTensor`): input to the layer of shape `(batch, seq_len, embed_dim)`
+            position_embeddings (`Tuple[torch.Tensor, torch.Tensor]`): position embeddings
             past_router_logits(`torch.FloatTensor`): logits of all previous routers
             attention_mask (`torch.FloatTensor`, *optional*): attention mask of size
                 `(batch, sequence_length)` where padding elements are indicated by 0.
@@ -520,8 +507,8 @@ class MixtralDecoderLayer(MixtralDecoderLayerHF):
         # Self Attention
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
+            position_embeddings=position_embeddings,
             attention_mask=attention_mask,
-            position_ids=position_ids,
             past_key_value=past_key_value,
             output_attentions=output_attentions,
             use_cache=use_cache,
@@ -565,6 +552,32 @@ class MixtralDecoderLayer(MixtralDecoderLayerHF):
             outputs += (router_logits,)
 
         return outputs
+    
+
+class MixtralRotaryEmbedding(MixtralRotaryEmbeddingHF):
+    """
+    Wrapper for HF Mixtral Rotary Embedding.
+    The forward function is overriden to use `double()` instead of `float()` for numerical precision,
+    because NxD is using downcast. See https://github.com/huggingface/transformers/pull/29285.
+    """
+    @torch.no_grad()
+    def forward(self, x, position_ids):
+        if "dynamic" in self.rope_type:
+            self._dynamic_frequency_update(position_ids, device=x.device)
+        # Core RoPE block
+        inv_freq_expanded = self.inv_freq[None, :, None].double().expand(position_ids.shape[0], -1, 1)
+        position_ids_expanded = position_ids[:, None, :].double()
+        device_type = x.device.type
+        device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):
+            freqs = (inv_freq_expanded.double() @ position_ids_expanded.double()).transpose(1, 2)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos()
+            sin = emb.sin()
+        # Advanced RoPE types (e.g. yarn) apply a post-processing scaling factor, equivalent to scaling attention
+        cos = cos * self.attention_scaling
+        sin = sin * self.attention_scaling
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
 @add_start_docstrings(
@@ -594,6 +607,7 @@ class MixtralModel(MixtralModelHF):
         self.norm = MixtralRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps, sequence_parallel_enabled=config.sequence_parallel_enabled
         )
+        self.rotary_emb = MixtralRotaryEmbedding(config=config)
 
         self.gradient_checkpointing = False
         # Initialize weights and apply final processing
@@ -660,6 +674,9 @@ class MixtralModel(MixtralModelHF):
                 )
                 use_cache = False
 
+        # create position embeddings to be shared across the decoder layers
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
@@ -679,6 +696,7 @@ class MixtralModel(MixtralModelHF):
                 layer_outputs = checkpoint_method(
                     decoder_layer.__call__,
                     hidden_states,
+                    position_embeddings,
                     all_router_logits,
                     attention_mask,
                     position_ids,
@@ -689,6 +707,7 @@ class MixtralModel(MixtralModelHF):
             else:
                 layer_outputs = decoder_layer(
                     hidden_states,
+                    position_embeddings,
                     all_router_logits,
                     attention_mask=attention_mask,
                     position_ids=position_ids,
@@ -891,7 +910,9 @@ def init_weights(module, device):
     """
     if isinstance(module, MixtralRMSNorm):
         module.weight.data.fill_(1.0)
-    elif isinstance(module, (ParallelEmbedding, RowParallelLinear, ColumnParallelLinear, LinearRouter)):
+    elif isinstance(module, torch.nn.Linear):
+        module.reset_parameters()
+    elif isinstance(module, (ParallelEmbedding, RowParallelLinear, ColumnParallelLinear)):
         module.init_weight_cpu()
         if hasattr(module, "bias") and module.bias is not None:
             module.bias.data.zero_()

@@ -1,10 +1,15 @@
 import torch
 from torch_neuronx.xla_impl.ops import TopK
+from torch_neuronx.utils import get_platform_target 
+
+import math
+from itertools import islice
 
 from neuronx_distributed.parallel_layers.parallel_state import get_tensor_model_parallel_group
 from neuronx_distributed.parallel_layers.mappings import  _gather_along_dim
 
-def topk(tensor, k, dim, gather_dim, process_group=None):
+
+def topk(tensor, k, dim, gather_dim, process_group=None, stages=1, rank_id=None):
     """
     This function performs a distributed topk.
     This function will take in a sharded tensor,
@@ -33,6 +38,37 @@ def topk(tensor, k, dim, gather_dim, process_group=None):
     
     process_group = process_group if process_group is not None else get_tensor_model_parallel_group(as_list=False)
     tp_degree = torch.distributed.get_world_size(group=process_group)
+    hardware = get_platform_target()
+
+    if stages > 1:
+        if hardware == "trn2":
+            assert tp_degree == 64, f"tp degree other than 64 is not supported got {tp_degree} on {hardware}"
+            assert stages == 3, f"stages other than 3 is not supported got {stages} on {hardware}"
+        else:
+            assert tp_degree == 32, f"tp degree other than 32 is not supported got {tp_degree} on {hardware}"
+            assert stages == 2, f"stages other than 2 is not supported got {stages} on {hardware}"
+
+
+        mesh = []
+        if hardware == "trn2": # 4x4x4 topology
+            group_size = int(math.ceil(math.pow(tp_degree,1/stages)))
+            n_groups = tp_degree//group_size
+
+            mesh.append([list(range(i, i + group_size)) for i in range(0, tp_degree, group_size)])
+            mesh.append([list(islice(range(j,tp_degree,group_size),i,i+group_size)) for i in range(0,n_groups,group_size) for j in range(group_size)])
+            mesh.append([list(range(i,tp_degree,n_groups)) for i in range(n_groups)])
+        elif hardware == "trn1": #8x4 topology
+            group_size = 8
+            n_groups = tp_degree//group_size
+
+            mesh.append([list(range(i, i + group_size)) for i in range(0, tp_degree, group_size)])
+            mesh.append([list(islice(range(j,tp_degree,group_size),i,i+group_size)) for i in range(0,n_groups,group_size) for j in range(group_size)])
+        else:
+            raise NotImplementedError(f"Unsupported hardware type {hardware}")
+
+        stage_pg=[]
+        for i in range(stages):
+            stage_pg.append(torch.distributed.new_group(mesh[i], pg_options={"xla_pg_options": {"mesh": mesh[i]}}))
 
     if tp_degree == 1:
         return TopK.apply(tensor, k, dim)
@@ -43,9 +79,24 @@ def topk(tensor, k, dim, gather_dim, process_group=None):
     # find local rank max value and index
     local_value, local_index = TopK.apply(tensor, k, dim=dim)
 
-    # perform all-gather on the local rank topk values and indices to get global topk and indices
-    global_values = _gather_along_dim(local_value, gather_dim, process_group=process_group)
-    global_indices = _gather_along_dim(local_index, gather_dim, process_group=process_group)
+    if stages > 1:
+        if gather_dim == dim:
+            rank_offset = rank_id*sharded_size
+            local_index = local_index + rank_offset.to(torch.int32)
+        else:
+            raise NotImplementedError
+        for i in range(stages):
+            local_value = _gather_along_dim(local_value, gather_dim, process_group=stage_pg[i])
+            local_index_ = _gather_along_dim(local_index, gather_dim, process_group=stage_pg[i])
+
+            local_value, local_index = TopK.apply(local_value, k, dim=dim) 
+            local_index = torch.gather(local_index_, dim, local_index)
+
+        return local_value, local_index
+    else:
+        # perform all-gather on the local rank topk values and indices to get global topk and indices
+        global_values = _gather_along_dim(local_value, gather_dim, process_group=process_group)
+        global_indices = _gather_along_dim(local_index, gather_dim, process_group=process_group)
 
     # indices are based on local shard, so we need to correct it by applying
     # an offset derived from tp degree and sharded size. This is only applicable

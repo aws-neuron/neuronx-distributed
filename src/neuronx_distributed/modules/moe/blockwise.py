@@ -1,19 +1,26 @@
 import torch
 import torch_xla.core.xla_model as xm
 import torch.nn.functional as F
+from neuronx_distributed.parallel_layers import mappings
 
 try:
     from neuronxcc.nki._private_kernels.blockwise_mm import (
         blockwise_mm as blockwise_mm_nki,
+        blockwise_mm_baseline as blockwise_mm_training_nki,
         check_blockwise_mm_kernel_compatibility,
     )
+    from neuronxcc.nki._private_kernels.blockwise_mm_bwd import blockwise_mm_bwd as blockwise_mm_bwd_nki
     from torch_neuronx.xla_impl.ops import nki_jit
     from torch_neuronx.xla_impl.base import xla_call
 
     _blockwise_mm_nki_call = nki_jit()(blockwise_mm_nki)
+    _blockwise_mm_training_nki_call = nki_jit()(blockwise_mm_training_nki)
+    _blockwise_mm_nki_bwd_call = nki_jit()(blockwise_mm_bwd_nki)
 except ImportError as e:
     import_error_msg = str(e)
     _blockwise_mm_nki_call = None
+    _blockwise_mm_nki_bwd_call = None
+
 
 
 def dynamic_slice_3D(tensor, start0, start1, start2, size0, size1, size2):
@@ -55,14 +62,14 @@ class TorchBlockwiseTraining(torch.autograd.Function):
         ctx,
         hidden_states,
         expert_affinities_masked,
-        block_position_to_token_idx,
-        block_to_expert_idx,
+        token_position_to_id,
+        block_to_expert,
         gate_up_weight,
         down_weight,
     ):
-        ctx.num_blocks = num_blocks = block_to_expert_idx.shape[0]
+        ctx.num_blocks = num_blocks = block_to_expert.shape[0]
         total_tokens, hidden_size = hidden_states.shape
-        block_size = (block_position_to_token_idx.shape[0] - 1) // num_blocks
+        block_size = token_position_to_id.shape[0] // num_blocks
         # Add extra row for output of padding tokens (i.e. tokens which have -1 index)
         output = torch.zeros(
             total_tokens + 1,
@@ -71,7 +78,7 @@ class TorchBlockwiseTraining(torch.autograd.Function):
             dtype=hidden_states.dtype,
         )
         # block_to_token_indices: (N, B)
-        block_to_token_indices = block_position_to_token_idx[1:].view(
+        block_to_token_indices = token_position_to_id.view(
             num_blocks, block_size
         )
         gate_up_activations = torch.empty(
@@ -108,9 +115,9 @@ class TorchBlockwiseTraining(torch.autograd.Function):
                 size0=1,
                 size1=block_to_token_indices.shape[1],
             ).squeeze(0)
-            # Original: block_expert_idx = block_to_expert_idx[block_idx]
+            # Original: block_expert_idx = block_to_expert[block_idx]
             block_expert_idx = dynamic_slice_1D(
-                tensor=block_to_expert_idx, start0=block_idx, size0=1
+                tensor=block_to_expert, start0=block_idx, size0=1
             )[0]
 
             # Gate up projection.
@@ -177,7 +184,7 @@ class TorchBlockwiseTraining(torch.autograd.Function):
             hidden_states,
             expert_affinities_masked,
             block_to_token_indices,
-            block_to_expert_idx,
+            block_to_expert,
             gate_up_weight,
             down_weight,
             gate_up_activations,
@@ -191,8 +198,8 @@ class TorchBlockwiseTraining(torch.autograd.Function):
         (
             hidden_states,
             expert_affinities_masked,
-            block_to_token_indices,
-            block_to_expert_idx,
+            token_position_to_id,
+            block_to_expert,
             gate_up_weight,
             down_weight,
             gate_up_activations,
@@ -233,14 +240,14 @@ class TorchBlockwiseTraining(torch.autograd.Function):
             # Get token indices and expert id.
             # Original: block_token_indices = block_to_token_indices[block_idx]
             block_token_indices = dynamic_slice_2D(
-                tensor=block_to_token_indices,
+                tensor=token_position_to_id,
                 start0=block_idx,
                 start1=zero_idx,
                 size0=1,
-                size1=block_to_token_indices.shape[1],
+                size1=token_position_to_id.shape[1],
             ).squeeze(0)
-            # Original: block_expert_idx = block_to_expert_idx[block_idx]
-            block_expert_idx = dynamic_slice_1D(block_to_expert_idx, block_idx, 1)[0]
+            # Original: block_expert_idx = block_to_expert[block_idx]
+            block_expert_idx = dynamic_slice_1D(block_to_expert, block_idx, 1)[0]
 
             block_grad = grad_output_padded[block_token_indices]
 
@@ -433,10 +440,11 @@ class BlockwiseMatmulNKIFunc(torch.autograd.Function):
         gate_up_proj_weight,
         down_proj_weight,
         block_size,
-        block_position_to_token_idx,
-        block_to_expert_idx,
+        token_position_to_id,
+        block_to_expert,
         gate_up_proj_scale,
         down_proj_scale,
+        is_training,
     ):
         """
         Forward pass using the blockwise matmul NKI kernel.
@@ -455,13 +463,22 @@ class BlockwiseMatmulNKIFunc(torch.autograd.Function):
             gate_up_proj_weight: (E, H, 2I)
             down_proj_weight: (E, I, H)
             block_size: int
-            block_position_to_token_idx: (N*B+1, )
-            block_to_expert_idx: (N, 1)
+            token_position_to_id: (N*B,)
+            block_to_expert: (N,)
         """
         assert _blockwise_mm_nki_call is not None
 
         total_tokens, hidden_size = hidden_states.shape
-        num_experts = expert_affinities_masked.shape[1]
+        ctx.total_tokens = total_tokens
+        ctx.num_experts = expert_affinities_masked.shape[1]
+        ctx.intermediate_size = down_proj_weight.shape[1]
+        if is_training:
+            num_block = block_to_expert.shape[0]
+            gate_up_activations = torch.empty(num_block, 2, ctx.intermediate_size, block_size, dtype=gate_up_proj_weight.dtype, device=gate_up_proj_weight.device)
+            down_activations = torch.empty(num_block, block_size, hidden_size, dtype=down_proj_weight.dtype, device=down_proj_weight.device)
+        else:
+            gate_up_activations = None
+            down_activations = None
 
         # Add extra row to hidden_states and output for padding tokens (i.e. tokens which have -1 index)
         # TODO: Change this to (T, H) once the compiler issue with NaNs in skipped DMAs is fixed
@@ -474,15 +491,16 @@ class BlockwiseMatmulNKIFunc(torch.autograd.Function):
         # expert_affinities_masked: (T+1, E)
         expert_affinities_masked = torch.cat([
             expert_affinities_masked,
-            torch.zeros(1, num_experts, device=expert_affinities_masked.device, dtype=expert_affinities_masked.dtype)
+            torch.zeros(1, ctx.num_experts, device=expert_affinities_masked.device, dtype=expert_affinities_masked.dtype)
         ])
 
         # TODO: Disable skipping DMAs until compiler issue is fixed
-        block_position_to_token_idx = block_position_to_token_idx.masked_fill(torch.eq(block_position_to_token_idx, -1), total_tokens)
+        token_position_to_id = token_position_to_id.masked_fill(torch.eq(token_position_to_id, -1), total_tokens)
 
         # Reshape gate_up_proj_weight to (E, H, 2, I) as expected by the kernel
-        gate_up_proj_weight = gate_up_proj_weight.view(num_experts, hidden_size, 2, -1)
+        gate_up_proj_weight = gate_up_proj_weight.view(ctx.num_experts, hidden_size, 2, -1)
         # Flatten expert_affinities_masked: ((T+1)*E, 1)
+        # TODO: cannot refactor to (T+1, E) as we currently don't support dynamic slice on both axis.
         expert_affinities_masked = expert_affinities_masked.view(-1, 1)
 
         if gate_up_proj_scale is not None:
@@ -495,54 +513,115 @@ class BlockwiseMatmulNKIFunc(torch.autograd.Function):
             assert down_proj_scale.shape[0] == 1 and down_proj_scale.shape[1] == 1
             down_proj_scale = down_proj_scale.view(-1)
 
-        _blockwise_mm_nki_call(
-            # Inputs
-            hidden_states,  # hidden_states: (T+1, H)
-            expert_affinities_masked,  # expert_affinities_masked: ((T+1)*E, 1)
-            # MLP weights
-            gate_up_proj_weight,  # gate_up_proj_weight: (E, H, 2, I)
-            down_proj_weight,  # down_proj_weight: (E, I, H)
-            # Block related
-            block_size,
-            block_position_to_token_idx.to(dtype=torch.int32),  # block_position_to_token_idx: (N*B+1, )
-            block_to_expert_idx.to(dtype=torch.int32),  # block_to_expert_idx: (N, 1)
-            # Output
-            output,  # output: (T+1, H)
-            # Meta parameters
-            False,  # SKIP_DMA
-            gate_up_proj_scale,  # gate_up_proj_scale: (2, I)
-            down_proj_scale,  # down_proj_scale: (H)
-        )
+        if is_training:
+            _blockwise_mm_training_nki_call(
+                # Inputs
+                hidden_states=hidden_states,
+                expert_affinities_masked=expert_affinities_masked,
+                # MLP weights
+                gate_up_proj_weight=gate_up_proj_weight,
+                down_proj_weight=down_proj_weight,
+                # Block related
+                block_size=block_size,
+                token_position_to_id=token_position_to_id.to(dtype=torch.int32),
+                block_to_expert=block_to_expert.to(dtype=torch.int32),
+                # Output
+                output=output,
+                gate_up_activations_T=gate_up_activations,
+                down_activations=down_activations,
+            )
+        else:
+            _blockwise_mm_nki_call(
+                # Inputs
+                hidden_states=hidden_states,
+                expert_affinities_masked=expert_affinities_masked,
+                # MLP weights
+                gate_up_proj_weight=gate_up_proj_weight,
+                down_proj_weight=down_proj_weight,
+                # Block related
+                block_size=block_size,
+                token_position_to_id=token_position_to_id.to(dtype=torch.int32),
+                block_to_expert=block_to_expert.to(dtype=torch.int32),
+                # Output
+                output=output,
+                skip_dma=False,
+                gate_up_proj_scale=gate_up_proj_scale,
+                down_proj_scale=down_proj_scale,
+            )
 
         # Drop the last row
         output = output[:total_tokens, :]
+        ctx.save_for_backward(
+            hidden_states,
+            expert_affinities_masked.view(total_tokens + 1, ctx.num_experts),
+            token_position_to_id,
+            block_to_expert,
+            gate_up_proj_weight,
+            down_proj_weight,
+            gate_up_activations,
+            down_activations,
+        )
 
         return output
 
     @staticmethod
-    def backward(ctx, *kwargs):
-        raise NotImplementedError("Backward pass of blockwise NKI kernel is not implemented.")
+    def backward(ctx, grad_output):
+        assert _blockwise_mm_nki_bwd_call is not None
+        (
+            hidden_states,
+            expert_affinities_masked,
+            token_position_to_id,
+            block_to_expert,
+            gate_up_proj_weight,
+            down_proj_weight,
+            gate_up_activations,
+            down_activations,
+        ) = ctx.saved_tensors
+        _, E = expert_affinities_masked.shape
+        T = ctx.total_tokens
+        H = hidden_states.shape[-1]
 
+        hidden_states_grad = torch.zeros(T + 1, H, device=hidden_states.device, dtype=hidden_states.dtype)
+        affinities_grad = torch.zeros(
+            T + 1, E, device=expert_affinities_masked.device, dtype=expert_affinities_masked.dtype
+        )
+        gate_up_proj_weight_grad = torch.zeros_like(gate_up_proj_weight, dtype=gate_up_proj_weight.dtype)
+        down_weight_grad = torch.zeros_like(down_proj_weight, dtype=down_proj_weight.dtype)
+        # add last row for -1 token index to get 0 grad
+        grad_output_padded = torch.concat(
+            [grad_output, torch.zeros(1, H, device=grad_output.device, dtype=grad_output.dtype)], dim=0
+        )
+        _blockwise_mm_nki_bwd_call(
+            hidden_states,
+            hidden_states_grad,
+            expert_affinities_masked.reshape(-1, 1),
+            affinities_grad.view(-1, 1),
+            gate_up_proj_weight,
+            gate_up_proj_weight_grad,
+            gate_up_activations,
+            down_proj_weight,
+            down_weight_grad,
+            down_activations,
+            token_position_to_id.to(dtype=torch.int32),
+            block_to_expert.to(dtype=torch.int32),
+            grad_output_padded,
+        )
+        # FIXME: Compiler error without .clone()
+        hidden_states_grad = hidden_states_grad[:T].clone()
+        torch.distributed.all_reduce(
+            hidden_states_grad,
+            group=mappings.get_tensor_model_parallel_group(),
+        )
+        return (
+            hidden_states_grad[:T],
+            affinities_grad[:T],
+            gate_up_proj_weight_grad.reshape(E, H, 2*ctx.intermediate_size),
+            down_weight_grad,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
 
-def blockwise_matmul_nki_func(
-    hidden_states,
-    expert_affinities_masked,
-    gate_up_proj_weight,
-    down_proj_weight,
-    block_size,
-    block_position_to_token_idx,
-    block_to_expert_idx,
-    gate_up_proj_scale=None,
-    down_proj_scale=None,
-):
-    return BlockwiseMatmulNKIFunc.apply(
-        hidden_states,
-        expert_affinities_masked,
-        gate_up_proj_weight,
-        down_proj_weight,
-        block_size,
-        block_position_to_token_idx,
-        block_to_expert_idx,
-        gate_up_proj_scale,
-        down_proj_scale,
-    )

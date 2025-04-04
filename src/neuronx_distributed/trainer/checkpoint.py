@@ -50,7 +50,7 @@ else:
     dcp_utils = None
 
 
-def _get_path(prefix: str, tp: bool = True, pp: bool = True, dp: bool = False, ep: bool = False) -> str:
+def _get_path(prefix: str, tp: bool = True, pp: bool = True, dp: bool = False, ep: bool = False, cp: bool = False) -> str:
     path = ""
     path += "_dp_rank_{:02d}".format(get_data_parallel_rank() if dp else 0)
     path += "_ep_rank_{:02d}".format(get_expert_model_parallel_rank()) if ep else ""
@@ -170,7 +170,6 @@ class CheckpointIOState:
     def _dealloc_tensor_host_memory_callback(self, future):
         """Future callback to asynchronous deallocate the tensor host memory"""
         self._save_items = []
-        gc.collect()
 
     def end(self, num_kept: int) -> None:
         if self._async_save:
@@ -220,6 +219,7 @@ class CheckpointIOState:
             # This is already asynchronously invoked in _dealloc_tensor_host_memory_callback
             # However, this needs to be kept for the sync checkpointing case
             self._save_items = []
+            gc.collect()
         if self._dcp_save_task:
             self._dcp_save_task = None
             self._dcp_save_items = []
@@ -319,7 +319,6 @@ class CheckpointIOState:
         self.wait_save(async_remove=False)
     
     def finalize_shutdown(self):
-        logger.info("Python interpreter is shutting down")
         global is_interpreter_active
         is_interpreter_active = False
 
@@ -345,7 +344,10 @@ def _get_ep_group_info() -> Tuple[int, int, int, int, List[List[int]], List[List
 
 
 def _xser_load_data(
-    checkpoint_dir: BaseCheckpointStorage, path: str, groups: Optional[List[List[int]]] = None, ep_only: bool = False
+    checkpoint_dir: BaseCheckpointStorage,
+    path: str, groups: Optional[List[List[int]]] = None,
+    ep_only: bool = False,
+    ignore_tensor_data: bool = False,
 ):
     """
     load tensors saved in path into a state_dict.
@@ -379,6 +381,12 @@ def _xser_load_data(
 
         def _load_tensors(tensor_list, _group, _rank, _group_size, _tensor_folder):
             for idx, (original_idx, t) in enumerate(tensor_list):
+
+                if ignore_tensor_data:
+                    if ref_info is None or ref_info[t.tid]["dtype"] is None:
+                        raise RuntimeError("Error: cannot ignore tensor data when dtype was not given")
+                    return torch.zeros(ref_info[t.tid]["shape"], dtype=ref_info[t.tid]["dtype"], device=xm.xla_device())
+
                 tensor_file = os.path.join(_tensor_folder, "tensor_{}.pt".format(t.tid))
 
                 if (ref_info is not None) and (groups is not None):
@@ -398,7 +406,7 @@ def _xser_load_data(
                         loaded = torch.zeros(shape, dtype=dtype, device=xm.xla_device())
 
                     # we use all_reduce to implement broadcast because xla does not have native broadcast support.
-                    loaded = xm.all_reduce(xm.REDUCE_SUM, loaded, groups=_group)
+                    xm.all_reduce(xm.REDUCE_SUM, [loaded], groups=_group)
                 else:
                     # when dtype and shape are not available or there is no redundency, all workers load tensor from disk
                     loaded = checkpoint_dir.load_object(tensor_file).to(xm.xla_device())
@@ -471,6 +479,7 @@ def _xser_save_data(
     state_dict,
     iostate: CheckpointIOState,
     groups: Optional[List[List[int]]] = None,
+    ignore_tensor_data: bool = False,
 ) -> Any:
     """
     This function save the tensors in a state_dict into a directory.
@@ -488,7 +497,7 @@ def _xser_save_data(
     emp_rank, edp_rank, emp_size, edp_size, emp_group, edp_group = _get_ep_group_info()
 
     def convert_fn(tensors: List[torch.Tensor]) -> List[object]:
-        torch_xla._XLAC._xla_sync_multi(tensors, devices=[], wait=True, sync_xla_data=True)
+        torch_xla._XLAC._xla_sync_multi(tensors, devices=[], wait=True, sync_xla_data=False)
 
         if groups is None:
             my_tensors = None
@@ -499,13 +508,14 @@ def _xser_save_data(
         for i, t in enumerate(tensors):
             is_expert_parallel = getattr(t, "expert_model_parallel", False)
             if (my_tensors is None) or (i in my_tensors):
-                t0 = datetime.now()
-                cpu_data = t.cpu()
-                t1 = datetime.now()
-                # if the below condition is not satisfied, someone else will store the same data
-                if my_tensors is None or (is_expert_parallel or emp_rank == 0):
-                    iostate.add_save_task(cpu_data, xser._get_tensor_file(path, i))
-                logger.debug("    transfer tensor %d to cpu elapsed: %d seconds", i, (t1 - t0).total_seconds())
+                if not ignore_tensor_data:
+                    t0 = datetime.now()
+                    cpu_data = t.cpu()
+                    t1 = datetime.now()
+                    # if the below condition is not satisfied, someone else will store the same data
+                    if my_tensors is None or (is_expert_parallel or emp_rank == 0):
+                        iostate.add_save_task(cpu_data, xser._get_tensor_file(path, i))
+                    logger.debug("    transfer tensor %d to cpu elapsed: %d seconds", i, (t1 - t0).total_seconds())
             rewritten_tensors.append(_InternalTensorReference(i, t.shape, t.dtype, is_expert_parallel))
         return rewritten_tensors
 
@@ -540,6 +550,7 @@ def _save(
     use_xser: bool = False,
     iostate: Optional[CheckpointIOState] = None,
     optimizer: bool = False,
+    ignore_tensor_data: bool = False,
 ) -> None:
     if ckpt is None:
         return
@@ -550,7 +561,9 @@ def _save(
     # quick path when use xser
     if use_xser:
         assert iostate
-        state_dict = _xser_save_data(checkpoint_dir, xser._get_tensors_folder(path), ckpt, iostate, groups)
+        if ignore_tensor_data:
+            logger.info("Because zero1 optimizer states have master weights, weights in model will not be saved")
+        state_dict = _xser_save_data(checkpoint_dir, xser._get_tensors_folder(path), ckpt, iostate, groups, ignore_tensor_data)
         if (groups is None) or (edp_rank == 0):
             tensor_info: Dict[int, Dict[str, Any]] = {}
             # to make sure path can be loaded using xser.load(), we must update
@@ -591,6 +604,7 @@ def _load(
     num_workers: int = 8,
     strict: bool = True,
     use_xser: bool = False,
+    ignore_tensor_data: bool = False,
 ) -> None:
     """
     Load object the save as path.
@@ -604,8 +618,11 @@ def _load(
     """
     # quick path when use xser
     if use_xser:
-        ckpt = _xser_load_data(checkpoint_dir, path, groups)
+        ckpt = _xser_load_data(checkpoint_dir, path, groups, ignore_tensor_data=ignore_tensor_data)
         ckpt = _move_step_to_cpu(ckpt)
+        # When zero1 master weights available, model params will be loaded from optim states master weights
+        if ignore_tensor_data:
+            return
         _load_obj_from_state_dict(obj, ckpt, strict)
         return
 
@@ -623,6 +640,12 @@ def has_checkpoint(checkpoint_dir_str: str) -> bool:
     checkpoint_dir = create_checkpoint_storage(checkpoint_dir_str)
     return len(checkpoint_dir.list_completed_checkpoint_tags()) > 0
 
+def _zero1_optimizer_states_have_master_weights(zero1_optimizer_states) -> bool:
+    if isinstance(zero1_optimizer_states, dict):
+        return 'sharded_master_weights' in zero1_optimizer_states
+    elif isinstance(zero1_optimizer_states, list) and len(zero1_optimizer_states) > 0:
+        return 'sharded_master_weights' in zero1_optimizer_states[0]
+    return False
 
 g_iostate = None
 
@@ -640,6 +663,7 @@ def save_checkpoint(
     async_save=False,
     zero1_optimizer=False,
     use_zero1_dcp=False,
+    avoid_saving_lower_precision_weights=False,
 ) -> None:
     """
     Method to save checkpoint, return ``None``.
@@ -694,6 +718,9 @@ def save_checkpoint(
     # TODO: Use distributed checkpoint
     assert torch.distributed.is_initialized(), "Only support distributed training mode."
 
+    # Can not use both
+    assert not (use_zero1_dcp and avoid_saving_lower_precision_weights), "Can not use DCP and avoid_saving_redundant_weights config"
+
     checkpoint_dir = create_checkpoint_storage(checkpoint_dir_str)
     if torch.distributed.get_rank() == 0:
         checkpoint_dir.create_dir(".")
@@ -711,29 +738,7 @@ def save_checkpoint(
 
     ep_enabled = get_expert_model_parallel_size() > 1
 
-    # save model
-    if model is not None:
-        if torch.distributed.get_rank() == 0:
-            checkpoint_dir.create_dir(os.path.join(ckpt_path, "model"), exist_ok=True)
-        xm.rendezvous("Ensure checkpoint directory for model has been created before moving on.")
-        model_path = os.path.join(ckpt_path, _get_path("model", ep=ep_enabled))
-
-        if isinstance(model, NxDPPModel):
-            ckpt = model.local_state_dict()
-        elif isinstance(model, dict):
-            ckpt = model
-        else:
-            ckpt = model.state_dict()
-
-        _save(
-            ckpt,
-            checkpoint_dir,
-            model_path,
-            groups=get_expert_data_parallel_replica_groups(),
-            num_workers=num_workers,
-            use_xser=use_xser,
-            iostate=g_iostate,
-        )
+    ignore_tensor_data = False
 
     # save optimizer
     if optimizer is not None:
@@ -753,6 +758,8 @@ def save_checkpoint(
 
         if zero1_enabled:
             par_args = {"dp": True}
+            if avoid_saving_lower_precision_weights and _zero1_optimizer_states_have_master_weights(optimizer_state_dict):
+                ignore_tensor_data = True
         elif ep_enabled:
             par_args = {"ep": True}
         else:
@@ -775,7 +782,33 @@ def save_checkpoint(
                 use_xser=use_xser,
                 iostate=g_iostate,
                 optimizer=True,
+                ignore_tensor_data=False # always save tensor data
             )
+
+    # save model
+    if model is not None:
+        if torch.distributed.get_rank() == 0:
+            checkpoint_dir.create_dir(os.path.join(ckpt_path, "model"), exist_ok=True)
+        xm.rendezvous("Ensure checkpoint directory for model has been created before moving on.")
+        model_path = os.path.join(ckpt_path, _get_path("model", ep=ep_enabled))
+
+        if isinstance(model, NxDPPModel):
+            ckpt = model.local_state_dict()
+        elif isinstance(model, dict):
+            ckpt = model
+        else:
+            ckpt = model.state_dict()
+            
+        _save(
+            ckpt,
+            checkpoint_dir,
+            model_path,
+            groups=get_expert_data_parallel_replica_groups(),
+            num_workers=num_workers,
+            use_xser=use_xser,
+            iostate=g_iostate,
+            ignore_tensor_data=ignore_tensor_data,
+        )
 
     # save scheduler
     if scheduler is not None:
@@ -798,6 +831,7 @@ def _move_step_to_cpu(ckpt: Any, key: Optional[str] = None) -> Any:
         return {k: _move_step_to_cpu(v, k) for k, v in ckpt.items()}
 
     return ckpt
+
 
 
 def load_checkpoint(
@@ -843,7 +877,7 @@ def load_checkpoint(
     if tag is None:
         tags = checkpoint_dir.list_completed_checkpoint_tags()
         if len(tags) == 0:
-            raise RuntimeError("Error: no checkpoint under directory {checkpoint_dir}")
+            raise RuntimeError(f"Error: no checkpoint under directory {checkpoint_dir}")
         tag = tags[-1]
 
     ckpt_path = str(tag)
@@ -853,40 +887,37 @@ def load_checkpoint(
     logger.info("loading checkpoint from %s", ckpt_path)
     groups: Optional[List[List[int]]]
 
-    # load model
-    if model is not None:
-        model_path = os.path.join(ckpt_path, _get_path("model", ep=ep_enabled))
-        _load(
-            model,
-            checkpoint_dir,
-            model_path,
-            groups=get_data_parallel_replica_groups(),
-            num_workers=num_workers,
-            strict=strict,
-            use_xser=use_xser,
-        )
+    # if z1 optim saved with sharded weights while omitting redundant model weights
+    ignore_tensors = False
 
     # load optimizer
     if optimizer is not None:
         if isinstance(optimizer, NxDOptimizer):
             zero1_enabled = optimizer.nxd_config["optimizer_config"]["zero_one_enabled"]
+            optimizer_state_dict = optimizer.state_dict()
         elif isinstance(optimizer, dict):
             # zero1 optimizer spread optimizer states across dp group, and each process has unique optimizer state and will save to disk
             # therefore, if there exists a file named dp_rank_01_tp_rank_00_pp_rank_00.pt, then the checkpoint was generated by zero1 optimizer.
             zero1_optimizer_specific_file = os.path.join(ckpt_path, "optim", "dp_rank_01_tp_rank_00_pp_rank_00.pt")
             zero1_enabled = checkpoint_dir.file_exists(zero1_optimizer_specific_file)
+            optimizer_state_dict = optimizer
         elif isinstance(optimizer, NeuronZero1Optimizer):
             zero1_enabled = True
+            optimizer_state_dict = optimizer
         else:
             raise RuntimeError(
                 f"Error: invalid type for the argument optimizer for load_checkpoint, expecting a dict or NxDOptimizer, or NeuronZero1Optimizer, got {type(optimizer)}"
             )
-
         ep_enabled = get_expert_model_parallel_size() > 1
 
         if zero1_enabled:
             par_args = {"dp": True}
             groups = None
+            if _zero1_optimizer_states_have_master_weights(optimizer_state_dict):
+                # zero1 overrides model params with master weights anyways
+                ignore_tensors = True
+                # note: this log msg is used in unit tests for assertion
+                logger.info("Sharded master weights found in optim states, ignoring model weight tensors")
         elif ep_enabled:
             par_args = {"ep": True}
             groups = get_expert_data_parallel_replica_groups()
@@ -903,6 +934,20 @@ def load_checkpoint(
         else:
             optimizer_path = os.path.join(ckpt_path, _get_path("optim", **par_args))
             _load(optimizer, checkpoint_dir, optimizer_path, groups=groups, num_workers=num_workers, use_xser=use_xser)
+
+    # load model
+    if model is not None:
+        model_path = os.path.join(ckpt_path, _get_path("model", ep=ep_enabled))
+        _load(
+            model,
+            checkpoint_dir,
+            model_path,
+            groups=get_data_parallel_replica_groups(),
+            num_workers=num_workers,
+            strict=strict,
+            use_xser=use_xser,
+            ignore_tensor_data=ignore_tensors
+        )
 
     # load scheduler
     if scheduler is not None:

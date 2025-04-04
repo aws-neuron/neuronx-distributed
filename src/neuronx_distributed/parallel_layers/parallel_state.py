@@ -13,6 +13,7 @@ from enum import Enum
 from collections import namedtuple
 from torch_neuronx.utils import get_platform_target
 
+from neuronxcc.nki._private_kernels.collectives import CollectivesConfig
 
 if TYPE_CHECKING:
     from torch._C._distributed_c10d import Store
@@ -48,6 +49,12 @@ _PREV_RANK_GROUP_SPMD: Optional[List[List[int]]] = None
 _NEXT_RANK_GROUP: Optional[ProcessGroup] = None
 _PREV_RANK_GROUP: Optional[ProcessGroup] = None
 
+# Intra-layer context parallel group that the current rank belongs to.
+_CONTEXT_MODEL_PARALLEL_GROUP: Optional[ProcessGroup] = None
+_CONTEXT_MODEL_PARALLEL_GROUP_SPMD: Optional[List[List[int]]] = None
+global _CONTEXT_PARALLEL_SRC_TGT_PAIRS
+_CONTEXT_PARALLEL_SRC_TGT_PAIRS = None
+
 # Data parallel group that the current rank belongs to.
 _DATA_PARALLEL_GROUP: Optional[ProcessGroup] = None
 _DATA_PARALLEL_GROUP_SPMD: Optional[List[List[int]]] = None
@@ -59,6 +66,8 @@ _EXP_DATA_PARALLEL_GROUP_SPMD: Optional[List[List[int]]] = None
 # These values enable us to change the mpu sizes on the fly.
 _MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE: Optional[int] = None
 _MPU_TENSOR_MODEL_PARALLEL_RANK: Optional[int] = None
+_MPU_CONTEXT_MODEL_PARALLEL_WORLD_SIZE: Optional[int] = None
+_MPU_CONTEXT_MODEL_PARALLEL_RANK: Optional[int] = None
 
 _MPU_EXPERT_MODEL_PARALLEL_WORLD_SIZE: Optional[int] = None
 _MPU_EXPERT_MODEL_PARALLEL_RANK: Optional[int] = None
@@ -88,11 +97,11 @@ PP_GROUP_PG_GLOO: Optional[ProcessGroup] = None
 _AOT_MODE = False
 
 
-ParallelGroups = namedtuple('ParallelGroups', ['tp_groups', 'dp_groups', 'pp_groups', 'ep_model_groups', 'ep_data_groups'])
+ParallelGroups = namedtuple('ParallelGroups', ['tp_groups', 'dp_groups', 'pp_groups', 'ep_model_groups', 'ep_data_groups', 'cp_groups'])
 
 def ascending_ring_PG_group(lnc_size: int, cluster_ranks_nonexp: torch.tensor,
                             cluster_ranks_exp: torch.tensor,  tp: int, dp: int, pp: int, 
-                            ep_model_degree: int, ep_data_degree: int) -> ParallelGroups:
+                            ep_model_degree: int, ep_data_degree: int, cp:int=1) -> ParallelGroups:
     # this function never uses lnc_size but passed along to support the fn pointer logic,
     # so its value doesnt matter eg: in case of trn1, this value doesnt matter.
     # Logic 1: Group tensor parallel group in ascending ring fashion 0 to n-1 consecutive ranks 
@@ -100,26 +109,38 @@ def ascending_ring_PG_group(lnc_size: int, cluster_ranks_nonexp: torch.tensor,
 
     # Build the tensor model-parallel groups.
     tp_groups = [
-        cluster_ranks_nonexp[pp_rank, dp_rank, :].tolist()
-        for pp_rank, dp_rank in itertools.product(
+        cluster_ranks_nonexp[pp_rank, dp_rank, cp_rank, :].tolist()
+        for pp_rank, dp_rank, cp_rank in itertools.product(
             range(pp),
             range(dp),
+            range(cp),
         )
     ]
 
     # Build the data parallel groups.
     dp_groups = [
-        cluster_ranks_nonexp[pp_rank, :, tp_rank].tolist()
-        for pp_rank, tp_rank in itertools.product(
+        cluster_ranks_nonexp[pp_rank, :, cp_rank, tp_rank].tolist()
+        for pp_rank, cp_rank, tp_rank in itertools.product(
             range(pp),
+            range(cp),
             range(tp),
         )
     ]
 
     # Build the pipeline model-parallel groups.
     pp_groups = [
-        cluster_ranks_nonexp[:, dp_rank, tp_rank].tolist()
-        for dp_rank, tp_rank in itertools.product(
+        cluster_ranks_nonexp[:, dp_rank, cp_rank, tp_rank].tolist()
+        for dp_rank, cp_rank, tp_rank in itertools.product(
+            range(dp),
+            range(cp),
+            range(tp),
+        )
+    ]
+
+    cp_groups = [
+        cluster_ranks_nonexp[pp_rank, dp_rank, :, tp_rank].tolist()
+        for pp_rank, dp_rank, tp_rank in itertools.product(
+            range(pp),
             range(dp),
             range(tp),
         )
@@ -145,11 +166,13 @@ def ascending_ring_PG_group(lnc_size: int, cluster_ranks_nonexp: torch.tensor,
         )
     ]
 
-    return ParallelGroups(tp_groups, dp_groups, pp_groups, ep_model_groups, ep_data_groups)
+    return ParallelGroups(tp_groups, dp_groups, pp_groups, ep_model_groups, ep_data_groups, cp_groups)
 
+
+#TODO: update this to work with context parallel
 def ascending_descending_ring_PG_group(lnc_size: int, cluster_ranks_nonexp: torch.tensor,
                                        cluster_ranks_exp: torch.tensor,  tp: int, dp: int, pp: int,
-                                       ep_model_degree: int, ep_data_degree: int) -> ParallelGroups:    
+                                       ep_model_degree: int, ep_data_degree: int, cp:int=1) -> ParallelGroups:
     # Logic 2: Group tensor parallel group in ascending ring fashion for first half and
     # for second half choose the consective ranks in opposite direction. (0 to n/2-1) + (lastRank-1 to lastRank-1+ n/2-1 )
     # eg: tp32 on 64 devices will have [0,1,..15] + [63,62,..48] and so on
@@ -239,8 +262,17 @@ def ascending_descending_ring_PG_group(lnc_size: int, cluster_ranks_nonexp: torc
         ]
     else:
         ep_data_groups = [[i] for i in range((world_size))]
+    
+    cp_groups = [
+        cluster_ranks_nonexp[pp_rank, dp_rank, :, tp_rank].tolist()
+        for pp_rank, dp_rank, tp_rank in itertools.product(
+            range(pp),
+            range(dp),
+            range(tp),
+        )
+    ]
 
-    return ParallelGroups(tp_groups, dp_groups, pp_groups, ep_model_groups, ep_data_groups)
+    return ParallelGroups(tp_groups, dp_groups, pp_groups, ep_model_groups, ep_data_groups, cp_groups)
 
 
 class PG_Group_Logic(Enum):
@@ -311,6 +343,7 @@ def get_logic_chosen(lnc_size: int, hardware_type: hardware, tp: int)-> PG_Group
 def initialize_model_parallel(
     tensor_model_parallel_size: int = 1,
     pipeline_model_parallel_size: int = 1,
+    context_parallel_size: int=1,
     expert_model_parallel_size: int = 1,
     skip_collective_init: bool = False,
     lnc_size: int = 1,
@@ -321,7 +354,7 @@ def initialize_model_parallel(
     Arguments:
         pipeline_model_parallel_size: number of Neuron devices used to parallelize model layer.
         tensor_model_parallel_size: number of Neuron devices used to parallelize model tensor.
-
+        context_parallel_size: number of Neuron devices used to parallelize model sequence.
         expert_model_parallel_size: number of Neuron devices used to parallelize MoE experts.
 
     mental model:
@@ -380,8 +413,41 @@ def initialize_model_parallel(
         [n16, n17, n18, n19, n20, n21, n22, n23],  # (PP=2, DP=0)
         [n24, n25, n26, n27, n28, n29, n30, n31],  # (PP=3, DP=0)
       ]
+    
+    EXAMPLE 2 (with CP=2)
+    # Note order is "tp-cp-dp-pp"
+    ----------------------------------------------------------------------------------
+    Let's say:
+    * we have a total of 32 Neuron devices denoted by n0 ... n32
+    * For CP - user specifies TP=8, PP=1, CP=4
+    From this we can derive that DP = N / (TP * PP * CP) = 1
 
-    EXAMPLE 2 (WITH EP)
+    The function will create:
+    * 32 data-parallel groups of size DP=1 (meaning no data parallelism).
+    * 8 context parallel groups of size CP=4
+      Stride is TP=8
+      [ 
+        [n00, n08, n16, n24]
+        [n01, n09, n17, n25] 
+        [n02, n10, n18, n26] 
+        [n03, n11, n19, n27]
+        [n04, n12, n20, n28]
+        [n05, n13, n21, n29]
+        [n06, n14, n22, n30]
+        [n07, n15, n23, n31]
+      ]
+
+    * 4 tensor model-parallel groups of size TP=8
+      Stride is 1 since this is the final parallelism dimension.
+      [
+        [n00, n01, n02, n03, n04, n05, n06, n07],  # (PP=0, DP=0)
+        [n08, n09, n10, n11, n12, n13, n14, n15],  # (PP=1, DP=0)
+        [n16, n17, n18, n19, n20, n21, n22, n23],  # (PP=2, DP=0)
+        [n24, n25, n26, n27, n28, n29, n30, n31],  # (PP=3, DP=0)
+      ]
+
+
+    EXAMPLE 3 (WITH EP)
     ----------------------------------------------------------------------------------
     Lets say:
     * we have a total of 128 neuron devices denoted by n0 ... n128
@@ -448,17 +514,20 @@ def initialize_model_parallel(
     tensor_model_parallel_size = min(tensor_model_parallel_size, world_size)
     pipeline_model_parallel_size = min(pipeline_model_parallel_size, world_size)
     expert_model_parallel_size = min(expert_model_parallel_size, world_size)
+    context_parallel_size = min(context_parallel_size, world_size)
+    parallel_size = tensor_model_parallel_size * pipeline_model_parallel_size * context_parallel_size
 
     # compute implied data parallel degrees for both expert and non-expert regions,
     # in both cases making sure implied data parallel size is an integer.
-    if world_size % (tensor_model_parallel_size * pipeline_model_parallel_size) != 0:
+    if world_size % (parallel_size) != 0:
         raise RuntimeError(
             f"invalid implied data parallel degree: "
             f"`world_size` ({world_size}) is not divisible by "
             f"tensor_model_parallel_size ({tensor_model_parallel_size}) x "
             f"pipeline_model_parallel_size ({pipeline_model_parallel_size})"
+            f"context_parallel_size ({context_parallel_size})"
         )
-    data_parallel_size: int = world_size // (tensor_model_parallel_size * pipeline_model_parallel_size)
+    data_parallel_size: int = world_size // (parallel_size)
 
     if world_size % (tensor_model_parallel_size * pipeline_model_parallel_size * expert_model_parallel_size) != 0:
         raise RuntimeError(
@@ -472,7 +541,7 @@ def initialize_model_parallel(
         tensor_model_parallel_size * pipeline_model_parallel_size * expert_model_parallel_size
     )
 
-    if tensor_model_parallel_size == 4:
+    if tensor_model_parallel_size == 4: # TODO, update with CP
         # On trn1, TP=4 is a special case where each TP group consists of locally connected,
         # non-contiguous ranks grouped within each node to avoid cross-node TP.
         # Ex: for TP=4 PP=1 on 2 trn1.32xl nodes (64 NeuronCores):
@@ -489,13 +558,13 @@ def initialize_model_parallel(
         local_world_size = int(os.environ["LOCAL_WORLD_SIZE"])
         num_local_ranks = local_world_size // tensor_model_parallel_size
         cluster_ranks = torch.arange(0, world_size).reshape(
-            pipeline_model_parallel_size, data_parallel_size // num_local_ranks, tensor_model_parallel_size, num_local_ranks
+            pipeline_model_parallel_size, data_parallel_size // num_local_ranks, context_parallel_size, tensor_model_parallel_size, num_local_ranks
         )
         cluster_ranks_exp = cluster_ranks.transpose(-1, -2).reshape(
             pipeline_model_parallel_size, data_parallel_size, expert_model_parallel_size, tensor_model_parallel_size
         )
         cluster_ranks_nonexp = cluster_ranks.transpose(-1, -2).reshape(
-            pipeline_model_parallel_size, data_parallel_size, tensor_model_parallel_size
+            pipeline_model_parallel_size, data_parallel_size, context_parallel_size, tensor_model_parallel_size
         )
     else:
         cluster_ranks = torch.arange(0, world_size)
@@ -511,12 +580,14 @@ def initialize_model_parallel(
             [
                 pipeline_model_parallel_size,
                 data_parallel_size,
+                context_parallel_size,
                 tensor_model_parallel_size,  # important: contiguous parallelism dimension
             ]
         )
 
     logger.info("> initializing tensor model parallel with size %d", tensor_model_parallel_size)
     logger.info("> initializing pipeline model parallel with size %d", pipeline_model_parallel_size)
+    logger.info("> initializing context model parallel with size %d", context_parallel_size)
     logger.info("> initializing data parallel with size %d", data_parallel_size)
     logger.info("> initializing world size to %d", world_size)
     if expert_model_parallel_size > 1:
@@ -551,12 +622,13 @@ def initialize_model_parallel(
     replica_groups = allocate_ranks_fn(lnc_size, cluster_ranks_nonexp, cluster_ranks_exp,
                                         tensor_model_parallel_size, data_parallel_size, 
                                         pipeline_model_parallel_size, expert_model_parallel_size,
-                                        expert_data_parallel_size)
+                                        expert_data_parallel_size, context_parallel_size)
     
 
     logger.info(rmsg(f"tp_groups: {replica_groups.tp_groups=}"))
     logger.info(rmsg(f"dp_groups: {replica_groups.dp_groups=}"))
     logger.info(rmsg(f"pp_groups: {replica_groups.pp_groups=}"))
+    logger.info(rmsg(f"cp_groups: {replica_groups.cp_groups=}"))
     logger.info(rmsg(f"ep_model_groups: {replica_groups.ep_model_groups=}"))
     logger.info(rmsg(f"ep_data_groups: {replica_groups.ep_data_groups=}"))
 
@@ -602,6 +674,22 @@ def initialize_model_parallel(
             _PIPELINE_GLOBAL_RANKS = ranks
             break
 
+
+    # Build context parallel groups
+    _build_and_assign_groups(
+        group_name="_CONTEXT_MODEL_PARALLEL_GROUP",
+        spmd_group_name="_CONTEXT_MODEL_PARALLEL_GROUP_SPMD",
+        mesh=replica_groups.cp_groups,
+        compress_rg=False,
+    )
+    # Build the src tgt pairs, needed for ring attention
+    cp_replica_groups = get_context_model_parallel_replica_groups()
+    rank = torch.distributed.get_rank()
+    cc_configs = CollectivesConfig(replica_groups=cp_replica_groups)
+    global _CONTEXT_PARALLEL_SRC_TGT_PAIRS
+    _CONTEXT_PARALLEL_SRC_TGT_PAIRS = cc_configs.rank_src_tgt_pairs[rank]
+
+
     # Only create pre/next groups if PP is enabled
     if pipeline_model_parallel_size > 1:
         _create_pipeline_parallel_sr_groups(rank)
@@ -640,7 +728,7 @@ def _create_pipeline_parallel_sr_groups(rank: int) -> None:
             if rank in ranks and _PREV_RANK in ranks:
                 _PREV_RANK_GROUP = group
                 _PREV_RANK_GROUP_SPMD = group
-
+    
 
 def _build_and_assign_groups(
     group_name: str,
@@ -950,6 +1038,43 @@ def get_pipeline_model_parallel_size() -> int:
     assert isinstance(group, ProcessGroup)
     return torch.distributed.get_world_size(group=group)
 
+def get_context_model_parallel_group(as_list: bool = False) -> Union[ProcessGroup, List[List[int]]]:
+    """Get the context parallel group the caller rank belongs to."""
+    if as_list:
+        return get_context_model_parallel_replica_groups()
+    assert _CONTEXT_MODEL_PARALLEL_GROUP, "context parallel group is not initialized"
+    return _CONTEXT_MODEL_PARALLEL_GROUP
+
+def get_context_model_parallel_replica_groups() -> List[List[int]]:
+    """Get the context parallel replica groups."""
+    assert _CONTEXT_MODEL_PARALLEL_GROUP_SPMD is not None, "context parallel group is not initialized"
+    return _CONTEXT_MODEL_PARALLEL_GROUP_SPMD
+
+def get_context_model_parallel_rank() -> int:
+    """Return my rank for the context parallel group."""
+    group = get_context_model_parallel_group()
+    assert isinstance(group, ProcessGroup)
+    return torch.distributed.get_rank(group=group)
+
+def get_context_model_parallel_size() -> int:
+    """Return world size for the context parallel group."""
+    if _MPU_CONTEXT_MODEL_PARALLEL_WORLD_SIZE is not None:
+        return _MPU_CONTEXT_MODEL_PARALLEL_WORLD_SIZE
+    group = get_context_model_parallel_group()
+    assert isinstance(group, ProcessGroup)
+    return torch.distributed.get_world_size(group=group)
+
+def set_context_model_parallel_size(world_size: int) -> None:
+    """Set the tensor model parallel size"""
+    global _MPU_CONTEXT_MODEL_PARALLEL_WORLD_SIZE
+    _MPU_CONTEXT_MODEL_PARALLEL_WORLD_SIZE = world_size
+
+def get_context_model_parallel_src_tgt_pairs():
+    """Get global rank pairs of the context parallel group that the caller rank belongs to."""
+    assert (
+        _CONTEXT_PARALLEL_SRC_TGT_PAIRS is not None
+    ), "_CONTEXT_PARALLEL_SRC_TGT_PAIRS is not initialized"
+    return _CONTEXT_PARALLEL_SRC_TGT_PAIRS
 
 def get_next_rank_group(as_list: bool = False) -> Union[ProcessGroup, List[List[int]]]:
     """Get the next tensor model parallel group the caller rank belongs to."""
@@ -1031,6 +1156,15 @@ def destroy_model_parallel() -> None:
     _PIPELINE_MODEL_PARALLEL_GROUP_SPMD = None
     global _PIPELINE_GLOBAL_RANKS
     _PIPELINE_GLOBAL_RANKS = None
+
+    global _CONTEXT_MODEL_PARALLEL_GROUP
+    _CONTEXT_MODEL_PARALLEL_GROUP = None
+    global _CONTEXT_MODEL_PARALLEL_GROUP_SPMD
+    _CONTEXT_MODEL_PARALLEL_GROUP_SPMD = None
+    global _MPU_CONTEXT_MODEL_PARALLEL_WORLD_SIZE
+    _MPU_CONTEXT_MODEL_PARALLEL_WORLD_SIZE = None
+    global _MPU_CONTEXT_MODEL_PARALLEL_RANK
+    _MPU_CONTEXT_MODEL_PARALLEL_RANK = None
 
     global _NEXT_RANK_GROUP
     _NEXT_RANK_GROUP = None
@@ -1154,9 +1288,15 @@ def initialize_pp_gloo_groups() -> None:
     logger.debug(f"initialize_pp_gloo_groups... {pp_group_spmd}")
     rank = torch.distributed.get_rank()
     for pp_group in pp_group_spmd:
-        if rank in pp_group:
-            PP_GROUP_PG_GLOO = torch.distributed.new_group(ranks=pp_group, backend="gloo")
-            break
+        if not cpu_mode():
+            # for cpu mode, we need call new_group from all ranks
+            if rank in pp_group:
+                PP_GROUP_PG_GLOO = torch.distributed.new_group(ranks=pp_group, backend="gloo")
+                break
+        else:
+            pg = torch.distributed.new_group(ranks=pp_group, backend="gloo")
+            if rank in pp_group:
+                PP_GROUP_PG_GLOO = pg
 
 
 def get_pp_gloo_group() -> ProcessGroup:
@@ -1196,11 +1336,12 @@ def create_pg_with_ranks(ranks: List[int]) -> ProcessGroup:
     # The pg will only contain the shared ranks
     # This is because that torch.distributed.new_group requires all processes in main group to enter
     pp_model_parallel_group_spmd = get_pipeline_model_parallel_replica_groups()
+    logger.debug(rmsg(f"creating pg for pp ranks {ranks}, with pp spmd groups {pp_model_parallel_group_spmd}"))
     saved_group = None
     for ranks, current_shared_ranks in zip(pp_model_parallel_group_spmd, all_shared_ranks_spmd):
         if cpu_mode():
-            group = torch.distributed.new_group(ranks, backend="gloo")
-            if world_rank in ranks:
+            group = torch.distributed.new_group(current_shared_ranks, backend="gloo")
+            if world_rank in current_shared_ranks:
                 saved_group = group
                 logger.debug(
                     rmsg(
@@ -1332,7 +1473,6 @@ def get_speculative_draft_replica_groups() -> List[List[int]]:
     return _SPECULATIVE_DRAFT_GROUP_SPMD
 
 
-
 def gather_python_object(obj: Any, group: ProcessGroup) -> List[Any]:
     """
     Eagerly gather python object for a group
@@ -1407,10 +1547,11 @@ def rmsg(msg: str) -> str:
     try:
         pp_rank = get_pipeline_model_parallel_rank()
         tp_rank = get_tensor_model_parallel_rank()
+        cp_rank = get_context_model_parallel_rank()
         dp_rank = get_data_parallel_rank()
     except AssertionError:
         # Parallel state is not initialized
-        pp_rank, tp_rank, dp_rank = -1, -1, -1
+        pp_rank, tp_rank, dp_rank, cp_rank = -1, -1, -1, -1
     try:
         global_rank = torch.distributed.get_rank()
     except RuntimeError:
@@ -1418,7 +1559,7 @@ def rmsg(msg: str) -> str:
         import torch_xla.core.xla_model as xm
 
         global_rank = xm.get_ordinal()
-    return f"[rank_{global_rank}_pp{pp_rank}_tp{tp_rank}_dp{dp_rank}] {msg}"
+    return f"[rank_{global_rank}_pp{pp_rank}_tp{tp_rank}_dp{dp_rank}_cp{cp_rank}] {msg}"
 
 
 def rmsg_ep(msg: str) -> str:
@@ -1427,3 +1568,34 @@ def rmsg_ep(msg: str) -> str:
     tp_rank = get_tensor_model_parallel_rank()
     dp_rank = get_data_parallel_rank()
     return f"[pp{pp_rank}|ep{ep_rank}|tp{tp_rank}|dp{dp_rank}] {msg}"
+
+
+def get_rank_info_str() -> str:
+    """Returns a tuple of (data, tensor, pipeline)-parallel-rank for logger."""
+    if model_parallel_is_initialized():
+        return f"DP_{get_data_parallel_rank()}_TP_{get_tensor_model_parallel_rank()}_PP_{get_pipeline_model_parallel_rank()}"
+    return "model_parallel_uninitialized"
+
+def get_zero1_sharding_groups() -> List[List[Union[Any, List[Any]]]]:
+    """
+    Get the sharding_groups for zero1 optimizer
+    """
+    dp_size = get_data_parallel_size()
+    pp_size = get_pipeline_model_parallel_size()
+    cp_groups = get_context_model_parallel_replica_groups()
+    
+    sharding_groups = []
+    for i in range(pp_size):
+        pp_group_list = []
+        offset_pp = len(cp_groups)//pp_size
+        sliced_cp_group = cp_groups[0+i*offset_pp:(i*offset_pp)+offset_pp]
+        for j in range(dp_size):
+            dp_offset = len(sliced_cp_group)//dp_size
+            pp_dp_cp_group = sliced_cp_group[0+j*dp_offset:(j*dp_offset)+dp_offset]
+            pp_group_list.append(pp_dp_cp_group)
+            
+        # Merge the lists
+        res = [[item for sublist in sublists for item in sublist] for sublists in zip(*pp_group_list)]
+        sharding_groups.extend(res)
+        pp_group_list = []
+    return sharding_groups

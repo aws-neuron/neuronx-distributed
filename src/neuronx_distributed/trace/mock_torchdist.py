@@ -29,6 +29,10 @@ class MockDistributed(MagicMock):
         return MockDistributed._rank
 
     @staticmethod
+    def get_backend(group=None):
+        return "xla"
+    
+    @staticmethod
     def get_world_size(group=None):
         if group is not None:
             return group.size()

@@ -5,7 +5,7 @@
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 
-export NEURON_CC_FLAGS="--model-type transformer --distribution-strategy=llm-training --cache_dir=~/neuron_compile_cache/"
+export NEURON_CC_FLAGS="--model-type transformer --cache_dir=~/neuron_compile_cache/"
 export NEURON_FUSE_SOFTMAX=1
 
 # Async Runtime
@@ -19,7 +19,11 @@ LLAMA_VERSION='3'
 : ${LLAMA_CONFIG_VERSION:=3}
 
 # TP degree
-TP_DEGREE=32
+: ${TP_DEGREE:=32}
+# CP degree
+: ${CP_DEGREE:=1}
+# Num layers
+: ${NUM_LAYERS:=32}
 # 0: bf16; 1: mixed precision
 USE_MIX_PRECISION=1
 # 0: use pure DP; 1: use ZeRO-1
@@ -122,6 +126,7 @@ torchrun $DISTRIBUTED_ARGS \
     --model_path $MODEL_PATH \
     --data_dir $DATA_PATH \
     --tensor_parallel_size $TP_DEGREE \
+    --context_parallel_size $CP_DEGREE \
     --batch_size $MBS \
     --steps_this_run $STEPS_THIS_RUN\
     --max_steps $TOTAL_STEPS \
@@ -136,5 +141,6 @@ torchrun $DISTRIBUTED_ARGS \
     --kv_replicator 4 \
     --use_flash_attention 1 \
     --use_gpu_compatible_precision 1 \
+    --num_layers $NUM_LAYERS \
     $EXTRA_ARGS |& tee $OUTPUT_LOG
 exit ${PIPESTATUS[0]}
