@@ -76,7 +76,9 @@ class CheckpointConverterBase:
 
         from transformers import AutoModelForCausalLM
 
-        token = getpass("Enter your Hugging Face API token: (If you don't have one, create it at https://huggingface.co/settings/tokens): ")
+        token = os.getenv("HF_TOKEN", None)
+        if token is None:
+            token = getpass("Enter your Hugging Face API token: (If you don't have one, create it at https://huggingface.co/settings/tokens): ")
         login(token=token)
 
         print(f"Downloading model: {model_identifier}")
