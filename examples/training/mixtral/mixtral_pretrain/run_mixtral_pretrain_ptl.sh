@@ -64,6 +64,12 @@ SEQUENCE_PARALLEL_ENABLED=1
 USE_MIX_PRECISION=1
 # 0: use pure DP; 1: use ZeRO-1
 USE_ZERO_1=1
+# Check if DP_DEGREE is 1 and modify USE_ZERO_1 accordingly
+if [ "$DP_DEGREE" -eq 1 ]; then
+    echo "WARNING: DP_DEGREE is 1, setting USE_ZERO_1 to 0"
+    USE_ZERO_1=0
+fi
+
 # global batch size
 : ${GBS:=32}
 # Micro batch size
@@ -153,6 +159,8 @@ if [ $USE_MIX_PRECISION -gt 0 ]; then
 fi
 if [ $USE_ZERO_1 -gt 0 ]; then
     EXTRA_ARGS+=" --use_zero_1"
+else
+    EXTRA_ARGS+=" --use_gpu_compatible_precision 0"
 fi
 if [ $SEQUENCE_PARALLEL_ENABLED -eq 1 ]; then
     EXTRA_ARGS+=" --sequence_parallel_enabled"

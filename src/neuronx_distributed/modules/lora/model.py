@@ -630,6 +630,7 @@ class LoraModel(torch.nn.Module):
             if key_word in mkey:
                 key = mkey.replace(key_word, "")
                 state_dict[mkey] = state_dict[key]
+                del state_dict[key]
         return state_dict
 
     """
@@ -668,7 +669,7 @@ class LoraModel(torch.nn.Module):
 
         xm.mark_step()
         # only the first rank need to save the merged LoRA adapter
-        return state_dict if xm.get_ordinal() == 0 else None
+        return state_dict
 
     def state_dict(self, *args, **kwargs):
         config = self.lora_config
@@ -682,7 +683,7 @@ class LoraModel(torch.nn.Module):
         return state_dict
 
     def load_state_dict(
-        self, state_dict: Optional[Mapping[str, Any]] = None, strict: bool = True, assign: bool = False
+        self, state_dict: Optional[Mapping[str, Any]] = None, strict: bool = False, assign: bool = False
     ):
         r"""
         There are two steps to load state dict for LoRA model.
@@ -690,14 +691,24 @@ class LoraModel(torch.nn.Module):
         Step 2: load the state dict for the LoRA adapter
         """
         lora_config = self.lora_config
+        load_result = None
         if state_dict is not None and (not lora_config.save_lora_base or not self.is_checkpoint_loaded):
             if self.is_lora_enabled:
-                self.update_state_dict_keys(dict(state_dict))
+                state_dict = self.update_state_dict_keys(dict(state_dict))
             # load the state dict to the base model
-            load_result = self.module.load_state_dict(state_dict, strict=False)
+            load_result = self.module.load_state_dict(state_dict, strict=strict)
             self.is_base_model_loaded = True
 
-        load_result = self.load_lora_adapter() if lora_config.load_lora_from_ckpt else None
+        if lora_config.load_lora_from_ckpt:
+            load_result_lora = self.load_lora_adapter()
+            if load_result is not None:
+                load_result.missing_keys.extend(load_result_lora.missing_keys)
+                load_result.unexpected_keys.extend(load_result_lora.unexpected_keys)
+            else:
+                load_result = load_result_lora
+
+        if load_result is not None and load_result.missing_keys and lora_config.load_lora_from_ckpt:
+            raise RuntimeError(f"Missing keys when loading state dictionary: {', '.join(load_result.missing_keys)}")
 
         return load_result
 

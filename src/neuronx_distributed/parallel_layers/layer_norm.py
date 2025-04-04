@@ -20,6 +20,7 @@ class LayerNorm(torch.nn.LayerNorm):
         normalized_shape: _shape_t,
         eps: float = 1e-5,
         elementwise_affine: bool = True,
+        bias: bool = True,
         device=None,
         dtype=None,
         sequence_parallel_enabled: bool = False,
@@ -28,13 +29,15 @@ class LayerNorm(torch.nn.LayerNorm):
             normalized_shape=normalized_shape,
             eps=eps,
             elementwise_affine=elementwise_affine,
+            bias=bias,
             device=device,
             dtype=dtype,
         )
         self.sequence_parallel_enabled = sequence_parallel_enabled
         if self.elementwise_affine:
             _set_sequence_parallel_enabled(self.weight, self.sequence_parallel_enabled)
-            _set_sequence_parallel_enabled(self.bias, self.sequence_parallel_enabled)
+            if bias:
+                _set_sequence_parallel_enabled(self.bias, self.sequence_parallel_enabled)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         original_input_dtype = input.dtype

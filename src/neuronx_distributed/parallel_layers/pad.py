@@ -1,3 +1,4 @@
+import torch
 from torch import nn
 from torch.nn import functional as F
 
@@ -5,6 +6,9 @@ from neuronx_distributed.parallel_layers.layers import (
     ColumnParallelLinear,
     RowParallelLinear,
 )
+
+from neuronx_distributed.utils.utils import hardware
+from torch_neuronx.utils import get_platform_target
 
 
 def get_number_of_extra_heads(n_head, tp_degree):
@@ -105,3 +109,77 @@ def pad_model(model, tp_degree, n_heads, wrapped_classes=(), pad_hook_fn=None):
     should_pad = not wrapped_classes or isinstance(model, wrapped_classes)
 
     return pad_helper(model, tgt_src_ratio, should_pad, pad_hook_fn)
+
+
+def generate_padding_mask(
+    num_heads, num_heads_with_pad, num_kv_heads, tp_degree, tp_rank, hardware_type=None
+):
+    """
+    Gets the padding mask for a given attention config, TP degree, TP rank, and the hardware type.
+    Different hardware types (e.g. TRN1 vs. TRN2) require different masking, due to
+    different K/V head weight layout on TP ranks.
+
+    Args:
+        num_heads: number of query heads in the (unsharded) model w/o padding.
+        num_heads_with_pad: number of query heads in the (unsharded) model w/ padding.
+        num_kv_heads: number of kv heads in the (unsharded) model.
+        tp_degree: TP degree.
+        tp_rank: TP rank of the worker to generate padding mask for.
+        hardware_type: type of the hardware to generate attention mask for.
+    Returns:
+        `torch.Tensor` 1D mask tensor whose length is the number of heads on each rank.
+        1s for original heads and 0s for padded heads.
+
+    For example, a model w/ 48 query heads and 8 kv heads in TP32:
+        - The number of query heads is padded from 48 to 64.
+        - The number of kv heads is replicated from 8 to 32.
+        - Each rank gets 2 query heads and 1 kv head.
+    We need to mask out 16 query heads (2 per kv head) to make sure we don't use more
+    heads than in the config.
+    """
+    if hardware_type is None:
+        hardware_type = hardware(get_platform_target())
+    num_heads_with_pad_per_rank = num_heads_with_pad // tp_degree
+    num_heads_per_kv_head = num_heads // num_kv_heads
+
+    if hardware_type == hardware.TRN1:
+        # On TRN1, KV heads are replicated in groups.
+        # For example, TP32 with 56 query heads, 8 kv heads and kv_replicator=4:
+        # (K0,K1,...,K7),(K0,K1,...,K7),(K0,K1,...,K7),(K0,K1,...,K7)
+        # We need to mask out the 1 out of 2 query heads on each TP rank in the last
+        # group of (K0,K1,...K7).
+        kv_group_idx = tp_rank // num_kv_heads
+
+        # Low and high query head index of the local query heads among all query heads
+        # associated with the KV head.
+        low_idx, high_idx = (
+            num_heads_with_pad_per_rank * kv_group_idx,
+            num_heads_with_pad_per_rank * (kv_group_idx + 1),
+        )
+
+        padding_mask = torch.arange(low_idx, high_idx) < num_heads_per_kv_head
+    elif hardware_type == hardware.TRN2:
+        # On TRN2, a KV head is replicated on adjacent ranks.
+        # For example, TP32 with 48 query heads, 8 kv heads and kv_replicator=4:
+        # (K0,K0,K0,K0),(K1,K1,K1,K1),...,(K7,K7,K7,K7)
+        # We need to mask out the query heads associated with the last replicate
+        # kv head in each 4 replicates.
+        # Note that LNC is irrelevant to attention head padding / masking.
+        kv_replicator = tp_degree // num_kv_heads
+        replicate_id = tp_rank % kv_replicator
+
+        # Low and high query head index of the local query heads among all query heads
+        # associated with the KV head.
+        low_idx, high_idx = (
+            num_heads_with_pad_per_rank * replicate_id,
+            num_heads_with_pad_per_rank * (replicate_id + 1),
+        )
+
+        padding_mask = torch.arange(low_idx, high_idx) < num_heads_per_kv_head
+    else:
+        raise RuntimeError(
+            f"Unexpected hardware_type {hardware_type} received in padding mask generation."
+        )
+
+    padding_mask.requires_grad = False
+    return padding_mask

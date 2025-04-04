@@ -38,7 +38,7 @@ def find_loss_from_output_and_spec(output_val, spec_val):
     Fetch loss tensor from the output spec provided by user.
     Refered from https://github.com/pytorch/PiPPy/blob/main/pippy/IR.py#L42
     """
-    if spec_val is False:
+    if spec_val is False or spec_val is None:
         return None
     if spec_val is True:
         if not isinstance(output_val, torch.Tensor):

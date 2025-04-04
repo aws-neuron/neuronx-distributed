@@ -187,6 +187,15 @@ def get_device_correctness_test_configs(dtype) -> List[ExptCfg]:
                 **get_model_config("mixtral", scale_down_factor=4),
                 **test_cfg
             ),
+            # Context-encoding for blockwise
+            ExptCfg(
+                seq_len=256,
+                batch_size=1,
+                capacity_factor=None,
+                num_iters=2, # increase n_iter leads to OOM
+                **get_model_config("mixtral", scale_down_factor=1),
+                **test_cfg
+            ),
             ExptCfg(
                 seq_len=256,
                 batch_size=1,

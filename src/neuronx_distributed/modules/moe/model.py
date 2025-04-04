@@ -91,7 +91,7 @@ class MoE(torch.nn.Module):
             if not sequence_parallel_enabled:
                 raise ValueError("MoE layer must have SP enabled to run router in SP")
             if router.sequence_dimension != sequence_dimension:
-                raise ValueError("Inconsistent sequence_dimension across MoE and router modules")
+                raise ValueError(f"Inconsistent sequence_dimension across MoE and router modules, {router.sequence_dimension} != {sequence_dimension}")
 
         self.router = router
         self.expert_mlps = expert_mlps
@@ -172,8 +172,12 @@ class MoE(torch.nn.Module):
         else:
             router_logits, expert_affinities, expert_index = self.router(full_hidden_states)
 
+        if not self.ep_enabled:
+            # All-Reduce expert_affinities gradients in backward pass, to account for delayed output All-Reduce
+            expert_affinities = mappings.copy_to_tensor_model_parallel_region(expert_affinities)
+
         # full_hidden_states: (S, B, H) or (B, S, H) -> (T, H)
-        full_hidden_states = full_hidden_states.view(-1, full_hidden_states_shape[-1])
+        full_hidden_states = full_hidden_states.reshape(-1, full_hidden_states_shape[-1])
 
         # Get the output from the ExpertMLPs
         output = self.expert_mlps(
@@ -192,11 +196,12 @@ class MoE(torch.nn.Module):
                 output, self.sequence_dimension, process_group=self.tensor_parallel_group,
             )
         elif self.sequence_parallel_enabled:
-            # Reduce-scatter back to sequence parallel (as the hidden_states were in sequence parallel)
+            # Delayed reduce-scatter back to sequence parallel (as the hidden_states were in SP)
             output = mappings.reduce_scatter_to_sequence_parallel_region(
                 output, self.sequence_dimension, process_group=self.tensor_parallel_group,
             )
         elif not self.ep_enabled:
+            # Delayed All-Reduce
             output = mappings.reduce_from_tensor_model_parallel_region(
                 output, process_group=self.tensor_parallel_group
             )

@@ -33,6 +33,7 @@ def neuronx_distributed_config(
     tensor_parallel_size=1,
     pipeline_parallel_size=1,
     expert_parallel_size=1,
+    context_parallel_size=1,
     pipeline_config=None,
     optimizer_config=None,
     activation_checkpoint_config=None,
@@ -117,6 +118,7 @@ def neuronx_distributed_config(
         "tensor_parallel_size": tensor_parallel_size,
         "pipeline_parallel_size": pipeline_parallel_size,
         "expert_parallel_size": expert_parallel_size,
+        "context_parallel_size": context_parallel_size,
         "pipeline_config": pipeline_config,
         "optimizer_config": optimizer_config,
         "activation_checkpoint_config": activation_checkpoint_config,
@@ -134,6 +136,7 @@ def neuronx_distributed_config(
             pipeline_model_parallel_size=config["pipeline_parallel_size"],
             expert_model_parallel_size=config["expert_parallel_size"],
             lnc_size=lnc_size,
+            context_parallel_size=config["context_parallel_size"]
         )
 
     if torch.distributed.is_initialized() and parallel_state.is_global_rank_zero():
@@ -148,6 +151,7 @@ def initialize_parallel_model(nxd_config, model_fn, include_buffers: bool = Fals
             pipeline_model_parallel_size=nxd_config["pipeline_parallel_size"],
             expert_model_parallel_size=nxd_config["expert_parallel_size"],
             lnc_size=nxd_config["lnc_size"],
+            context_parallel_size=nxd_config["context_parallel_size"],
         )
 
     # Phase 1: get the base model
@@ -242,10 +246,11 @@ def initialize_optimizer_from_class(nxd_config, optimizer_class, parameters, mod
     if optimizer_config["zero_one_enabled"]:
         ep_enabled = parallel_state.get_expert_model_parallel_size() > 1
         zero1_optimizer_cls = NeuronEPZero1Optimizer if ep_enabled else NeuronZero1Optimizer
+        sharding_groups = parallel_state.get_zero1_sharding_groups() if parallel_state.get_context_model_parallel_size() > 1 else parallel_state.get_data_parallel_replica_groups()
         zero1_configs = {
             "grad_clipping": optimizer_config["grad_clipping"],
             "pin_layout": False,
-            "sharding_groups": parallel_state.get_data_parallel_replica_groups(),
+            "sharding_groups": sharding_groups,
             "grad_norm_groups": parallel_state.get_tensor_model_parallel_replica_groups(),
         }
         if version.parse(torch.__version__) == version.parse("2.1"):

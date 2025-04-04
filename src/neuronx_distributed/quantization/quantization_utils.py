@@ -1,4 +1,4 @@
-from typing import Any, Dict
+from typing import Any, Dict, Optional, List
 import torch
 import torch.ao.nn.quantized.dynamic as nnqd
 import torch.nn as nn
@@ -9,6 +9,27 @@ from torch.quantization import MinMaxObserver, default_observer
 from neuronx_distributed.quantization.observer import PerChannelAbsMaxObserver
 from neuronx_distributed.quantization.quantization_config import DtypeBound
 
+def _normalize_modules_to_not_convert_paths(float_model: torch.nn.Module, modules_to_not_convert: list) -> list:
+
+    """
+    Since module to not convert list is used for both loaded checkpoints and model creation, we need to make 
+    sure we handle the names because we have different layer names in both cases.
+
+    Args:
+        modules_to_not_convert (list): A list of module paths to process. Each path is a string
+            representing the module's location in the model architecture.
+
+    Returns:
+        list: A new list containing the expanded module paths.
+    """
+    full_modules_to_not_convert_path = []
+    
+    for name,_ in float_model.named_modules():
+        for module in modules_to_not_convert:
+            if module in name:
+                full_modules_to_not_convert_path.append(name)
+
+    return full_modules_to_not_convert_path
 
 def extract_q_scale_per_tensor(q_tensor: torch.Tensor) -> torch.Tensor:
     """Extract scales per tensor.
@@ -88,20 +109,23 @@ def convert_qint8_to_int8_state_dict(state_dict: Dict[str, Any]) -> None:
         state_dict.pop(prefix + "zero_point")
 
 #### TODO: Deprecated after testing with pytorch 2.3+ and adapt to https://github.com/huggingface/optimum-quanto
-
-def quantize_fp8_per_channel(tensor: torch.Tensor, dtype: torch.dtype, channel_axis: int):
+def quantize_fp8_per_channel(tensor: torch.Tensor, dtype: torch.dtype, channel_axis: int, clamp_bound: float = float('inf')):
     assert dtype in [torch.float8_e4m3fn, torch.float8_e5m2]
     fp8_max, fp8_min = DtypeBound.from_torch_dtype(dtype)
     dim = tuple(d for d in range(len(tensor.shape)) if d != channel_axis)
+    tensor = tensor.to(torch.float32)
     max_values = torch.amax(torch.abs(tensor), dim=dim, keepdim=True)
+    if clamp_bound != float('inf'):
+        max_values = torch.clamp(input=max_values, min=-clamp_bound, max=clamp_bound)
     scales = max_values / fp8_max
-    quantized_weights = tensor / scales
-    quantized_weights = torch.clamp(quantized_weights, fp8_min, fp8_max)
-    quantized_weights = quantized_weights.to(dtype)
+    scales = torch.max(scales, torch.ones(scales.shape, device=scales.device) * 1e-05)
+    quantized_tensor = tensor / scales
+    quantized_tensor = torch.clamp(quantized_tensor, fp8_min, fp8_max)
 
-    scale_shape = [1] * len(quantized_weights.shape)
-    scale_shape[channel_axis] = quantized_weights.shape[channel_axis]
-    return quantized_weights, scales.to(torch.float32).view(scale_shape)
+    scale_shape = [1] * len(quantized_tensor.shape)
+    scale_shape[channel_axis] = quantized_tensor.shape[channel_axis]
+    quantized_tensor = quantized_tensor.to(dtype)
+    return quantized_tensor, scales.to(torch.float32).view(scale_shape)
 
 def quantize_fp8_per_tensor(tensor, dtype):
     assert dtype in [torch.float8_e4m3fn, torch.float8_e5m2]
@@ -169,17 +193,23 @@ def quantize_pytorch_model_per_tensor_symmetric(float_model: torch.nn.Module, in
     return quant_model
 
 
-def quantize_pytorch_model_per_channel_symmetric(float_model: torch.nn.Module, inplace: bool = False, dtype=torch.qint8) -> torch.nn.Module:
+def quantize_pytorch_model_per_channel_symmetric(float_model: torch.nn.Module, inplace: bool = False, dtype=torch.qint8, modules_to_not_convert: Optional[List[str]] = None) -> torch.nn.Module:
+    
+    if modules_to_not_convert is None:
+        full_modules_to_not_convert_path = []
+    else:
+        full_modules_to_not_convert_path = _normalize_modules_to_not_convert_paths(float_model, modules_to_not_convert)
+    
     if dtype == torch.qint8 or dtype == torch.int8:
         q_config = QConfig(
             activation=default_observer,
             weight=PerChannelAbsMaxObserver.with_args(dtype=torch.qint8, qscheme=torch.per_channel_symmetric, ch_axis=0),
         )
-        qconfig_spec = {nn.Linear: q_config}
+        qconfig_spec = {nn.Linear: q_config,**{modules: None for modules in full_modules_to_not_convert_path}}
         mapping = {nn.Linear: nnqd.Linear}
     elif dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
         # This is not the best practice to monkey patch weight field in Qconfig. Again adapt to optimum-quanto
-        qconfig_spec = {torch.nn.Linear: QConfig(activation=None, weight=dict(qscheme=torch.per_channel_symmetric, dtype=dtype, ch_axis=0))}
+        qconfig_spec = {torch.nn.Linear: QConfig(activation=None, weight=dict(qscheme=torch.per_channel_symmetric, dtype=dtype, ch_axis=0)),**{modules: None for modules in full_modules_to_not_convert_path}}
         mapping = {nn.Linear: QuantizedLinear}
     else:
         raise ValueError(f"dtype: {dtype} is not supported to quantize model on CPU")

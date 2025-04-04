@@ -5,26 +5,43 @@ import os
 import random
 import shutil
 import time
+import requests
 from abc import abstractmethod
+from boto3.s3.transfer import TransferConfig
+from botocore.session import Session
 from io import BytesIO
-from typing import List, Dict, Any, Optional, Tuple, TYPE_CHECKING
+from tempfile import NamedTemporaryFile
+from tenacity import (before_sleep_log, retry, retry_if_exception,
+                      stop_after_attempt, RetryCallState)
+from tenacity.wait import wait_base
+from typing import List, Dict, Any, Optional, Tuple, Union, TYPE_CHECKING
 
 import boto3
 import botocore
 import torch
 import torch_xla.core.xla_model as xm
+import math
 
 try:
+    import s3transfer
+    import s3transfer.crt
     import awscrt
 
     use_crt = True
 except ImportError:
     use_crt = False
 
+from neuronx_distributed.utils.logger import get_logger
+logger = get_logger()
+
 if TYPE_CHECKING:
     from mypy_boto3_s3 import S3ServiceResource, S3Client
     from mypy_boto3_s3.type_defs import ListObjectsV2OutputTypeDef
 
+# bytes in MB
+MB = 1024 ** 2
+# glibc linux system expects POSIX shared memory to be mounted at /dev/shm
+SHM_PATH = '/dev/shm'
 
 class BaseCheckpointStorage:
     def __init__(self, dirname: str):
@@ -179,7 +196,7 @@ class FilesysCheckpointStorage(BaseCheckpointStorage):
 
     def load_object(self, filename: str, map_location: torch.serialization.MAP_LOCATION = None) -> Any:
         filename = os.path.join(self._dirname, filename)
-        return torch.load(filename, map_location=map_location)
+        return torch.load(filename, map_location=map_location, weights_only=False)
 
     def remove_dir(self, dirname: str) -> None:
         dirname = os.path.join(self._dirname, dirname)
@@ -216,18 +233,76 @@ class FilesysCheckpointStorage(BaseCheckpointStorage):
             # once xla backend support barrier
             xm.rendezvous("create shared dir")
 
+class wait_decrementing_with_jitter(wait_base):
+    def __init__(self, max_sleep: Union[int, float]) -> None:
+        self.max_sleep = max_sleep
+
+    def __call__(self, retry_state: RetryCallState) -> float:
+        return random.randint(1, math.ceil(self.max_sleep/retry_state.attempt_number))
+
+# Keeping these variables as globals as they can't be pickled and cause issues
+# when checkpoint-saving tries to pickle S3CheckpointStorage as part of multiprocess
+# parallelization.
+_s3_resource = None
+_s3_client = None
+_s3_transfer_manager = None
+
+def is_slow_down_error(exception):
+    # Example Invalid response status that is slow down
+    # AWS_ERROR_S3_INVALID_RESPONSE_STATUS: Invalid response status from request.
+    # Body from error request is:
+    # '<?xml version="1.0" encoding="UTF-8"?>
+    #  <Error>
+    #      <Code>RequestTimeout</Code>
+    #      <Message>
+    #         Your socket connection to the server was not read from or written to within the timeout period. Idle connections will be closed.
+    #      </Message>
+    #    <RequestId>XPHS9896G3RJE364</RequestId>
+    #    <HostId>ZAiF3HPpUD5IgSr/mfkP2QPs7ttuvY+uTRG9MET/jZZ45MJ6bVbnvSBQLggICvPCROPP/1k85p4=</HostId>
+    # </Error>'
+    message = str(exception)
+    if ("<Code>SlowDown</Code>" in message or
+        "<Code>RequestTimeout</Code>" in message or
+        "<Code>InternalError</Code>" in message):
+        return True
+
+    if use_crt and isinstance(exception, awscrt.exceptions.AwsCrtError):
+        return True
+
+    if isinstance(exception, botocore.exceptions.ConnectionClosedError):
+        if "Connection was closed before we received a valid response from endpoint" in message and ".s3." in message:
+            return True
+
+    if isinstance(exception, botocore.exceptions.ClientError):
+        if exception.response:
+            if 'Error' not in exception.response:
+                message = str(exception.response)
+                return "MaxAttemptsReached" in message
+            else:
+                error_code = exception.response['Error']['Code']
+                return error_code in ['SlowDown', 'RequestTimeout', 'InternalError', 'Throttling']
+
+    return False
 
 class S3CheckpointStorage(BaseCheckpointStorage):
-    UPLOAD = 1
-    DOWNLOAD = 2
-    REMOVE_DIR = 3
-    REMOVE_FILE = 4
+    S3_PATH_PREFIX = 's3://'
 
-    def __init__(self, dirname: str):
+    retry_with_jitter = retry(
+        stop=stop_after_attempt(10),
+        retry=retry_if_exception(is_slow_down_error),
+        wait=wait_decrementing_with_jitter(max_sleep=int(os.environ.get("WORLD_SIZE", "50000")) / 10000),
+        before_sleep=before_sleep_log(logger, logging.INFO),
+    )
+
+    def __init__(self, dirname: str, crt_config={}):
         super().__init__(dirname)
         self._bucket, self._base_key = S3CheckpointStorage.parse_path(dirname)
         if self._base_key and not self._base_key.endswith("/"):
             self._base_key += "/"
+
+        # TODO @jaczhao: Support user config to pass crt configs here. Only cherry picking checkpoint_storage changes for now
+        self._s3_crt_upload_part_size_mb = crt_config.get("s3_crt_upload_part_size_mb")
+        self._s3_crt_upload_num_threads = crt_config.get("s3_crt_upload_num_threads")
 
         boto3.set_stream_logger(name="botocore.credentials", level=logging.ERROR)
 
@@ -238,16 +313,17 @@ class S3CheckpointStorage(BaseCheckpointStorage):
         """
         return True
 
+    @retry_with_jitter
     def file_exists(self, filename: str) -> bool:
-        subdir = os.path.dirname(filename)
-        basename = os.path.basename(filename)
-        paths = self._list_with_retry(subdir or None)
-        for path in paths:
-            if path["name"] == basename and path["type"] == "file":
-                return True
+        try:
+            S3CheckpointStorage.get_client().head_object(Bucket=self._bucket, Key=self.convert_path_to_key(filename))
+            return True
+        except botocore.exceptions.ClientError as e:
+            if e.response['Error']['Code'] == "404":
+                return False
+            raise
 
-        return False
-
+    @retry_with_jitter
     def _list(self, prefix: Optional[str] = None) -> List[Dict[str, Any]]:
         s3 = S3CheckpointStorage.get_client()
 
@@ -273,29 +349,6 @@ class S3CheckpointStorage(BaseCheckpointStorage):
 
         return results
 
-    def _list_with_retry(self, prefix: Optional[str] = None) -> List[Dict[str, Any]]:
-        max_try = 4
-        sleep_second = 60.0
-        for try_idx in range(max_try):
-            try:
-                return self._list(prefix)
-            except Exception as e:
-                if S3CheckpointStorage.is_slow_down_error(e):
-                    if try_idx < max_try - 1:
-                        current_sleep_time = sleep_second + random.randint(20, 60)
-                        logging.info(
-                            f"Encountered slow down error when upload file for {try_idx+1} times. Sleep {current_sleep_time} seconds then retry"
-                        )
-                        time.sleep(current_sleep_time)
-                        sleep_second *= 1.5
-                    else:
-                        logging.info(
-                            f"Encountered slow down error when upload file for {try_idx+1} times. No more retrying"
-                        )
-                        raise e
-                else:
-                    raise e
-        assert False, "unreachable"
 
     def _find_files_impl(self, pattern: str, search_depth: int, search_root: Optional[str], max_count: Optional[int]):
         search_dirs = [search_root]
@@ -306,7 +359,7 @@ class S3CheckpointStorage(BaseCheckpointStorage):
         while level <= search_depth and search_bgn < search_end:
             for i in range(search_bgn, search_end):
                 dirname = search_dirs[i]
-                paths = self._list_with_retry(dirname)
+                paths = self._list(dirname)
                 for path in paths:
                     if fnmatch.fnmatch(path["name"], pattern):
                         mdate = path.get("mdate", None)
@@ -348,6 +401,14 @@ class S3CheckpointStorage(BaseCheckpointStorage):
                 stream.write(bytes(self._text, "utf-8"))
                 return stream
 
+            def create_tmp_file(self):
+                try:
+                    tempfile = NamedTemporaryFile(dir=SHM_PATH, mode='w', delete=False)
+                    tempfile.write(text)
+                    return tempfile.name
+                finally:
+                    tempfile.close()
+
         self.upload_stream_to_file(TextStreamCreator(text), filename, 64, 10, use_threads)
 
     def save_object(self, obj: object, filename: str) -> None:
@@ -360,11 +421,19 @@ class S3CheckpointStorage(BaseCheckpointStorage):
                 torch.save(obj, stream)
                 return stream
 
+            def create_tmp_file(self):
+                try:
+                    tempfile = NamedTemporaryFile(dir=SHM_PATH, delete=False)
+                    torch.save(self._obj, tempfile)
+                    return tempfile.name
+                finally:
+                    tempfile.close()
+
         self.upload_stream_to_file(ObjectStreamCreator(obj), filename)
 
     def load_object(self, filename: str, map_location: Optional[torch.serialization.MAP_LOCATION] = None) -> Any:
         stream: BytesIO = self.download_file_to_stream(filename)
-        return torch.load(stream, map_location=map_location)
+        return torch.load(stream, map_location=map_location, weights_only=False)
 
     def create_dir(self, dirname: str, exist_ok: bool = True) -> None:
         """
@@ -380,36 +449,62 @@ class S3CheckpointStorage(BaseCheckpointStorage):
         nothing need to be done here.
         """
 
+    @retry_with_jitter
     def remove_dir(self, dirname: str) -> None:
         key = self.convert_path_to_key(dirname)
-        client = S3CheckpointStorage.get_client()
-        S3CheckpointStorage.s3_action_with_retry(S3CheckpointStorage.REMOVE_DIR, client, self._bucket, key, None)
+        s3 = S3CheckpointStorage.get_resource()
+        s3_bucket = s3.Bucket(self._bucket)
+        s3_bucket.objects.filter(Prefix=key + "/").delete()
 
+    @retry_with_jitter
     def remove_file(self, filename: str) -> None:
         key = self.convert_path_to_key(filename)
-        client = S3CheckpointStorage.get_client()
-        S3CheckpointStorage.s3_action_with_retry(S3CheckpointStorage.REMOVE_FILE, client, self._bucket, key, None)
+        s3 = S3CheckpointStorage.get_resource()
+        s3_object = s3.Object(self._bucket, key)
+        s3_object.delete()
 
+    @retry_with_jitter
     def upload_stream_to_file(
             self, stream_creator, filename: str, chunk_size_MB: int = 64, max_concurrency: int = 10, use_threads: bool = True
     ) -> None:
-        client = S3CheckpointStorage.get_client()
         chunk_size = chunk_size_MB * 1048576
-        config = boto3.s3.transfer.TransferConfig(use_threads=use_threads, multipart_chunksize=chunk_size, max_concurrency=max_concurrency)
+        ckpt_fileobj = None
+        tmpfile_buffer = False
+        if os.path.exists(SHM_PATH) and use_threads:
+            tmpfile_buffer = True
+            ckpt_fileobj = stream_creator.create_tmp_file()
+        else:
+            ckpt_fileobj = stream_creator.create_stream()
+            ckpt_fileobj.seek(0)
+        config = TransferConfig(use_threads=use_threads, multipart_chunksize=chunk_size, max_concurrency=max_concurrency)
         key = self.convert_path_to_key(filename)
-        S3CheckpointStorage.s3_action_with_retry(
-            S3CheckpointStorage.UPLOAD, client, self._bucket, key, config, upload_stream_creator=stream_creator
-        )
+        if use_threads:
+            manager = self.get_transfer_manager(config)
+            future = manager.upload(
+                fileobj=ckpt_fileobj,
+                bucket=self._bucket,
+                key=key,
+            )
+            future.result()
+            if tmpfile_buffer:
+                os.remove(ckpt_fileobj)
+        else: 
+            # if use_threads is False, then we need to use boto3 client directly as CRT transfer manager doesn't support non-background threading
+            client = self.get_client()
+            client.upload_fileobj(ckpt_fileobj, self._bucket, key, Config=config)
 
     def convert_path_to_key(self, path: str) -> str:
         return path if self._base_key is None else self._base_key + path
 
+    @retry_with_jitter
     def download_file_to_stream(self, filename: str, chunk_size_MB: int = 64, max_concurrency: int = 15) -> BytesIO:
-        client = S3CheckpointStorage.get_client()
-        key = self.convert_path_to_key(filename)
-        chunk_size = chunk_size_MB * 1048576
-        config = boto3.s3.transfer.TransferConfig(multipart_chunksize=chunk_size, max_concurrency=max_concurrency)
-        return S3CheckpointStorage.s3_action_with_retry(S3CheckpointStorage.DOWNLOAD, client, self._bucket, key, config)
+        stream = BytesIO()
+        # Using get_object to avoid spinning up more threads as download_fileobj does.
+        # Downloading the checkpoint tensors happens already from 3 threads per process for 32 processes per node.
+        response = S3CheckpointStorage.get_client().get_object(Bucket=self._bucket, Key=self.convert_path_to_key(filename))
+        stream.write(response['Body'].read())
+        stream.seek(0)
+        return stream
 
     @staticmethod
     def parse_path(s3_path: str) -> Tuple[str, Optional[str]]:
@@ -431,135 +526,87 @@ class S3CheckpointStorage(BaseCheckpointStorage):
         return s3_path[0:first_slash], s3_path[first_slash + 1 :]
 
     @staticmethod
-    def get_resource(
-        profile: Optional[str] = None,
-        creds: Optional[botocore.credentials.Credentials] = None,
-        session: Optional[boto3.Session] = None,
-        config: Optional[Dict[str, Any]] = None,
-    ) -> "S3ServiceResource":
-        s3_config = botocore.config.Config(max_pool_connections=30, **(config or {}))
-
-        if profile is not None and creds is not None:
-            raise ValueError("Please provide profile or creds or neither, not both.")
-
-        if profile is not None:
-            s3 = boto3.Session(profile_name=profile).resource("s3", config=s3_config)
-        elif creds is not None:
-            s3 = (session or boto3._get_default_session()).resource(
-                "s3",
-                aws_access_key_id=creds.access_key,
-                aws_secret_access_key=creds.secret_key,
-                aws_session_token=creds.token,
-                config=s3_config,
-            )
-        else:
-            s3 = (session or boto3._get_default_session()).resource("s3", config=s3_config)
-
-        return s3
+    def get_resource() -> "S3ServiceResource":
+        s3_resource, _ = S3CheckpointStorage._ensure_s3_resource_and_client()
+        return s3_resource
 
     @staticmethod
-    def get_client(
-        profile: Optional[str] = None,
-        creds: Optional[botocore.credentials.Credentials] = None,
-        session: Optional[boto3.Session] = None,
-        config: Optional[Dict[str, Any]] = None,
-    ) -> "S3Client":
-        return S3CheckpointStorage.get_resource(profile, creds, session, config).meta.client
+    def get_client() -> "S3Client":
+        _, s3_client = S3CheckpointStorage._ensure_s3_resource_and_client()
+        return s3_client
 
     @staticmethod
-    def is_slow_down_error(exception: Exception) -> bool:
-        # Example Invalid response status that is slow down
-        # AWS_ERROR_S3_INVALID_RESPONSE_STATUS: Invalid response status from request.
-        # Body from error request is:
-        # '<?xml version="1.0" encoding="UTF-8"?>
-        #  <Error>
-        #      <Code>RequestTimeout</Code>
-        #      <Message>
-        #         Your socket connection to the server was not read from or written to within the timeout period. Idle connections will be closed.
-        #      </Message>
-        #    <RequestId>XPHS9896G3RJE364</RequestId>
-        #    <HostId>ZAiF3HPpUD5IgSr/mfkP2QPs7ttuvY+uTRG9MET/jZZ45MJ6bVbnvSBQLggICvPCROPP/1k85p4=</HostId>
-        # </Error>'
-        message = str(exception)
-        if (
-            "<Code>SlowDown</Code>" in message
-            or "<Code>RequestTimeout</Code>" in message
-            or "<Code>InternalError</Code>" in message
-        ):
-            return True
-
-        if use_crt and isinstance(exception, awscrt.exceptions.AwsCrtError):
-            return True
-
-        if isinstance(exception, botocore.exceptions.ConnectionClosedError):
-            if (
-                "Connection was closed before we received a valid response from endpoint" in message
-                and ".s3." in message
-            ):
-                return True
-
-        if isinstance(exception, botocore.exceptions.ClientError):
-            if exception.response:
-                if "Error" not in exception.response:
-                    message = str(exception.response)
-                    return "MaxAttemptsReached" in message
-                else:
-                    error_code = exception.response["Error"]["Code"]
-                    return error_code in ["SlowDown", "RequestTimeout", "InternalError", "Throttling"]
-
-        return False
+    def _ensure_s3_resource_and_client() -> Tuple["S3ServiceResource", "S3Client"]:
+        """Only instantiate the s3 resource and client once per process."""
+        global _s3_resource, _s3_client
+        if _s3_resource is None or _s3_client is None:
+            _s3_resource = boto3.Session().resource('s3', config=botocore.config.Config(max_pool_connections=max(1, (os.cpu_count() or 1) // 4)))
+            _s3_client = _s3_resource.meta.client
+        return _s3_resource, _s3_client
 
     @staticmethod
-    def s3_action_with_retry(action, client, bucket, key, config, upload_stream_creator=None):
-        max_try = 12
-        sleep_second: float = 60.0
-        for try_idx in range(max_try):
-            try:
-                if action == S3CheckpointStorage.DOWNLOAD:
-                    stream = BytesIO()
-                    client.download_fileobj(bucket, key, stream, Config=config)
-                    stream.seek(0)
-                    return stream
-                elif action == S3CheckpointStorage.UPLOAD:
-                    stream = upload_stream_creator.create_stream()
-                    stream.seek(0)
-                    client.upload_fileobj(stream, bucket, key, Config=config)
-                    return
-                elif action == S3CheckpointStorage.REMOVE_FILE:
-                    assert not key.endswith("/")
-                    client.delete_object(Bucket=bucket, Key=key)
-                    return
-                elif action == S3CheckpointStorage.REMOVE_DIR:
-                    prefix = key if key.endswith("/") else key + "/"
-                    response = client.list_objects(Bucket=bucket, Prefix=prefix)
-                    while "Contents" in response:
-                        objects = response["Contents"]
-                        assert len(objects) > 0
-                        delete: Dict[str, List[Any]] = {"Objects": []}
-                        for obj in objects:
-                            delete["Objects"].append({"Key": obj["Key"]})
-                        client.delete_objects(Bucket=bucket, Delete=delete)
-                        response = client.list_objects(Bucket=bucket, Prefix=prefix)
-                    return
-                else:
-                    raise RuntimeError(f"Error: unknow action {action}")
-            except Exception as e:
-                if S3CheckpointStorage.is_slow_down_error(e):
-                    if try_idx < max_try - 1:
-                        current_sleep_time = sleep_second + random.randint(20, 60)
-                        logging.info(
-                            f"Encountered slow down error when upload file for {try_idx+1} times. Sleep {current_sleep_time} seconds then retry"
-                        )
-                        time.sleep(current_sleep_time)
-                        sleep_second *= 1.5
-                    else:
-                        logging.info(
-                            f"Encountered slow down error when upload file for {try_idx+1} times. No more retrying"
-                        )
-                        raise e
-                else:
-                    raise e
+    def _get_s3_region() -> str:
+        url = "http://169.254.169.254/latest/dynamic/instance-identity/document"
+        try:
+            response = requests.get(url, timeout=2)
+            response.raise_for_status()
+            instance_data = response.json()
+            return instance_data['region']
+        except requests.exceptions.RequestException as e:
+            # Fallback to AWS SDK region environment variable
+            logging.info(f"Failed to retrieve instance region: {e}. Defaulting to AWS_REGION value")
+            region = os.getenv("AWS_REGION")
+            if region is None:
+                # If not AWS_REGION not set, fallback to the region that is auto-resolved by boto3 client
+                region = S3CheckpointStorage.get_client().meta.region_name
+                logging.info(f"AWS_REGION env variable not set. Defaulting to {region}")
+            return region
 
 
-def create_checkpoint_storage(dirname: str):
-    return S3CheckpointStorage(dirname) if dirname.startswith("s3://") else FilesysCheckpointStorage(dirname)
+    @staticmethod
+    def _create_s3_crt_client(session: botocore.session.Session, num_threads=None, part_size=None, target_throughput=None) -> Any:
+        logging.debug(f"CRT client config: part_size={part_size}, num_threads={num_threads}")
+
+        botocore_credentials = session.get_credentials()
+        # ignoring type error b/c this is how it is done in CRT integ/unit tests: https://github.com/boto/s3transfer/pull/283/commits/a86f7cf04b2e4dc89a868f5c198b9c057aada7de
+        wrapper = s3transfer.crt.BotocoreCRTCredentialsWrapper(
+            botocore_credentials  # type: ignore[arg-type] 
+        )
+        crt_credentials_provider = wrapper.to_crt_credentials_provider()
+        s3_crt_client = s3transfer.crt.create_s3_crt_client(
+            region=S3CheckpointStorage._get_s3_region(),
+            crt_credentials_provider=crt_credentials_provider,
+            target_throughput=target_throughput,
+            num_threads=num_threads,
+            part_size=part_size,
+        )
+        return s3_crt_client
+
+    def _create_transfer_manager(self, transfer_config: TransferConfig) -> Any:
+
+        crt = use_crt and awscrt.__version__ > "0.19.18" # type: ignore[attr-defined]
+        if crt: 
+            config = {}
+            if self._s3_crt_upload_num_threads:
+                config['num_threads'] = int(self._s3_crt_upload_num_threads)
+            if self._s3_crt_upload_part_size_mb:
+                config['part_size'] = int(float(self._s3_crt_upload_part_size_mb) * MB)
+            session = Session()
+            s3_crt_client = S3CheckpointStorage._create_s3_crt_client(session, **config)
+            request_serializer = s3transfer.crt.BotocoreCRTRequestSerializer(session)
+            crt_transfer_manager = s3transfer.crt.CRTTransferManager(s3_crt_client, request_serializer)
+            return crt_transfer_manager
+        s3_client = S3CheckpointStorage.get_client()
+        return s3transfer.manager.TransferManager(s3_client, transfer_config)
+
+    def get_transfer_manager(self, config: Optional[TransferConfig]=None) -> Any:
+        global _s3_transfer_manager
+        if _s3_transfer_manager is None:
+            if config is None:
+                config = TransferConfig()
+            _s3_transfer_manager = self._create_transfer_manager(config)
+        return _s3_transfer_manager
+
+
+def create_checkpoint_storage(dirname: str, crt_config: Optional[Dict]={}):
+    return S3CheckpointStorage(dirname, crt_config) if dirname.startswith(S3CheckpointStorage.S3_PATH_PREFIX) else FilesysCheckpointStorage(dirname)

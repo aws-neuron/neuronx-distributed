@@ -93,7 +93,7 @@ def _gather_along_dim(x: Tensor, partition_dim: int, process_group: Optional[Pro
     tp_group = process_group if process_group is not None else get_tensor_model_parallel_group()
 
     # bpyass the function if we only have 1 TP rank.
-    if get_tensor_model_parallel_size() == 1:
+    if tp_group.size() == 1:  # type: ignore
         return x
 
     output = all_gather(
@@ -401,6 +401,10 @@ def copy_to_tensor_model_parallel_region(input_, process_group: Optional[Process
 
 
 def reduce_from_tensor_model_parallel_region(input_, process_group: Optional[ProcessGroup] = None):
+    return _ReduceFromModelParallelRegion.apply(input_, process_group)
+
+
+def reduce_from_context_model_parallel_region(input_, process_group: Optional[ProcessGroup] = None):
     return _ReduceFromModelParallelRegion.apply(input_, process_group)
 
 

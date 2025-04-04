@@ -30,6 +30,13 @@ from neuronx_distributed.parallel_layers.utils import (
 )
 from neuronx_distributed.utils.logger import get_logger
 from neuronx_distributed.utils.utils import hardware
+from neuronx_distributed.modules.qkv_linear_utils import (
+    _qkvlinear_autograd_base_setup_fwd,
+    _qkvlinear_autograd_base_setup_bwd,
+    _qkvlinear_autograd_bwd_grad_reduce,
+    _qkvlinear_autograd_bwd_no_weight_grad,
+    _qkvlinear_autograd_bwd_input_grad
+)
 from torch_neuronx.utils import get_platform_target
 
 logger = get_logger()
@@ -111,17 +118,6 @@ def _compute_gradients(
 
     return grad_weight, grad_bias
 
-
-def check_requires_grad(weight_qkv, fuse_qkv, weight_q):
-    return weight_qkv.requires_grad if fuse_qkv else weight_q.requires_grad
-
-
-def check_use_bias(weight_qkv, fuse_qkv, weight_q, bias_q, bias_qkv):
-    return (bias_qkv is not None if fuse_qkv else bias_q is not None) and check_requires_grad(
-        weight_qkv, fuse_qkv, weight_q
-    )
-
-
 class GQAQKVLinearWithAsyncCommunication(torch.autograd.Function):
     """Linear layer execution with asynchronous communication."""
 
@@ -145,35 +141,26 @@ class GQAQKVLinearWithAsyncCommunication(torch.autograd.Function):
         output_size_kv: Optional[int] = None,
         reduce_dtype: torch.dtype = torch.float32,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        ctx.use_bias = check_use_bias(weight_qkv, fuse_qkv, weight_q, bias_q, bias_qkv)
-        ctx.async_grad_allreduce = async_grad_allreduce
-        ctx.sequence_parallel_enabled = sequence_parallel_enabled
-        ctx.compute_weight_gradient = check_requires_grad(weight_qkv, fuse_qkv, weight_q)
-        ctx.kv_size_multiplier = kv_size_multiplier
-        ctx.fuse_qkv = fuse_qkv
-        ctx.reduce_dtype = reduce_dtype
-
-        if ctx.compute_weight_gradient:
-            if ctx.fuse_qkv:
-                ctx.save_for_backward(input, weight_qkv)
-            else:
-                ctx.save_for_backward(input, weight_q, weight_k, weight_v)
-        else:
-            if ctx.fuse_qkv:
-                ctx.save_for_backward(weight_qkv)
-            else:
-                ctx.save_for_backward(weight_q, weight_k, weight_v)
-
-        if ctx.sequence_parallel_enabled:
-            # `input` is supposed to be 3D and its order of dimension is [sequence, batch, hidden]
-            total_input = xm.all_gather(
-                input,
-                groups=get_tensor_model_parallel_replica_groups(),
-                pin_layout=False,
-            )
-        else:
-            total_input = input
-
+        
+        total_input = _qkvlinear_autograd_base_setup_fwd(
+            ctx,
+            input,
+            weight_q,
+            weight_k,
+            weight_v,
+            bias_q,
+            bias_k,
+            bias_v,
+            async_grad_allreduce,
+            sequence_parallel_enabled,
+            kv_size_multiplier,
+            weight_qkv,
+            bias_qkv,
+            fuse_qkv,
+            output_size_q,
+            output_size_kv,
+            reduce_dtype
+        )
         if ctx.fuse_qkv:
             assert weight_qkv is not None and output_size_q is not None and output_size_kv is not None
             output_qkv = _linear_forward(total_input, weight_qkv, bias_qkv)
@@ -190,46 +177,8 @@ class GQAQKVLinearWithAsyncCommunication(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output_q, grad_output_k, grad_output_v):
-        if ctx.compute_weight_gradient:
-            if ctx.fuse_qkv:
-                input, weight_qkv = ctx.saved_tensors
-            else:
-                input, weight_q, weight_k, weight_v = ctx.saved_tensors
-        else:
-            if ctx.fuse_qkv:
-                weight_qkv = ctx.saved_tensors[:1]
-            else:
-                weight_q, weight_k, weight_v = ctx.saved_tensors[:3]
-            input = None
-
-        use_bias = ctx.use_bias
-        if ctx.compute_weight_gradient:
-            if ctx.sequence_parallel_enabled:
-                total_input = xm.all_gather(
-                    input,
-                    groups=get_tensor_model_parallel_replica_groups(),
-                    pin_layout=False,
-                )
-            else:
-                total_input = input
         
-        if ctx.kv_size_multiplier > 1:
-            # Since we repeat the K and V by a factor of kv_size_multipler, we need to
-            # sum up the gradients from the repeated portions. get_kv_shared_group()
-            # returns the ranks which have the same K and V heads, and hence allows us to
-            # sum up from the distributed ranks.
-            original_dtype = grad_output_k.dtype
-            grad_output_k = grad_output_k.to(ctx.reduce_dtype)
-            grad_output_v = grad_output_v.to(ctx.reduce_dtype)
-
-            outs = xm.all_reduce(
-                xm.REDUCE_SUM,
-                [grad_output_k, grad_output_v],
-                scale=1.0,
-                groups=parallel_state.get_kv_shared_replica_groups(),
-                pin_layout=False
-            )
-            grad_output_k, grad_output_v = outs[0].to(original_dtype), outs[1].to(original_dtype)
+        total_input, weight_qkv, weight_q, weight_k, weight_v, grad_output_k, grad_output_v = _qkvlinear_autograd_base_setup_bwd(ctx, grad_output_q, grad_output_k, grad_output_v)
 
         if ctx.fuse_qkv:
             # Divide grad_output_k and grad_output_v by the kv replication factor
@@ -250,41 +199,13 @@ class GQAQKVLinearWithAsyncCommunication(torch.autograd.Function):
 
         original_dtype = grad_input.dtype
 
-        if ctx.async_grad_allreduce:
-            # Asynchronous all-reduce
-            grad_input = grad_input.to(ctx.reduce_dtype)
-            torch.distributed.all_reduce(grad_input, group=get_tensor_model_parallel_group())
-            grad_input=grad_input.to(original_dtype)
+        grad_input = _qkvlinear_autograd_bwd_grad_reduce(ctx, grad_input, original_dtype)
 
         # if no weight gradient, immediately return
         if not ctx.compute_weight_gradient:
             if ctx.sequence_parallel_enabled:
-                assert not ctx.async_grad_allreduce
-                world_size = get_tensor_model_parallel_size()
-                shape = list(grad_input.shape)
-                shape[0] //= world_size
-
-                grad_input = grad_input.to(ctx.reduce_dtype)
-
-                sub_grad_input = torch.empty(
-                    torch.Size(shape),
-                    dtype=grad_input.dtype,
-                    device=grad_input.device,
-                    requires_grad=False,
-                )
-
-                xm.reduce_scatter(
-                    xm.REDUCE_SUM,
-                    grad_input,
-                    output=sub_grad_input,
-                    groups=get_tensor_model_parallel_replica_groups(),
-                    shard_count=world_size,
-                    scatter_dim=0,
-                    scale=1,
-                    pin_layout=False,
-                )
-
-                sub_grad_input=sub_grad_input.to(original_dtype)
+                
+                sub_grad_input = _qkvlinear_autograd_bwd_no_weight_grad(ctx, grad_input, original_dtype)
 
                 return (
                     sub_grad_input,
@@ -311,25 +232,13 @@ class GQAQKVLinearWithAsyncCommunication(torch.autograd.Function):
 
         if ctx.sequence_parallel_enabled:
             assert not ctx.async_grad_allreduce
-            grad_input = grad_input.to(ctx.reduce_dtype)
-            sub_grad_input = torch.empty(grad_input.shape, dtype=grad_input.dtype, device=grad_input.device, requires_grad=False)
-            xm.reduce_scatter(
-                xm.REDUCE_SUM,
-                grad_input,
-                output=sub_grad_input,
-                groups=get_tensor_model_parallel_replica_groups(),
-                shard_count=get_tensor_model_parallel_size(),
-                scatter_dim=0,
-                scale=1,
-                pin_layout=False,
-            )
-            sub_grad_input=sub_grad_input.to(original_dtype)
+            sub_grad_input = _qkvlinear_autograd_bwd_input_grad(ctx, grad_input, original_dtype)
 
         if ctx.fuse_qkv:
             # Use grad_output_qkv without scaling by the kv replication factor
             grad_output_qkv_not_scaled = torch.cat([grad_output_q, grad_output_k, grad_output_v], dim=-1)
             grad_weight_qkv, grad_bias_qkv = _compute_gradients(
-                total_input, weight_qkv, grad_output_qkv_not_scaled, use_bias
+                total_input, weight_qkv, grad_output_qkv_not_scaled, ctx.use_bias
             )
 
             if ctx.sequence_parallel_enabled:
@@ -372,9 +281,9 @@ class GQAQKVLinearWithAsyncCommunication(torch.autograd.Function):
             )
 
         else:
-            grad_weight_q, grad_bias_q = _compute_gradients(total_input, weight_q, grad_output_q, use_bias)
-            grad_weight_k, grad_bias_k = _compute_gradients(total_input, weight_k, grad_output_k, use_bias)
-            grad_weight_v, grad_bias_v = _compute_gradients(total_input, weight_v, grad_output_v, use_bias)
+            grad_weight_q, grad_bias_q = _compute_gradients(total_input, weight_q, grad_output_q, ctx.use_bias)
+            grad_weight_k, grad_bias_k = _compute_gradients(total_input, weight_k, grad_output_k, ctx.use_bias)
+            grad_weight_v, grad_bias_v = _compute_gradients(total_input, weight_v, grad_output_v, ctx.use_bias)
 
         if ctx.sequence_parallel_enabled:
             return (

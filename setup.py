@@ -53,7 +53,8 @@ setup(
     install_requires=[
         "torch-neuronx",
         "torch-xla",
-        "safetensors"
+        "safetensors",
+        "tenacity",
     ],
     distclass=BinaryDistribution,
     cmdclass={

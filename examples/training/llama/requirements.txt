@@ -3,3 +3,7 @@ regex
 tensorboard
 datasets
 sentencepiece
+tenacity
+s3transfer
+awscrt
+huggingface-hub>=0.27.1

@@ -61,22 +61,28 @@ def on_exit() -> None:
     print(met.metrics_report())
 
 
-def test_initialize_model_parallel(tp_size: int) -> None:
+def test_initialize_model_parallel(tp_size: int, cp_size=1) -> None:
     """test initialize model parallel"""
-    parallel_state.initialize_model_parallel(tensor_model_parallel_size=tp_size)
+    parallel_state.initialize_model_parallel(tensor_model_parallel_size=tp_size, context_parallel_size=cp_size)
 
     # Model parallel.
-    dp_size = torch.distributed.get_world_size() // tp_size
+    dp_size = torch.distributed.get_world_size() // (tp_size*cp_size)
     rank = torch.distributed.get_rank()
     if tp_size == 4:  # a special case
         dp_rank = rank % dp_size
         tp_rank = (rank // dp_size) % tp_size
+        cp_rank = rank % cp_size
     else:
         tp_rank = rank % tp_size
-        dp_rank = (rank // tp_size) % dp_size
+        dp_rank = (rank // (tp_size*cp_size)) % dp_size
+        cp_rank = rank % cp_size
     assert tp_size == parallel_state.get_tensor_model_parallel_size()
     assert tp_rank == parallel_state.get_tensor_model_parallel_rank()
     check(parallel_state.get_tensor_model_parallel_group(), tp_size, tp_rank)
+
+    assert cp_size == parallel_state.get_context_model_parallel_size()
+    assert cp_rank == parallel_state.get_context_model_parallel_rank()
+    check(parallel_state.get_context_model_parallel_group(), cp_size, cp_rank)
 
     # Data parallel.
     assert dp_size == parallel_state.get_data_parallel_size()
@@ -112,4 +118,14 @@ if __name__ == "__main__":
         run_test(test_initialize_model_parallel, tensor_model_parallel_size)
         run_test(test_get_tensor_model_parallel_src_rank, tensor_model_parallel_size)
         tensor_model_parallel_size *= 2
+    
+    # Commenting the below block till CP gets enabled
+    # # Test with TP and CP
+    # tensor_model_parallel_size = 1
+    # context_model_parallel_size = 1
+    # while context_model_parallel_size*tensor_model_parallel_size <= world_size:
+    #     print_separator("test initialize model parallel")
+    #     test_initialize_model_parallel(tensor_model_parallel_size, context_model_parallel_size)
+    #     context_model_parallel_size *= 2
+
     atexit.register(on_exit)

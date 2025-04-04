@@ -72,6 +72,74 @@ if [ $META_DEVICE_INIT -gt 0 ]; then
     EXTRA_ARGS+=" --use_meta_device_init 1"
 fi
 
+if [[ "${ENABLE_CHECKPOINTING}" == "1" ]]; then
+    echo "Checkpointing is enabled."
+
+    if [ $XSER -gt 0 ]; then
+        EXTRA_ARGS+=" --save_load_xser 1"
+    else
+        EXTRA_ARGS+=" --save_load_xser 0"
+    fi
+
+    if [ $ASYNC_CHECKPOINT_SAVING -gt 0 ]; then
+        EXTRA_ARGS+=" --async_checkpoint_saving 1"
+    fi
+    # Check for CHECKPOINT_DIR
+    if [[ -n "${CHECKPOINT_DIR}" ]]; then
+        checkpoint_dir="${CHECKPOINT_DIR}"
+    else
+        checkpoint_dir="ckpt"
+    fi
+    echo "Checkpoint directory set to: ${checkpoint_dir}"
+    EXTRA_ARGS+=" --checkpoint_dir $checkpoint_dir"
+
+    # Checkpoint frequency
+    if [[ -n "${CHECKPOINT_FREQ}" ]]; then
+        if [[ "${CHECKPOINT_FREQ}" =~ ^[0-9]+$ ]]; then
+            checkpoint_freq="${CHECKPOINT_FREQ}"
+            echo "Checkpoint freq set to: ${CHECKPOINT_FREQ}"
+        else
+            echo "Error: CHECKPOINT_FREQ must be an integer."
+            exit 1
+        fi
+    else
+        echo "Setting CHECKPOINT_FREQ to be 10"
+        checkpoint_freq="10"
+    fi
+    EXTRA_ARGS+=" --checkpoint_freq $checkpoint_freq"
+
+    # Check for LOAD_CHECKPOINT_STEP
+    if [[ -n "${LOAD_CHECKPOINT_STEP}" ]]; then
+        if [[ "${LOAD_CHECKPOINT_STEP}" =~ ^[0-9]+$ ]]; then
+            load_checkpoint_step="${LOAD_CHECKPOINT_STEP}"
+            echo "Load checkpoint step set to: ${load_checkpoint_step}"
+            EXTRA_ARGS+=" --loading_step $load_checkpoint_step" 
+            LOG_PATH=$LOG_PATH/load
+        else
+            echo "Error: LOAD_CHECKPOINT_STEP must be an integer."
+            exit 1
+        fi
+    else
+        echo "LOAD_CHECKPOINT_STEP is unset. Training from scratch"
+        LOG_PATH=$LOG_PATH/save
+    fi
+    
+    EXTRA_ARGS+=" --num_kept_checkpoint 10"
+else
+    echo "Checkpointing is disabled or not configured."
+fi
+
+if [ $USE_ZERO_1 -gt 0 ]; then
+    EXTRA_ARGS+=" --use_zero1_optimizer 1"
+    if [ $USE_MASTER_WEIGHT_IN_CKPT -gt 0 ]; then
+        EXTRA_ARGS+=" --use_master_weight_in_ckpt 1"
+        if [ $AVOID_SAVING_LOWER_PRECISION_WEIGHTS -gt 0 ]; then
+            EXTRA_ARGS+=" --avoid_saving_lower_precision_weights 1"
+        fi
+    fi
+fi
+mkdir -p $LOG_PATH
+
 torchrun $DISTRIBUTED_ARGS run_llama_nxd.py \
     --train_batch_size $BS \
     --training_dir $DATA_PATH \
@@ -103,17 +171,6 @@ else
       success=1
   else
       success=0
-  fi
-
-  if [ -z "$NEURON_EXTRACT_GRAPHS_ONLY" ]; then
-      echo "success=$success"
-      echo "update json with $HOME/ktest/dump_to_s3_update_test_json.sh"
-      dump_to_s3_update_json_scr=$HOME/ktest/dump_to_s3_update_test_json.sh
-      if [ -e $dump_to_s3_update_json_scr ]; then
-          $dump_to_s3_update_json_scr $@ --key=inference_success --value=$success || echo "Unable to update test result JSON."
-      else
-          echo "WARNING: Script $dump_to_s3_update_json_scr not found. Not updating test result JSON."
-      fi
   fi
 fi
 

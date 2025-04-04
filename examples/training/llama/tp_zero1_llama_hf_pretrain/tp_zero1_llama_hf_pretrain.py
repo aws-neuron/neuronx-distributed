@@ -32,7 +32,7 @@ import torch_xla.distributed.parallel_loader as pl
 import torch_xla.distributed.xla_multiprocessing as xmp
 from logger import Logger
 from modeling_llama_nxd import CoreAttention, LlamaForCausalLM, init_weights
-from training_utils import Throughput, create_llama_pretraining_dataset, get_mixed_precision_config, get_sin_cos_matrix
+from training_utils import Throughput, create_llama_pretraining_dataset, get_mixed_precision_config, get_sin_cos_matrix, get_batch_on_this_context_parallel_rank
 from transformers import AdamW, LlamaConfig, set_seed
 from transformers.optimization import get_linear_schedule_with_warmup
 
@@ -191,6 +191,7 @@ def train_llama(flags):
 
     nxd_config = nxd.neuronx_distributed_config(
         tensor_parallel_size=flags.tensor_parallel_size,
+        context_parallel_size=flags.context_parallel_size,
         optimizer_config={"zero_one_enabled": flags.use_zero_1, "grad_clipping": True, "max_grad_norm": 1.0},
         sequence_parallel=flags.sequence_parallel_enabled,
         activation_checkpoint_config=CoreAttention if flags.selective_checkpoint_enabled else "full",
@@ -211,7 +212,7 @@ def train_llama(flags):
     running_loss = torch.zeros(1, dtype=torch.double).to(device)
 
     param_optimizer = list(model.named_parameters())
-    no_decay = ["bias", "LayerNorm"]  # gamma/beta are in LayerNorm.weight
+    no_decay = ["bias", "norm"]  # gamma/beta are in LayerNorm.weight
 
     optimizer_grouped_parameters = [
         {
@@ -278,6 +279,8 @@ def train_llama(flags):
 
     def train_loop_fn(model, optimizer, train_loader, epoch, global_step, training_ustep, running_loss, use_zero_1):
         for _, data in enumerate(train_loader):
+            if parallel_state.get_context_model_parallel_size() > 1:
+                data = get_batch_on_this_context_parallel_rank(data, parallel_state)
             training_ustep += 1
             input_ids = data["input_ids"]
             attention_mask = data["attention_mask"]
@@ -288,6 +291,10 @@ def train_llama(flags):
                 labels=labels,
             )
             loss = outputs.loss / flags.grad_accum_usteps
+            cp_size = parallel_state.get_context_model_parallel_size()
+            if cp_size > 1:
+                torch.distributed.all_reduce(running_loss, group=parallel_state.get_context_model_parallel_group())
+                running_loss /= cp_size
             loss.backward()
             running_loss += loss.detach()
 
@@ -582,6 +589,7 @@ if __name__ == "__main__":
         help="Whether to print grad norm",
     )
     parser.add_argument("--tensor_parallel_size", default=2, type=int, help="Tensor parallel size")
+    parser.add_argument("--context_parallel_size", type=int, default=1, help="CP size")
     parser.add_argument("--seq_len", default=2048, type=int, help="Sequence length")
     parser.add_argument("--use_mix_precision", action="store_true", help="Use mix precision.")
     parser.add_argument("--use_zero_1", action="store_true", help="Use ZeRO-1.")
@@ -671,7 +679,7 @@ if __name__ == "__main__":
 
     os.environ["NEURON_RT_STOCHASTIC_ROUNDING_EN"] = "0" if args.use_gpu_compatible_precision > 0 else "1"
     if not args.use_gpu_compatible_precision:
-        if args.use_mix_precision: 
+        if args.use_mix_precision:
             os.environ["XLA_DOWNCAST_BF16"] = "1"
         else:
             os.environ["XLA_USE_BF16"] = "1"

@@ -16,6 +16,8 @@ fi
 python3.8 -m pip install mypy
 # Install type bindings
 python3.8 -m pip install types-requests boto3-stubs[s3] types-PyYAML
+# Dependencies for s3 checkpoint storage
+python3.8 -m pip install tenacity
 # removing cache fails in ToD
 python3.8 -m mypy --no-incremental --cache-dir=/dev/null
 # exit when asked to run `mypy` only

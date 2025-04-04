@@ -40,6 +40,7 @@ from neuronx_distributed.parallel_layers import (
 from neuronx_distributed.parallel_layers.parallel_state import (
     get_data_parallel_rank,
     get_data_parallel_size,
+    get_context_model_parallel_rank,
     get_pipeline_model_parallel_rank,
     get_tensor_model_parallel_rank,
     initialize_model_parallel,
@@ -75,6 +76,8 @@ from training_utils import (
     get_sin_cos_matrix,
     print_logs,
     set_random_seed,
+    get_batch_on_this_context_parallel_rank,
+
 )
 
 from neuronx_distributed.utils.adamw_fp32_optim_params import AdamW_FP32OptimParams
@@ -116,10 +119,13 @@ def train_llama(args):
     # For 8K seq-length, we have to checkpoint the MLP block as it produces large activation maps.
     selective_activation_checkpointing_modules = (CoreAttention, LlamaMLP) if args.seq_len == 8192 else (CoreAttention)
     mixed_precision_config = get_mixed_precision_config(args.use_gpu_compatible_precision > 0)
+    if args.use_master_weight_in_ckpt:
+        mixed_precision_config["use_master_weights_in_ckpt"] = True
 
     nxd_config = nxd.neuronx_distributed_config(
         tensor_parallel_size=args.tensor_parallel_size,
         pipeline_parallel_size=args.pipeline_parallel_size,
+        context_parallel_size=args.context_parallel_size,
         pipeline_config={
             "transformer_layer_cls": LlamaDecoderLayer,
             "num_microbatches": args.num_microbatches,
@@ -183,6 +189,7 @@ def train_llama(args):
     dp_size = get_data_parallel_size()
     tp_rank = get_tensor_model_parallel_rank()
     pp_rank = get_pipeline_model_parallel_rank()
+    cp_rank = get_context_model_parallel_rank()
 
     lr_scheduler = get_learning_rate_scheduler(optimizer, args)
 
@@ -194,7 +201,7 @@ def train_llama(args):
 
     # Only print/logging on the last PP rank of the first PP group
     # Since loss is only in the last PP rank
-    should_print = pp_rank == args.pipeline_parallel_size - 1 and dp_rank == 0 and tp_rank == 0
+    should_print = pp_rank == args.pipeline_parallel_size - 1 and dp_rank == 0 and tp_rank == 0 and cp_rank == 0
 
     logger = Logger(args, should_print)
 
@@ -269,6 +276,9 @@ def train_llama(args):
         if torch.distributed.get_rank() == 0:
             print(f"Epoch {epoch}")
         for batch_idx, batch in enumerate(train_dataloader):
+            # Split the batch for CP rank
+            if parallel_state.get_context_model_parallel_size() > 1:
+                batch = get_batch_on_this_context_parallel_rank(batch, parallel_state)
             if resume_batch_idx is not None and batch_idx <= resume_batch_idx and epoch <= resume_epoch:
                 if torch.distributed.get_rank() == 0:
                     print(f"skipping batch {batch_idx}")
@@ -285,6 +295,10 @@ def train_llama(args):
                     attention_mask=attention_mask,
                     labels=labels,
                 )
+                cp_size = parallel_state.get_context_model_parallel_size()
+                if cp_size > 1:
+                    torch.distributed.all_reduce(loss, group=parallel_state.get_context_model_parallel_group())
+                    loss /= cp_size
             optimizer.step()
             global_norm = optimizer.grad_norm  # Global norm before clipping
             optimizer.zero_grad()
@@ -322,6 +336,7 @@ def train_llama(args):
                     use_xser=args.save_load_xser,
                     num_kept_ckpts=args.num_kept_checkpoint,
                     async_save=args.async_checkpoint_saving,
+                    avoid_saving_lower_precision_weights=args.avoid_saving_lower_precision_weights,
                 )
             if total_steps >= args.max_steps:
                 break
@@ -386,6 +401,7 @@ if __name__ == "__main__":
     parser.add_argument("--train_batch_size", type=int, default=16, help="batch size")
     parser.add_argument("--pipeline_parallel_size", type=int, default=1, help="PP size")
     parser.add_argument("--virtual_pipeline_size", type=int, default=1, help="VPP size")
+    parser.add_argument("--context_parallel_size", type=int, default=1, help="CP size")
     parser.add_argument("--kv_replicator", type=int, default=1, help="KV replication size")
     parser.add_argument("--seq_len", type=int, default=4096, help="PP size")
     parser.add_argument("--use_flash_attention", type=int, default=0, help="Use neuron kernel")
@@ -415,6 +431,18 @@ if __name__ == "__main__":
         type=int,
         default=0,
         help="whether to use asynchronous checkpoint saving. 1 for using, 0 for not using. Default is 0",
+    )
+    parser.add_argument(
+        "--use_master_weight_in_ckpt",
+        type=int,
+        default=0,
+        help="whether to save master weights in optimizer states checkpoint for mixed precision training. Default is 0",
+    )
+    parser.add_argument(
+        "--avoid_saving_lower_precision_weights",
+        type=int,
+        default=0,
+        help="whether to avoid saving redundant low precision weights when running mixed precision zero1 training. Default is 0",
     )
     parser.add_argument(
         "--use_gpu_compatible_precision",

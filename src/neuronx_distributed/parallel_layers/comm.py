@@ -1,3 +1,4 @@
+import torch.distributed
 from neuronx_distributed.utils import cpu_mode
 from neuronx_distributed.utils.logger import get_logger
 import torch_xla.core.xla_model as xm
@@ -209,7 +210,8 @@ def all_reduce(
         op_type = _reduce_type_mapping[op_type]
         if isinstance(tensor_bucket, torch.Tensor):
             tensor_bucket = [tensor_bucket]
-        torch.distributed.all_reduce_coalesced(tensor_bucket, op=op_type, group=groups)
+        for tensor in tensor_bucket:
+            dist.all_reduce(tensor, op=op_type, group=groups)
     else:
         if isinstance(tensor_bucket, torch.Tensor):
             tensor_bucket = [tensor_bucket]

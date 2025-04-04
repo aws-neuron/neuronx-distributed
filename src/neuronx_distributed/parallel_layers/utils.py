@@ -223,7 +223,7 @@ def move_all_tensor_to_cpu(data: Any, convert: bool = True) -> Any:
         return tensor.device.type == "xla"
 
     def convert_fn(tensors):
-        torch_xla._XLAC._xla_sync_multi(tensors, devices=[], wait=True, sync_xla_data=True)
+        torch_xla._XLAC._xla_sync_multi(tensors, devices=[], wait=True, sync_xla_data=False)
         if not convert:
             return tensors
         return [tensor.to("cpu") for tensor in tensors]

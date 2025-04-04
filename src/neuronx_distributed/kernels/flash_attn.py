@@ -150,7 +150,7 @@ class NKIAttnFunc(torch.autograd.Function):
             softmax_scale=ctx.softmax_scale,
             use_sharded=ctx.use_sharded,
         )
-        return dq, dk, dv, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None
 
 
 def nki_flash_attn_func(

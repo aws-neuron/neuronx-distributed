@@ -1,4 +1,4 @@
-from typing import List, Dict, Optional
+from typing import List, Dict, Tuple
 
 from neuronx_distributed.parallel_layers.utils import is_torch_version_greater_than_2
 import torch
@@ -6,6 +6,7 @@ from torch_neuronx.xla_impl import structure
 
 def default_bucket_kernel(inputs: List[torch.Tensor]):
     return inputs, torch.tensor(0).to(torch.int)
+
 
 class SPMDBucketModelScript(torch.nn.Module):
     """
@@ -45,53 +46,6 @@ class SPMDBucketModelScript(torch.nn.Module):
             raise ValueError("This model is not initialized, please call traced_model.nxd_model.initialize(sharded_checkpoint) or traced_model.nxd_model.initialize_with_saved_weights()")
 
 
-class SPMDBucketModel(torch.nn.Module):
-    """
-    This classes implements bucketing with the SPMDModel runtime class.
-     The major difference from torch_neuronx's BucketModel class is that the
-     weights are not registered in this class but passed in as parameter in the forward.
-    """
-
-    def __init__(
-        self,
-        bucket_kernel,
-        bucket_kernel_constant_args,
-        bucket_model_executor: SPMDBucketModelScript,
-    ):
-        super().__init__()
-        # bucket kernel & preprocessors goes here
-        # weights and states are passed in
-        self.bucket_kernel = bucket_kernel
-        self.bucket_kernel_constant_args = bucket_kernel_constant_args
-
-        self.bucket_model_executor = bucket_model_executor
-
-    def forward(
-        self,
-        inputs: List[torch.Tensor],
-    ):
-        preprocessed_inputs, bucket_idx_tensor = self.bucket_kernel(
-            inputs, *self.bucket_kernel_constant_args
-        )
-
-        return self.bucket_model_executor(preprocessed_inputs, bucket_idx_tensor)
-
-    @torch.jit.export
-    def forward_async(
-        self,
-        input_collection: List[List[torch.Tensor]]
-    ):
-        preprocessed_input_collection: List[List[torch.Tensor]] = []
-        bucket_idx_tensor = torch.tensor(0)
-        for inputs in input_collection:
-            preprocessed_inputs, bucket_idx_tensor = self.bucket_kernel(
-                inputs, *self.bucket_kernel_constant_args
-            )
-            preprocessed_input_collection.append(preprocessed_inputs)
-
-        return self.bucket_model_executor.forward_async(preprocessed_input_collection, bucket_idx_tensor)
-
-
 class StateInitializer(torch.nn.Module):
     # torchscript cannot script dict of with values of different types
     # so we store shapes and dtypes in separate dicts
@@ -124,7 +78,7 @@ class NxDModel(torch.nn.Module):
         self,
         models: torch.nn.ModuleDict,
         flattener_map: torch.nn.ModuleDict,
-        input_shape_map: Dict[str, str],
+        input_shape_map: Dict[str, Tuple[str, int]],
         packer: structure.Packer,
         state_initializer: StateInitializer,
         weight_loader: torch.classes.neuron.LayoutTransformation, # type: ignore[name-defined, torch.classes.neuron.LayoutTransformation]
@@ -150,7 +104,7 @@ class NxDModel(torch.nn.Module):
         start_rank_id: int,
     ):
         for bucket_model in self.models.values():
-            for model in bucket_model.bucket_model_executor.models:
+            for model in bucket_model.models:
                 model.initialize(states, weights, start_rank_id)
 
     @torch.jit.export
@@ -183,17 +137,17 @@ class NxDModel(torch.nn.Module):
         and won't be serialized on jit.save
         """
         for script_model in self.models.modules():
-            if script_model.original_name == SPMDBucketModel.__name__:
-                for model in script_model.bucket_model_executor.models:
+            if script_model.original_name == SPMDBucketModelScript.__name__:
+                for model in script_model.models:
                     model.set_mock_initialized(mock)
 
-    def router(self, inputs: List[torch.Tensor]) -> str:
+    def router(self, inputs: List[torch.Tensor]) -> Tuple[str, int]:
         actual_shape = str([tensor.shape for tensor in inputs])
         return self.input_shape_map[actual_shape]
 
     def forward(self, inputs: List[torch.Tensor]):
         """ """
-        model_name = self.router(inputs)
+        model_name, bucket_idx = self.router(inputs)
 
         # Initialize empty tensor to ensure jit.script gets the write type
         flattened_inputs : List[torch.Tensor] = [torch.zeros(0)]
@@ -207,7 +161,7 @@ class NxDModel(torch.nn.Module):
         result: List[torch.Tensor] = [torch.zeros(0)]
         for name, model in self.models.items():
             if name == model_name:
-                result = model.forward(flattened_inputs)
+                result = model.forward(flattened_inputs, torch.tensor(bucket_idx, dtype=torch.int32))
 
         result = self.packer(result)
         return result
@@ -215,7 +169,7 @@ class NxDModel(torch.nn.Module):
     @torch.jit.export
     def forward_async(self, input_collection: List[List[torch.Tensor]]) -> List[List[torch.Tensor]]:
         sample_inputs: List[torch.Tensor] = input_collection[0]
-        model_name = self.router(sample_inputs)
+        model_name, bucket_idx = self.router(sample_inputs)
 
         flattened_input_collection: List[List[torch.Tensor]] = []
         for name, flattener in self.flattener_map.items():
@@ -227,7 +181,7 @@ class NxDModel(torch.nn.Module):
         result: List[List[torch.Tensor]] = []
         for name, model in self.models.items():
             if name == model_name:
-                result = model.forward_async(flattened_input_collection)
+                result = model.forward_async(flattened_input_collection, torch.tensor(bucket_idx, dtype=torch.int32))
 
         return result
 

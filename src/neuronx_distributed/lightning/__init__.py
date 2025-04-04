@@ -5,3 +5,4 @@ from .module import NeuronLTModule
 from .precision_plugin import NeuronXLAPrecisionPlugin
 from .progress_bar import NeuronTQDMProgressBar
 from .strategy import NeuronXLAStrategy
+from .neuron_hooks_callback import NeuronHooksCallback

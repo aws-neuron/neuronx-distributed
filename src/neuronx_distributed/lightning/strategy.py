@@ -2,6 +2,7 @@ import os
 from typing import Any, Dict, Optional, Union, TYPE_CHECKING
 
 import torch
+from importlib.metadata import version as get_version
 from lightning_fabric.plugins.environments import (
     TorchElasticEnvironment,
     XLAEnvironment,
@@ -23,6 +24,7 @@ from neuronx_distributed.parallel_layers.parallel_state import (
 from .accelerator import NeuronXLAAccelerator
 from .checkpoint_io import NeuronCheckpointIO
 from .launcher import _NeuronXLALauncher
+import torch_xla
 import torch_xla.core.xla_model as xm
 from torch_xla.distributed.parallel_loader import MpDeviceLoader
 
@@ -163,14 +165,32 @@ class NeuronXLAStrategy(XLAStrategy):
                 f" {reduce_op}"
             )
 
-        # Replace xm.mesh_reduce since it will cause error in PT2.x
-        xm.mark_step()
+        torch_version_tuple = tuple(map(int, get_version("torch").split(".")[:2]))
+        is_pt2_5 = torch_version_tuple == (2, 5)
+        if is_pt2_5:
+            # For PT2.5, xm.mark_step does not work due to an XLA bug:
+            # https://github.com/pytorch/xla/issues/8499
+            # Sync just output tensor, do not allow aliasing.
+            torch_xla._XLAC._xla_sync_multi(
+                [output], devices=[], wait=True, sync_xla_data=False
+            )
+        else:
+            xm.mark_step()
 
         torch.distributed.all_reduce(output, op=torch.distributed.ReduceOp.SUM)
         if isinstance(reduce_op, str) and reduce_op.lower() in ("avg", "mean"):
             output = output / self.world_size
 
-        xm.mark_step()
+        if is_pt2_5:
+            # For PT2.5, xm.mark_step does not work due to an XLA bug:
+            # https://github.com/pytorch/xla/issues/8499
+            # Sync just output tensor, do not allow aliasing.
+            torch_xla._XLAC._xla_sync_multi(
+                [output], devices=[], wait=True, sync_xla_data=False
+            )
+        else:
+            xm.mark_step()
+
         return output.cpu()
 
     def process_dataloader(self, dataloader: torch.utils.data.DataLoader) -> MpDeviceLoader:

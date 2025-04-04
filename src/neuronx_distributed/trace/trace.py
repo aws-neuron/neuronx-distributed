@@ -40,6 +40,7 @@ from neuronx_distributed.quantization.quantization_layers import (
     QuantizedRowParallel,
 )
 from neuronx_distributed.utils.model_utils import init_on_device
+from neuronx_distributed.utils.safetensors_utils import remove_duplicate_tensors
 
 logger = logging.getLogger("Neuron")
 
@@ -355,7 +356,7 @@ def parallel_model_trace(
                 max_parallel_compilations if max_parallel_compilations is not None else tp_degree,
             ),
             start_method="spawn",
-            nprocs=tp_degree,
+            nprocs = 1 if tp_degree == 1 else None
         )
         collector_func = collect_tp_neuron_models if not bucket_config else collect_tp_bucket_neuron_models
         models = [None if not bucket_config else [None] * bucket_config.bucket_degree] * tp_degree
@@ -453,7 +454,7 @@ def _spmd_trace(
             tp_degree,
         ),
         start_method="spawn",
-        nprocs=tp_degree,
+        nprocs = 1 if tp_degree == 1 else None,
     )
 
     if serialization_path is None:
@@ -623,15 +624,26 @@ def _load_weights(
         replace_weights(traced_model, checkpoint)
         return traced_model
 
+def preprocess_checkpoint(model, checkpoint):
+    # to overcome tensors sharing memory issue
+    checkpoint = remove_duplicate_tensors(checkpoint)
 
-def get_sharded_checkpoint(checkpoint, model, rank, tp_degree):
+    # Load checkpoints for just modules with preshard hook into memory and apply transformation in preshard hook
     invoke_preshard_hook(model, checkpoint, "")
+
+    # Update weights for Lora
     if hasattr(model, "lora_wrapped_model"):
         checkpoint = model.update_weights_for_lora(checkpoint)
 
+    # Remove redundant keys in checkpoints that don't exist in model's state_dict
     keys_to_delete = [key for key in checkpoint.keys() if key not in model.state_dict()]
     for key in keys_to_delete:
         checkpoint.pop(key, None)
+
+def get_sharded_checkpoint(checkpoint, model, rank, tp_degree, is_cached=False):
+    # Skip processing checkpoints if already processed and cached in memory
+    if not is_cached:
+        preprocess_checkpoint(model, checkpoint)
 
     dtype = None
     if hasattr(model, "config") and hasattr(model.config, "torch_dtype"):

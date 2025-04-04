@@ -12,6 +12,7 @@ then
     total_steps=150
     TP_DEGREE=8
     use_flash_attention=0
+    export NEURON_CC_FLAGS="--distribution-strategy=llm-training"
 elif [[ $SEQ_LEN = 8192 ]];
 then
     DATA_PATH="$HOME/wikicorpus_datasets/wikicorpus_llama_v2_tokenized_8k"
@@ -46,7 +47,7 @@ fi
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 
-export NEURON_CC_FLAGS="--model-type transformer --distribution-strategy=llm-training --cache_dir=$HOME/neuron_compile_cache$SEQ_LEN/ --retry_failed_compilation --enable-saturate-infinity"
+export NEURON_CC_FLAGS="--model-type transformer --cache_dir=$HOME/neuron_compile_cache$SEQ_LEN/ --retry_failed_compilation --enable-saturate-infinity $NEURON_CC_FLAGS"
 export NEURON_FUSE_SOFTMAX=1
 
 # Async Runtime

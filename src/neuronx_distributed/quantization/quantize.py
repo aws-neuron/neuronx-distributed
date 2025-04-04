@@ -67,7 +67,7 @@ def convert(
             else:
                 # Recursively  swap modules from the current root
                 logger.info(f"Will be recursively swapping the module within : {name}")
-                _convert_initialized_float_to_initialized_quantized(module=module_to_swap, q_config=q_config, mapping=mapping)
+                _convert_initialized_float_to_initialized_quantized(module=module_to_swap, q_config=q_config, mapping=mapping, modules_to_not_convert=modules_to_not_convert)
     return module
 
 def _swap_module(
@@ -117,7 +117,7 @@ def _convert_initialized_float_to_initialized_quantized(
                 q_config=q_config,
                 mapping=mapping,
                 prefixes=prefixes,
-                modules_to_not_convert=modules_to_not_convert
+                modules_to_not_convert=modules_to_not_convert,
             )
         if type(mod) in mapping and name not in modules_to_not_convert:
             if not any(key in ".".join(prefixes) for key in modules_to_not_convert):
@@ -126,13 +126,14 @@ def _convert_initialized_float_to_initialized_quantized(
                     mod=mod,
                     q_config=q_config,
                 )
+
         # Currently there is a bug in quantize.convert function where even though
         # Parallel embedding has set for tensor_model_parallel attribute, it does not show
         # up in the converted module. Detailed investigation to be performed here: NAPP-2474
         if type(mod).__name__ == "ParallelEmbedding":
             setattr(mod.weight, "tensor_model_parallel", True)
-            setattr(mod.weight, "partition_dim", mod.stride)
-            setattr(mod.weight, "partition_stride", mod.weight_partition_dim)
+            setattr(mod.weight, "partition_dim", mod.weight_partition_dim)
+            setattr(mod.weight, "partition_stride", mod.stride)
             setattr(mod.weight, "num_partitions", mod.tensor_model_parallel_size)
 
         # Remove the last key for recursion

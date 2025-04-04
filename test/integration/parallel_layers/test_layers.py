@@ -288,7 +288,7 @@ def test_row_parallel_linear_seq_parallel(tp_size, device):
         assert error < 1.0e-3, "error: {}".format(error)
 
 def test_row_parallel_linear_seq_parallel_HLO_test(tp_size, device):
-    os.environ["XLA_DOWNCAST_BF16"]="1"
+    os.environ["XLA_DOWNCAST_BF16"] = "1"
     batch_size = 8
     seq_length = 128
     hidden_size = 256
@@ -684,7 +684,12 @@ if __name__ == "__main__":
         run_test(test_padding_attention_heads, tensor_model_parallel_size, device)
         run_test(test_output_channel_parallel_conv, tensor_model_parallel_size)
         run_test(test_input_channel_parallel_conv, tensor_model_parallel_size)
-        run_test(test_back_to_back_parallel_convs, tensor_model_parallel_size)
+
+        if torch.__version__.startswith('1.13'):
+            print("Skipping test_back_to_back_parallel_convs for PyTorch 1.13")
+        else:
+            run_test(test_back_to_back_parallel_convs, tensor_model_parallel_size)
+
         run_test(test_row_parallel_linear_seq_parallel_HLO_test, tensor_model_parallel_size, device)
         tensor_model_parallel_size *= 2
     atexit.register(on_exit)
