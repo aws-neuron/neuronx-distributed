@@ -18,4 +18,8 @@ It should place the wheel at `build/`
 
 For a detailed API reference guide, please refer to: https://awsdocs-neuron.readthedocs-hosted.com/en/latest/libraries/neuronx-distributed/api_guide.html#api-guide
 
+## Examples
+To use this package for training refer to https://github.com/aws-neuron/neuronx-distributed-training
+
+To use this package for inference refer to https://github.com/aws-neuron/neuronx-distributed-inference
 
