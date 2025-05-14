@@ -16,7 +16,7 @@ from neuronx_distributed.parallel_layers import (
     parallel_state,
     scatter_to_tensor_model_parallel_region,
 )
-from neuronx_distributed.parallel_layers.loss_functions import parallel_cross_entropy
+from neuronx_distributed.parallel_layers.loss_functions import parallel_cross_entropy, from_parallel_logits_to_logprobs
 from neuronx_distributed.parallel_layers.utils import requires_init_pg_override
 
 datetime_str = str(datetime.now())
@@ -119,6 +119,68 @@ def test_parallel_cross_entropy(tensor_model_parallel_size):
         print(traceback.format_exc())
         raise
 
+def test_parallel_logits_to_logprobs(tensor_model_parallel_size):
+    def torch_logits_to_logprobs(
+        logits,
+        target,
+        seed,
+    ) -> torch.Tensor:
+        target = target.roll(shifts=-1, dims=-1)
+        set_random_seed(seed)
+        log_probs = F.log_softmax(logits, dim=-1)
+        gathered_log_probs = torch.gather(log_probs, -1, target.unsqueeze(-1)).squeeze(-1)
+        return gathered_log_probs[:, :-1]
+
+    def tensor_sharded_logits_to_logprobs(
+        logits,
+        target,
+        seed,
+    ):
+        set_random_seed(seed)
+        logits_parallel = scatter_to_tensor_model_parallel_region(logits)
+        log_probs = from_parallel_logits_to_logprobs(logits_parallel, target, inference=True)
+        return log_probs
+
+    def _test_parallel_logits_to_logprobs():
+        device = xm.xla_device()
+        tensor_model_parallel_size_ = tensor_model_parallel_size
+        parallel_state.initialize_model_parallel(tensor_model_parallel_size_)
+        tensor_model_parallel_size_ = parallel_state.get_tensor_model_parallel_size()
+
+        batch_size, sequence_length, vocab_size_per_partition = 2, 8, 16
+        vocab_size = vocab_size_per_partition * tensor_model_parallel_size_
+        logits_scale = 1.0
+        seed = 1234
+
+        # Generate full logits and target
+        set_random_seed(seed)
+        logits = torch.randn((batch_size, sequence_length, vocab_size), device=device) * logits_scale
+        target = torch.randint(0, vocab_size, (batch_size, sequence_length), device=device)
+
+        # Compute torch log probs
+        log_probs_torch = torch_logits_to_logprobs(logits, target, seed)
+
+        # Compute parallel log probs
+        log_probs_parallel = tensor_sharded_logits_to_logprobs(logits, target, seed)
+
+        error = log_probs_parallel.sub(log_probs_torch).abs().max()
+        print(f"Max error in log_probs on rank {torch.distributed.get_rank()}: {error}")
+        assert error < 1.0e-5, f"Error too large: {error}"
+
+        # Reset groups
+        parallel_state.destroy_model_parallel()
+
+        torch.distributed.barrier()
+        if torch.distributed.get_rank() == 0:
+            print("Test passed")
+
+    global results
+    try:
+        _test_parallel_logits_to_logprobs()
+    except Exception:
+        results["inference_success"] = 0
+        print(traceback.format_exc())
+        raise
 
 def on_exit():
     print(met.metrics_report())
@@ -136,5 +198,8 @@ if __name__ == "__main__":
     while tensor_model_parallel_size <= world_size:
         print_separator("test parallel cross entropy")
         test_parallel_cross_entropy(tensor_model_parallel_size)
+
+        print_separator("test parallel logits to logprobs")
+        test_parallel_logits_to_logprobs(tensor_model_parallel_size)
         tensor_model_parallel_size *= 2
     atexit.register(on_exit)

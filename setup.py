@@ -2,7 +2,9 @@ import os
 from setuptools import setup, PEP420PackageFinder
 from setuptools.dist import Distribution
 from wheel.bdist_wheel import bdist_wheel
-
+import os
+import subprocess
+from subprocess import CalledProcessError
 
 class BinaryDistribution(Distribution):
 
@@ -21,10 +23,23 @@ class bdist_wheel_plat_only(bdist_wheel):
         python, abi = 'py3', 'none'
         return python, abi, plat
 
-exec(open('src/neuronx_distributed/_version.py').read())
+
+def get_version(version_str):
+    major, minor, patch = version_str.split(".")
+    patch = os.getenv('VERSION_PATCH', patch)
+    suffix = os.getenv('SUFFIX')
+    if not suffix:
+        try:
+            suffix = f'{subprocess.check_output(["git", "rev-parse", "HEAD"]).decode("ascii").strip()[0:8]}.dev'
+        except CalledProcessError:
+            suffix = 'dev'
+    return f"{major}.{minor}.{patch}+{suffix}"
+
+
+exec(open("src/neuronx_distributed/_version.py").read())
 setup(
     name="neuronx-distributed",
-    version=__version__, #noqa
+    version=get_version(__version__), #noqa
     classifiers=[
         'Development Status :: 3 - Alpha',
         'Intended Audience :: Developers',

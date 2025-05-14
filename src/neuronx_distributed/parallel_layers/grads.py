@@ -355,7 +355,7 @@ def allreduce_context_parallel_gradients(optimizer):
         for group, params in param_group.items():
             if group == "params":
                 for p in params:
-                    if isinstance(p, torch.Tensor) and get_context_model_parallel_size() > 1:
+                    if isinstance(p, torch.Tensor):
                         if p.grad is not None:
                             grads.append(p.grad.data)
                         elif hasattr(p, "main_grad"):

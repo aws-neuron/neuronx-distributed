@@ -234,7 +234,7 @@ class LoraLinear(LoraLayer):
             assert self.lora_A is not None and self.lora_B is not None and self.lora_dropout is not None
             scaling = self.scaling
             x = x.to(self.lora_A.weight.dtype)
-            result += self.lora_B(self.lora_A(self.lora_dropout(x))) * scaling
+            result = result + self.lora_B(self.lora_A(self.lora_dropout(x))) * scaling
 
         result = result.to(previous_dtype)
         return result

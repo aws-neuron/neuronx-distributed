@@ -73,7 +73,7 @@ CONFIG_NAME = "adapter_config.json"
 
 class LoraModel(torch.nn.Module):
     """
-    Creates Low Rank Adapter (LoRA) model from a pretrained transformers model.
+    Creates Low Rank Adapter (LoRA) model from a pretrained model.
 
     The method is described in detail in https://arxiv.org/abs/2106.09685.
 
@@ -84,22 +84,6 @@ class LoraModel(torch.nn.Module):
     Returns:
         `torch.nn.Module`: The model with LoRA adapter injected.
 
-    Example:
-
-        ```py
-        >>> from transformers import AutoModelForSeq2SeqLM
-        >>> from peft import LoraModel, LoraConfig
-
-        >>> config = LoraConfig(
-        ...     r=8,
-        ...     lora_alpha=32,
-        ...     target_modules=["q_proj", "v_proj"],
-        ...     lora_dropout=0.01,
-        ... )
-
-        >>> model = AutoModelForSeq2SeqLM.from_pretrained("Llama2-7B")
-        >>> lora_model = LoraModel(model, config, "default")
-        ```
     **Attributes**:
         - **model** ([`~transformers.PreTrainedModel`]) -- The model to be adapted.
         - **lora_config** ([`LoraConfig`]): The configuration of the Lora model.

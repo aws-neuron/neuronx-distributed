@@ -9,13 +9,13 @@ SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 
 export NEURON_CC_FLAGS="--model-type transformer --cache_dir=/home/ubuntu/aahila/neuron_compile_cache/tp128/"
 vnc_size=1
-export NEURON_CC_FLAGS="${NEURON_CC_FLAGS} --target=trn2 --internal-compiler-debug-mode=penguin" # --internal-backend-options=--enable-indirect-memcpy-bound-check=false"
+export NEURON_CC_FLAGS="${NEURON_CC_FLAGS} --target=trn2" # --internal-backend-options=--enable-indirect-memcpy-bound-check=false"
 export NEURON_CC_FLAGS="${NEURON_CC_FLAGS} --internal-num-neuroncores-per-sengine=${vnc_size} --internal-hlo2tensorizer-options='--fuse-dot-logistic=false'"
 #export NEURON_CC_FLAGS="${NEURON_CC_FLAGS} --internal-enable-dge-levels vector_dynamic_offsets spill_reload scalar_dynamic_offset io"
 export NEURON_RT_VIRTUAL_CORE_SIZE=${vnc_size}
 
 # To dump HLOs
-export NEURON_FRAMEWORK_DEBUG=1
+# export NEURON_FRAMEWORK_DEBUG=1
 
 export NEURON_FUSE_SOFTMAX=1
 
@@ -178,5 +178,6 @@ torchrun $DISTRIBUTED_ARGS \
     --lr $LR \
     --min_lr $MIN_LR \
     --seq_len $SEQ_LEN \
+    --vocab_size 32000 \
     --capacity_factor $CAPACITY_FACTOR \
     $EXTRA_ARGS |& tee $OUTPUT_LOG

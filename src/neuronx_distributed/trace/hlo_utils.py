@@ -4,11 +4,17 @@ import shutil
 import pathlib
 import importlib.util
 import subprocess
+import tempfile
 from safetensors.torch import load_file, save_file
 from functools import partial
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set, Any
 from copy import deepcopy
+
+from neuronx_distributed.trace.model_builder_utils import (
+    WLOArtifacts,
+    generate_key
+)
 
 from torch_neuronx.proto import metaneff_pb2
 from torch_neuronx.pyhlo import hlo_pb2, xla_data_pb2
@@ -67,6 +73,135 @@ def add_weight_idx_attr_to_hlo(hlo: hlo_pb2.HloModuleProto, weight_name_to_idx: 
     weight_idx_list_str = ",".join([str(idx) for idx in weight_idx])
     hlo.frontend_attributes.map[TRANSPOSABLE_WEIGHT_IDX] = weight_idx_list_str
     return hlo
+
+
+def mark_weights_for_wlo(
+    priority_model_trace_hlo: hlo_pb2.HloModuleProto,
+    priority_model_weight_name_to_idx: Dict[str, int],
+    weights_to_skip_layout_optimization: Optional[Set] = None
+) -> None:
+    """
+    Mark weights in the priority model for Weight Layout Optimization (WLO).
+    
+    Args:
+        priority_model_trace_hlo: Priority model trace HLO
+        priority_model_weight_name_to_idx: A dictionary mapping weight names to their indices for the priority model
+        weights_to_skip_layout_optimization: Set of weight names to exclude from optimization
+        
+    Returns:
+        None
+    """
+    if weights_to_skip_layout_optimization is None:
+        weights_to_skip_layout_optimization = set()
+
+    try:
+        # Input validation
+        if not priority_model_trace_hlo:
+            raise ValueError("Priority model trace HLO is None")
+            
+        # Validate that all skipped weights exist in the weight_name_to_idx
+        invalid_weights = weights_to_skip_layout_optimization - set(priority_model_weight_name_to_idx.keys())
+        if invalid_weights:
+            raise ValueError(f"Invalid weights in skip set: {invalid_weights}")
+
+        logger.info("Marking weights in the priority model for weight layout optimization.")
+
+        add_weight_idx_attr_to_hlo(
+            hlo=priority_model_trace_hlo,
+            weight_name_to_idx=priority_model_weight_name_to_idx,
+            weight_names_to_skip=weights_to_skip_layout_optimization
+        )
+
+    except Exception as e:
+        logger.error(f"Failed to mark weights for WLO: {str(e)}")
+        raise RuntimeError(f"Weight layout optimization marking failed: {str(e)}") from e
+
+
+def apply_layout_transformation(
+    hlo_module: hlo_pb2.HloModuleProto,
+    flattener: Any,
+    packer: Any,
+    metaneff: Any,
+    weight_name_to_idx: Dict[str, int],
+    wlo_artifacts: WLOArtifacts,
+    key: Optional[str] = None
+) -> None:
+    """
+    Apply the layout transformation suggestion from the priority HLO to the given non-priority model trace artifacts.
+
+    Args:
+        hlo_module: The HLO module to apply the layout optimization to.
+        flattener: Function to flatten inputs.
+        packer: Function to pack outputs.
+        metaneff: The meta information for the Neuron Executable File Format (NEFF).
+        weight_name_to_idx: Dictionary mapping weight names to their indices.
+        wlo_artifacts: Artifacts containing the weight layout optimization information.
+        key: Optional key used to tag the bucket with a meaningful name.
+
+    Returns:
+        None
+    """
+    try:
+        # Input validation
+        if not hlo_module:
+            raise ValueError("HLO module is None")
+        if not weight_name_to_idx:
+            raise ValueError("Weight name to index mapping is empty")
+        if not wlo_artifacts:
+            raise ValueError("WLO artifacts is missing")
+
+        # Generate key for logging and tracking
+        key = generate_key(hlo_module, key)
+        logger.info(f"Applying layout transformation to {key}")
+
+        # Read the WLO stub
+        wlo_stub = read_hlo(wlo_artifacts.wrapped_neff_hlo_filename)
+        if not wlo_stub:
+            raise ValueError("Failed to read WLO stub")
+
+        # Get the layout transformation map
+        weight_name_to_transform_cpt = get_layout_transform_map(
+            hlo_stub=wlo_stub, 
+            weight_name_to_idx=weight_name_to_idx
+        )
+
+        # Create HLO artifacts
+        hlo_artifacts = HloArtifacts(
+            hlo_module=hlo_module,
+            flattener=flattener,
+            packer=packer,
+            metaneff=metaneff,
+            weights=None,
+            constant_parameter_tensors=None,
+            weight_name_to_idx=weight_name_to_idx
+        )
+
+        # Apply layout transformation
+        append_layout_computation_to_hlo(hlo_artifacts, weight_name_to_transform_cpt)
+
+        # Use temporary files
+        with tempfile.NamedTemporaryFile(mode='w+', suffix='.hlo') as original_hlo_file, \
+             tempfile.NamedTemporaryFile(mode='w+', suffix='.hlo') as optimized_hlo_file:
+            
+            # Write original HLO to temporary file
+            write_hlo(original_hlo_file.name, hlo_artifacts.hlo_module)
+
+            # Convert the inputs in HLO to optimal shape
+            convert_inputs_to_optimal_shape(original_hlo_file.name, optimized_hlo_file.name)
+
+            # Read the optimized HLO and update the trace artifacts
+            optimized_hlo = read_hlo(optimized_hlo_file.name)
+            hlo_artifacts.hlo_module = cleanup_after_layout_transformation(
+                optimized_hlo, 
+                hlo_artifacts.hlo_module.frontend_attributes.map
+            )
+
+            logger.info(f"Successfully applied layout optimization to {key}")
+
+    except Exception as e:
+        raise RuntimeError(f"Layout transformation failed for {key}: {str(e)}") from e
+
+    logger.info(f"Completed layout optimization process for {key}")
 
 
 def get_layout_transform_map(hlo_stub: hlo_pb2.HloModuleProto, weight_name_to_idx: Dict[str, int]):

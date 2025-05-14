@@ -316,6 +316,7 @@ class TestCustomFunction(unittest.TestCase):
                 output, 
                 model.sequence_dimension, 
                 process_group=model.tensor_parallel_group,
+                dtype=model.reduce_dtype,
             )
             mock_reduce.assert_not_called()
 

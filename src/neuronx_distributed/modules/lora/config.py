@@ -110,7 +110,7 @@ class LoraConfig:
     )
     save_lora_base: bool = field(default=False, metadata={"help": "save the base model"})
     save_lora_config_adapter: bool = field(
-        default=True, metadata={"help": "save LoRA configuration and LoRA adapter in the same checkpoint file."}
+        default=False, metadata={"help": "save LoRA configuration and LoRA adapter in the same checkpoint file."}
     )
     merge_sharded_lora: bool = field(
         default=True, metadata={"help": "merge the sharded LoRA adapter checkpoints into a single one."}
@@ -140,7 +140,8 @@ class LoraConfig:
         for key, value in config_dict.items():
             if key in selected_fields:
                 selected_dict[key] = value
-
+        # make configurations compatible with the format from Huggingface PEFT
+        selected_dict["r"] = selected_dict["lora_rank"]
         return selected_dict
 
     def __post_init__(self):

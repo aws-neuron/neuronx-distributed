@@ -85,6 +85,7 @@ def train_llama(flags):
     model_config.pretrained_ckpt = flags.pretrained_ckpt
     model_config.use_cache = False
     model_config.fuse_qkv = flags.fuse_qkv > 0
+    model_config.transpose_nki_inputs = flags.transpose_nki_inputs > 0
     model_config.kv_shared_group_size = flags.kv_replicator
     model_config.qkv_linear = flags.qkv_linear
     model_config.max_position_embeddings = max(model_config.max_position_embeddings, flags.seq_len)
@@ -371,6 +372,12 @@ if __name__ == "__main__":
         help="KV replication number",
     )
     parser.add_argument("--fuse_qkv", type=int, default=1, help="Whether to enable fused qkv")
+    parser.add_argument(
+        "--transpose_nki_inputs", 
+        type=int, 
+        default=1, 
+        help="Whether to transpose inputs to nki kernel for better perf when using FlashAttention"
+    )
 
     parser.add_argument("--do_eval", action="store_true", help="Do evaluation after fine-tuning.")
     parser.add_argument(

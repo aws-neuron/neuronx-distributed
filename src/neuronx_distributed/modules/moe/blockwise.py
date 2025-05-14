@@ -2,6 +2,7 @@ import torch
 import torch_xla.core.xla_model as xm
 import torch.nn.functional as F
 from neuronx_distributed.parallel_layers import mappings
+from neuronxcc.nki.compiler.backends.neuron.dimensions import VNC
 
 try:
     from neuronxcc.nki._private_kernels.blockwise_mm import (
@@ -445,6 +446,7 @@ class BlockwiseMatmulNKIFunc(torch.autograd.Function):
         gate_up_proj_scale,
         down_proj_scale,
         is_training,
+        logical_nc_config=1
     ):
         """
         Forward pass using the blockwise matmul NKI kernel.
@@ -530,6 +532,24 @@ class BlockwiseMatmulNKIFunc(torch.autograd.Function):
                 gate_up_activations_T=gate_up_activations,
                 down_activations=down_activations,
             )
+        elif logical_nc_config == 2:
+            _blockwise_mm_nki_call[VNC(2)](
+                # Inputs
+                hidden_states=hidden_states,
+                expert_affinities_masked=expert_affinities_masked,
+                # MLP weights
+                gate_up_proj_weight=gate_up_proj_weight,
+                down_proj_weight=down_proj_weight,
+                # Block related
+                block_size=block_size,
+                token_position_to_id=token_position_to_id.to(dtype=torch.int32),
+                block_to_expert=block_to_expert.to(dtype=torch.int32),
+                # Output
+                output=output,
+                gate_up_proj_scale=gate_up_proj_scale,
+                down_proj_scale=down_proj_scale,
+                lnc=2,
+            )
         else:
             _blockwise_mm_nki_call(
                 # Inputs
@@ -544,7 +564,6 @@ class BlockwiseMatmulNKIFunc(torch.autograd.Function):
                 block_to_expert=block_to_expert.to(dtype=torch.int32),
                 # Output
                 output=output,
-                skip_dma=False,
                 gate_up_proj_scale=gate_up_proj_scale,
                 down_proj_scale=down_proj_scale,
             )
@@ -617,6 +636,7 @@ class BlockwiseMatmulNKIFunc(torch.autograd.Function):
             affinities_grad[:T],
             gate_up_proj_weight_grad.reshape(E, H, 2*ctx.intermediate_size),
             down_weight_grad,
+            None,
             None,
             None,
             None,

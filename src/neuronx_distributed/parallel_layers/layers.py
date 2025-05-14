@@ -313,12 +313,14 @@ class ParallelEmbedding(torch.nn.Module):
         )
         # Mask the output embedding.
         if self.tensor_model_parallel_size > 1:
-            output_parallel = torch.mul(output_parallel, torch.unsqueeze(input_mask.float(), dim=-1)).to(self.dtype)
+            if self.dtype==torch.float32:
+                output_parallel = torch.mul(output_parallel, torch.unsqueeze(input_mask.float(), dim=-1)).to(self.dtype)
+            else:
+                output_parallel = torch.mul(output_parallel, torch.unsqueeze(input_mask.bfloat16(), dim=-1)).to(torch.bfloat16)
 
         if self.sequence_parallel_enabled:
             if self.sequence_dim:
-                return _reduce_scatter_along_dim(output_parallel, self.sequence_dim,
-                                    process_group=self.tensor_model_parallel_group)
+                return output_parallel
             # TODO: use sequence dimension instead of a manual transpose which assumes a layout
             return reduce_scatter_to_sequence_parallel_region(
                 output_parallel.transpose(0, 1).contiguous(), process_group=self.tensor_model_parallel_group,
@@ -935,7 +937,7 @@ class RowParallelLinear(BaseParallelLinear):
 
             if self.sequence_parallel_enabled:
                 output_ = reduce_scatter_to_sequence_parallel_region(
-                    output_, self.sequence_dimension, process_group=self.tensor_parallel_group,
+                    output_, self.sequence_dimension, process_group=self.tensor_parallel_group, dtype=original_dtype,
                 )
             else:
                 output_ = reduce_from_tensor_model_parallel_region(

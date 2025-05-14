@@ -1,4 +1,5 @@
 import os
+import time
 import shutil
 import torch
 import multiprocessing
@@ -148,6 +149,57 @@ def test_executing_loaded_model():
         torch.testing.assert_close(cpu_result, nxd_result)
 
     os.remove("test.pt")
+
+
+def test_compiler_caching():
+    """ Test the caching feature of neuron_xla_compile() """
+    original_dir = os.getcwd()
+    new_dir = os.path.join(original_dir, "caching_test")
+    print(f"Current dir is {original_dir}, will move working dir to {new_dir}")
+    if os.path.exists(new_dir):
+        shutil.rmtree(new_dir)
+    os.makedirs(new_dir)
+    os.chdir(new_dir)
+    assert os.getcwd() == new_dir
+
+    hidden_dim=4
+    batch_size=2
+
+    model = CPLRPLModel(hidden_dim=hidden_dim, is_distributed=False)
+    torch.save(model.state_dict(), ckpt_path)
+
+    builder = ModelBuilder(router=None,
+                           tp_degree=2,
+                           checkpoint_loader=partial(torch.load, ckpt_path),
+                           compiler_workdir="compiler_workdir/")
+    x = torch.randn((batch_size, hidden_dim))
+    start_time = time.time()
+    timestamp = int(start_time) # timestamp to ensure unique logfile name in each test run
+    builder.add(key = "main",
+                model_instance = BaseModelInstance(partial(CPLRPLModel, hidden_dim=hidden_dim, is_distributed=True), input_output_aliases={}),
+                example_inputs=[(x,)],
+                compiler_args=f"--auto-cast=none --logfile=logfile_{timestamp}.txt")
+    # First trace runs a new compilation
+    builder.trace(initialize_model_weights=True)
+    without_caching_execution_time = time.time() - start_time
+
+    builder = ModelBuilder(router=None,
+                        tp_degree=2,
+                        checkpoint_loader=partial(torch.load, ckpt_path),
+                        compiler_workdir="compiler_workdir_with_cache/")
+    start_time = time.time()
+    builder.add(key = "main",
+                model_instance = BaseModelInstance(partial(CPLRPLModel, hidden_dim=hidden_dim, is_distributed=True), input_output_aliases={}),
+                example_inputs=[(x,)],
+                compiler_args=f"--auto-cast=none --logfile=logfile_{timestamp}.txt")
+    # This run should utilize artifacts from cache
+    builder.trace(initialize_model_weights=True)
+    with_caching_execution_time = time.time() - start_time
+
+    assert with_caching_execution_time < without_caching_execution_time, \
+        "ERROR: Compilation time did not reduce after caching."
+
+    os.chdir(original_dir)
 
 
 def test_CPL_RPL_model():
@@ -440,7 +492,6 @@ def test_batch_bucketed_model():
 
 
 def test_loading_checkpoint():
-
     hidden_dim=4
     batch_size=2
     tp_degree=2
@@ -471,6 +522,48 @@ def test_loading_checkpoint():
     for rank in range(tp_degree):
         ckpt = safetensors.torch.load_file(os.path.join(shard_weights_path, f"tp{rank}_sharded_checkpoint.safetensors"))
         weights.append(ckpt)
+
+    # Load the traced model
+    traced_model = torch.jit.load("traced_model.pt")
+
+    # Load weights
+    start_rank_tensor = torch.tensor([0], dtype=torch.int32, device="cpu")
+    traced_model.nxd_model.initialize(weights, start_rank_tensor)
+
+    # Test multiple invocations
+    for _ in range(5):
+        x = torch.randn((batch_size, hidden_dim))
+        cpu_result = model(x)
+        nxd_result = traced_model(x)
+        torch.testing.assert_close(cpu_result, nxd_result)
+
+
+def test_shard_on_load():
+    hidden_dim=4
+    batch_size=2
+    tp_degree=2
+
+    model = CPLRPLModel(hidden_dim=hidden_dim, is_distributed=False)
+    torch.save(model.state_dict(), ckpt_path)
+
+    builder = ModelBuilder(router=None,
+                           tp_degree=tp_degree,
+                           checkpoint_loader=partial(torch.load, ckpt_path),
+                           compiler_workdir="new_compiler_workdir/")
+    x = torch.randn((batch_size, hidden_dim))
+    builder.add(key = "main",
+                model_instance = BaseModelInstance(partial(CPLRPLModel, hidden_dim=hidden_dim, is_distributed=True), input_output_aliases={}),
+                example_inputs=[(x,)],
+                compiler_args="--auto-cast=none")
+
+    traced_model = builder.trace(initialize_model_weights=False) # stops weight sharding
+
+    # Save the traced model
+    torch.jit.save(traced_model, "traced_model.pt")
+    del traced_model
+
+    # Shard weights from checkpoint but do not serialize
+    weights = builder.shard_checkpoint()
 
     # Load the traced model
     traced_model = torch.jit.load("traced_model.pt")
@@ -511,3 +604,4 @@ if __name__ == "__main__":
         else:
             raise Exception(f"Test failed: {test.__name__}\n")
     print(f"All {len(test_list)} tests on ModelBuilder succeeded!")
+

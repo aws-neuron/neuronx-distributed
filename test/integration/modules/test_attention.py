@@ -94,6 +94,8 @@ def test_llama_attention(tensor_model_parallel_size=8, seq_len=8192):
         config.num_hidden_layers = 4
         config.batch_size = 8
         config.seq_length = seq_len
+        config.use_flash_attention = False
+        config.transpose_nki_inputs = False
 
         tensor_shape = (config.seq_length, config.batch_size, config.hidden_size)
         with torch.no_grad():

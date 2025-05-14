@@ -676,10 +676,11 @@ def create_local_weight(rank, world_size, full_weight, partition_dim, per_partit
     per_partition_per_stride_size = divide(per_partition_size, stride)
     weight_list = torch.split(full_weight, per_partition_per_stride_size, dim=partition_dim)
     my_weight_list = weight_list[rank::world_size]
-    if is_torch_version_greater_than_2() and full_weight.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
-        return my_weight_list[0].clone()
-    with torch.no_grad():
-        return torch.cat(my_weight_list, dim=partition_dim, out=out_weight)
+    if stride > 1:
+        with torch.no_grad():
+            return torch.cat(my_weight_list, dim=partition_dim, out=out_weight)
+    else:
+        return my_weight_list[0]
 
 
 def _mock_parallel_state(tp_degree: int, rank: int):

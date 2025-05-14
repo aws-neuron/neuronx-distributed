@@ -7,8 +7,6 @@ if [[ ${SLURM_NODEID-0} == 0 ]]; then
     set -x
 fi
 
-sudo sysctl -w net.ipv4.ip_local_reserved_ports=44000
-
 MODEL_SIZE="70B"
 LLAMA_VERSION='2'
 
@@ -32,11 +30,14 @@ HOSTNAME=`hostname`
 
 MODEL_SIZE="70B"
 LLAMA_VERSION='2'
+DATA_PATH="$HOME/examples_datasets/wikicorpus_llama${LLAMA_VERSION}_tokenized_4k"
+METRICS_FILE="results.json"
 
 set +x
 
 if [ -v SLURM_NTASKS ]; then
     # SLURM runs
+    sudo sysctl -w net.ipv4.ip_local_reserved_ports=44000
     IPS=""
     for h in $(scontrol show hostname); do
         IPS="$IPS $(nslookup $h  | awk '/^Address: / { print $2 }')";
@@ -53,7 +54,35 @@ if [ -v SLURM_NTASKS ]; then
     MASTER_ADDR=${HOSTS[0]}
     MASTER_PORT=44000
     DISTRIBUTED_ARGS="--nproc_per_node $PROCESSES_PER_NODE --nnodes $NTASKS --node_rank $NODEID --master_addr $MASTER_ADDR --master_port $MASTER_PORT"
+elif [ -v OMPI_COMM_WORLD_RANK ]; then
+    # Increase the fd limit for container
+    ulimit -n 65535
+    WORLD_SIZE=$OMPI_COMM_WORLD_SIZE
+    NTASKS=$OMPI_COMM_WORLD_SIZE
+    NODEID=$OMPI_COMM_WORLD_RANK
+    NODELIST=$(/root/nodelist_helper.py)
+    HOSTS=(${NODELIST//\ / })
+    MASTER_ADDR=${HOSTS[0]}
+    MASTER_PORT=44000
+    DISTRIBUTED_ARGS="--nproc_per_node $PROCESSES_PER_NODE --nnodes $NTASKS --node_rank $NODEID --master_addr $MASTER_ADDR --master_port $MASTER_PORT"
+    
+    export FI_EFA_USE_DEVICE_RDMA=1
+    export FI_PROVIDER=efa
+    export CCOM_SOCKET_IFNAME=eth0
+    export FI_EFA_FORK_SAFE=1
+
+    # Dataset is in shared location
+    DATA_PATH="$SHARED_PATH_PREFIX/mars_data_set/examples_datasets/wikicorpus_llama${LLAMA_VERSION}_tokenized_4k"
+    
+    # Store metrics in shared location
+    METRICS_FILE=$ARTIFACT_PATH/results.json
+    mkdir -p $ARTIFACT_PATH
+
+    JOB_ID=$POD_UID
+    export EXPLICIT_LOGDIR=null
+    LOG_PATH="$ARTIFACT_PATH/logs/$JOB_ID/$NODEID/"
 else
+    sudo sysctl -w net.ipv4.ip_local_reserved_ports=44000
     DISTRIBUTED_ARGS="--nproc_per_node $PROCESSES_PER_NODE"
     LOG_PATH=logs
 fi
@@ -82,9 +111,6 @@ NUM_MICROBATCHES=$BS
 # Turn on the GPU compatible precision by default
 : ${GPU_COMPATIBLE_PRECISION:=1}
 
-DATA_PATH="$HOME/examples_datasets/wikicorpus_llama${LLAMA_VERSION}_tokenized_4k"
-
-
 if [ "$NEURON_EXTRACT_GRAPHS_ONLY" = "1" ]; then
     max_steps=10
     tb_dir="/shared/tensorboard/llama${LLAMA_VERSION}_${MODEL_SIZE}_compile"
@@ -100,6 +126,7 @@ fi
 
 set -x
 torchrun $DISTRIBUTED_ARGS run_llama_nxd.py \
+    --metrics_file $METRICS_FILE \
     --train_batch_size $BS \
     --use_meta_device_init 1 \
     --training_dir $DATA_PATH \

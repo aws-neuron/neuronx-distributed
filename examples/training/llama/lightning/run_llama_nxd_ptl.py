@@ -81,6 +81,7 @@ def train_llama(args):
     model_config.selective_checkpoint_enabled = args.use_selective_checkpoint > 0
     model_config.max_position_embeddings = max(model_config.max_position_embeddings, args.seq_len)
     model_config.use_flash_attention = args.use_flash_attention > 0
+    model_config.transpose_nki_inputs = args.transpose_nki_inputs > 0 
     if args.pretrained_weight is not None:
         model_config.pretrained_ckpt = args.pretrained_weight
     if args.num_layers > 0:
@@ -122,6 +123,7 @@ def train_llama(args):
 
     nxd_config = nxd.neuronx_distributed_config(
         tensor_parallel_size=args.tensor_parallel_size,
+        context_parallel_size=args.context_parallel_size,
         pipeline_parallel_size=args.pipeline_parallel_size,
         pipeline_config=pipeline_config,
         optimizer_config={
@@ -320,6 +322,7 @@ if __name__ == "__main__":
     parser.add_argument("--save_load_xser", action="store_true", help="save/load with xla serialization")
 
     parser.add_argument("--tensor_parallel_size", default=2, type=int, help="Tensor parallel size")
+    parser.add_argument("--context_parallel_size", type=int, default=1, help="CP size")
     parser.add_argument("--pipeline_parallel_size", default=1, type=int, help="Pipeline parallel size")
     parser.add_argument("--num_microbatches", type=int, default=8, help="num_microbatches")
     parser.add_argument("--seq_len", default=4096, type=int, help="Sequence length")
@@ -380,6 +383,12 @@ if __name__ == "__main__":
         default=0,
         type=int,
         help="Use neuron kernel",
+    )
+    parser.add_argument(
+        "--transpose_nki_inputs", 
+        type=int, 
+        default=1, 
+        help="Whether to transpose inputs to nki kernel for better perf when using FlashAttention"
     )
     parser.add_argument(
         "--use_gpu_compatible_precision",

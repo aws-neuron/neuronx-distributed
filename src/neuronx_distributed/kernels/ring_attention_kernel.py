@@ -1,8 +1,5 @@
-import neuronxcc.nki.language as nl
-import numpy as np
 import torch
-import os
-import torch_xla.core.xla_model as xm
+from neuronx_distributed.kernels.kernel_utils import get_seed, move_seed, permute, cast
 
 # FIXME: not capturing runtimeerror
 def _ring_attn_placeholder(*args, **kwargs):
@@ -14,20 +11,36 @@ def _ring_attn_placeholder(*args, **kwargs):
 
 
 try:
-    from neuronxcc.nki._private_kernels.attention import (
+    from neuronxcc.nki._pre_prod_kernels.ring_attention import (
         ring_attention_bwd,
         ring_attention_fwd,
     )
     from neuronxcc.nki.kernels.attention import FlashConfig
-    from torch_neuronx.xla_impl.ops import nki_jit
 
-    _ring_fwd_nki_call = nki_jit()(ring_attention_fwd)
-    _ring_bwd_nki_call = nki_jit()(ring_attention_bwd)
+    _ring_fwd_nki_call = ring_attention_fwd
+    _ring_bwd_nki_call = ring_attention_bwd
 
 except Exception:
-    _ring_fwd_nki_call = _ring_attn_placeholder
-    _ring_bwd_nki_call = _ring_attn_placeholder
+    try:
+        from neuronxcc.nki._private_kernels.attention import (
+            ring_attention_bwd,
+            ring_attention_fwd,
+        )
+        _ring_fwd_nki_call = ring_attention_fwd
+        _ring_bwd_nki_call = ring_attention_bwd
+    except Exception:
+        _ring_fwd_nki_call = _ring_attn_placeholder
+        _ring_bwd_nki_call = _ring_attn_placeholder
 
+    
+
+def get_seq_tile_size(seqlen: int) -> int:
+    if seqlen >= 4096:
+        seq_tile_size = 2048
+    else:
+        seq_tile_size = seqlen // 2
+    seq_tile_size = max(seq_tile_size, 1024)
+    return seq_tile_size
 
 class NkiRingAttnFunc(torch.autograd.Function):
     @staticmethod
@@ -48,41 +61,17 @@ class NkiRingAttnFunc(torch.autograd.Function):
         if softmax_scale is None:
             softmax_scale = q.shape[-2] ** (-0.5)
 
-        if seed is None and dropout_p > 0.0:
-            # NKI only supports 32bit seed
-            seed = np.array([xm.get_rng_state()]).astype(np.int32)
-            seed = torch.from_numpy(seed).to(q.device)
+        if seed is None:
+            seed = get_seed(dropout_p, q.device)
 
-        attn_output = torch.zeros(
-            size=(bs, num_heads, seqlen, head_dim), dtype=q.dtype, device=q.device
-        )
-        if mixed_precision:
-            if os.environ.get("XLA_DOWNCAST_BF16"):
-                lse_dtype = torch.float64
-            else:
-                lse_dtype = torch.float32
-        else:
-            lse_dtype = q.dtype
-        lse = torch.zeros(
-            size=(bs, num_heads, nl.tile_size.pmax, seqlen // nl.tile_size.pmax),
-            dtype=lse_dtype,
-            device=q.device,
-        )
-        if seqlen >= 4096:
-            seq_tile_size = 2048
-        else:
-            seq_tile_size = seqlen // 2
-        seq_tile_size = max(seq_tile_size, 1024)
-
+        seq_tile_size = get_seq_tile_size(seqlen)
         flash_config = FlashConfig(should_transpose_v=True, seq_tile_size=seq_tile_size)
-
-        _ring_fwd_nki_call[bs, num_heads](
+        
+        attn_output, lse = _ring_fwd_nki_call[bs, num_heads](
             q,
             k,
             v,
             seed,
-            attn_output,
-            lse,
             rank_id=rank_id,
             src_tgt_pairs=src_tgt_pairs,
             use_causal_mask=causal,
@@ -100,12 +89,7 @@ class NkiRingAttnFunc(torch.autograd.Function):
         ctx.dropout_p = dropout_p
         ctx.softmax_scale = softmax_scale
 
-        # Move seed manually if the dropout is used
-        # https://github.com/pytorch/xla/blob/v1.13.0/torch_xla/csrc/tensor.cpp#L323
-        if dropout_p > 0.0:
-            orig_seed = xm.get_rng_state()
-            running_seed = (orig_seed * 214013 + 2531011) & 0xFFFFFFFFFFFFFFFF
-            xm.set_rng_state(int(running_seed))
+        move_seed(dropout_p)
         return attn_output
 
     @staticmethod
@@ -114,10 +98,7 @@ class NkiRingAttnFunc(torch.autograd.Function):
         dout = dout.permute(0, 1, 3, 2)
         attn_output = attn_output.permute(0, 1, 3, 2)
         bs, num_heads, _, _ = q.shape
-        dq = torch.zeros_like(q)
-        dk = torch.zeros_like(k)
-        dv = torch.zeros_like(v)
-        _ring_bwd_nki_call[bs, num_heads](
+        dq, dk, dv = _ring_bwd_nki_call[bs, num_heads](
             q,
             k,
             v,
@@ -125,9 +106,6 @@ class NkiRingAttnFunc(torch.autograd.Function):
             dout,
             lse,
             seed,
-            dq,
-            dk,
-            dv,
             rank_id=ctx.rank_id,
             src_tgt_pairs=ctx.src_tgt_pairs,
             use_causal_mask=ctx.causal,
@@ -173,15 +151,8 @@ def nki_ring_attn_func(
             f"Only support sequence as multiples of 1K, got {seqlen}"
         )
 
-    # Permute QKV to match the kernel required layouts
-    q = q.permute(0, 1, 3, 2)
-    k = k.permute(0, 1, 3, 2)
-    v = v.permute(0, 1, 3, 2)
-
-    if os.environ.get("XLA_USE_BF16") or os.environ.get("XLA_DOWNCAST_BF16"):
-        q = q.to(torch.bfloat16)
-        k = k.to(torch.bfloat16)
-        v = v.to(torch.bfloat16)
+    q, k, v = permute(q, k, v)
+    q, k, v = cast(q, k, v)
 
     return NkiRingAttnFunc.apply(
         q,
