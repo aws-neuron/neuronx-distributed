@@ -15,6 +15,7 @@ from neuronx_distributed.trainer import (
     initialize_parallel_model,
     initialize_parallel_optimizer,
 )
+from neuronx_distributed.utils.batch_utils import get_batch_on_this_context_parallel_rank
 
 
 class NeuronLlamaLTModule(NeuronLTModule):
@@ -86,13 +87,22 @@ class NeuronLlamaLTModule(NeuronLTModule):
         for logger in self.trainer.loggers:
             logger.print_step = -1
         self.should_print = False
+        # Split the batch if CP is enabled
+        batch = get_batch_on_this_context_parallel_rank(batch)
+        cp_size = parallel_state.get_context_model_parallel_size()
         if self.trainer.strategy.pipeline_parallel_size > 1:
             loss = self.model.run_train(
                 input_ids=batch["input_ids"],
                 attention_mask=batch["attention_mask"],
                 labels=batch["labels"],
             )
-
+            if cp_size > 1:
+                loss = xm.all_reduce(
+                    xm.REDUCE_SUM,
+                    loss,
+                    groups=parallel_state.get_context_model_parallel_group(),
+                )
+                loss /= cp_size
             loss_detached = (
                 loss.detach() if self.trainer.strategy.pipeline_parallel_rank == self.print_pp_rank else None
             )
@@ -103,8 +113,14 @@ class NeuronLlamaLTModule(NeuronLTModule):
                 attention_mask=batch["attention_mask"],
                 labels=batch["labels"],
             )
-            # print(f"outputs is {outputs}")
             loss = outputs.loss / self.grad_accum_steps
+            if cp_size > 1:
+                loss = xm.all_reduce(
+                    xm.REDUCE_SUM,
+                    loss,
+                    groups=parallel_state.get_context_model_parallel_group(),
+                )
+                loss /= cp_size
             loss.backward()
             self.averaged_loss += loss.detach()
             xm.mark_step()

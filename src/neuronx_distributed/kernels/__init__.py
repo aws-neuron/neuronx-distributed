@@ -1,1 +1,2 @@
 from .flash_attn import nki_flash_attn_func
+from .ring_attention_kernel import nki_ring_attn_func

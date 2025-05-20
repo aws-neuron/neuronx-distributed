@@ -32,7 +32,7 @@ import torch_xla.distributed.parallel_loader as pl
 import torch_xla.distributed.xla_multiprocessing as xmp
 from logger import Logger
 from modeling_llama_nxd import CoreAttention, LlamaForCausalLM, init_weights
-from training_utils import Throughput, create_llama_pretraining_dataset, get_mixed_precision_config, get_sin_cos_matrix, get_batch_on_this_context_parallel_rank
+from training_utils import Throughput, create_llama_pretraining_dataset, get_mixed_precision_config, get_sin_cos_matrix
 from transformers import AdamW, LlamaConfig, set_seed
 from transformers.optimization import get_linear_schedule_with_warmup
 
@@ -40,6 +40,7 @@ import neuronx_distributed as nxd
 from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.parallel_layers.utils import requires_init_pg_override
 from neuronx_distributed.utils.adamw_fp32_optim_params import AdamW_FP32OptimParams
+from neuronx_distributed.utils.batch_utils import get_batch_on_this_context_parallel_rank
 
 # Workaround for NaNs seen with transformers version >= 4.21.0
 # https://github.com/aws-neuron/aws-neuron-sdk/issues/593
@@ -137,6 +138,7 @@ def get_model(flags):
     config.qkv_linear = flags.qkv_linear
     config.max_position_embeddings = max(config.max_position_embeddings, seq_len)
     config.use_flash_attention = args.use_flash_attention > 0
+    config.transpose_nki_inputs = args.transpose_nki_inputs > 0
     config.fuse_qkv = args.fuse_qkv > 0
     if flags.num_layers > 0:
         config.num_hidden_layers = flags.num_layers
@@ -280,7 +282,7 @@ def train_llama(flags):
     def train_loop_fn(model, optimizer, train_loader, epoch, global_step, training_ustep, running_loss, use_zero_1):
         for _, data in enumerate(train_loader):
             if parallel_state.get_context_model_parallel_size() > 1:
-                data = get_batch_on_this_context_parallel_rank(data, parallel_state)
+                data = get_batch_on_this_context_parallel_rank(data)
             training_ustep += 1
             input_ids = data["input_ids"]
             attention_mask = data["attention_mask"]
@@ -331,6 +333,7 @@ def train_llama(flags):
                             throughput.get_throughput(),
                             total_norm_cpu,
                         )
+                        throughput.reset_time()
 
                 if global_step % flags.logging_interval == 0:
                     # Printing the loss inside the step closure. This won't block
@@ -669,6 +672,12 @@ if __name__ == "__main__":
         help="Use neuron kernel",
     )
     parser.add_argument("--fuse_qkv", type=int, default=1, help="Whether to enable fused qkv")
+    parser.add_argument(
+        "--transpose_nki_inputs", 
+        type=int, 
+        default=1, 
+        help="Whether to transpose inputs to nki kernel for better perf when using FlashAttention"
+    )
 
 
 

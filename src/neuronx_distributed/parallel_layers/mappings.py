@@ -324,25 +324,28 @@ class _ReduceScatterToSequenceParallelRegion(torch.autograd.Function):
     # https://pytorch.org/docs/stable/onnx.html#static-symbolic-method
     @staticmethod
     def symbolic(
-        graph, input_: Tensor, partition_dim: int, process_group: Optional[ProcessGroup] = None,
+            graph, input_: Tensor, partition_dim: int, process_group: Optional[ProcessGroup] = None, dtype: Optional[torch.dtype] = None
     ) -> Tensor:
         process_group = process_group if process_group is not None else get_tensor_model_parallel_group()
         return _reduce_scatter_along_dim(input_, partition_dim=partition_dim, process_group=process_group)
 
     @staticmethod
     def forward(
-        ctx, input_: Tensor, partition_dim: int, process_group: Optional[ProcessGroup] = None,
+        ctx, input_: Tensor, partition_dim: int, process_group: Optional[ProcessGroup] = None, dtype: Optional[torch.dtype] = None
     ) -> Tensor:
         ctx.partition_dim = partition_dim
         process_group if process_group is not None else get_tensor_model_parallel_group()
         ctx.process_group = process_group
+        ctx.dtype = dtype
         return _reduce_scatter_along_dim(input_, partition_dim=partition_dim, process_group=process_group)
 
     @staticmethod
     def backward(ctx, *grad_outputs: Any) -> Any:
+        if ctx.dtype is not None:
+            grad_outputs = (grad_outputs[0].to(ctx.dtype),) + grad_outputs[1:]
         return _gather_along_dim(
             grad_outputs[0], partition_dim=ctx.partition_dim, process_group=ctx.process_group,
-        ), None, None
+        ), None, None, None
 
 
 class _AllToAllInExpertParallelRegion(Function):
@@ -442,11 +445,11 @@ def gather_from_sequence_parallel_region(
 
 
 def reduce_scatter_to_sequence_parallel_region(
-    input_: Tensor, sequence_dimension: int = 0, process_group: Optional[ProcessGroup] = None,
+        input_: Tensor, sequence_dimension: int = 0, process_group: Optional[ProcessGroup] = None, dtype: Optional[torch.dtype] = None,
 ) -> Tensor:
     return _ReduceScatterToSequenceParallelRegion.apply(
-        input_, sequence_dimension, process_group,
-    ) # type: ignore
+        input_, sequence_dimension, process_group, dtype
+    )  # type: ignore
 
 
 def reduce_scatter_to_tensor_model_parallel_region_with_dim(

@@ -258,6 +258,19 @@ def initialize_optimizer_from_class(nxd_config, optimizer_class, parameters, mod
         if version.parse(torch.__version__) >= version.parse("2.2"):
             # P148368176: Bucket cap >140MB causes NaN at step 3 (known issue)
             _ALL_GATHER_REDUCE_SCATTER_BUCKET_CAP_MB = 130
+            if os.getenv("XLA_DOWNCAST_BF16") == "0" and mixed_precision_config["use_master_weights"]:
+                #mixed_precision_config["use_master_weights"]=True and XLA_DOWNCAST_BF16=0
+                #for autocast, this is to differentiate it from fp32 precision scenario.
+                #Bucket size has been halved because in the case where XLA_DOWNCAST_BF16=1,
+                #inside torch_xla.core.xla_model.py in __call__ of CoalescingBuckets
+                #tensor.element_size() is used which uses the tensor's size for determining 
+                #number of buckets. When XLA_DOWNCAST_BF16=1, the tensor in torch land is fp32,
+                #but is actually bf16 in xla device, so the buckets are calculate as per fp32.
+                #When we move to autocast, the dtype in torch land is bf16 and hence the number
+                #of buckets is calculated as per bf16, hence halving the CAP ensures same number 
+                #of buckets in both scenarios and ensures same HLOs as the case where 
+                #XLA_DOWNCAST_BF16=1
+                _ALL_GATHER_REDUCE_SCATTER_BUCKET_CAP_MB = 65
             bucket_cap = int(
                 os.getenv("ALL_GATHER_REDUCE_SCATTER_BUCKET_CAP_MB", _ALL_GATHER_REDUCE_SCATTER_BUCKET_CAP_MB)
             )

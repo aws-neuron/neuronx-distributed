@@ -73,6 +73,7 @@ class ExpertMLPs(torch.nn.Module):
         tensor_model_parallel_group: Optional[ProcessGroup] = None,
         enable_spmd_rank: bool = False,  # spmd_rank will be removed once we support ReplicaID (P87857655)
         blockwise_nki_autograd_cls=None,
+        logical_nc_config=1, #uses lnc1 blockwise kernel by default
     ):
         super().__init__()
 
@@ -108,7 +109,7 @@ class ExpertMLPs(torch.nn.Module):
         if self.enable_spmd_rank:
             # spmd_rank will be removed once we support ReplicaID (P87857655)
             self.spmd_rank = SPMDRank(world_size=parallel_state.get_world_group().size())
-
+        self.logical_nc_config = logical_nc_config
         self.blockwise_nki_autograd_cls = blockwise_nki_autograd_cls if blockwise_nki_autograd_cls else BlockwiseMatmulNKIFunc
 
         self.mlp_op = Experts(
@@ -404,6 +405,7 @@ class ExpertMLPs(torch.nn.Module):
                 getattr(self.mlp_op.gate_up_proj, "scale", None),
                 getattr(self.mlp_op.down_proj, "scale", None),
                 self.training,
+                self.logical_nc_config,
             )
         elif self.training:
             # we split training/inference torch blockwise because training backward pass implements a simplified version of mlp_op.

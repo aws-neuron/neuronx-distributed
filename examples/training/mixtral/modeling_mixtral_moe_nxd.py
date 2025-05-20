@@ -312,7 +312,7 @@ class MixtralAttention(MixtralAttentionHF):
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
         attn_output = (
-            nki_flash_attn_func(query_states, key_states, value_states)
+            nki_flash_attn_func(query_states, key_states, value_states, transpose_nki_inputs=False)
             if self.use_flash_attention
             else self.core_attn(query_states, key_states, value_states)
         )

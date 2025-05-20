@@ -40,3 +40,4 @@ class Logger:
                 total_steps,
             )
         self.throughputs.append(tps)
+        throughput.reset_time()

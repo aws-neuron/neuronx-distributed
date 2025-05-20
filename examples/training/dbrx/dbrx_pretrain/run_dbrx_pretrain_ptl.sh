@@ -94,7 +94,7 @@ MIN_LR=3.0e-5
 MODEL_PATH_ARG=""
 # data path; takes in -d option argument to parse the data path
 DATA_PATH="$HOME/examples_datasets/wikicorpus_llama2_tokenized_4k"
-#steps this run; takes in -s option argument for early exit 
+#steps this run; takes in -s option argument for early exit
 STEPS_THIS_RUN=-1
 while getopts "m:d:s:" opt; do
   case $opt in
@@ -189,7 +189,7 @@ else
     OUTPUT_LOG=log_exe-$NODE_ID.log
 fi
 
-DEFAULT_MODEL_PATH="$SCRIPT_DIR/configs/full_scale.json"
+DEFAULT_MODEL_PATH="$SCRIPT_DIR/configs/16x13b_config.json"
 
 #sets model_path to 7b config if not specified
 if [ -z "$MODEL_PATH_ARG" ]; then
@@ -238,6 +238,7 @@ torchrun $DISTRIBUTED_ARGS \
     --lr $LR \
     --min_lr $MIN_LR \
     --seq_len $SEQ_LEN \
+    --vocab_size 32000 \
     --capacity_factor $CAPACITY_FACTOR \
     --kv_replicator $KV_REPLICATOR \
     --i_tp_round_factor $I_TP_ROUND_FACTOR \

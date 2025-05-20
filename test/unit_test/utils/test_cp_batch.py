@@ -4,10 +4,10 @@ import torch
 from transformers import PretrainedConfig
 import sys
 sys.path.append('/home/ubuntu/ktest/NeuronxDistributed/examples/training/llama/')
-from training_utils import get_batch_on_this_context_parallel_rank
 from neuronx_distributed.parallel_layers import (
     parallel_state,
 )
+from neuronx_distributed.utils.batch_utils import get_batch_on_this_context_parallel_rank
 
 
 class TestCpBatch(unittest.TestCase):
@@ -24,7 +24,7 @@ class TestCpBatch(unittest.TestCase):
                 mock_get_context_model_parallel_size.return_value = cp_degree
                 for key in ['input_ids', 'attention_mask', 'labels']:
                     batch[key] = torch.ones(mbs, seq_len)
-                cp_batch = get_batch_on_this_context_parallel_rank(batch, parallel_state)
+                cp_batch = get_batch_on_this_context_parallel_rank(batch)
                     
                 for k, v in cp_batch.items():
                     if cp_degree > 1:

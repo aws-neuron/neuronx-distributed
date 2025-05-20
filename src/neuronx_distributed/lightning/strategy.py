@@ -39,6 +39,7 @@ class NeuronXLAStrategy(XLAStrategy):
         tensor_parallel_size: int = 1,
         pipeline_parallel_size: int = 1,
         expert_parallel_size: int = 1,
+        context_parallel_size: int = 1,
         debug: bool = False,
         sync_module_states: bool = False,
         checkpoint_io: Optional[NeuronCheckpointIO] = None,
@@ -72,10 +73,12 @@ class NeuronXLAStrategy(XLAStrategy):
             self.tensor_parallel_size = self.nxd_config["tensor_parallel_size"]
             self.pipeline_parallel_size = self.nxd_config["pipeline_parallel_size"]
             self.expert_parallel_size = self.nxd_config["expert_parallel_size"]
+            self.context_parallel_size = self.nxd_config["context_parallel_size"]
         else:
             self.tensor_parallel_size = tensor_parallel_size
             self.pipeline_parallel_size = pipeline_parallel_size
             self.expert_parallel_size = expert_parallel_size
+            self.context_parallel_size = context_parallel_size
 
     def _configure_launcher(self) -> None:
         self._launcher = _NeuronXLALauncher(self)
@@ -108,6 +111,7 @@ class NeuronXLAStrategy(XLAStrategy):
                 tensor_model_parallel_size=self.tensor_parallel_size,
                 pipeline_model_parallel_size=self.pipeline_parallel_size,
                 expert_model_parallel_size=self.expert_parallel_size,
+                context_parallel_size=self.context_parallel_size,
             )
 
         self.data_parallel_rank = get_data_parallel_rank()

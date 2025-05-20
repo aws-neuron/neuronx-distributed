@@ -76,10 +76,9 @@ from training_utils import (
     get_sin_cos_matrix,
     print_logs,
     set_random_seed,
-    get_batch_on_this_context_parallel_rank,
-
 )
 
+from neuronx_distributed.utils.batch_utils import get_batch_on_this_context_parallel_rank
 from neuronx_distributed.utils.adamw_fp32_optim_params import AdamW_FP32OptimParams
 
 Metric = namedtuple("Metric", ["name", "value", "units", "additional_data"])
@@ -101,6 +100,7 @@ def train_llama(args):
     config.max_position_embeddings = max(config.max_position_embeddings, args.seq_len)
     config.use_flash_attention = args.use_flash_attention > 0
     config.fuse_qkv = args.fuse_qkv > 0
+    config.transpose_nki_inputs = args.transpose_nki_inputs > 0
     if args.num_layer != -1:
         config.num_hidden_layers = args.num_layer
     if args.hidden_size != -1:
@@ -278,7 +278,7 @@ def train_llama(args):
         for batch_idx, batch in enumerate(train_dataloader):
             # Split the batch for CP rank
             if parallel_state.get_context_model_parallel_size() > 1:
-                batch = get_batch_on_this_context_parallel_rank(batch, parallel_state)
+                batch = get_batch_on_this_context_parallel_rank(batch)
             if resume_batch_idx is not None and batch_idx <= resume_batch_idx and epoch <= resume_epoch:
                 if torch.distributed.get_rank() == 0:
                     print(f"skipping batch {batch_idx}")
@@ -295,10 +295,6 @@ def train_llama(args):
                     attention_mask=attention_mask,
                     labels=labels,
                 )
-                cp_size = parallel_state.get_context_model_parallel_size()
-                if cp_size > 1:
-                    torch.distributed.all_reduce(loss, group=parallel_state.get_context_model_parallel_group())
-                    loss /= cp_size
             optimizer.step()
             global_norm = optimizer.grad_norm  # Global norm before clipping
             optimizer.zero_grad()
@@ -405,6 +401,12 @@ if __name__ == "__main__":
     parser.add_argument("--kv_replicator", type=int, default=1, help="KV replication size")
     parser.add_argument("--seq_len", type=int, default=4096, help="PP size")
     parser.add_argument("--use_flash_attention", type=int, default=0, help="Use neuron kernel")
+    parser.add_argument(
+        "--transpose_nki_inputs", 
+        type=int, 
+        default=1, 
+        help="Whether to transpose inputs to nki kernel for better perf when using FlashAttention"
+    )
     parser.add_argument("--training_dir", type=str, default=None)
     parser.add_argument("--training_config", type=str, default=None)
     parser.add_argument("--trace_file_path", type=str, default=None)

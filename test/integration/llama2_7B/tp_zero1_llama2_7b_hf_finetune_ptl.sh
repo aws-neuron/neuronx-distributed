@@ -3,6 +3,7 @@
 #############################################
 # Override transformers and Optimum-Neuron packages, can be removed once ON released changes in https://github.com/huggingface/optimum-neuron/pull/370
 pip install git+https://github.com/huggingface/optimum-neuron.git
+sed -i 's/original_forward = copy\.deepcopy(self\.forward)/original_forward = self.forward/' /home/ubuntu/aws_neuron_venv/lib/python3.10/site-packages/optimum/neuron/generation/utils.py
 pip install --no-warn-conflicts transformers==4.32.1 nltk
 
 #############################################

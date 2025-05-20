@@ -1996,6 +1996,7 @@ class NxDPPModel(nn.Module):
                     loss_all = [loss.detach().cpu() if self.return_loss_on_cpu else loss.detach() for loss in loss_all]
                 loss = torch.sum(torch.stack(loss_all), dim=0) / len(loss_all)
                 if self.broadcast_and_average_loss:
+                    loss = self._average_loss_across_cp_ranks(loss)
                     loss = self._average_loss_across_dp_ranks(loss)
                     loss = self._bcast_loss_across_pp_ranks(loss)
                 return loss.detach().cpu() if self.return_loss_on_cpu else loss.detach()
@@ -2006,6 +2007,13 @@ class NxDPPModel(nn.Module):
             loss = self._bcast_loss_across_pp_ranks(loss)
             return loss.detach().cpu()
         return None
+
+    def _average_loss_across_cp_ranks(self, loss):
+        cp_size = parallel_state.get_context_model_parallel_size()
+        if cp_size > 1:
+            loss /= cp_size
+            torch.distributed.all_reduce(loss, group=parallel_state.get_context_model_parallel_group())
+        return loss
 
     def _average_loss_across_dp_ranks(self, loss):
         loss /= parallel_state.get_data_parallel_size()

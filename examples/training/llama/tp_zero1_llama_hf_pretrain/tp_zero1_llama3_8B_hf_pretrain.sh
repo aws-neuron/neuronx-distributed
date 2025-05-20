@@ -5,7 +5,7 @@
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 
-export NEURON_CC_FLAGS="--model-type transformer --cache_dir=~/neuron_compile_cache/"
+export NEURON_CC_FLAGS="--model-type transformer --cache_dir=$HOME/neuron_compile_cache/"
 export NEURON_FUSE_SOFTMAX=1
 
 # Async Runtime
@@ -22,6 +22,8 @@ LLAMA_VERSION='3'
 : ${TP_DEGREE:=32}
 # CP degree
 : ${CP_DEGREE:=1}
+# Flash attention
+: ${USE_FLASH_ATTENTION:=1}
 # Num layers
 : ${NUM_LAYERS:=32}
 # 0: bf16; 1: mixed precision
@@ -41,7 +43,7 @@ LR=1.5e-4
 # model path
 MODEL_PATH=$SCRIPT_DIR/${MODEL_SIZE}_config_llama${LLAMA_CONFIG_VERSION}
 # data path
-DATA_PATH="$HOME/examples_datasets/wikicorpus_llama3_tokenized_8k"
+DATA_PATH="$HOME/examples_datasets/wikicorpus_llama3_tokenized_8k" 
 # sequence length
 SEQ_LEN=8192
 
@@ -51,6 +53,8 @@ export NUM_NEURONCORES=32
 NODE_ID=0
 WORLD_SIZE=1
 DISTRIBUTED_ARGS="--nproc_per_node $NUM_NEURONCORES"
+METRICS_FILE="results.json"
+
 if [ ! -z "$SLURM_NTASKS" ]; then
     WORLD_SIZE=$SLURM_NTASKS
     NODE_ID=$SLURM_NODEID
@@ -64,13 +68,59 @@ if [ ! -z "$SLURM_NTASKS" ]; then
     fi
     export FI_EFA_USE_DEVICE_RDMA=1
     export FI_PROVIDER=efa
+    sudo sysctl -w net.ipv4.ip_local_reserved_ports=44000,48620
+
+    if [ $NEURON_EXTRACT_GRAPHS_ONLY -gt 0 ]; then
+    STEPS_THIS_RUN=2
+    OUTPUT_LOG=log_compile-$NODE_ID.log
+    elif [ -v PERF_TEST ] && [ $PERF_TEST -gt 0 ]; then
+        STEPS_THIS_RUN=${EARLY_EXIT_STEPS:-100}
+        OUTPUT_LOG=log_exe-$NODE_ID.log
+    else
+        STEPS_THIS_RUN=-1
+        OUTPUT_LOG=log_exe-$NODE_ID.log
+    fi
+elif [ -v OMPI_COMM_WORLD_RANK ]; then
+    # Increase the fd limit for container
+    ulimit -n 65535
+    WORLD_SIZE=$OMPI_COMM_WORLD_SIZE
+    NODE_ID=$OMPI_COMM_WORLD_RANK
+    NODELIST=$(/root/nodelist_helper.py)
+    HOSTS=(${NODELIST//\ / })
+    MASTER_ADDRESS=${HOSTS[0]}
+    DISTRIBUTED_ARGS="--nproc_per_node $NUM_NEURONCORES --nnodes $WORLD_SIZE --node_rank $NODE_ID --master_addr $MASTER_ADDRESS --master_port 44000"
+    export FI_EFA_USE_DEVICE_RDMA=1
+    export FI_PROVIDER=efa
+    export CCOM_SOCKET_IFNAME=eth0
+    export FI_EFA_FORK_SAFE=1
+
+    # Dataset is in shared location
+    DATA_PATH="$SHARED_PATH_PREFIX/mars_data_set/examples_datasets/wikicorpus_llama3_tokenized_8k" 
+
+    # Store metrics in shared location
+    METRICS_FILE=$ARTIFACT_PATH/results.json
+    mkdir -p $ARTIFACT_PATH
+
+    JOB_ID=$POD_UID
+    export EXPLICIT_LOGDIR=null
+    LOG_PATH="$SARTIFACT_PATH/logs/$JOB_ID/$NODE_ID"
+    mkdir -p $LOG_PATH
+
+    if [ $NEURON_EXTRACT_GRAPHS_ONLY -gt 0 ]; then
+        STEPS_THIS_RUN=2
+        OUTPUT_LOG="$LOG_PATH/log_compile-$NODE_ID.log"
+    elif [ -v PERF_TEST ] && [ $PERF_TEST -gt 0 ]; then
+        STEPS_THIS_RUN=100
+        OUTPUT_LOG="$LOG_PATH/log_exe-$NODE_ID.log"
+    else
+        STEPS_THIS_RUN=-1
+        OUTPUT_LOG="$LOG_PATH/log_exe-$NODE_ID.log"
+    fi
 fi
 
 echo "WORLD_SLURM_NTASKS=$WORLD_SIZE"
 echo "NODE_ID=$NODE_ID"
 echo "MASTER_ADDRESS=$MASTER_ADDRESS"
-
-sudo sysctl -w net.ipv4.ip_local_reserved_ports=44000,48620
 
 export NEURON_RT_NUM_CORES=32
 export NUM_NEURONCORES=$NEURON_RT_NUM_CORES
@@ -89,18 +139,6 @@ fi
 
 DP=$(($NEURON_RT_NUM_CORES * $WORLD_SIZE / $TP_DEGREE))
 ACC_STEPS=$(($GBS / $MBS / $DP))
-
-
-if [ $NEURON_EXTRACT_GRAPHS_ONLY -gt 0 ]; then
-    STEPS_THIS_RUN=2
-    OUTPUT_LOG=log_compile-$NODE_ID.log
-elif [ -v PERF_TEST ] && [ $PERF_TEST -gt 0 ]; then
-    STEPS_THIS_RUN=${EARLY_EXIT_STEPS:-100}
-    OUTPUT_LOG=log_exe-$NODE_ID.log
-else
-    STEPS_THIS_RUN=-1
-    OUTPUT_LOG=log_exe-$NODE_ID.log
-fi
 
 echo EARLY_EXIT_STEPS=$EARLY_EXIT_STEPS
 echo TP_DEGREE=$TP_DEGREE
@@ -123,6 +161,7 @@ echo OUTPUT_LOG=$OUTPUT_LOG
 
 torchrun $DISTRIBUTED_ARGS \
     tp_zero1_llama_hf_pretrain.py \
+    --metrics_file $METRICS_FILE \
     --model_path $MODEL_PATH \
     --data_dir $DATA_PATH \
     --tensor_parallel_size $TP_DEGREE \
@@ -139,7 +178,7 @@ torchrun $DISTRIBUTED_ARGS \
     --logging_interval 1 \
     --qkv_linear \
     --kv_replicator 4 \
-    --use_flash_attention 1 \
+    --use_flash_attention $USE_FLASH_ATTENTION \
     --use_gpu_compatible_precision 1 \
     --num_layers $NUM_LAYERS \
     $EXTRA_ARGS |& tee $OUTPUT_LOG

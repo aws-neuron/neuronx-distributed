@@ -3,6 +3,8 @@ import argparse
 import json
 import os
 import re
+import math
+from typing import Any, Dict
 
 from numpy import format_float_scientific
 
@@ -19,7 +21,8 @@ from neuronx_distributed.scripts.yaml_converter import convert_yaml_to_json
 
 
 class CheckpointConverterBase:
-
+    # Map of standard config keys to model-specific keys
+    attribute_map : Dict[str, str] = {}
     # ParallelEmbedding
     embedding_partition_dim = 0
     # ColumnParallelLinear or GQAQKVColumnParallelLinear
@@ -30,9 +33,54 @@ class CheckpointConverterBase:
     down_proj_partition_dim = 1
     # RowParallelLinear
     o_proj_partition_dim = 1
+    # Pattern of layer name
+    layer_name = "layers"
+    layer_name_pattern = r"^(model\.layers\.\d+)"
+
+    def _get_config_value(self, config, key):
+        """Get config value handling mapped attribute names.
+
+        Some models like DBRX use different names for standard config parameters.
+        This method checks both the standard name and any mapped names.
+
+        Args:
+            config: The model configuration dictionary
+            key: The configuration key to look up
+
+        Returns:
+            The configuration value
+
+        Raises:
+            KeyError: If neither the standard key nor its mapped name exists
+        """
+        def get_nested_value(d, nested_key):
+            # Split the key by dots and traverse the nested dictionaries
+            keys = nested_key.split('.')
+            value = d
+            for k in keys:
+                if not isinstance(value, dict) or k not in value:
+                    return None
+                value = value[k]
+            return value
+
+        # First try direct key access
+        if key in config:
+            return config[key]
+        # Then try mapped attribute if it exists
+        if key in self.attribute_map:
+            mapped_key = self.attribute_map[key]
+            # Check if mapped key uses dot notation
+            nested_value = get_nested_value(config, mapped_key)
+            if nested_value is not None:
+                return nested_value
+            # If not nested, try direct access with mapped key
+            if mapped_key in config:
+                return config[mapped_key]
+
+        raise KeyError(f"Could not find {key} or its mapped name in config")
 
     def get_partition_dim(self, name):
-        if "embed_tokens" in name or "lm_head" in name:
+        if "embed_tokens" in name or "lm_head" in name or "wte" in name:
             partition_dim = self.embedding_partition_dim
         elif self.is_qkv_weight(name):
             partition_dim = self.qkv_partition_dim
@@ -270,9 +318,9 @@ class CheckpointConverterBase:
         full_state = {}
         with open(args.config, "r") as f:
             config = json.load(f)
-        q_heads = config["num_attention_heads"]
-        kv_heads = config["num_key_value_heads"]
-        head_dim = config["hidden_size"] // q_heads
+        q_heads = self._get_config_value(config, "num_attention_heads")
+        kv_heads = self._get_config_value(config, "num_key_value_heads")
+        head_dim = self._get_config_value(config, "hidden_size") // q_heads
         is_gqa = q_heads != kv_heads
         keys_hf_to_nxd, keys_nxd_to_hf = self.get_hf_to_nxd_model_keys(args.qkv_linear, is_gqa)
 
@@ -307,7 +355,7 @@ class CheckpointConverterBase:
                                 continue
 
                             full_weight = torch.cat(full_state[name], dim=partition_dim)
-                            if "k" in name or "v" in name or self.is_q_or_o_for_megatron(args,name): # no kv replication in megatron so q needs to be appended directly
+                            if "k_proj" in name or "v_proj" in name or self.is_q_or_o_for_megatron(args,name): # no kv replication in megatron so q needs to be appended directly
                                 # If kv_multiplier is set, the kv heads are repeated. So we need to
                                 # take only the first chunk
                                 full_state[name] = torch.chunk(full_weight, args.kv_size_multiplier)[0].detach().clone()
@@ -318,7 +366,7 @@ class CheckpointConverterBase:
                                 Example: num_heads = 64, num_kv_heads = 16, kv_size_multiplier= 4
                                 For TRN1 (interleaved KV replication):
                                 - KV pattern: (K0,K1,...,K15)(K0,K1,...,K15)... repeated 4 times
-                                - Query order: Q0,Q16,Q32,Q48, Q1,Q17,Q33,Q49, ..., Q15,Q31,Q47,Q63
+                                - Query order: (Q0,Q4,...,Q60)(Q1,Q5,...,Q61)...(Q3,Q7,...,Q63)
                                 This groups 4 query heads (e.g., Q0,Q16,Q32,Q48) with each KV head,
                                 repeating 4 times to match the KV replication.
 
@@ -330,26 +378,34 @@ class CheckpointConverterBase:
                                 Hence when creating the merged checkpoint, we need to bring the Q heads and o_proj in order.
                                 Reordering query heads to align with the KV head replication pattern.
                                 """
+                                if args.pad_attn_heads:
+                                    padded_q_heads = math.ceil(q_heads / args.tp_size) * args.tp_size
+                                else:
+                                    padded_q_heads = q_heads
                                 if "o_proj" in name:
                                     # The shuffling is same for both o_proj and q, but o_proj is sharded on column.
                                     # Hence to reuse the same shuffling code, we just transpose, do the shuffling and
                                     # transpose back
                                     full_weight = torch.transpose(full_weight, 0, 1)
-                                weights = full_weight.reshape(q_heads, head_dim, -1)
+                                weights = full_weight.reshape(padded_q_heads, head_dim, -1)
                                 weights_shape = weights.size()
                                 weight_splits = []
                                 if args.hw_backend == "trn2":
-                                    group_size = q_heads // kv_heads
+                                    group_size = padded_q_heads // kv_heads
                                     weights = weights.reshape(kv_heads, group_size, head_dim, weights_shape[-1])
                                     for i in range(kv_heads):
                                         weight_splits.append(weights[i].reshape(-1, weights_shape[-1]))
+                                    # TODO: trn2 unpad for `pad_attn_heads`
                                 else:
                                     weights = weights.reshape(
-                                        -1, q_heads // (kv_heads * args.kv_size_multiplier), head_dim, weights_shape[-1]
+                                        -1, padded_q_heads // (kv_heads * args.kv_size_multiplier), head_dim, weights_shape[-1]
                                     )
                                     indicies = torch.arange(0, args.tp_size // kv_heads) * kv_heads
                                     for i in range(kv_heads):
-                                        weight_splits.append(weights[indicies + i].reshape(-1, weights_shape[-1]))
+                                        weight_split = weights[indicies + i]
+                                        if args.pad_attn_heads:
+                                            weight_split = weight_split[:args.kv_size_multiplier * q_heads // padded_q_heads]
+                                        weight_splits.append(weight_split.reshape(-1, weights_shape[-1]))
                                 full_weight = torch.cat(weight_splits, dim=self.qkv_partition_dim)
                                 full_state[name] = (
                                     torch.transpose(full_weight, 0, 1).detach().clone()
@@ -375,6 +431,7 @@ class CheckpointConverterBase:
                             or self.is_qkv_weight(name)
                             or "o_proj" in name
                             or "lm_head" in name
+                            or "wte" in name
                         ):
                             partition_dim = self.get_partition_dim(name)
                             name = self.get_weight_key(keys_hf_to_nxd, keys_nxd_to_hf, name, False)
@@ -390,6 +447,11 @@ class CheckpointConverterBase:
                             name = self.get_weight_key(keys_hf_to_nxd, keys_nxd_to_hf, name, False)
                             if name not in full_state:
                                 full_state[name] = [[]]
+                            if args.i_tp_round_factor > 0:
+                                assert partition_dim == 1
+                                i_tp = self._get_config_value(config["ffn_config"], "ffn_hidden_size") // args.tp_size
+                                with torch.no_grad():
+                                    param = param[:, :i_tp, :].detach().clone()
                             full_state[name][tp_rank].append(param)
                             if ep_rank == (args.ep_size - 1):
                                 full_weight = torch.cat(full_state[name][tp_rank], dim=expert_partition_dim)
@@ -407,6 +469,12 @@ class CheckpointConverterBase:
                             up_proj_name = name.replace("gate_up_proj", "up_proj")
                             gate_proj_weight = param.narrow(partition_dim, 0, dim_size).detach().clone()
                             up_proj_weight = param.narrow(partition_dim, dim_size, dim_size).detach().clone()
+                            if args.i_tp_round_factor > 0:
+                                assert partition_dim == 2
+                                i_tp = self._get_config_value(config["ffn_config"], "ffn_hidden_size") // args.tp_size
+                                with torch.no_grad():
+                                    gate_proj_weight = gate_proj_weight[:, :, :i_tp].detach().clone()
+                                    up_proj_weight = up_proj_weight[:, :, :i_tp].detach().clone()
                             if gate_proj_name not in full_state:
                                 full_state[gate_proj_name] = [[]]
                             if up_proj_name not in full_state:
@@ -449,9 +517,9 @@ class CheckpointConverterBase:
         kv_size_multiplier = args.kv_size_multiplier
 
         partial_state = {}
-        q_heads = config["num_attention_heads"]
-        kv_heads = config["num_key_value_heads"]
-        head_dim = config["hidden_size"] // q_heads
+        q_heads = self._get_config_value(config, "num_attention_heads")
+        kv_heads = self._get_config_value(config, "num_key_value_heads")
+        head_dim = self._get_config_value(config, "hidden_size") // q_heads
 
         is_gqa = q_heads != kv_heads
         keys_hf_to_nxd, keys_nxd_to_hf = self.get_hf_to_nxd_model_keys(args.qkv_linear, is_gqa)
@@ -459,7 +527,7 @@ class CheckpointConverterBase:
         for name, full_p in full_state.items():
             ##################### PP Slice #########################################
             # Embedding only in first PP
-            if pp_rank != 0 and "embed_tokens" in name:
+            if pp_rank != 0 and ("embed_tokens" in name or "wte" in name):
                 continue
 
             # Non-expert parameters only in EP rank 0
@@ -467,9 +535,9 @@ class CheckpointConverterBase:
                 continue
 
             # LMhead and final layer norm only in last PP rank
-            if pp_rank != pp_size - 1 and ("lm_head" in name or "model.norm.weight" in name):
+            if pp_rank != pp_size - 1 and ("lm_head" in name or "model.norm.weight" in name or "norm_f.weight" in name):
                 continue
-            if "layers" in name:
+            if self.layer_name in name:
                 layer_idx = int(name.split(".")[2])
                 current_stage = len(partitions)
                 # iterate through the pp cuts and find the current stage
@@ -529,30 +597,50 @@ class CheckpointConverterBase:
                     Q reordering: [Q0,Q1,Q2,Q3, Q16,Q17,Q18,Q19, Q32,Q33,Q34,Q35, Q48,Q49,Q50,Q51,
                                 Q4,Q5,Q6,Q7, Q20,Q21,Q22,Q23, Q36,Q37,Q38,Q39, Q52,Q53,Q54,Q55, ...]
                     """
-                    if "o_proj" in name:
-                        # The shuffling is same for both o_proj and q, but o_proj is sharded on column.
-                        # Hence to reuse the same shuffling code, we just transpose, do the shuffling and
-                        # transpose back
-                        full_p = torch.transpose(full_p, 0, 1)
-                    weights = full_p.reshape(q_heads, head_dim, -1)
-                    weights_shape = weights.size()
-                    weight_splits = []
-
-                    if args.hw_backend == "trn2":
-                        group_size = q_heads // kv_heads
-                        weights = weights.reshape(kv_heads, group_size, head_dim, weights_shape[-1])
-                        for i in range(kv_heads):
-                            weight_splits.append(weights[i])
+                    if args.pad_attn_heads:
+                        padded_q_heads = math.ceil(q_heads / args.tp_size) * args.tp_size
                     else:
-                        weights = weights.reshape(-1, q_heads // (kv_heads * kv_size_multiplier), head_dim, weights_shape[-1])
-                        indicies = torch.arange(0, kv_heads) * tp_size // kv_heads
-                        for i in range(tp_size // kv_heads):
-                            weight_splits.append(weights[indicies + i])
-                    weights = torch.cat(weight_splits, dim=self.qkv_partition_dim)
+                        padded_q_heads = q_heads
+
                     with torch.no_grad():
+                        if "o_proj" in name:
+                            # The shuffling is same for both o_proj and q, but o_proj is sharded on column.
+                            # Hence to reuse the same shuffling code, we just transpose, do the shuffling and
+                            # transpose back
+                            full_p = torch.transpose(full_p, 0, 1)
+
+                        weights = full_p.reshape(q_heads, head_dim, -1)
+                        weights_shape = weights.size()
+                        weight_splits = []
+
                         if args.hw_backend == "trn2":
-                            start_idx = tp_rank * (q_heads // tp_size)
-                            end_idx = (tp_rank + 1) * (q_heads // tp_size)
+                            group_size = q_heads // kv_heads
+                            weights = weights.reshape(kv_heads, group_size, head_dim, weights_shape[-1])
+                            for i in range(kv_heads):
+                                weight_splits.append(weights[i])
+                            if args.pad_attn_heads:
+                                # TODO: trn2 unpad
+                                for i in range(padded_q_heads // kv_heads - group_size):
+                                    weight_splits.append(torch.zeros_like(weight_splits[0]))
+                        else:
+                            num_heads_per_tp_rank = padded_q_heads // (kv_heads * kv_size_multiplier)
+                            weights = weights.reshape(-1, num_heads_per_tp_rank, head_dim, weights_shape[-1])
+                            if args.pad_attn_heads:
+                                indicies = torch.arange(0, kv_heads) * weights.size(0) // kv_heads
+                                for i in range(weights.size(0) // kv_heads):
+                                    weight_splits.append(weights[indicies + i])
+                                for i in range((padded_q_heads - q_heads) // kv_heads // num_heads_per_tp_rank):
+                                    weight_splits.append(torch.zeros_like(weight_splits[0]))
+                            else:
+                                indicies = torch.arange(0, kv_heads) * tp_size // kv_heads
+                                for i in range(tp_size // kv_heads):
+                                    weight_splits.append(weights[indicies + i])
+
+                        weights = torch.cat(weight_splits, dim=self.qkv_partition_dim)
+
+                        if args.hw_backend == "trn2":
+                            start_idx = tp_rank * (padded_q_heads // tp_size)
+                            end_idx = (tp_rank + 1) * (padded_q_heads // tp_size)
                             # Select the appropriate slice for this rank
                             to_load = weights[start_idx:end_idx].reshape(-1, weights_shape[-1])
                         else:
@@ -568,6 +656,7 @@ class CheckpointConverterBase:
                 or "o_proj" in name
                 or "down_proj" in name
                 or "lm_head" in name
+                or "wte" in name
             ):
                 partition_dim = self.get_partition_dim(name)
                 dim_size = full_p.size()[partition_dim]
@@ -575,6 +664,15 @@ class CheckpointConverterBase:
                 partition_size = dim_size // tp_size
                 with torch.no_grad():
                     to_load = full_p.narrow(partition_dim, tp_rank * partition_size, partition_size)
+                    if "down_proj" in name and args.i_tp_round_factor > 0:
+                        assert partition_dim == 1
+                        i_tp = self._get_config_value(config["ffn_config"], "ffn_hidden_size") // args.tp_size
+                        leftover = i_tp % args.i_tp_round_factor
+                        padding_per_rank = 0 if leftover == 0 else (args.i_tp_round_factor - leftover)
+                        i_tp_padded = i_tp + padding_per_rank
+                        padded_to_load = torch.zeros(to_load.size(0), i_tp_padded, to_load.size(2), dtype=to_load.dtype, device=to_load.device)
+                        padded_to_load[:, :i_tp, :] = to_load
+                        to_load = padded_to_load
                     partial_state[name] = to_load.detach().clone()
             elif "gate_proj" in name or "up_proj" in name:
                 partition_dim = self.get_partition_dim(name)
@@ -583,6 +681,15 @@ class CheckpointConverterBase:
                 partition_size = dim_size // tp_size
                 with torch.no_grad():
                     to_load = full_p.narrow(partition_dim, tp_rank * partition_size, partition_size).detach().clone()
+                    if args.i_tp_round_factor > 0:
+                        assert partition_dim == 2
+                        i_tp = self._get_config_value(config["ffn_config"], "ffn_hidden_size") // args.tp_size
+                        leftover = i_tp % args.i_tp_round_factor
+                        padding_per_rank = 0 if leftover == 0 else (args.i_tp_round_factor - leftover)
+                        i_tp_padded = i_tp + padding_per_rank
+                        padded_to_load = torch.zeros(to_load.size(0), to_load.size(1), i_tp_padded, dtype=to_load.dtype, device=to_load.device)
+                        padded_to_load[:, :, :i_tp] = to_load
+                        to_load = padded_to_load
                 token = "gate_proj" if "gate_proj" in name else "up_proj"
                 updated_name = name.replace(token, "gate_up_proj")
                 if updated_name in partial_state:
@@ -596,6 +703,8 @@ class CheckpointConverterBase:
                         )
                 else:
                     partial_state[updated_name] = to_load.detach().clone()
+                if name in partial_state:
+                    partial_state.pop(name)
             else:
                 # no TP
                 partial_state[name] = full_p
@@ -722,14 +831,13 @@ class CheckpointConverterBase:
 
     def convert_from_full_state(self, args):
         full_state = self.load_full_state(args)
-        layer_name_pattern = r"^(model\.layers\.\d+)"
         model_layer_names = sorted(
             list(
                 set(
                     [
-                        re.match(layer_name_pattern, key).group(1)
+                        re.match(self.layer_name_pattern, key).group(1)
                         for key in full_state.keys()
-                        if re.match(layer_name_pattern, key)
+                        if re.match(self.layer_name_pattern, key)
                     ]
                 )
             ),
@@ -792,6 +900,12 @@ class CheckpointConverterBase:
         )
         parser.add_argument(
             "--fuse_qkv", type=bool, default=False, help="Whether to fuse qkv"
+        )
+        parser.add_argument(
+            "--i_tp_round_factor", type=int, default=0, help="Round factor for ffn intermediate size to make NKI blockwise run efficiently"
+        )
+        parser.add_argument(
+            "--pad_attn_heads", type=bool, default=False, help="Whether to pad attention heads"
         )
         parser.add_argument("--load_xser", type=bool, default=False, help="Load from xser saved checkpoints")
         parser.add_argument("--save_xser", type=bool, default=False, help="Save with xser")

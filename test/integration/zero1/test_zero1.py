@@ -2,7 +2,7 @@ import argparse
 import atexit
 import itertools
 from datetime import datetime
-
+import sys
 import torch
 import torch_xla
 import torch_xla.core.xla_model as xm
@@ -153,10 +153,11 @@ if __name__ == "__main__":
     else:
         torch.distributed.init_process_group("xla")
 
+    model_dtype = torch.float32 if len(sys.argv) < 2 or sys.argv[1] == "fp32" else torch.bfloat16
+    optimizer_dtype = torch.float32 if len(sys.argv) < 3 or sys.argv[2] == "fp32" else torch.bfloat16
+
     for (
         parallel_config,
-        model_dtype,
-        optimizer_dtype,
         grad_clipping,
         max_norm,
         pin_layout,
@@ -167,8 +168,6 @@ if __name__ == "__main__":
             {"tp_degree": 1, "pp_degree": 4, "ep_degree": 1},
             {"tp_degree": 1, "pp_degree": 1, "ep_degree": 8},
         ],
-        [torch.float32, torch.bfloat16],
-        [torch.float32, torch.bfloat16],
         [True, False],
         [1.0, 0.5, 0.2, 2.0],
         [True, False],

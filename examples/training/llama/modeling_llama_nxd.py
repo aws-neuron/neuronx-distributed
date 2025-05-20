@@ -56,9 +56,7 @@ from transformers.models.llama.modeling_llama import LlamaPreTrainedModel
 from transformers.models.llama.modeling_llama import LlamaRMSNorm as LlamaRMSNormHF
 from transformers.models.llama.modeling_llama import (
     LlamaRotaryEmbedding,
-    apply_rotary_pos_emb,
     repeat_kv,
-    rotate_half,
 )
 from transformers.utils import (
     add_start_docstrings,
@@ -71,6 +69,7 @@ import neuronx_distributed.parallel_layers.utils as neuronx_dist_utils
 from neuronx_distributed.kernels.flash_attn import nki_flash_attn_func
 from neuronx_distributed.kernels.ring_attention_kernel import nki_ring_attn_func
 from neuronx_distributed.modules.qkv_linear import GQAQKVColumnParallelLinear
+from neuronx_distributed.overrides.transformer_overrides import apply_rotary_pos_emb
 from neuronx_distributed.parallel_layers import mappings
 from neuronx_distributed.parallel_layers.layers import (
     ColumnParallelLinear,
@@ -277,6 +276,11 @@ class LlamaAttention(LlamaAttentionHF):
             self.use_ring_attention = True
         else:
             self.use_ring_attention = False
+            
+        if self.use_ring_attention and self.use_flash_attention:
+            raise ValueError(
+                "Context parallelism is not supported with flash attention. Please set `use_flash_attention` to False to use context parallelism with ring attention"
+        )
 
         if (self.head_dim * self.num_heads) != self.hidden_size:
             raise ValueError(
@@ -401,23 +405,26 @@ class LlamaAttention(LlamaAttentionHF):
                 key_states = self.k_proj(hidden_states)
                 value_states = self.v_proj(hidden_states)
 
-        if self.config.sequence_parallel_enabled:
-            query_states = query_states.view(q_len, bsz, self.num_heads, self.head_dim).permute(1, 2, 0, 3)
-            key_states = key_states.view(q_len, bsz, self.num_key_value_heads, self.head_dim).permute(1, 2, 0, 3)
-            value_states = value_states.view(q_len, bsz, self.num_key_value_heads, self.head_dim).permute(1, 2, 0, 3)
-        else:
-            query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-            key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-            value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        # permute/transpose qkv
+        query_states, key_states, value_states, seq_len_dim_index = self.permute_qkv_for_attn(
+            query_states, key_states, value_states, bsz, q_len, self.num_heads,
+            self.num_key_value_heads, self.head_dim, self.config
+        )
 
-        kv_seq_len = key_states.shape[-2]
+        kv_seq_len = key_states.shape[seq_len_dim_index]
         if past_key_value is not None:
             kv_seq_len += past_key_value[0].shape[-2]
+        # Multiply by context parallel size as seq_len is sharded by context parallel size
         kv_seq_len *= get_context_model_parallel_size()
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
         cos = self.get_position_embedding_on_this_context_parallel_rank(cos, 2)
         sin = self.get_position_embedding_on_this_context_parallel_rank(sin, 2)
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        
+        # The first two dimensions of cos and sin are always 1, so we can `squeeze` them.
+        cos = cos.squeeze(1).squeeze(0)  # [seq_len, dim]
+        sin = sin.squeeze(1).squeeze(0)  # [seq_len, dim]
+        
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids, self.use_flash_attention, self.config.transpose_nki_inputs)
 
         if past_key_value is not None:
             # reuse k, v, self_attention
@@ -434,7 +441,7 @@ class LlamaAttention(LlamaAttentionHF):
         if self.use_ring_attention:
             attn_output = nki_ring_attn_func(query_states, key_states, value_states, torch.distributed.get_rank(), get_context_model_parallel_src_tgt_pairs())
         elif self.use_flash_attention:
-            attn_output = nki_flash_attn_func(query_states, key_states, value_states)
+            attn_output = nki_flash_attn_func(query_states, key_states, value_states, transpose_nki_inputs=self.config.transpose_nki_inputs)
         else:
             attn_output = self.core_attn(query_states, key_states, value_states)
 
@@ -477,6 +484,34 @@ class LlamaAttention(LlamaAttentionHF):
             *position_embedding.shape[:seq_dim], -1, *position_embedding.shape[(seq_dim + 2) :]
         )
         return position_embedding
+        
+    def reshape_and_permute_states_for_fa(self, states, bsz, q_len, num_heads, head_dim, use_sequence_parallel):
+        if use_sequence_parallel:
+            return states.view(q_len, bsz, num_heads, head_dim).permute(1, 2, 3, 0)
+        else:
+            return states.view(bsz, q_len, num_heads, head_dim).permute(0, 2, 3, 1)
+
+    def permute_qkv_for_attn(
+            self, query_states, key_states, value_states, bsz, q_len, num_heads, num_key_value_heads, head_dim, config
+        ):
+
+        if config.transpose_nki_inputs and self.use_flash_attention and not self.use_ring_attention:
+            query_states = self.reshape_and_permute_states_for_fa(query_states, bsz, q_len, num_heads, head_dim, config.sequence_parallel_enabled)
+            key_states = self.reshape_and_permute_states_for_fa(key_states, bsz, q_len, num_key_value_heads, head_dim, config.sequence_parallel_enabled)
+            value_states = self.reshape_and_permute_states_for_fa(value_states, bsz, q_len, num_key_value_heads, head_dim, config.sequence_parallel_enabled)
+            dim_index = -1
+        elif config.sequence_parallel_enabled:
+            query_states = query_states.view(q_len, bsz, num_heads, head_dim).permute(1, 2, 0, 3)
+            key_states = key_states.view(q_len, bsz, num_key_value_heads, head_dim).permute(1, 2, 0, 3)
+            value_states = value_states.view(q_len, bsz, num_key_value_heads, head_dim).permute(1, 2, 0, 3)
+            dim_index = -2
+        else:
+            query_states = query_states.view(bsz, q_len, num_heads, head_dim).transpose(1, 2)
+            key_states = key_states.view(bsz, q_len, num_key_value_heads, head_dim).transpose(1, 2)
+            value_states = value_states.view(bsz, q_len, num_key_value_heads, head_dim).transpose(1, 2)
+            dim_index = -2
+        
+        return query_states, key_states, value_states, dim_index
 
 
 class LlamaDecoderLayer(LlamaDecoderLayerHF):
@@ -801,7 +836,6 @@ class LlamaForCausalLM(LlamaForCausalLMHF):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
-
 
 def init_weights(module, device):
     """

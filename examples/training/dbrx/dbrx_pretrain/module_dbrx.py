@@ -187,6 +187,11 @@ class NeuronDbrxLTModule(NeuronLTModule):
                     prog_bar=True,
                 )
                 self.log(
+                    "grad-norm",
+                    self.global_norm,
+                    prog_bar=True,
+                )
+                self.log(
                     "input_ids",
                     torch.sum(self.input_ids.detach().cpu()).item(),
                     prog_bar=True,

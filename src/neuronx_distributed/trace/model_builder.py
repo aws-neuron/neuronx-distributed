@@ -3,8 +3,12 @@ import os
 import shutil
 import time
 import logging
+import hashlib
+from pathlib import Path
 import contextlib
-from typing import Dict, List, Optional, Tuple, Union
+import pathlib
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple, Union, Any, Callable, Set
 import warnings
 
 import torch
@@ -13,9 +17,12 @@ import torch.distributed
 import torch_neuronx
 import torch_neuronx.xla_impl
 import torch_neuronx.xla_impl.trace
+from libneuronxla import neuron_xla_compile # type: ignore
 from torch_neuronx import BucketModelConfig
 from torch_neuronx.proto import metaneff_pb2
-from torch_neuronx.xla_impl.trace import get_torch_dtype, HloArtifacts
+from torch_neuronx.pyhlo import hlo_pb2
+from torch_neuronx.xla_impl.trace import get_torch_dtype, HloArtifacts, generate_neff, NeffArtifacts
+from torch_neuronx.utils import get_platform_target
 from packaging import version
 if version.parse(torch.__version__) >= version.parse("2.1"):
     from torch_neuronx.experimental.profiler.v2_x.custom_op_name import hlo_debug
@@ -34,12 +41,277 @@ from neuronx_distributed.trace.spmd import (
 )
 from neuronx_distributed.trace.trace import _mock_parallel_state, get_sharded_checkpoint, preprocess_checkpoint
 from neuronx_distributed.trace.mock_torchdist import mock_distributed
+from neuronx_distributed.trace.model_builder_utils import (
+    ModelBuilderConstants,
+    TraceArtifacts,
+    CompilationArtifacts,
+    generate_key,
+)
 import neuronx_distributed.trace.hlo_utils as hlo_utils
 from neuronx_distributed.utils.model_utils import init_on_device
 from neuronx_distributed.utils.safetensors_utils import remove_duplicate_tensors
 
 ModelInputType = List[Union[Tuple[Union[torch.Tensor, List[torch.Tensor]]], torch.Tensor]]
 logger = logging.getLogger("Neuron")
+
+try:
+    from libneuronxla import neuron_xla_wlo_compile # type: ignore
+except ImportError:
+    # This is a temporary check to allow users to upgrade LibNeuronXla and utilize
+    # neuron persistent cache feature as part of neuron_xla_wlo_compile().
+    warnings.warn("neuron_xla_wlo_compile() API requires a later version of libneuronxla, "
+    "upgrade to enable Neuron persistent cache for HLO compilation.", category=ImportWarning)
+    neuron_xla_wlo_compile = None
+
+
+# Constants
+NEFF_FILE = "graph.neff"
+WRAPPED_NEFF_FILE = "wrapped_neff.hlo"
+GRAPH_HLO_FILE = "graph.hlo"
+LOG_FILE_DEFAULT_NAME = "log-neuron-cc.txt"
+
+
+def get_hash_module(hlo_module, flags):
+    # Hashing is pretty fast and negligible compared to compilation time
+    hash_gen = hashlib.sha256()
+    text = str(hlo_module)
+    if flags is not None:
+        text += flags.replace(" ", "")
+    hash_gen.update(text.encode('utf-8'))
+    hash = str(hash_gen.hexdigest())[:20]
+    return hash
+
+
+def trace(
+    model: Union[Callable, torch.nn.Module],
+    example_inputs: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
+    spmd: bool = True,
+    preserve_parameters: bool = True
+) -> TraceArtifacts:
+    """
+    Traces a model with the given example inputs.
+
+    Args:
+        model (Union[Callable, torch.nn.Module]): The model to be traced.
+        example_inputs (Union[torch.Tensor, Tuple[torch.Tensor, ...]]): 
+            The example inputs to be used for tracing. Can be either a single tensor
+            or a tuple of tensors.
+        spmd (bool, optional): Whether to use SPMD for tracing. Currently only SPMD=True
+            is supported. Defaults to True.
+        preserve_parameters (bool, Optional): Whether to preserve parameters. Recommended to be
+            False if tracing only one bucket for a particular module. Should be set to True
+            when tracing multiple buckets of the same module.
+
+    Returns:
+        TraceArtifacts: An instance of the TraceArtifacts class containing the traced HLO artifacts,
+        metaneff, flattener, packer and weight name to idx mapping components.
+    """
+    if not spmd:
+        raise NotImplementedError("MPMD tracing is not currently supported.")
+
+    # Validate and preprocess the inputs
+    if isinstance(example_inputs, torch.Tensor):
+        processed_inputs = (example_inputs,)
+    elif isinstance(example_inputs, tuple) and all(isinstance(t, torch.Tensor) for t in example_inputs):
+        processed_inputs = example_inputs
+    else:
+        raise ValueError("example_inputs must be either a single tensor or a tuple of tensors")
+
+    # Generate HLO
+    hlo_artifacts = torch_neuronx.xla_impl.trace.generate_hlo(
+        model,
+        processed_inputs,
+        inline_weights_to_neff=False,
+        return_weights=False,
+        output_aliased_tensor=False,
+        cpu_backend=True,
+        preserve_parameters=preserve_parameters,
+        enable_aliasing=True,
+    )
+
+    return TraceArtifacts(
+        hlo=hlo_artifacts.hlo_module,
+        metaneff=hlo_artifacts.metaneff,
+        flattener=hlo_artifacts.flattener,
+        packer=hlo_artifacts.packer,
+        weight_name_to_idx=hlo_artifacts.weight_name_to_idx
+    )
+
+def compile(
+    hlo_module: hlo_pb2.HloModuleProto,
+    flattener: Any,
+    packer: Any,
+    metaneff: Any,
+    weight_name_to_idx: Optional[Dict[str, int]] = None,
+    compiler_workdir: Optional[Union[str, pathlib.Path]] = None,
+    compiler_args: Optional[Union[str, List[str]]] = None,
+    key: Optional[str] = None
+) -> CompilationArtifacts:
+    """
+    Compiles the traced model with the Neuron Compiler to a Neuron Executable File Format (NEFF).
+
+    Args:
+        hlo_module (hlo_pb2.HloModuleProto): The HLO module representing the computational graph to be compiled.
+        flattener (Any): Function to flatten inputs.
+        packer (Any): Function to pack outputs.
+        metaneff (Any): The meta information for the Neuron Executable File Format (NEFF).
+        weight_name_to_idx (Optional[Dict[str, int]]): Dictionary mapping weight names to their indices.
+        compiler_workdir (Optional[Union[str, pathlib.Path]]): Path to store compiler artifacts. If None, uses a default path.
+        compiler_args (Optional[Union[str, List[str]]]): Compiler flags for neuronx-cc.
+        key (Optional[str]): Key to tag the bucket with a meaningful name. If None, a hash of the HLO will be used.
+
+    Returns:
+        CompilationArtifacts: An object containing the path to the compiled NEFF.
+    """
+    # Input validation
+    missing_args = {
+        'hlo_module': hlo_module,
+        'flattener': flattener,
+        'packer': packer,
+        'metaneff': metaneff
+    }
+    missing = [arg_name for arg_name, arg_value in missing_args.items() if not arg_value]
+    
+    if missing:
+        raise ValueError(f"Required trace arguments missing: {', '.join(missing)}")
+
+    try:
+        logger.info(f"Started compilation for {key}")
+        compile_start_time = time.time()
+
+        # Generate key to tag the bucket with a meaningful name
+        key = generate_key(hlo_module, key)
+
+        # Set-up compiler workdir
+        timestamp = datetime.now().isoformat().replace(':', '-')
+        output_dir = os.path.join(ModelBuilderConstants.DEFAULT_COMPILER_WORKDIR if compiler_workdir is None else compiler_workdir, key, timestamp)
+        os.makedirs(output_dir, exist_ok=True)
+        logger.info(f"Compiler workdir for {key} is: {output_dir}")
+
+        # Set compiler flags
+        if compiler_args is None:
+            compiler_args = "--enable-saturate-infinity --auto-cast=none --model-type=transformer -O1"
+        if isinstance(compiler_args, str):
+            if '--logfile' not in compiler_args:
+                compiler_args += f" --logfile={os.path.join(output_dir, ModelBuilderConstants.LOG_FILE_DEFAULT_NAME)}"
+        elif isinstance(compiler_args, list):
+            if not any('--logfile' in arg for arg in compiler_args):
+                compiler_args.append(f"--logfile={os.path.join(output_dir, ModelBuilderConstants.LOG_FILE_DEFAULT_NAME)}")
+        else:
+            raise TypeError(f"compiler_args must be either a string or a list of strings, got {type(compiler_args).__name__}")
+
+        # Prepare HloArtifacts
+        hlo_artifacts = HloArtifacts(
+            hlo_module=hlo_module,
+            flattener=flattener,
+            packer=packer,
+            metaneff=metaneff,
+            weights=None,
+            constant_parameter_tensors=None,
+            weight_name_to_idx=weight_name_to_idx
+        )
+
+        # Generate NEFF
+        neff_artifacts = generate_neff(
+            hlo_artifacts=hlo_artifacts,
+            compiler_workdir=output_dir,
+            compiler_args=compiler_args,
+            inline_weights_to_neff=False
+        )
+
+        # Save metaneff
+        metaneff_path = os.path.join(output_dir, ModelBuilderConstants.METANEFF_FILE)
+        with open(metaneff_path, "wb") as f:
+            f.write(hlo_artifacts.metaneff.SerializeToString())
+
+        logger.info(f"Finished compilation for {key} in {time.time() - compile_start_time} seconds")
+
+        return CompilationArtifacts(neff_filename=neff_artifacts.neff_filename)
+
+    except Exception as e:
+        logger.error(f"Compilation failed for {key}: {str(e)}")
+        raise RuntimeError(f"Compilation failed for {key}") from e
+
+
+
+
+class ModelBuilderV2:
+    """
+    A class for tracing and compiling models for Neuron devices.
+
+    This class provides functionality to trace and compile models for efficient
+    execution on Neuron hardware. It supports SPMD (Single Program Multiple Data)
+    tracing and compilation.
+    """
+    def __init__(
+        self,
+        model: Union[Callable, torch.nn.Module],
+        world_size: int,
+        weights_to_skip_layout_optimization: Optional[Set] = None
+    ):
+        """
+        Initialize the ModelBuilderV2.
+
+        Args:
+            model (Union[Callable, torch.nn.Module]): The PyTorch model to be traced and compiled.
+            world_size (int): The number of parallel processes for SPMD execution.
+            weights_to_skip_layout_optimization (Optional[Set]): A set of weight names to skip during layout optimization.
+
+        Raises:
+            AssertionError: If the torch-neuronx version is not compatible.
+        """
+        if not torch_neuronx.__version__.startswith("2"):
+            raise AssertionError(
+                f"ModelBuilderV2 requires torch-neuronx>=2.* but found torch-neuronx=={torch_neuronx.__version__}."
+            )
+
+        self.model = model
+        self.world_size = world_size
+        self.traces: Dict[str, TraceArtifacts] = {}
+        self.weights_to_skip_layout_optimization = weights_to_skip_layout_optimization
+    
+    def trace(
+        self,
+        example_inputs: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
+        tag: Optional[str] = None,
+        spmd: bool = True,
+    ):
+        """
+        Traces a model with given example inputs and stores the resulting trace artifacts.
+
+        Args:
+            example_inputs (Union[torch.Tensor, Tuple[torch.Tensor, ...]]):
+                The example inputs to be used for tracing. Can be either a single tensor 
+                or a tuple of tensors.
+            tag (Optional[str]): A unique identifier for this trace. If None, a default tag will be generated.
+            spmd (bool): Whether to use SPMD for tracing. Currently only SPMD=True
+                is supported. Defaults to True.
+
+        Returns:
+            self: Returns the instance to allow method chaining.
+        """
+        raise NotImplementedError("The trace method has not been implemented yet")
+    
+    def compile(
+        self,
+        priority_model_key: Optional[str] = None,
+        compiler_workdir: Optional[Union[str, pathlib.Path]] = None,
+        compiler_args: Optional[Union[str, List[str]]] = None,
+    ):
+        """
+        Compiles the traced model using the Neuron compiler, generating
+        a Neuron Executable File Format (NEFF) for each trace.
+
+        Args:
+            priority_model_key (Optional[str]): Key of the model to prioritize during compilation.
+            compiler_workdir (Optional[Union[str, pathlib.Path]]):
+                Path to store compiler artifacts. If None, uses a default path.
+            compiler_args (Optional[Union[str, List[str]]]): Compiler flags for neuronx-cc.
+
+        Returns:
+            The compiled model, ready for execution on Neuron hardware.
+        """
+        raise NotImplementedError("The compile method has not been implemented yet")
 
 
 # TODO write a generic class which can accept a function as well
@@ -186,7 +458,7 @@ class ModelBuilder:
         )
         return self
 
-    def trace(self, initialize_model_weights=True):
+    def trace(self, initialize_model_weights=True, dry_run=False):
         """
         Trace and compile a NxD model into a NEFF that can be excuted on neuron
         devices.
@@ -195,6 +467,7 @@ class ModelBuilder:
         explictly release runtime at the end, so that it can clean memory
         garbage on devices.
         """
+        start_time = time.time()
         prev_sharing_strategy = torch.multiprocessing.get_sharing_strategy()
         torch.multiprocessing.set_sharing_strategy("file_system")
 
@@ -209,6 +482,7 @@ class ModelBuilder:
         weight_names_to_skip = set(self.weights_to_skip_layout_optimization)
         num_hlos = 0
         logger.info(f"Generating HLOs for the following models: {list(self.model_collection.keys())}")
+        trace_start_time = time.time()
         with mock_distributed(world_size=self.world_size):
             backend = 'xla'
             torch.distributed.init_process_group(backend, rank=0, world_size=self.world_size)
@@ -226,14 +500,11 @@ class ModelBuilder:
 
             for key in self.model_collection:
                 model_artifacts = self.model_collection[key]
-
                 bucket_degree = len(model_artifacts.example_inputs)
                 num_hlos += bucket_degree
 
                 logger.info(f"Generating {bucket_degree} hlos for key: {key}")
-
                 hlo_artifact_collection = self._generate_hlo(key)
-
                 model_artifacts.hlo_artifact_collection = hlo_artifact_collection
                 hm = hlo_artifact_collection[0].hlo_module
                 id_to_computation = {cpt.id: cpt for cpt in hm.computations}
@@ -254,38 +525,117 @@ class ModelBuilder:
             parallel_state.destroy_model_parallel()
             torch.distributed.destroy_process_group()
 
+        logger.info(f"Generated all HLOs in {time.time() - trace_start_time} seconds")
+
         self._mark_weight_in_priority_hlo(weight_names_to_skip)
 
-        def submit_compilation_job(key, bucket_rank, args):
-            return key, bucket_rank, torch_neuronx.xla_impl.trace.generate_neff(*args)
+        def submit_compilation_job_with_cache(key, bucket_rank, **kwargs):
+            neuron_xla_compile_kwargs = {
+                "module_bytes": kwargs["module_bytes"],
+                "compiler_flags": kwargs["compiler_flags"],
+                "input_format": "hlo",
+                "platform_target": get_platform_target(kwargs["compiler_flags"]),
+                "cache_key": kwargs["cache_key"],
+                "retry_failed_compilation": False,
+                "lazy": True,
+                "use_cache": True,
+                "cache_dir": None,
+                "work_dir": kwargs["work_dir"],
+                "create_subdir": False,
+            }
+            try:
+                compile_result = neuron_xla_compile(**neuron_xla_compile_kwargs)
+            except TypeError:
+                # Backward compatibility with earlier versions that lack create_subdir arg.
+                del neuron_xla_compile_kwargs["create_subdir"]
+                compile_result = neuron_xla_compile(**neuron_xla_compile_kwargs)
 
-        logger.info("Started compilation for all HLOs")
+            return key, bucket_rank, compile_result
+
         for key, model_artifacts in self.model_collection.items():
             # init placeholder for all hlo
             model_artifacts.neff_artifact_collection = [None] * len(model_artifacts.hlo_artifact_collection)
 
             if model_artifacts.priority_model_idx is not None:
+                priority_model_start_time = time.time()
+                logger.info("Starting compilation for the priority HLO")
                 bucket_rank = model_artifacts.priority_model_idx
                 hlo_artifacts = model_artifacts.hlo_artifact_collection[bucket_rank]
+                logger.info(f"'{key}' is the priority model with bucket rank {bucket_rank}")
+                hlo_module = hlo_artifacts.hlo_module
+                module_bytes = hlo_module.SerializeToString()
+                output_dir = os.path.join(self.compiler_workdir, key, f"_tp0_bk{bucket_rank}")
+                self._create_output_dir(output_dir)
 
-                # TODO: improve these compiler flags if possiable
+                # TODO: improve these compiler flags if possible
                 compiler_args = model_artifacts.compiler_args
                 if '--logfile' not in compiler_args:
-                    compiler_args += f" --logfile={os.path.join(self.compiler_workdir, key, f'_tp0_bk{bucket_rank}', 'log-neuron-cc.txt')}"
+                    compiler_args += f" --logfile={Path(os.path.join(output_dir, LOG_FILE_DEFAULT_NAME)).absolute()}"
                 compiler_args += " --enable-internal-neff-wrapper"
+                platform_target = get_platform_target(compiler_args)
+                module_hash = get_hash_module(hlo_module, compiler_args)
+                if neuron_xla_wlo_compile:
+                    neff_bytes, wrapped_neff_bytes = neuron_xla_wlo_compile(module_bytes, compiler_args,
+                                                                            input_format="hlo",
+                                                                            platform_target=platform_target,
+                                                                            cache_key=module_hash,
+                                                                            retry_failed_compilation=False,
+                                                                            lazy=True,
+                                                                            use_cache=True,
+                                                                            cache_dir=None,
+                                                                            work_dir=Path(output_dir).absolute(),
+                                                                            create_subdir=False)
+                    self._create_output_dir(os.path.join(output_dir, "model"))
+                    hlo_utils.write_hlo(os.path.join(output_dir, "model", GRAPH_HLO_FILE), hlo_module)
+                    neff_artifacts = self.write_neff_to_file(neff_bytes, os.path.join(output_dir, NEFF_FILE))
+                    if wrapped_neff_bytes:
+                        # This file is only generated when the weights need to be optimized
+                        wrapped_neff_path = os.path.join(output_dir, WRAPPED_NEFF_FILE)
+                        with open(wrapped_neff_path, 'wb') as f:
+                            f.write(wrapped_neff_bytes)
+                else:
+                    logger.debug("Falling back to generate_neff() as libneuronxla is outdated")
+                    neff_artifacts = torch_neuronx.xla_impl.trace.generate_neff(
+                        hlo_artifacts,
+                        os.path.join(self.compiler_workdir, key, f"_tp0_bk{bucket_rank}"),
+                        compiler_args,
+                        False,
+                    )
 
-                neff_artifacts = torch_neuronx.xla_impl.trace.generate_neff(
-                    hlo_artifacts,
-                    os.path.join(self.compiler_workdir, key, f"_tp0_bk{bucket_rank}"),
-                    compiler_args,
-                    False,
-                )
                 # The neff is still valid for this SPMD model
                 self.model_collection[key].neff_artifact_collection[bucket_rank] = neff_artifacts
-        logger.info("Done compilation for the priority HLO")
+                logger.info(f"Done compilation for the priority HLO in {time.time() - priority_model_start_time} seconds")
 
         self._add_layout_optimization_to_remaining_hlo()
 
+        if dry_run:
+            logger.info(f"Saving HLOs and commands to {self.compiler_workdir} for dry run")
+            for key, model_artifacts in self.model_collection.items():
+                for bucket_rank, hlo_artifacts in enumerate(model_artifacts.hlo_artifact_collection):
+                    if bucket_rank == model_artifacts.priority_model_idx:
+                        # Priority model HLO is already saved.
+                        continue
+
+                    compiler_workdir = os.path.join(self.compiler_workdir, key, f"_tp0_bk{bucket_rank}")
+                    compiler_target = torch_neuronx.xla_impl.trace.setup_compiler_dirs(
+                        hlo_artifacts.hlo_module,
+                        compiler_workdir,
+                        hlo_artifacts.constant_parameter_tensors,
+                        False,
+                    )
+
+                    # Write the command that produces the NEFF
+                    command = torch_neuronx.xla_impl.trace.get_compile_command(compiler_target, compiler_workdir, compiler_args)
+                    torch_neuronx.xla_impl.trace.save_compile_command(command, compiler_workdir)
+
+            # Prepare weight layout transformation model
+            self._prepare_weight_layout_transform_model(dry_run=True)
+
+            logger.info(f"Saved HLOs and commands to {self.compiler_workdir} for dry run in {time.time() - start_time} seconds")
+            return None
+
+        logger.info("Starting compilation for all HLOs")
+        compile_start_time = time.time()
         executor = concurrent.futures.ThreadPoolExecutor()
         jobs = []
         for key, model_artifacts in self.model_collection.items():
@@ -293,27 +643,35 @@ class ModelBuilder:
                 if bucket_rank == model_artifacts.priority_model_idx:
                     # no need to compile the priority model again
                     continue
+                output_dir = os.path.join(self.compiler_workdir, key, f"_tp0_bk{bucket_rank}")
+                self._create_output_dir(output_dir)
 
                 compiler_args = model_artifacts.compiler_args
                 if '--logfile' not in compiler_args:
-                    compiler_args += f" --logfile={os.path.join(self.compiler_workdir, key, f'_tp0_bk{bucket_rank}', 'log-neuron-cc.txt')}"
+                    compiler_args += f" --logfile={Path(output_dir, LOG_FILE_DEFAULT_NAME).absolute()}"
+
+                hlo_module = hlo_artifacts.hlo_module
+                module_bytes = hlo_module.SerializeToString()
+                module_hash = get_hash_module(hlo_module, compiler_args)
+                self._create_output_dir(os.path.join(output_dir, "model"))
+                hlo_utils.write_hlo(os.path.join(output_dir, "model", GRAPH_HLO_FILE), hlo_module)
 
                 jobs.append(
                     executor.submit(
-                        submit_compilation_job,
+                        submit_compilation_job_with_cache,
                         key,
                         bucket_rank,
-                        (
-                            hlo_artifacts,
-                            os.path.join(self.compiler_workdir, key, f"_tp0_bk{bucket_rank}"),
-                            compiler_args,
-                            False,
-                        ),
+                        module_bytes=module_bytes,
+                        compiler_flags=compiler_args,
+                        cache_key=module_hash,
+                        work_dir=Path(output_dir).absolute(),
                     )
                 )
 
         for future in concurrent.futures.as_completed(jobs):
-            key, bucket_rank, neff_artifacts = future.result()
+            key, bucket_rank, neff_bytes = future.result()
+            output_dir = os.path.join(self.compiler_workdir, key, f"_tp0_bk{bucket_rank}")
+            neff_artifacts = self.write_neff_to_file(neff_bytes, os.path.join(output_dir, NEFF_FILE))
             self.model_collection[key].neff_artifact_collection[bucket_rank] = neff_artifacts
 
         # Save metaneff
@@ -323,7 +681,7 @@ class ModelBuilder:
                 with open(path, "wb") as f:
                     f.write(hlo_artifacts.metaneff)
 
-        logger.info("Finished Compilation for all HLOs")
+        logger.info(f"Finished Compilation for all HLOs in {time.time() - compile_start_time} seconds")
 
         nxd_model_executor = self.build_nxd_model()
 
@@ -346,10 +704,11 @@ class ModelBuilder:
         if initialize_model_weights:
             nxd_model_executor.nxd_model.initialize_with_saved_weights(torch.tensor(0))
 
+        logger.info(f"Finished building model in {time.time() - start_time} seconds")
         return nxd_model_executor
 
-    def shard_checkpoint(self, serialize_path):
-        if not os.path.exists(serialize_path):
+    def shard_checkpoint(self, serialize_path=None):
+        if serialize_path is not None and not os.path.exists(serialize_path):
             os.makedirs(serialize_path)
 
         source_model_key = list(self.model_collection.keys())[0]
@@ -358,6 +717,7 @@ class ModelBuilder:
             f"Sharding Weights for ranks: {self.start_rank_id}...{self.start_rank_id + self.local_ranks_size - 1}")
         start_time_shard = time.monotonic()
 
+        sharded_checkpoints = []
         with mock_distributed(world_size=self.world_size), init_on_device(torch.device("meta"),
                                                                           force_custom_init_on_device=True):
             torch.distributed.init_process_group(backend="xla", rank=0, world_size=self.world_size)
@@ -382,11 +742,12 @@ class ModelBuilder:
             preprocess_checkpoint(model, checkpoint)
 
             for rank in range(self.start_rank_id, self.start_rank_id + self.local_ranks_size):
-                self.shard_weights_with_cache(rank, model, checkpoint, serialize_path)
+                sharded_checkpoints.append(self.shard_weights_with_cache(rank, model, checkpoint, serialize_path))
 
             parallel_state.destroy_model_parallel()
             torch.distributed.destroy_process_group()
         logger.info(f"Done Sharding weights in {time.monotonic() - start_time_shard}")
+        return sharded_checkpoints
 
     def _generate_hlo(
             self,
@@ -399,7 +760,11 @@ class ModelBuilder:
             torch_xla._XLAC._set_ir_debug(True)
             os.environ["XLA_IR_DEBUG"] = "1"
             os.environ["XLA_HLO_DEBUG"] = "1"
-            run_context = hlo_debug()
+            # add_var_names=False avoids traversing the complete HLO graph,
+            # instead only minimal information to metadata.
+            # For e.g., op_name="NeuronLlamaForCausalLM[.1]/ModelBuilder[.1]/NeuronFusedSpecModel[.1]/
+            #                       NeuronLlamaModel[.2]/ParallelEmbedding[.2]/aten__index_select"
+            run_context = hlo_debug(add_var_names=False)
 
         with run_context:
             model_input_container = self.model_collection[key]
@@ -432,6 +797,7 @@ class ModelBuilder:
                 func, input_output_aliases = model_input_container.model_instance.get(bucket_rank, **func_kwargs)
 
                 logger.info(f"generating HLO: {key}, input example shape = {example_inputs[0].shape}")
+                start_time = time.time()
 
                 hlo_artifacts = torch_neuronx.xla_impl.trace.generate_hlo(
                     func, example_inputs, input_output_aliases,
@@ -443,6 +809,11 @@ class ModelBuilder:
                 )
                 hlo_artifacts.metaneff = hlo_artifacts.metaneff.SerializeToString()
                 hlo_artifact_collection.append(hlo_artifacts)
+
+                logger.info(
+                    f"Finished generating HLO for {key} in {time.time() - start_time} seconds, "
+                    f"input example shape = {example_inputs[0].shape}"
+                )
 
         return hlo_artifact_collection
 
@@ -471,15 +842,8 @@ class ModelBuilder:
 
             get_sharded_checkpoint(checkpoint, model, rank, self.tp_degree)
 
-            # to overcome tensors sharing memory issue
-            checkpoint = remove_duplicate_tensors(checkpoint)
-
             if serialize_path is not None:
-                try:
-                    save_file(checkpoint, os.path.join(serialize_path, f"tp{rank}_sharded_checkpoint.safetensors"))
-                except ValueError as e:
-                    logging.warning(f"Failed to save checkpoint: {e}. Trying converting checkpoint to contiguous tensors...")
-                    save_file({ k: v.contiguous() for k, v in checkpoint.items() }, os.path.join(serialize_path, f"tp{rank}_sharded_checkpoint.safetensors"))
+                save_file({ k: v.contiguous() for k, v in checkpoint.items() }, os.path.join(serialize_path, f"tp{rank}_sharded_checkpoint.safetensors"))
 
             parallel_state.destroy_model_parallel()
             torch.distributed.destroy_process_group()
@@ -490,11 +854,8 @@ class ModelBuilder:
         get_sharded_checkpoint(sharded_checkpoint, model, rank, self.tp_degree, is_cached=True)
 
         if serialize_path is not None:
-            try:
-                save_file(sharded_checkpoint, os.path.join(serialize_path, f"tp{rank}_sharded_checkpoint.safetensors"))
-            except ValueError as e:
-                logging.warning(f"Failed to save checkpoint: {e}. Trying converting checkpoint to contiguous tensors...")
-                save_file({ k: v.contiguous() for k, v in sharded_checkpoint.items() }, os.path.join(serialize_path, f"tp{rank}_sharded_checkpoint.safetensors"))
+            save_file({ k: v.contiguous() for k, v in sharded_checkpoint.items() }, os.path.join(serialize_path, f"tp{rank}_sharded_checkpoint.safetensors"))
+        return sharded_checkpoint
 
     def build_state_initializer(self):
         shapes = {}
@@ -603,9 +964,20 @@ class ModelBuilder:
 
         return nxd_model_executor
 
+    @staticmethod
+    def _create_output_dir(output_dir):
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir, exist_ok=True)
+
     def _read_neff_from_path(self, neff_path: str):
         with open(neff_path, "rb") as f:
             return f.read()
+
+    @staticmethod
+    def write_neff_to_file(neff_bytes, neff_path) -> NeffArtifacts:
+        with open(neff_path, 'wb') as f:
+            f.write(neff_bytes)
+        return NeffArtifacts(neff_path)
 
     def _get_priority_hlo_artifact(self) -> HloArtifacts:
         for model_artifacts in self.model_collection.values():
@@ -641,7 +1013,7 @@ class ModelBuilder:
             if model_artifacts.priority_model_idx is not None:
                 neff_artifacts = model_artifacts.neff_artifact_collection[model_artifacts.priority_model_idx]
         assert neff_artifacts.neff_filename is not None, "Can't find the path for the NEFF from the priority model"
-        hlo_stub_filepath = neff_artifacts.neff_filename.replace("graph.neff", "wrapped_neff.hlo")
+        hlo_stub_filepath = neff_artifacts.neff_filename.replace(NEFF_FILE, WRAPPED_NEFF_FILE)
 
         if os.path.exists(hlo_stub_filepath):
             return hlo_utils.read_hlo(hlo_stub_filepath)
@@ -664,6 +1036,7 @@ class ModelBuilder:
             logger.info("No changes on weight layout, skip updating weight layout for other HLOs")
             return
 
+        start_time = time.time()
         priority_hlo_artifacts = self._get_priority_hlo_artifact()
         weight_name_to_transform_cpt = hlo_utils.get_layout_transform_map(
             hlo_stub=hlo_stub, weight_name_to_idx=priority_hlo_artifacts.weight_name_to_idx
@@ -694,9 +1067,9 @@ class ModelBuilder:
                 os.remove(original_hlo_file_name)
                 os.remove(optimized_hlo_file_name)
 
-        logger.info("Done optimizing weight layout for all HLOs")
+        logger.info(f"Done optimizing weight layout for all HLOs in {time.time() - start_time} seconds")
 
-    def _prepare_weight_layout_transform_model(self):
+    def _prepare_weight_layout_transform_model(self, dry_run=False):
         """
         Generate a NEFF for weight layout transformation, which will be run on
         device before actual inference.
@@ -725,6 +1098,26 @@ class ModelBuilder:
             weight_name_to_idx=weight_name_to_idx,
         )
 
+        compiler_args = (
+            "--model-type=transformer -O1" +
+            f" --lnc={self.logical_nc_config}" +
+            " --internal-hlo2tensorizer-options=--experimental-unsafe-fp8e4m3fn-as-fp8e4m3" +
+            f" --logfile={os.path.join(layout_dir, 'log-neuron-cc.txt')}"
+        )
+
+        if dry_run:
+            compiler_target = torch_neuronx.xla_impl.trace.setup_compiler_dirs(
+                wlt_hlo,
+                layout_dir,
+                None,
+                False,
+            )
+
+            # Write the command that produces the NEFF
+            command = torch_neuronx.xla_impl.trace.get_compile_command(compiler_target, layout_dir, compiler_args)
+            torch_neuronx.xla_impl.trace.save_compile_command(command, layout_dir)
+            return None
+
         metaneff = hlo_utils.prepare_metaneff_for_wlt_hlo(
             wlt_hlo=wlt_hlo,
             weight_name_to_idx=weight_name_to_idx,
@@ -751,12 +1144,7 @@ class ModelBuilder:
         wlt_neff_artifact = torch_neuronx.xla_impl.trace.generate_neff(
             wlt_hlo_artifact,
             compiler_workdir=layout_dir,
-            compiler_args=(
-                "--model-type=transformer -O1" +
-                f" --lnc={self.logical_nc_config}" +
-                " --internal-hlo2tensorizer-options=--experimental-unsafe-fp8e4m3fn-as-fp8e4m3" +
-                f" --logfile={os.path.join(layout_dir, 'log-neuron-cc.txt')}"
-            ),
+            compiler_args=compiler_args,
             inline_weights_to_neff=False,
         )
         wlt_neff = self._read_neff_from_path(wlt_neff_artifact.neff_filename)
@@ -771,8 +1159,8 @@ class ModelBuilder:
             logger.info(f"Overriden option for weight layout: {overriden_option}")
 
             if overriden_option == hlo_utils.NXD_LAYOUT_ON_CPU_AND_SERIALIZE:
-                layout_dir = wlt_neff_artifact.neff_filename.strip("/graph.neff")
-                hlo_path = os.path.join(layout_dir, "model/graph.hlo")
+                layout_dir = wlt_neff_artifact.neff_filename.strip(f"/{NEFF_FILE}")
+                hlo_path = os.path.join(layout_dir, f"model/{GRAPH_HLO_FILE}")
                 self.args_for_cpu_transformation = [
                     hlo_path,
                     metaneff_path,

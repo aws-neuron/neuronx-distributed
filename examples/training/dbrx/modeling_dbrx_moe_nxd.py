@@ -189,7 +189,7 @@ class DbrxAttention(DbrxAttentionHF):
         self.num_heads_with_pad = self.num_heads + num_heads_to_pad
 
         init_method = partial(_init_normal, config.initializer_range)
-        self.Wqkv = GQAQKVColumnParallelLinear(
+        self.qkv_proj = GQAQKVColumnParallelLinear(
                 self.hidden_size,
                 [self.num_heads_with_pad * self.head_dim, self.num_key_value_heads * self.head_dim],
                 bias=False,
@@ -260,7 +260,7 @@ class DbrxAttention(DbrxAttentionHF):
         min_val = -self.clip_qkv if self.clip_qkv is not None else None
         max_val = self.clip_qkv
 
-        query_states, key_states, value_states = self.Wqkv(hidden_states)
+        query_states, key_states, value_states = self.qkv_proj(hidden_states)
 
         query_states = query_states.clamp(min=min_val, max=max_val)
         key_states = key_states.clamp(min=min_val, max=max_val)
@@ -283,7 +283,7 @@ class DbrxAttention(DbrxAttentionHF):
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
         attn_output = (
-            nki_flash_attn_func(query_states, key_states, value_states)
+            nki_flash_attn_func(query_states, key_states, value_states, transpose_nki_inputs=False)
             if self.use_flash_attention
             else self.core_attn(query_states, key_states, value_states)
         )
@@ -326,7 +326,7 @@ class DbrxNormAttentionNorm(DbrxNormAttentionNormHF):
         self.norm_2 = LayerNorm(config.d_model,
                                 sequence_parallel_enabled=config.sequence_parallel_enabled,
                                 bias=False)
-    
+
 def initialize_dbrx_moe_layer(config: DbrxConfig):
     ffn_config = config.ffn_config
 
@@ -393,7 +393,7 @@ class DbrxBlock(DbrxBlockHF):
             # Only applying mask to weight b/c bias is not used.
             self.ffn.expert_mlps.mlp_op.gate_up_proj.weight.mul_(self.gate_up_padding_mask.view(1,1,-1))
             self.ffn.expert_mlps.mlp_op.down_proj.weight.mul_(self.down_padding_mask.view(1,-1,1))
-    
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -774,7 +774,7 @@ class DbrxForCausalLM(DbrxForCausalLMHF):
             router_logits=outputs.router_logits,
         )
 
-def init_weights(module, device):
+def init_weights(module, device, std):
     """
     Re-init weights after partition
     """
@@ -782,7 +782,13 @@ def init_weights(module, device):
         module.init_weight_cpu()
         if hasattr(module, "bias") and module.bias is not None:
             module.bias.data.zero_()
-    elif isinstance(module, (LayerNorm, torch.nn.Linear)):
-        module.reset_parameters()
+    elif isinstance(module, LayerNorm):
+        module.weight.data.fill_(1.0)
+        if module.bias is not None:
+            module.bias.data.zero_()
+    elif isinstance(module, torch.nn.Linear):
+        module.weight.data.normal_(mean=0.0, std=std)
+        if module.bias is not None:
+            module.bias.data.zero_()
     elif isinstance(module, GQAQKVColumnParallelLinear):
         module.initialize_weight_biases()

@@ -18,6 +18,7 @@
 import argparse
 import os
 import sys
+from functools import partial
 
 current = os.path.dirname(os.path.realpath(__file__))
 parent = os.path.dirname(current)
@@ -71,7 +72,7 @@ def train_dbrx(flags):
 
     model_config = _setup_model_config(flags)
     xm.master_print(model_config)
-    nxd_config = _setup_nxd_config(flags)
+    nxd_config = _setup_nxd_config(flags, model_config)
     model = _initialize_neuron_model(model_config, nxd_config, flags)
 
     dm = NeuronLightningDataModule(
@@ -137,16 +138,18 @@ def _setup_model_config(flags):
     model_config.attn_config.use_flash_attention = flags.use_flash_attention
     if flags.num_layers != -1:
         model_config.num_hidden_layers = flags.num_layers
+    if flags.vocab_size != -1:
+        model_config.vocab_size = flags.vocab_size
     return model_config
 
 
-def _setup_nxd_config(flags):
+def _setup_nxd_config(flags, model_config):
     model_init_config = (
         None
         if not flags.use_meta_device_init
         else {
             "meta_device_init": True,
-            "param_init_fn": init_weights,
+            "param_init_fn": partial(init_weights, std=model_config.initializer_range),
             "sequential_move_factor": 11,
         }
     )
@@ -307,6 +310,12 @@ if __name__ == "__main__":
         type=int,
         default=-1,
         help="Override number of layers for this DBRX model",
+    )
+    parser.add_argument(
+        "--vocab_size",
+        type=int,
+        default=-1,
+        help="Override vocab size for this DBRX model",
     )
     parser.add_argument(
         "--sequence_parallel_enabled",
