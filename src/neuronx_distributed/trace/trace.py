@@ -339,7 +339,7 @@ def parallel_model_trace(
         )
     else:
         logging.warn(
-            "Using non SPMD mode. Set spmd_mode=True if the worlkload is SPMD for a faster trace. Tracing in non SPMD mode for large models can run into OOM errors as we compile all ranks"
+            "Using non SPMD mode. Set spmd_mode=True if the workload is SPMD for a faster trace. Tracing in non SPMD mode for large models can run into OOM errors as we compile all ranks"
         )
         xmp.spawn(
             _trace,
