@@ -33,6 +33,7 @@ import requests
 import torch
 import torch.distributed as dist
 import torch_xla.core.xla_model as xm
+import torch_xla.runtime as xr
 import torch_xla.distributed.parallel_loader as pl
 import torch_xla.distributed.xla_multiprocessing as xmp
 from adamw_fp32_optim_params import AdamW_FP32OptimParams
@@ -263,7 +264,7 @@ def get_model():
 
 
 def get_and_move_model_sequential(device, num_workers_per_step=11):
-    local_rank = xm.get_local_ordinal()
+    local_rank = xr.local_ordinal()
     local_world_size = neuronx_dist_utils.get_local_world_size()
     for worker in range(math.ceil(local_world_size / num_workers_per_step)):
         if local_rank // num_workers_per_step == worker:
@@ -342,7 +343,7 @@ def train_gpt_neox(flags):
             {
                 "Model": model.name_or_path,
                 "Model configuration": str(model.config),
-                "World size": xm.xrt_world_size(),
+                "World size": xr.world_size(),
                 "Data parallel degree": world_size,
                 "Batch size": flags.batch_size,
                 "Total steps": flags.steps_this_run,

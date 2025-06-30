@@ -3,20 +3,26 @@ import dataclasses
 import itertools
 import os
 import unittest
+from types import SimpleNamespace
 
 # Third Party
 import torch
+import torch_neuronx.testing
 from parameterized import parameterized
+from transformers.models.llama4.modeling_llama4 import Llama4TextMLP
 
-from neuronx_distributed import parallel_layers
 from neuronx_distributed.modules.moe import (
     load_balancing_loss_func as neuron_load_balancing_loss_func,
 )
+from neuronx_distributed.modules.moe.shared_experts import SharedExperts
+from neuronx_distributed.modules.moe.routing import GroupLimitedRouter
 
 from . import loss_fn_correctness_test_helper as lch
 from . import mixtral_model as m_mixtral
 from . import sbase_model as m_sbase
+from . import llama4_moe as llama4_moe
 from . import utils_testing as ut
+from .deepseek_v3_router import DeepSeekV3HFMoEGate
 from .utils_testing import ExptCfg
 
 if not torch.distributed.is_initialized():
@@ -73,20 +79,35 @@ def get_impl_correctness_test_configs(test_modes):
                 ExptCfg(seq_len=128, batch_size=4, hidden_size=384, num_experts=8, capacity_factor=1.0, **test_cfg),
             ]
         )
-
-        # Inference tests
+        # Inference tests 
         test_cfg["test_mode"] = "inference"
         sbase_test_configs.extend(
             [
-                # Test context encoding
+                # Test context encoding  
                 ExptCfg(seq_len=128, batch_size=1, hidden_size=384, num_experts=2, capacity_factor=None, **test_cfg),
                 ExptCfg(seq_len=128, batch_size=4, hidden_size=384, num_experts=8, capacity_factor=None, **test_cfg),
                 ExptCfg(seq_len=128, batch_size=1, hidden_size=384, num_experts=4, capacity_factor=2.0, **test_cfg),
                 ExptCfg(seq_len=128, batch_size=4, hidden_size=384, num_experts=8, capacity_factor=1.0, **test_cfg),
+                # Test forward_capacity_factor equivalent to forward_all_expert: capacity_factor >= num_experts / top_k
+                ExptCfg(seq_len=128, batch_size=4, hidden_size=384, num_experts=8, capacity_factor=8.0, **test_cfg),
+                # Test forward_selective_loading with cte: seq_len*top_k < num_experts
+                ExptCfg(seq_len=32, batch_size=4, hidden_size=384, num_experts=64, capacity_factor=None, **test_cfg),
+                # Test forward_all_experts with cte: seq_len*top_k < 512
+                ExptCfg(seq_len=256, batch_size=4, hidden_size=384, num_experts=8, capacity_factor=None, **test_cfg),
+                # Test forward_blockwise with cte: seq_len*top_k > 512
+                ExptCfg(seq_len=1024, batch_size=4, hidden_size=384, num_experts=8, capacity_factor=None, **test_cfg),
+                #ExpertMLPsV2
+                ExptCfg(seq_len=128, batch_size=4, hidden_size=384, num_experts=8, capacity_factor=None, use_expert_mlps_v2=True, **test_cfg),
+                ExptCfg(seq_len=128, batch_size=1, hidden_size=384, num_experts=4, capacity_factor=2.0, use_expert_mlps_v2=True, **test_cfg),
                 # Test token generation
+                # Test forward_all_experts with tkg: batch_size < self.num_experts
                 ExptCfg(seq_len=1, batch_size=1, hidden_size=384, num_experts=4, capacity_factor=None, **test_cfg),
                 ExptCfg(seq_len=1, batch_size=2, hidden_size=384, num_experts=4, capacity_factor=None, **test_cfg),
+                # Test forward_all_experts with tkg: batch_size > self.num_experts
                 ExptCfg(seq_len=1, batch_size=8, hidden_size=960, num_experts=4, capacity_factor=None, **test_cfg),
+                # ExpertMLPsV2
+                ExptCfg(seq_len=1, batch_size=2, hidden_size=384, num_experts=4, capacity_factor=None, use_expert_mlps_v2=True, **test_cfg),
+                ExptCfg(seq_len=1, batch_size=8, hidden_size=960, num_experts=4, capacity_factor=None, use_expert_mlps_v2=True, **test_cfg),
             ]
         )
 
@@ -165,6 +186,33 @@ def get_impl_correctness_test_configs(test_modes):
                 top_k=4,
                 **test_cfg,
             ),
+            # Test forward_selective_loading with cte: seq_len*top_k < num_experts
+            ExptCfg(
+                seq_len=32,
+                batch_size=1,
+                hidden_size=384,
+                num_experts=64,
+                top_k=1,
+                **test_cfg,
+            ),
+            # Test forward_all_experts with cte: seq_len*top_k < 512
+            ExptCfg(
+                seq_len=128,
+                batch_size=1,
+                hidden_size=384,
+                num_experts=64,
+                top_k=1,
+                **test_cfg,
+            ),
+            # Test forward_blockwise with cte: seq_len*top_k > 512
+            ExptCfg(
+                seq_len=1024,
+                batch_size=1,
+                hidden_size=384,
+                num_experts=64,
+                top_k=1,
+                **test_cfg,
+            ),
             # Test token generation
             ExptCfg(
                 seq_len=1,
@@ -188,6 +236,104 @@ def get_impl_correctness_test_configs(test_modes):
                 hidden_size=384,
                 num_experts=8,
                 top_k=4,
+                **test_cfg,
+            ),
+            # Test forward_all_experts with tkg: batch_size * self.top_k > self.num_experts
+            ExptCfg(
+                seq_len=128,
+                batch_size=4,
+                hidden_size=384,
+                num_experts=4,
+                top_k=4,
+                use_expert_mlps_v2=True,
+                **test_cfg,
+            ),
+            ExptCfg(
+                seq_len=1,
+                batch_size=4,
+                hidden_size=384,
+                num_experts=8,
+                top_k=4,
+                **test_cfg,
+            ),
+            # Test forward_selective_loading with tkg: batch_size * self.top_k < self.num_experts
+            ExptCfg(
+                seq_len=1,
+                batch_size=1,
+                hidden_size=384,
+                num_experts=8,
+                top_k=4,
+                use_expert_mlps_v2=True,
+                **test_cfg,
+            ),
+            # Test early_expert_affinity
+            ExptCfg(
+                seq_len=1,
+                batch_size=1,
+                hidden_size=384,
+                num_experts=8,
+                top_k=1,
+                early_expert_affinity_modulation=True,
+                **test_cfg,
+            ),
+            ExptCfg(
+                seq_len=1,
+                batch_size=4,
+                hidden_size=384,
+                num_experts=8,
+                top_k=1,
+                early_expert_affinity_modulation=True,
+                **test_cfg,
+            ),
+            ExptCfg(
+                seq_len=1024,
+                batch_size=1,
+                hidden_size=384,
+                num_experts=8,
+                top_k=1,
+                early_expert_affinity_modulation=True,
+                **test_cfg,
+            ),
+            ExptCfg(
+                seq_len=128,
+                batch_size=1,
+                hidden_size=384,
+                num_experts=8,
+                top_k=1,
+                early_expert_affinity_modulation=True,
+                **test_cfg,
+            ),
+         ]
+     )
+
+    test_cfg = {
+        "dtype": torch.float32,
+        "glu_mlp": True,
+        "hidden_act": "silu",
+        "implementation": "llama4",
+        "capacity_factor": None,
+    }
+    test_cfg["test_mode"] = "inference"
+    test_configs.extend(
+        [
+            ExptCfg(
+                seq_len=1,
+                batch_size=1,
+                hidden_size=5120,
+                intermediate_size=7192,
+                num_experts=16,
+                top_k=1,
+                num_shared_experts=1,
+                **test_cfg,
+            ),
+            ExptCfg(
+                seq_len=128,
+                batch_size=1,
+                hidden_size=5120,
+                intermediate_size=7192,
+                num_experts=16,
+                top_k=1,
+                num_shared_experts=1,
                 **test_cfg,
             ),
         ]
@@ -226,6 +372,8 @@ def initialize_neuron_and_golden_models(cfg):
         model_golden = m_sbase.initialize_sbase_model(cfg)
     elif cfg.implementation == "topk":
         model_golden = m_mixtral.initialize_mixtral_model(cfg)
+    elif cfg.implementation == "llama4":
+        model_golden = llama4_moe.initialize_llama4_text_moe(cfg)
     else:
         raise ValueError(f"Unknown implementation: {cfg.implementation}")
 
@@ -244,6 +392,8 @@ def convert_golden_to_neuron_state_dict(golden_state_dict, cfg):
         convert_golden_to_neuron_state_dict_func = m_sbase.convert_sbase_to_neuron_state_dict
     elif cfg.implementation == "topk":
         convert_golden_to_neuron_state_dict_func = m_mixtral.convert_mixtral_to_neuron_state_dict
+    elif cfg.implementation == "llama4":
+        convert_golden_to_neuron_state_dict_func = llama4_moe.convert_llama4_moe_to_neuron_state_dict
     else:
         raise ValueError(f"Unknown implementation: {cfg.implementation}")
 
@@ -265,6 +415,119 @@ def get_expected_dropped_token_indices(expert_ind, cfg):
             expected_dropped_token_indices.append(token_idx)
     return expected_dropped_token_indices
 
+
+def _matching_neuron_golden_shared_expert_weights(golden_shared_expert, neuron_shared_expert):
+    """
+      Match weights between golden and neuron shared experts by copying weights from golden expert to neuron expert.
+
+      Args:
+          golden_shared_expert: Source expert model containing the original weights
+          neuron_shared_expert: Target expert model where weights will be copied to
+
+      Notes:
+          - For fused gate_up projection, concatenates gate_proj and up_proj weights
+          - For non-fused version, copies gate_proj and up_proj weights separately
+          - Down projection weights are copied directly
+
+      The function handles two cases:
+      1. Fused gate-up projection: Concatenates gate and up projection weights
+      2. Non-fused: Copies gate and up projection weights separately
+      """
+    if neuron_shared_expert.fused_gate_up_projection:
+        neuron_shared_expert.gate_up_proj.weight.data = torch.cat((golden_shared_expert.gate_proj.weight,
+                   golden_shared_expert.up_proj.weight))
+    else:
+        neuron_shared_expert.gate_proj.weight = golden_shared_expert.gate_proj.weight
+        neuron_shared_expert.up_proj.weight = golden_shared_expert.up_proj.weight
+    neuron_shared_expert.down_proj.weight = golden_shared_expert.down_proj.weight
+
+def _generate_shared_expert_test_configs():
+    test_config1 = {"num_shared_experts": 1,
+                    "intermediate_size": 2048,
+                    "hidden_size": 1024,
+                    "hidden_act": "silu",
+                    "seq_len": 1,
+                    "fused_gate_up_projection": False,
+                    }
+    test_config2 = {"num_shared_experts": 2,
+                    "intermediate_size": 2048,
+                    "hidden_size": 1024,
+                    "hidden_act": "silu",
+                    "seq_len": 16,
+                    "fused_gate_up_projection": True,
+                    }
+    test_config3 = {"num_shared_experts": 4,
+                    "intermediate_size": 2048,
+                    "hidden_size": 1024,
+                    "hidden_act": "silu",
+                    "seq_len": 1,
+                    "fused_gate_up_projection": False,
+                    }
+
+    test_configs = []
+    test_configs.append(test_config1)
+    test_configs.append(test_config2)
+    test_configs.append(test_config3)
+    return test_configs
+
+def _generate_router_test_configs():
+    test_config1 = {"bsz": 2,
+                    "seq_len": 2,
+                    "hidden_size": 4,
+                    "n_group": 2,
+                    "top_k": 3,
+                    "n_routed_experts": 4,
+                    "topk_group": 2,
+                    "routed_scaling_factor": 2.5
+                    }
+
+    test_config2 = {"bsz": 1,
+                    "seq_len": 8,
+                    "hidden_size": 16,
+                    "n_group": 4,
+                    "top_k": 1,
+                    "n_routed_experts": 8,
+                    "topk_group": 2,
+                    "routed_scaling_factor": 2.5
+                    }
+
+    test_config3 = {"bsz": 1,
+                    "seq_len": 16,
+                    "hidden_size": 64,
+                    "n_group": 8,
+                    "top_k": 2,
+                    "n_routed_experts": 16,
+                    "topk_group": 4,
+                    "routed_scaling_factor": 2.5
+                    }
+
+    test_config4 = {"bsz": 1,
+                    "seq_len": 1,
+                    "hidden_size": 7068,
+                    "n_group": 8,
+                    "top_k": 8,
+                    "n_routed_experts": 256,
+                    "topk_group": 4,
+                    "routed_scaling_factor": 1
+                    }
+
+    test_config5 = {"bsz": 1,
+                    "seq_len": 16,
+                    "hidden_size": 7068,
+                    "n_group": 8,
+                    "top_k": 8,
+                    "n_routed_experts": 256,
+                    "topk_group": 4,
+                    "routed_scaling_factor": 2.5
+                    }
+
+    test_configs = []
+    test_configs.append(test_config1)
+    test_configs.append(test_config2)
+    test_configs.append(test_config3)
+    test_configs.append(test_config4)
+    test_configs.append(test_config5)
+    return test_configs
 
 class TestImplCorrectness(unittest.TestCase):
     @parameterized.expand(
@@ -308,6 +571,13 @@ class TestImplCorrectness(unittest.TestCase):
                     )
                     ut.check_tensors(op_neuron, op_mixtral, **TEST_TOLS, additional_msg=f"Iteration {it}")
 
+                elif cfg.implementation == "llama4":
+                    # Run fwd on both the Neuron and llama4 HF model
+                    op_neuron, _, _ = model_neuron(ip)
+                    op_llama4, _ = model_golden(ip)
+                    # Check that router logits and outputs match
+                    ut.check_tensors(op_neuron.view(-1, cfg.hidden_size), op_llama4, **TEST_TOLS, additional_msg=f"Iteration {it}")
+
                 elif cfg.implementation == "sbase":
                     # Run fwd on both the Neuron and S-BASE model
                     op_neuron, _, exp_ind_neuron = model_neuron(ip)
@@ -348,6 +618,59 @@ class TestImplCorrectness(unittest.TestCase):
 
                 else:
                     raise ValueError(f"Unknown implementation: {cfg.implementation}")
+
+    def test_group_limited_router(self):
+        test_configs = _generate_router_test_configs()
+        for test_config in test_configs:
+            bsz = test_config["bsz"]
+            seq_len = test_config["seq_len"]
+            hidden_size = test_config["hidden_size"]
+            n_group = test_config["n_group"]
+            top_k = test_config["top_k"]
+            n_routed_experts = test_config["n_routed_experts"]
+            topk_group = test_config["topk_group"]
+            routed_scaling_factor = test_config["routed_scaling_factor"]
+            hidden_states = torch.rand((bsz, seq_len, hidden_size))
+            norm_topk_prob = True
+            torch.manual_seed(42)
+            router = GroupLimitedRouter(num_experts=n_routed_experts,
+                                       topk_group=topk_group,
+                                       top_k=top_k,
+                                       dtype=torch.float32,
+                                       hidden_size=hidden_size,
+                                       n_group=n_group).eval()
+            shared_correctional_bias = torch.nn.Parameter(torch.zeros((n_routed_experts)), requires_grad=False)
+            router.e_score_correction_bias = shared_correctional_bias
+            router_logits, expert_weights, topk_idx = router(hidden_states)
+            config = SimpleNamespace(
+                n_routed_experts=n_routed_experts,
+                topk_group=topk_group,
+                num_experts_per_tok=top_k,
+                hidden_size=hidden_size,
+                n_group=n_group,
+                norm_topk_prob=norm_topk_prob,
+                dtype=torch.float32,
+                neuron_config=SimpleNamespace(torch_dtype=torch.float32, rpl_reduce_dtype=torch.float32),
+                routed_scaling_factor=routed_scaling_factor,
+                scoring_func="sigmoid",
+                seq_aux="",
+                topk_method="noaux_tc",
+            )
+            hf_router = DeepSeekV3HFMoEGate(config=config).eval()
+            hf_router.weight = router.linear_router.weight
+            hf_router.e_score_correction_bias = shared_correctional_bias
+            hf_router.training = False
+            hf_topk_idx, hf_expert_weights = hf_router(hidden_states)
+            # NxD's expert implementation expects full expert weights output, so the operation below is to match HF's
+            # router implementation
+            expert_weights_topk = expert_weights.gather(1, topk_idx)
+            if norm_topk_prob and top_k > 1:
+                denominator = expert_weights_topk.sum(dim=-1, keepdim=True) + 1e-20
+                expert_weights_topk = expert_weights_topk / denominator
+            expert_weights_topk *= config.routed_scaling_factor
+            # HF expert weights are not sorted
+            hf_expert_weights_sorted, _ = torch.sort(hf_expert_weights, descending=True)
+            torch_neuronx.testing.assert_close(expert_weights_topk, hf_expert_weights_sorted)
 
     @parameterized.expand(get_impl_correctness_test_configs(test_modes=["training"]), name_func=ut.custom_name_func)
     def test_bwd_correctness(self, cfg):
@@ -447,6 +770,65 @@ class TestImplCorrectness(unittest.TestCase):
                 assert neuron_loss.dtype == hf_loss.dtype
                 test_tols = lch.FP32_TEST_TOLS if cfg.dtype == torch.float32 else lch.BF16_TEST_TOLS
                 ut.check_tensors(neuron_loss, hf_loss, **test_tols, additional_msg=f"Iteration {it}")
+
+    def test_shared_expert_correctness(self):
+        """
+        Test the correctness of shared expert implementation by comparing outputs
+        between golden and neuron models across different configurations.
+
+        The test:
+        1. Generates various test configurations
+        2. Creates both golden and neuron models for each config
+        3. Matches weights between models
+        4. Compares output results
+        """
+
+        def _create_golden_model(config):
+            torch.manual_seed(42)
+            model = Llama4TextMLP(config, config.intermediate_size * config.num_shared_experts)
+            model.eval()
+            return model
+
+        def _create_neuron_model(test_config):
+            model = SharedExperts(
+                hidden_size=test_config["hidden_size"],
+                intermediate_size=test_config["intermediate_size"],
+                num_shared_experts=test_config["num_shared_experts"],
+                fused_gate_up_projection=test_config["fused_gate_up_projection"],
+                hidden_act=test_config["hidden_act"],
+            )
+            model.eval()
+            return model
+
+        def _create_config(test_config):
+            return SimpleNamespace(
+                num_shared_experts=test_config["num_shared_experts"],
+                intermediate_size=test_config["intermediate_size"],
+                hidden_size=test_config["hidden_size"],
+                hidden_act=test_config["hidden_act"],
+            )
+
+        # Test each configuration
+        test_configs = _generate_shared_expert_test_configs()
+        for test_config in test_configs:
+            # Create configuration object
+            config = _create_config(test_config)
+
+            # Initialize models
+            golden_shared_expert = _create_golden_model(config)
+            neuron_shared_expert = _create_neuron_model(test_config)
+
+            # Generate input data
+            hidden_states = torch.rand((1, test_config["seq_len"], test_config["hidden_size"]))
+
+            # Match weights between models
+            _matching_neuron_golden_shared_expert_weights(golden_shared_expert, neuron_shared_expert)
+
+            # Compare outputs
+            golden_output = golden_shared_expert(hidden_states)
+            neuron_output = neuron_shared_expert(hidden_states)
+            torch_neuronx.testing.assert_close(golden_output, neuron_output)
+
 
 
 if __name__ == "__main__":

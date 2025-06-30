@@ -8,6 +8,7 @@ import torch
 import torch_xla
 import torch_xla.core.xla_env_vars as xenv
 import torch_xla.core.xla_model as xm
+import torch_xla.runtime as xr
 
 from neuronx_distributed.parallel_layers.parallel_state import (
     get_tensor_model_parallel_rank,
@@ -48,7 +49,7 @@ def param_is_not_tensor_parallel_duplicate(param: torch.Tensor) -> bool:
     )
 
 
-def set_tensor_model_parallel_attributes(tensor: torch.Tensor, is_parallel:bool, dim:int, stride:int, num_partitions:int = -1) -> None:
+def set_tensor_model_parallel_attributes(tensor: torch.Tensor, is_parallel:bool, dim:int, stride:int, num_partitions:int = -1, rank_ordering: Optional[list] = None) -> None:
     # Make sure the attributes are not set.
     for attribute in _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS:
         assert not hasattr(tensor, attribute)
@@ -57,12 +58,17 @@ def set_tensor_model_parallel_attributes(tensor: torch.Tensor, is_parallel:bool,
         warnings.warn("NeuronxDistributed: Please pass \"num_partitions\" argument to set_tensor_model_parallel_attributes() method. "
                       "Default value may not work correctly and will be removed in later versions.")
         num_partitions = get_tensor_model_parallel_size()
+    
+    if rank_ordering is not None:
+        if not all(rank in rank_ordering for rank in range(0, get_tensor_model_parallel_size())):
+            raise ValueError(f"all ranks 0...{get_tensor_model_parallel_size()} must be present in given rank ordering {rank_ordering}")
 
     # Set the attributes.
     setattr(tensor, "tensor_model_parallel", is_parallel)
     setattr(tensor, "partition_dim", dim)
     setattr(tensor, "partition_stride", stride)
     setattr(tensor, "num_partitions", num_partitions)
+    setattr(tensor, "rank_ordering", rank_ordering)
 
 
 def set_defaults_if_not_set_tensor_model_parallel_attributes(
@@ -243,7 +249,8 @@ def get_local_world_size() -> int:
         import torch_xla.runtime as xr
         return xr.local_process_count()
     else:
-        return xm.xrt_world_size() // int(os.environ[xenv.HOST_WORLD_SIZE])
+        import torch_xla.runtime as xr
+        return xr.world_size() // int(os.environ[xenv.HOST_WORLD_SIZE])
 
 
 def move_model_to_device(model: torch.nn.Module, device: torch.device) -> None:

@@ -11,11 +11,10 @@ from device_correctness_test_configs import (
     get_neuron_cc_flags,
 )
 from device_correctness_test_runner import run_device_correctness_test
-from checkpoint_test_runner import run_checkpoint_test
 
-import neuronx_distributed as nxd
 from neuronx_distributed.parallel_layers.parallel_state import rmsg
 from neuronx_distributed.parallel_layers.utils import requires_init_pg_override
+from utils_testing import get_platform_lnc
 
 SEPARATOR = "-" * 70
 
@@ -45,11 +44,16 @@ def parse_args():
     parser.add_argument("--s3_bucket", default="s3://ktf-test-runs/neuronx_distributed_modules/moe")
     parser.add_argument("--test_dtype", required=True, choices=["fp32", "bf16"], help="Either fp32 or bf16")
     parser.add_argument("--test_mode", required=True, type=str, help="Either training or inference")
+    allowed_tp_degrees = [1, 2, 8, 16, 32]
+    tp_degrees_help_msg = "One of 1, 2, 8, 16, 32"
+    if get_platform_lnc() == 2:
+        allowed_tp_degrees.append(64)
+        tp_degrees_help_msg.join(", 64")
     parser.add_argument(
-        "--test_tp_degree", required=True, type=int, choices=[1, 2, 8, 16, 32], help="One of 1, 2, 8, 16 or 32"
+        "--test_tp_degree", required=True, type=int, choices=allowed_tp_degrees, help=tp_degrees_help_msg
     )
     parser.add_argument(
-        "--test_ep_degree", required=False, default=1, type=int, choices=[1, 2, 4, 8, 16, 32], help="One of 1, 2, 4, 8, 16 or 32"
+        "--test_ep_degree", required=False, default=1, type=int, choices=[1, 2, 4, 8, 16, 32], help="One of 1, 2, 4, 8, 16, 32"
     )
     parser.add_argument(
         "--token_shuffle_group_size", required=False, type=int, default=1,
@@ -71,10 +75,11 @@ os.environ["NEURON_CC_FLAGS"] = get_neuron_cc_flags(test_dtype=TEST_DTYPE)
 
 # TRN enablement
 import torch_xla.core.xla_model as xm  # noqa: E402
+import torch_xla.runtime as xr  # noqa: E402
 
 
 def print_rank0(s):
-    if xm.get_ordinal() == 0:
+    if xr.global_ordinal() == 0:
         print(s)
 
 

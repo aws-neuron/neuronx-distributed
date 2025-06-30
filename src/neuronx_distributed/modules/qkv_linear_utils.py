@@ -205,7 +205,12 @@ def _qkvlinear_autograd_bwd_input_grad(
     degree.'''
 
     grad_input = grad_input.to(ctx.reduce_dtype)
-    sub_grad_input = torch.empty(grad_input.shape, dtype=grad_input.dtype, device=grad_input.device, requires_grad=False)
+    tp_group = get_tensor_model_parallel_group()
+    tp_size = tp_group.size()
+    shape = list(grad_input.shape)
+    shape[0] //= tp_size
+
+    sub_grad_input = torch.empty(shape, dtype=grad_input.dtype, device=grad_input.device, requires_grad=False)
     xm.reduce_scatter(
         xm.REDUCE_SUM,
         grad_input,

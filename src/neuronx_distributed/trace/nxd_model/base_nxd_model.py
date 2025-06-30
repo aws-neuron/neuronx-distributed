@@ -57,17 +57,14 @@ class BaseNxDModel(ABC):
         pass
 
     @abstractmethod
-    def add(self, key: str, hlo, neff, metaneff, example_inputs,
-            flattener: structure.Flattener, packer: structure.Packer):
+    def add(self, key: str, hlo: bytes, neff: bytes):
         """
-        Adds a neff to the NxDModel. If a layout_transformer is available in the NxDModel, add can fail if it is identified that the neff was compiled with a different weight layout than what layout_transformer was made for.
+        Adds a neff to the NxDModel.
 
         Parameters:
         1) key: str - This is used for identifying the neff.
-        2) neff: Union[NeffArtifacts, str] - This is either the NeffArtifacts object returned by the ModelBuilder.compile_to_neff function, or a path to a .neff file
-        3) metaneff: Union[metaneff_pb2.MetaNeff, str] - This is either the metaneff proto object found in the HloArtifacts object, or a path to the metaneff.pb file associated with the respective neff.
-        4) flattener: Optional[torch.jit.ScriptModule] - This is a parameter to specify a flattener function. This converts the inputs to a 1d flattened list, and is also responsible for removing unused inputs in the neff. This is returned by the spmd_trace() function as part of the TraceArtifacts object.
-        5) packer: Optional[torch.jit.ScriptModule] - This is a parameter to specify a packer function. This converts the outputs from a flattened list to the original representation from the traced model, and is also responsible for removing unused inputs in the neff. This is returned by the spmd_trace() function as part of the TraceArtifacts object.
+        2) hlo: bytes - This is the hlo which was used to compile the neff.
+        3) neff: bytes - This is either the NeffArtifacts object returned by the ModelBuilder.compile_to_neff function, or a path to a .neff file
         """
         pass
 

@@ -6,6 +6,7 @@ from datetime import datetime
 
 import torch
 import torch_xla.core.xla_model as xm
+import torch_xla.runtime as xr
 import torch_xla.debug.metrics as met
 from commons import print_separator
 
@@ -111,7 +112,7 @@ if __name__ == "__main__":
         torch.distributed.init_process_group("xla", init_method="pjrt://")
     else:
         torch.distributed.init_process_group("xla")
-    world_size = xm.xrt_world_size()
+    world_size = xr.world_size()
     assert world_size <= torch.distributed.get_world_size()
     tensor_model_parallel_size = 1
     while tensor_model_parallel_size <= world_size:
@@ -119,13 +120,12 @@ if __name__ == "__main__":
         run_test(test_get_tensor_model_parallel_src_rank, tensor_model_parallel_size)
         tensor_model_parallel_size *= 2
     
-    # Commenting the below block till CP gets enabled
-    # # Test with TP and CP
-    # tensor_model_parallel_size = 1
-    # context_model_parallel_size = 1
-    # while context_model_parallel_size*tensor_model_parallel_size <= world_size:
-    #     print_separator("test initialize model parallel")
-    #     test_initialize_model_parallel(tensor_model_parallel_size, context_model_parallel_size)
-    #     context_model_parallel_size *= 2
+    # Test with TP and CP
+    tensor_model_parallel_size = 1
+    context_model_parallel_size = 1
+    while context_model_parallel_size*tensor_model_parallel_size <= world_size:
+        print_separator("test initialize model parallel")
+        test_initialize_model_parallel(tensor_model_parallel_size, context_model_parallel_size)
+        context_model_parallel_size *= 2
 
     atexit.register(on_exit)

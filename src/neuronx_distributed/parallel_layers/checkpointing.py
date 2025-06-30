@@ -1,6 +1,6 @@
 import gc
 import os
-from typing import Any, Callable, Optional, Dict
+from typing import Any, Callable, Optional, Dict, IO, Union
 
 import torch
 import torch_xla.core.xla_model as xm
@@ -248,8 +248,10 @@ def load(
 
     return check_point
 
-
-def _xser_load(path: torch.serialization.FILE_LIKE, weights_only: bool = False) -> Any:
+# Argument "path" has type torch.serialization.FILE_LIKE in PT <=2.6, changed to torch.types.FileLike in PT2.7.
+# Rather than do some weird if-else based on PT version, and to maintain backwards compat, 
+# just use the origial type definition Union[str, os.PathLike[str], IO[bytes]]
+def _xser_load(path: Union[str, os.PathLike[str], IO[bytes]], weights_only: bool = False) -> Any:
     """
     Modify from xla serialization load https://github.com/pytorch/xla/blob/master/torch_xla/utils/serialization.py#L79-L100,
     with casting tensors to xla device to prevent OOM

@@ -1,5 +1,6 @@
 from pytorch_lightning.callbacks import Callback
 import torch_xla.core.xla_model as xm
+import torch_xla.runtime as xr
 from neuronx_distributed.parallel_layers import parallel_state
 import os
 import numpy as np
@@ -106,7 +107,7 @@ class NeuronHooksCallback(Callback):
                     processed_input, processed_output = self.process_input_output(input, output)
                     
                     # Conditional saving based on master rank
-                    if (not self.dump_only_master_rank) or (self.dump_only_master_rank and xm.get_ordinal() == 0):
+                    if (not self.dump_only_master_rank) or (self.dump_only_master_rank and xr.global_ordinal() == 0):
                         self.activations_map[layer_name].append((
                             pl_module.global_step,
                             processed_input,
@@ -174,7 +175,7 @@ class NeuronHooksCallback(Callback):
                         
                     processed_input, processed_output = self.process_input_output(grad_input, grad_output)
                     
-                    if (not self.dump_only_master_rank) or (self.dump_only_master_rank and xm.get_ordinal() == 0):
+                    if (not self.dump_only_master_rank) or (self.dump_only_master_rank and xr.global_ordinal() == 0):
                         self.gradients_map[layer_name].append((
                             pl_module.global_step,
                             processed_input,

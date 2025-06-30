@@ -73,6 +73,7 @@ class BaseQuantizeParallelLinear(torch.nn.Module, metaclass=ABCMeta):
         quantized_dtype: Union[QuantizedDtype, torch.dtype] = torch.int8,
         device: Optional[torch.device] = None,
         tensor_model_parallel_group: Optional[ProcessGroup] = None,
+        rank_ordering: Optional[list] = None,
     ) -> None:
         """_summary_
 
@@ -81,6 +82,8 @@ class BaseQuantizeParallelLinear(torch.nn.Module, metaclass=ABCMeta):
             dequantized_dtype (torch.dtype, optional): Detype to dequantize the weight to. Defaults to torch.bfloat16.
             quantized_dtype (torch.dtype, optional): Dtype to qunatize the weight to. Defaults to torch.int8.
             device (torch.device, optional): Device to which initialize the Parameters. Defaults to None.
+            rank_ordering (list, optional): indicates how sharded weights are mapped, the i'th element 
+                in the list corresponds to the original rank which is mapped to rank_ordering[i]
         """
         super().__init__()
         assert (
@@ -95,6 +98,7 @@ class BaseQuantizeParallelLinear(torch.nn.Module, metaclass=ABCMeta):
         self.device = device
         self.tensor_parallel_group = tensor_model_parallel_group if \
             tensor_model_parallel_group is not None else cast(ProcessGroup, get_tensor_model_parallel_group())
+        self.rank_ordering = rank_ordering
 
         self.register_parameter("scale", None)
 
@@ -150,7 +154,8 @@ class BaseQuantizeParallelLinear(torch.nn.Module, metaclass=ABCMeta):
                 is_parallel=True,
                 dim=self.weight_partition_dim,
                 stride=self.stride,
-                num_partitions=self.tensor_parallel_group.size()
+                num_partitions=self.tensor_parallel_group.size(),
+                rank_ordering=self.rank_ordering,
             )
         else:
             _initialize_affine_weight_neuron(
@@ -227,6 +232,7 @@ class BaseQuantizeParallelLinear(torch.nn.Module, metaclass=ABCMeta):
                     dim=weight_partition_dim, # type: ignore
                     stride=self.stride, # type: ignore
                     num_partitions=self.tensor_parallel_group.size(),
+                    rank_ordering=self.rank_ordering,
                 )
             else:
                 set_tensor_model_parallel_attributes(
@@ -392,6 +398,8 @@ class QuantizedColumnParallel(BaseQuantizeParallelLinear):
         stride (int, optional): stride. Defaults to 1.
         sequence_parallel_enabled (bool, optional): Defaults to False.
         keep_master_weight (bool, optional): Defaults to False.
+        rank_ordering (list, optional): indicates how sharded weights are mapped, the i'th element 
+            in the list corresponds to the original rank which is mapped to rank_ordering[i]
     """
 
     def __init__(
@@ -412,7 +420,8 @@ class QuantizedColumnParallel(BaseQuantizeParallelLinear):
         tensor_model_parallel_group: Optional[ProcessGroup] = None,
         pad: bool = False,
         activation_quantization_type: Optional[Union[ActivationQuantizationType, str]] = None,
-        clamp_bound: float = float('inf')
+        clamp_bound: float = float('inf'),
+        rank_ordering: Optional[list] = None,
     ):
         super().__init__(
             quantization_type=quantization_type,
@@ -420,6 +429,7 @@ class QuantizedColumnParallel(BaseQuantizeParallelLinear):
             quantized_dtype=quantized_dtype,
             device=device,
             tensor_model_parallel_group=tensor_model_parallel_group,
+            rank_ordering=rank_ordering,
         )
 
         # Keep input parameters
@@ -638,6 +648,8 @@ class QuantizedRowParallel(BaseQuantizeParallelLinear):
         stride (int, optional): stride. Defaults to 1.
         sequence_parallel_enabled (bool, optional): Defaults to False.
         keep_master_weight (bool, optional):Defaults to False.
+        rank_ordering(list, optional): indicates how sharded weights are mapped, the i'th element 
+        in the list corresponds to the original rank which is mapped to rank_ordering[i]
 
     Raises:
         RuntimeError: When sequence parallel is enabled without input is parallel
@@ -662,7 +674,8 @@ class QuantizedRowParallel(BaseQuantizeParallelLinear):
         tensor_model_parallel_group: Optional[ProcessGroup] = None,
         pad: bool = False,
         activation_quantization_type: Optional[Union[ActivationQuantizationType, str]] = None,
-        clamp_bound = float('inf')
+        clamp_bound = float('inf'),
+        rank_ordering: Optional[list] = None,
     ):
         super().__init__(
             quantization_type=quantization_type,
@@ -670,6 +683,7 @@ class QuantizedRowParallel(BaseQuantizeParallelLinear):
             quantized_dtype=quantized_dtype,
             device=device,
             tensor_model_parallel_group=tensor_model_parallel_group,
+            rank_ordering=rank_ordering,
         )
 
         # Keep input parameters
@@ -884,6 +898,7 @@ class QuantizedExpertFusedColumnParallel(QuantizedColumnParallel, ExpertFusedLin
         keep_master_weight: bool = False,
         quantization_per_channel_axis: Optional[int] = None,
         tensor_model_parallel_group: Optional[ProcessGroup] = None,
+        rank_ordering: Optional[list] = None,
     ):
         self.num_experts = num_experts
         self._n_local_experts = divide(num_experts, get_expert_model_parallel_size())
@@ -910,6 +925,7 @@ class QuantizedExpertFusedColumnParallel(QuantizedColumnParallel, ExpertFusedLin
             keep_master_weight=keep_master_weight,
             quantization_per_channel_axis=quantization_per_channel_axis,
             tensor_model_parallel_group=tensor_model_parallel_group,
+            rank_ordering=rank_ordering,
         )
 
     def _setup_for_weight_and_bias_config(self, bias: bool):
@@ -997,6 +1013,7 @@ class QuantizedExpertFusedRowParallel(QuantizedRowParallel, ExpertFusedLinear):
         keep_master_weight: bool = False,
         quantization_per_channel_axis: Optional[int] = None,
         tensor_model_parallel_group: Optional[ProcessGroup] = None,
+        rank_ordering: Optional[list] = None,
     ):
         self.num_experts = num_experts
         self._n_local_experts = divide(num_experts, get_expert_model_parallel_size())
@@ -1024,6 +1041,7 @@ class QuantizedExpertFusedRowParallel(QuantizedRowParallel, ExpertFusedLinear):
             quantization_per_channel_axis=quantization_per_channel_axis,
             reduce_output=reduce_output,
             tensor_model_parallel_group=tensor_model_parallel_group,
+            rank_ordering=rank_ordering,
         )
 
     def _setup_for_weight_and_bias_config(self, bias: bool):

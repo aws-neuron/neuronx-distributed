@@ -16,6 +16,7 @@ from checkpoint_test_runner import run_checkpoint_test
 
 from neuronx_distributed.parallel_layers.utils import requires_init_pg_override
 import torch_xla.core.xla_model as xm  # TRN enablement
+import torch_xla.runtime as xr
 
 SEPARATOR = "-" * 70
 
@@ -51,7 +52,7 @@ results = {"inference_success": 1}
 os.environ["NEURON_CC_FLAGS"] = get_neuron_cc_flags(test_dtype=TEST_DTYPE)
 
 def print_rank0(s):
-    if xm.get_ordinal() == 0:
+    if xr.global_ordinal() == 0:
         print(s)
 
 
@@ -99,14 +100,14 @@ def test_moe_layer_checkpoint_parallel():
 
 def clean_dir():
     xm.rendezvous("Cleaning directory")
-    if xm.get_ordinal() == 0:
+    if xr.global_ordinal() == 0:
         cur_dir = os.path.dirname(os.path.abspath(__file__))
         path = os.path.join(cur_dir, "model")
         os.system(f"rm -rf {path}")
     xm.rendezvous("Cleaned directory")
 
 def on_exit():
-    if xm.get_ordinal() == 0:
+    if xr.global_ordinal() == 0:
         for k in test_config:
             os.system(f"rm {args.test_json}")
             with open(args.test_json, "w") as f:

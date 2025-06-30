@@ -5,6 +5,7 @@ from typing import Any, List, Optional, Union, TYPE_CHECKING, Callable
 import torch
 import torch.distributed
 import torch_xla.core.xla_model as xm
+import torch_xla.runtime as xr
 from torch.distributed import ProcessGroup
 from neuronx_distributed.utils.logger import get_logger
 from neuronx_distributed.utils.utils import hardware
@@ -173,7 +174,6 @@ def ascending_ring_PG_group(lnc_size: int, cluster_ranks_nonexp: torch.tensor,
     return ParallelGroups(tp_groups, dp_groups, pp_groups, ep_model_groups, ep_data_groups, cp_groups)
 
 
-#TODO: update this to work with context parallel
 def ascending_descending_ring_PG_group(lnc_size: int, cluster_ranks_nonexp: torch.tensor,
                                        cluster_ranks_exp: torch.tensor,  tp: int, dp: int, pp: int,
                                        ep_model_degree: int, ep_data_degree: int, cp:int=1) -> ParallelGroups:
@@ -209,38 +209,83 @@ def ascending_descending_ring_PG_group(lnc_size: int, cluster_ranks_nonexp: torc
                                                [i for i in range(ranks_start[3] + node_skip_val, ranks_end[3] + node_skip_val)]) # first row and last row are one group in Logic2
         tp_groups.append([i for i in range(ranks_start[1] + node_skip_val, ranks_end[1] + node_skip_val)]+
                                                [i for i in range(ranks_start[2] + node_skip_val, ranks_end[2] + node_skip_val)]) # second and third row are one group in Logic2
+    
+    assert len(tp_groups)==(world_size//tp)
+    
+    def merge_groups(chunk, prev_parallel_degree):
+        """
+        Merges groups within a chunk based on the previous parallel degree.
 
-    def _combine_tp_groups_for_dp(tp_groups, dp_degree):
-        # Slice the first `dp_degree` groups from `tp_groups`
-        result = []
-        for i in range(len(tp_groups)//dp_degree):
-            groups = tp_groups[i*dp_degree:dp_degree+i*dp_degree]
-            # Use zip to combine elements in an element-wise fashion
-            result += [list(combo) for combo in zip(*groups)]
-        return result
+        Args:
+            chunk (list): List of lists to be merged.
+            prev_parallel_degree (int or None): Number of consecutive groups to merge.
+                                            If None, returns chunk unchanged.
 
-    def _combine_dp_groups_for_pp(dp_groups, tp_degree):
-        # Step 1: Determine the number of parts needed
-        num_parts = len(dp_groups) // tp_degree
+        Returns:
+            list: Merged groups if prev_parallel_degree is specified,
+                otherwise returns the original chunk.
 
-        # Step 2: Split the result into multiple parts
-        parts = [dp_groups[i * tp_degree:(i + 1) * tp_degree] for i in range(num_parts)]        
+        Example:
+            >>> chunk = [[0,1], [2,3], [4,5], [6,7]]
+            >>> merge_groups(chunk, 2)
+            [[0,1,2,3], [4,5,6,7]]
+            >>> merge_groups(chunk, None)
+            [[0,1], [2,3], [4,5], [6,7]]
+        """
+        if prev_parallel_degree is not None:
+            result = []
+            for i in range(0, len(chunk), prev_parallel_degree):
+                merged = []
+                for sublist in chunk[i:i+prev_parallel_degree]:
+                    merged.extend(sublist)
+                result.append(merged)
+            return result
+        return chunk
 
-        # Step 3: Combine corresponding elements from each part
-        combined_result = [[list(sublist) for sublist in zip(*tup)] for tup in zip(*parts)]
-        
-        # Step 4:  Remove one dimension
-        combined_result = [item for sublist in combined_result for item in sublist]
+    def create_parallel_groups_from_tp_groups(tp_groups, parallel_size, prev_parallel_degree):
+        """
+        Creates parallel groups from tensor parallel groups based on specified parameters.
+        Args:
+            tp_groups (list): List of tensor parallel groups.
+            parallel_size (int): Size of parallel groups to create.
+            prev_parallel_degree (int or None): Previous parallel degree for merging groups.
+                                            If None, no merging is performed.
 
-        return combined_result
+        Returns:
+            list: Reorganized groups in parallel configuration.
 
-    dp_groups = _combine_tp_groups_for_dp(tp_groups, dp)
+        Raises:
+            AssertionError: If the number of tensor parallel groups is not divisible by parallel_size.
 
-    if pp>1:
-        pp_groups=_combine_dp_groups_for_pp(dp_groups=dp_groups, tp_degree=tp) # given tp and dp, pp is auto calculated
+        Example:
+            >>> tp_groups = [[0,1], [2,3], [4,5], [6,7]]
+            >>> create_parallel_groups_from_tp_groups(tp_groups, 2, None)
+            [[0,2], [1,3], [4,6], [5,7]]
+        """
+        num_tp_groups=len(tp_groups)
+        assert num_tp_groups % parallel_size == 0, "tp groups must be divisible by parallel size"
+        cp_groups = []
+            
+        for i in range(0, num_tp_groups, parallel_size):
+            chunk = tp_groups[i:i+parallel_size]
+            chunk = merge_groups(chunk, prev_parallel_degree)
+            for zipped in zip(*chunk):
+                cp_groups.append(list(zipped))
+                    
+        return cp_groups
+    
+    cp_groups = create_parallel_groups_from_tp_groups(tp_groups, cp, None)
+    
+    if dp > 1:
+        dp_groups = create_parallel_groups_from_tp_groups(tp_groups, dp*cp, cp)
     else:
-        pp_groups = [[i] for i in range((world_size))] # might not be required and above code should handle this also, but keeping it till its tested
-
+        dp_groups = [[i] for i in range(world_size)]
+        
+    if pp > 1:
+        pp_groups = create_parallel_groups_from_tp_groups(tp_groups, pp*dp*cp, dp*cp)
+    else:
+        pp_groups = [[i] for i in range(world_size)]
+    
     # Build the expert model-parallel groups
     if ep_model_degree>1:
         ep_model_groups = [
@@ -266,15 +311,6 @@ def ascending_descending_ring_PG_group(lnc_size: int, cluster_ranks_nonexp: torc
         ]
     else:
         ep_data_groups = [[i] for i in range((world_size))]
-    
-    cp_groups = [
-        cluster_ranks_nonexp[pp_rank, dp_rank, :, tp_rank].tolist()
-        for pp_rank, dp_rank, tp_rank in itertools.product(
-            range(pp),
-            range(dp),
-            range(tp),
-        )
-    ]
 
     return ParallelGroups(tp_groups, dp_groups, pp_groups, ep_model_groups, ep_data_groups, cp_groups)
 
@@ -788,7 +824,7 @@ def get_world_group(as_list: bool = False) -> ProcessGroup:
     return group
 
 
-def get_tensor_model_parallel_group(as_list: bool = False) -> Union[ProcessGroup, List[List[int]]]:
+def get_tensor_model_parallel_group(as_list: bool = False) -> ProcessGroup:
     """Get the tensor model parallel group the caller rank belongs to."""
     if as_list:
         return get_tensor_model_parallel_replica_groups()
@@ -802,7 +838,7 @@ def get_tensor_model_parallel_replica_groups() -> List[List[int]]:
     return _TENSOR_MODEL_PARALLEL_GROUP_SPMD
 
 
-def get_expert_model_parallel_group(as_list: bool = False) -> Union[ProcessGroup, List[List[int]]]:
+def get_expert_model_parallel_group(as_list: bool = False) -> ProcessGroup:
     """Get the expert model parallel group the caller rank belongs to."""
     if as_list:
         return get_expert_model_parallel_replica_groups()
@@ -925,6 +961,51 @@ def get_expert_model_parallel_rank() -> int:
     set_expert_model_parallel_rank(emp_rank)
     return emp_rank
 
+
+
+def get_expert_parallel_rank_from_global_rank(rank: int, expert_parallel_group: ProcessGroup) -> int:
+    """Given a rank, find its expert rank
+
+    Args:
+        rank: Global rank
+        expert_parallel_group: Expert Parallel process group
+
+    Raises:
+        ValueError: Raised if the rank is not present in the expert_parallel_group
+
+    Returns:
+        int: expert parallel rank
+    """
+    mesh:  List[List[int]] = expert_parallel_group._mesh
+
+    for _, ranks in enumerate(mesh):
+        if rank in ranks:
+            return ranks.index(rank)
+    raise ValueError(f"rank: {rank} not found in the mesh: {mesh}")
+
+
+def get_experts_for_expert_parallel_rank(expert_parallel_rank: int, total_number_of_experts: int, expert_model_parallel_size: int) -> List[int]:
+    """
+    Get list of expert indices that belong to a specific ep_rank.
+    
+    Args:
+        ep_rank: The parallel rank to get experts for
+        n_expert: Total number of experts
+        EP_DEGREE: Number of parallel ranks (EP)
+    
+    Returns:
+        list[int]: List of expert indices belonging to this ep_rank
+    """
+    assert total_number_of_experts % expert_model_parallel_size == 0, \
+        f"total_number_of_experts: {total_number_of_experts} is not a multiple of expert_model_parallel_size: {expert_model_parallel_size}"
+    assert expert_parallel_rank < expert_model_parallel_size, \
+        f"expert_parallel_rank: {expert_parallel_rank} is not less than expert_model_parallel_size: {expert_model_parallel_size}"
+    experts_per_rank = total_number_of_experts // expert_model_parallel_size
+
+    start_expert = expert_parallel_rank * experts_per_rank
+    end_expert = start_expert + experts_per_rank
+    
+    return list(range(start_expert, end_expert))
 
 def get_data_parallel_src_rank() -> int:
     """Calculate the global rank corresponding to the first local rank in the data parallel group."""
@@ -1314,7 +1395,7 @@ def is_global_rank_zero() -> bool:
     if cpu_mode():
         return torch.distributed.get_rank() == 0
     else:
-        return xm.get_ordinal() == 0
+        return xr.global_ordinal() == 0
 
 
 def create_pg_with_ranks(ranks: List[int]) -> ProcessGroup:
@@ -1560,9 +1641,9 @@ def rmsg(msg: str) -> str:
         global_rank = torch.distributed.get_rank()
     except RuntimeError:
         # torch distributed not initialized, mainly in PTL case
-        import torch_xla.core.xla_model as xm
+        import torch_xla.runtime as xr
 
-        global_rank = xm.get_ordinal()
+        global_rank = xr.global_ordinal()
     return f"[rank_{global_rank}_pp{pp_rank}_tp{tp_rank}_dp{dp_rank}_cp{cp_rank}] {msg}"
 
 

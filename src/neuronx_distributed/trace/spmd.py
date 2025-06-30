@@ -45,6 +45,21 @@ class SPMDBucketModelScript(torch.nn.Module):
         else:
             raise ValueError("This model is not initialized, please call traced_model.nxd_model.initialize(sharded_checkpoint) or traced_model.nxd_model.initialize_with_saved_weights()")
 
+    @torch.jit.export
+    def forward_ranked(
+        self,
+        input_collection: List[List[torch.Tensor]],
+        bucket_idx_tensor: torch.Tensor
+    ):
+        bucket_idx = torch.ops.aten.Int(bucket_idx_tensor)
+        initialized = self.models[bucket_idx].is_initialized()
+
+        if initialized:
+            output = self.models[bucket_idx].forward_ranked(input_collection)
+            return output
+        else:
+            raise ValueError("This model is not initialized, please call traced_model.nxd_model.initialize(sharded_checkpoint) or traced_model.nxd_model.initialize_with_saved_weights()")
+
 
 class StateInitializer(torch.nn.Module):
     # torchscript cannot script dict of with values of different types
@@ -184,6 +199,26 @@ class NxDModel(torch.nn.Module):
                 result = model.forward_async(flattened_input_collection, torch.tensor(bucket_idx, dtype=torch.int32))
 
         return result
+
+    @torch.jit.export
+    def forward_ranked(self, input_collection: List[List[torch.Tensor]]) -> List[List[torch.Tensor]]:
+        sample_inputs: List[torch.Tensor] = input_collection[0]
+        model_name, bucket_idx = self.router(sample_inputs)
+
+        flattened_input_collection: List[List[torch.Tensor]] = []
+        for name, flattener in self.flattener_map.items():
+            if name == model_name:
+                for inputs in input_collection:
+                    flattened_inputs = flattener(inputs)
+                    flattened_input_collection.append(flattened_inputs)
+
+        result: List[List[torch.Tensor]] = []
+        for name, model in self.models.items():
+            if name == model_name:
+                result = model.forward_ranked(flattened_input_collection, torch.tensor(bucket_idx, dtype=torch.int32))
+
+        return result
+
 
 class NxDModelExecutor(torch.nn.Module):
     """

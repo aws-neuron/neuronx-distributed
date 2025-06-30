@@ -1,10 +1,13 @@
 import math
 from contextlib import contextmanager
+from enum import IntEnum
 from typing import Dict, List, Optional, Set, Union, Callable, Any, Iterable, Iterator
 
 import torch
 import torch_xla.core.xla_model as xm
+import torch_xla.runtime as xr
 from torch import nn
+from torch_neuronx.utils import get_platform_target
 
 from ..parallel_layers.parallel_state import rmsg
 from ..parallel_layers.utils import (
@@ -336,7 +339,7 @@ def get_model_sequential(
 ) -> torch.nn.Module:
     from ..pipeline import NxDPPModel
 
-    local_rank = xm.get_local_ordinal()
+    local_rank = xr.local_ordinal()
     local_world_size = get_local_world_size()
     for worker in range(math.ceil(local_world_size / sequential_move_factor)):
         if local_rank // sequential_move_factor == worker:
@@ -362,3 +365,13 @@ def get_delay_tracing(arg) -> bool:
     # Temporarily disabling delayed tracing while we investigate some issues
     # TODO re-enable once the issues with delayed tracing are resolved
     return False
+
+class LogicalNCConfig(IntEnum):
+    LNC_1 = 1
+    LNC_2 = 2
+
+def get_platform_lnc():
+    """
+    Get the Logical NeuronCore Configuration (LNC) for the current platform.
+    """
+    return LogicalNCConfig.LNC_2 if get_platform_target() == "trn2" else LogicalNCConfig.LNC_1

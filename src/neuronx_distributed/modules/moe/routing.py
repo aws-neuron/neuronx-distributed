@@ -6,7 +6,7 @@ from torch.distributed import ProcessGroup
 import torch.nn.functional as F
 
 from neuronx_distributed.parallel_layers import mappings
-from neuronx_distributed.parallel_layers.parallel_state import get_tensor_model_parallel_group
+from neuronx_distributed.parallel_layers.parallel_state import get_tensor_model_parallel_group, get_world_group, get_expert_model_parallel_size
 
 
 class RouterBase(torch.nn.Module, ABC):
@@ -55,8 +55,12 @@ class RouterBase(torch.nn.Module, ABC):
         self.device = device
         self.jitter_eps = jitter_eps
 
-        self.tensor_parallel_group = tensor_model_parallel_group if \
-            tensor_model_parallel_group is not None else get_tensor_model_parallel_group()
+        # TODO: Refactor with expert MLPv2 design to include parallel groups as mandatory arg
+        if get_expert_model_parallel_size() > 1:
+            self.tensor_parallel_group = get_world_group()
+        else:
+            self.tensor_parallel_group = tensor_model_parallel_group if \
+                tensor_model_parallel_group is not None else get_tensor_model_parallel_group()
 
         # Create router
         self.linear_router = torch.nn.Linear(hidden_size, num_experts, dtype=dtype, device=device, bias=False)
@@ -139,13 +143,14 @@ class RouterTopK(RouterBase):
         dtype: torch.dtype = torch.float32,
         device: torch.device = torch.device("cpu"),
         tensor_model_parallel_group: Optional[ProcessGroup] = None,
+        act_fn="softmax",
         jitter_eps: float = 0.0,
     ):
         super().__init__(
             num_experts=num_experts,
             top_k=top_k,
             hidden_size=hidden_size,
-            act_fn="softmax",  # Always use softmax activation for TopK router
+            act_fn=act_fn,
             sequence_parallel_enabled=sequence_parallel_enabled,
             sequence_dimension=sequence_dimension,
             dtype=dtype,
@@ -265,3 +270,146 @@ class RouterSinkhorn(RouterBase):
         if tol is not None:
             assert float(error) < tol, f"Sinkhorn error {float(error)} exceeds tolerance {tol}"
         return d1 * cost * d0.unsqueeze(1)
+
+class GroupLimitedRouter(RouterBase):
+    """
+    Implements top-K expert routing using the no auxiliary loss method from DeepSeekV3.
+
+    The topk selection method selects the top-k experts based on computed scores using Sigmoid gate.
+    This involves adding a bias term to the scores, grouping the scores, selecting the top groups,
+    masking out scores for experts not in the top groups, then selecting the top-k experts based on
+    the masked scores.
+
+    Args:
+        num_experts (int): Number of experts in the model
+        top_k (int): Number of experts to route to for each token
+        hidden_size (int): Size of the hidden layer
+        n_group (int): Number of expert groups
+        topk_group (int): Number of top groups to select
+        sequence_parallel_enabled (bool): Whether sequence parallelism is enabled
+        sequence_dimension (Optional[int]): Dimension for sequence parallelism
+        dtype (torch.dtype): Data type for computations
+        device (torch.device): Device to run computations on
+        tensor_model_parallel_group (Optional[ProcessGroup]): Process group for tensor parallelism
+        jitter_eps (float): Jitter epsilon for noise addition
+    """
+
+    def __init__(
+            self,
+            num_experts: int,
+            top_k: int,
+            hidden_size: int,
+            n_group: int,
+            topk_group: int,
+            sequence_parallel_enabled: bool = False,
+            sequence_dimension: Optional[int] = None,
+            dtype: torch.dtype = torch.float32,
+            device: torch.device = torch.device("cpu"),
+            tensor_model_parallel_group: Optional[ProcessGroup] = None,
+            jitter_eps: float = 0.0,
+    ):
+        super().__init__(
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            act_fn="sigmoid",
+            sequence_parallel_enabled=sequence_parallel_enabled,
+            sequence_dimension=sequence_dimension,
+            dtype=dtype,
+            device=device,
+            tensor_model_parallel_group=tensor_model_parallel_group,
+            jitter_eps=jitter_eps,
+        )
+        self.n_group = n_group
+        self.topk_group = topk_group
+
+    def forward(self, hidden_states):
+        """
+        Forward pass of the router.
+
+        Args:
+            hidden_states: Input tensor to be routed
+
+        Returns:
+            tuple: (router_logits, expert_weights, topk_idx)
+                - router_logits: Raw routing scores
+                - expert_weights: Weights for each selected expert
+                - topk_idx: Indices of selected experts
+        """
+        router_logits, expert_affinities = self.get_router_logits_and_expert_affinities(hidden_states)
+        topk_idx, expert_weights = self.noaux_tc_top_k(expert_affinities)
+        topk_idx = topk_idx.detach().to(dtype=torch.long)
+
+        return router_logits, expert_weights, topk_idx
+
+    def noaux_tc_top_k(self, scores):
+        """
+        Performs top-k selection using the no auxiliary loss method.
+
+        Args:
+            scores (torch.Tensor): Expert scores of shape (batch_size, num_experts)
+
+        Returns:
+            tuple: (topk_idx, scores)
+                - topk_idx: Indices of selected top-k experts
+                - scores: Original expert scores
+        """
+        batch_size, num_experts = scores.shape
+        scores_for_choice = scores + self.e_score_correction_bias.unsqueeze(0)
+
+        group_scores = self._calculate_group_scores(scores_for_choice, batch_size)
+        group_idx = torch.topk(group_scores, k=self.topk_group)[1]
+        group_mask = self._create_group_mask(group_scores, group_idx)
+        score_mask = self._expand_group_mask(group_mask, batch_size)
+        masked_scores = scores_for_choice.masked_fill(~score_mask.bool(), 0.0)
+
+        _, topk_idx = torch.topk(masked_scores, k=self.top_k)
+        return topk_idx, scores
+
+    def _calculate_group_scores(self, scores, batch_size):
+        """
+        Calculates scores for each group of experts.
+
+        Args:
+            scores (torch.Tensor): Expert scores
+            batch_size (int): Batch size
+
+        Returns:
+            torch.Tensor: Group scores
+        """
+        return torch.topk(scores.view(batch_size, self.n_group, -1), k=2)[0].sum(dim=-1)
+
+    def _create_group_mask(self, group_scores, group_idx):
+        """
+        Creates a mask for selected expert groups.
+
+        Args:
+            group_scores (torch.Tensor): Scores for each group
+            group_idx (torch.Tensor): Indices of selected groups
+
+        Returns:
+            torch.Tensor: Binary mask for selected groups
+        """
+        return torch.scatter(
+            input=torch.zeros_like(group_scores),
+            dim=1,
+            index=group_idx,
+            src=torch.ones_like(group_scores)
+        )
+
+    def _expand_group_mask(self, group_mask, batch_size):
+        """
+        Expands the group mask to expert-level granularity.
+
+        Args:
+            group_mask (torch.Tensor): Mask for selected groups
+            batch_size (int): Batch size
+
+        Returns:
+            torch.Tensor: Expanded mask for individual experts
+        """
+        return group_mask.unsqueeze(-1).expand(
+            batch_size, self.n_group, self.num_experts // self.n_group
+        ).reshape(batch_size, -1)
+
+

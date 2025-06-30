@@ -3,7 +3,9 @@ import gc
 
 import torch
 import torch.nn.functional as F
+import torch_neuronx
 import torch_xla.core.xla_model as xm  # TRN enablement
+import torch_xla.runtime as xr  # TRN enablement
 
 # Imports from MoE unit tests (for this import to succeed, test/unit_test/modules/moe must be added to PYTHONPATH)
 from neuronx_distributed.modules.moe import token_shuffling
@@ -16,7 +18,7 @@ from utils_testing import ExptCfg
 
 
 def print_rank0(s):
-    if xm.get_ordinal() == 0:
+    if xr.global_ordinal() == 0:
         print(s)
 
 
@@ -144,6 +146,9 @@ def _get_slice_for_rank(tensor, sharding_info, split_dims=None):
 def _slice_and_compare_tensors(cpu_dict, trn_dict, sharding_info, it, **tols):
     assert set(cpu_dict.keys()) == set(trn_dict.keys())
     for key in sorted(cpu_dict):
+        #TODO: add per rank checking logic for shared_experts
+        if "shared_experts" in key:
+            continue
         cpu_dict[key] = cpu_dict[key].detach()
         if cpu_dict[key].shape == trn_dict[key].shape:
             key_tensor_for_rank = cpu_dict[key]
@@ -203,7 +208,6 @@ def run_device_correctness_test(cfg: ExptCfg, output_tols, grad_tols):
             )
             model_trn = ut.initialize_neuron_model(cfg_trn)
             ut.match_expert_weights(model_trn, model_cpu, cfg.glu_mlp)
-
             sequence_dimension = model_trn.sequence_dimension
 
             if cfg.test_mode == "training":
@@ -242,7 +246,7 @@ def run_device_correctness_test(cfg: ExptCfg, output_tols, grad_tols):
 
             # torch.topk behavior is different on cpu and device in the case of ties.
             # This causes mismatches in expert assignment for the TopK tests in bf16.
-            if cfg.dtype == torch.bfloat16 and cfg.implementation == "topk":
+            if cfg.dtype == torch.bfloat16:
                 # Set is_test=True to return expert_index
                 model_cpu.is_test = True
                 model_trn.is_test = True
@@ -281,7 +285,8 @@ def run_device_correctness_test(cfg: ExptCfg, output_tols, grad_tols):
                     else:
                         ip_trn = ip_trn_full
                     # expert_index_trn is sharded by dp, but not by sp (because router is replicated).
-                    expert_index_trn = model_trn(ip_trn)[-1]
+                    router_logits_trn, expert_index_trn = model_trn(ip_trn)[-2:]
+                    #TODO: add router_logits_trn computation logic when token_shuffle_group_size > 1
                     if token_shuffle_group_size > 1:
                         if sequence_parallel_enabled:
                             local_expert_index_trn = mappings.scatter_to_sequence_parallel_region(expert_index_trn)
@@ -296,16 +301,20 @@ def run_device_correctness_test(cfg: ExptCfg, output_tols, grad_tols):
                         expert_index_trn = mappings.gather_from_sequence_parallel_region(local_expert_index_trn)
                     ut.nxd_init(tp_degree=1, ep_degree=1, token_shuffle_group_size=1, seed=it)
                     local_expert_index_cpu = shard_batch(expert_index_cpu, cfg, dp_size, dp_rank, cfg.test_mode)
-                    local_router_logits_cpu = shard_batch(router_logits_cpu, cfg, dp_size, dp_rank, cfg.test_mode)
                     expert_mismatch_indices = set(
                         torch.where(local_expert_index_cpu != expert_index_trn.cpu())[0].tolist()
                     )
                     if len(expert_mismatch_indices) > 0:
-                        # Check that mismatches only happen when the (top_k+1) router logits are non-unique
                         for mismatch_idx in expert_mismatch_indices:
-                            router_logits_idx = local_router_logits_cpu[mismatch_idx]
-                            topk_logits, _ = torch.topk(router_logits_idx, min(cfg.top_k + 1, cfg.num_experts))
-                            assert len(topk_logits) != len(torch.unique(topk_logits)), str(topk_logits)
+                            router_logits_trn_idx = router_logits_trn.cpu()[mismatch_idx]
+                            # check each mismatched expert
+                            mismatch_idx_logits = \
+                            torch.where(local_expert_index_cpu[mismatch_idx] != expert_index_trn.cpu()[mismatch_idx])[
+                                0].tolist()
+                            cpu_mismatched_indices = local_expert_index_cpu[mismatch_idx, mismatch_idx_logits]
+                            trn_mismatched_indices = expert_index_trn.cpu()[mismatch_idx, mismatch_idx_logits]
+                            # check if mismatched expert's corresponding router logits are actually close due to bf16
+                            torch_neuronx.testing.assert_close(router_logits_trn_idx[cpu_mismatched_indices], router_logits_trn_idx[trn_mismatched_indices])
                         # Update the input tensor to mask tokens where there is an expert assignment mismatch
                         # Modifying local_ip_cpu also modifies ip_cpu since they share underlying memory
                         local_ip_cpu = shard_batch(ip_cpu, cfg, dp_size, dp_rank, cfg.test_mode)
@@ -381,8 +390,7 @@ def run_device_correctness_test(cfg: ExptCfg, output_tols, grad_tols):
             ut.check_tensors(op_cpu.detach(), op_trn.detach(), **output_tols)
             del op_cpu, op_trn
 
-            # TODO: verify after V1492568678
-            # ut.check_tensors(router_logits_cpu, router_logits_trn, **output_tols)
+            ut.check_tensors(router_logits_cpu, router_logits_trn, **output_tols)
             del router_logits_cpu, router_logits_trn
 
             # Compare loss

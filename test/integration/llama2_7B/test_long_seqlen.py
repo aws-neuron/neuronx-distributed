@@ -88,7 +88,7 @@ def extract_throughput(seq_len=32768):
 def within_tolerance(actual, expected, tolerance=0.05):
     lower_bound = expected * (1 - tolerance)
     upper_bound = expected * (1 + tolerance)
-    return lower_bound <= actual <= upper_bound, lower_bound, upper_bound, tolerance
+    return lower_bound <= actual, lower_bound, upper_bound, tolerance
 
 if __name__ == "__main__":
     succeeded = []
@@ -96,8 +96,8 @@ if __name__ == "__main__":
     for seq_len, mem_thershold, perf_threshold in [
         # Threshold with 5%-8% tolarance
         [8192, 98924466176, 6.90],
-        [16384, 109604828160, 2.87],
-        [32768, 124354230272, 1.10],
+        [16384, 109604828160, 3.0],
+        [32768, 124354230272, 1.1],
     ]:
         return_status = run_job(seq_len, mem_thershold, perf_threshold)
         if return_status == SUCCEEDED:

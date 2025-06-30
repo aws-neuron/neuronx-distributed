@@ -288,6 +288,9 @@ def initialize_optimizer_from_class(nxd_config, optimizer_class, parameters, mod
         )
         if get_delay_tracing(nxd_config):
             defaults["lazy_init"] = True
+        # This line is necesary due to transition to PT 2.7.
+        # Adam has decoupled_weight_decay parameter, however, AdamW not.
+        defaults.pop('decoupled_weight_decay', None)
         logger.info("printing defaults here %s", defaults)
         logger.info("printing zero1 config here %s", zero1_configs)
         optimizer = zero1_optimizer_cls(
