@@ -9,6 +9,7 @@ from typing import Tuple
 import torch
 import torch.nn.functional as F
 import torch_xla.core.xla_model as xm
+import torch_xla.runtime as xr
 import torch_xla.debug.metrics as met
 from commons import IdentityLayer, print_separator, set_random_seed
 
@@ -193,7 +194,7 @@ if __name__ == "__main__":
         torch.distributed.init_process_group("xla", init_method="pjrt://")
     else:
         torch.distributed.init_process_group("xla")
-    world_size = xm.xrt_world_size()
+    world_size = xr.world_size()
     tensor_model_parallel_size = 1
     while tensor_model_parallel_size <= world_size:
         print_separator("test parallel cross entropy")

@@ -5,6 +5,7 @@ from typing import Dict, List
 import numpy as np
 import torch
 import torch_xla.core.xla_model as xm
+import torch_xla.runtime as xr
 
 from ..parallel_layers import parallel_state
 from ..parallel_layers.parallel_state import rmsg
@@ -53,7 +54,7 @@ def send(tensor, send_next=True, all_reduce_send_recv=False):
         return tensor
     elif not all_reduce_send_recv:
         # Use all_gather instead of all_reduce for send/recv
-        rank = xm.get_ordinal()
+        rank = xr.global_ordinal()
         split_index = 0
         assert isinstance(groups, List)
         for group in groups:
@@ -88,7 +89,7 @@ def recv_from(tensor_meta, recv_prev=True, tracing=False, all_reduce_send_recv=F
         torch.distributed.recv(tensor_recv_next, src=src_rank, group=groups)
     elif not all_reduce_send_recv:
         # Use all_gather instead of all_reduce for send/recv
-        rank = xm.get_ordinal()
+        rank = xr.global_ordinal()
         split_index = 0
         assert isinstance(groups, List)
         for group in groups:

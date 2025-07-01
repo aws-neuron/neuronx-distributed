@@ -11,6 +11,7 @@ from types import ModuleType
 import torch
 import torch_xla
 import torch_xla.core.xla_model as xm
+import torch_xla.runtime as xr
 import torch_xla.utils.serialization as xser
 
 from neuronx_distributed.optimizer import NeuronZero1Optimizer
@@ -574,7 +575,7 @@ def _save(
             iostate.add_save_task(tensor_info, path + ".info.pt")
         return
 
-    local_rank = xm.get_local_ordinal()
+    local_rank = xr.local_ordinal()
     for worker in range(math.ceil(get_local_world_size() / num_workers)):
         if groups is None or my_rank_in_group == 0:
             if local_rank // num_workers == worker:
@@ -626,7 +627,7 @@ def _load(
         _load_obj_from_state_dict(obj, ckpt, strict)
         return
 
-    local_rank = xm.get_local_ordinal()
+    local_rank = xr.local_ordinal()
     for worker in range(math.ceil(get_local_world_size() / num_workers)):
         if local_rank // num_workers == worker:
             logger.debug(f"worker {local_rank} loading checkpoint {path}")

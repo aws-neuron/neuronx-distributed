@@ -10,6 +10,7 @@ import time
 import numpy as np
 import torch
 import torch_xla.core.xla_model as xm
+import torch_xla.runtime as xr
 
 from neuronx_distributed.modules import qkv_linear
 from neuronx_distributed.parallel_layers import layers, parallel_state
@@ -118,11 +119,11 @@ def test_llama_attention(tensor_model_parallel_size=8, seq_len=8192):
         # without fused qkv
         attn_output, throughput = run_fwd_and_measure_throughput(self_attn, attn_input, config)
 
-        if xm.get_ordinal()==0:
+        if xr.global_ordinal()==0:
             # assert outputs are equal
             assert torch.allclose(
                 attn_output[0].detach().cpu().numpy(), attn_output_fused[0].detach().cpu().numpy(), rtol=1e-1, atol=1e-1
-            ), "output doesn't match rank{}".format(xm.get_ordinal())
+            ), "output doesn't match rank{}".format(xr.global_ordinal())
 
             # assert that the throughput with fused qkv is equal to or better than the throughput without fused qkv
             print(f"Throughput fused: {throughput_fused:.2f} and throughput not fused: {throughput:.2f} tokens/second")
@@ -147,7 +148,7 @@ if __name__ == "__main__":
         torch.distributed.init_process_group("xla", init_method="pjrt://")
     else:
         torch.distributed.init_process_group("xla")
-    world_size = xm.xrt_world_size()
+    world_size = xr.world_size()
     if is_torch_version_greater_than_2():
         # Set the XLA_DISABLE_FUNCTIONALIZATION flag to avoid accuracy issues with PT2.1 and fused_qkv
         os.environ['XLA_DISABLE_FUNCTIONALIZATION'] = '0'

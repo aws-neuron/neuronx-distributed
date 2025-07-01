@@ -6,6 +6,7 @@ from collections import namedtuple
 import torch
 import torch.distributed
 import torch_xla.core.xla_model as xm
+import torch_xla.runtime as xr
 from training_utils import Throughput, TrainingMetrics
 
 from neuronx_distributed.lightning import NeuronLTModule
@@ -43,7 +44,7 @@ class NeuronDbrxLTModule(NeuronLTModule):
                 {
                     "Model": self.model_args[0].model_type,
                     "Model configuration": str(self.model_args[0]),
-                    "World size": xm.xrt_world_size(),
+                    "World size": xr.world_size(),
                     "Data parallel degree": self.trainer.strategy.data_parallel_size,
                     "Batch size": self.train_batch_size,
                     "Optimizer": str(self.opt_cls),
@@ -169,7 +170,7 @@ class NeuronDbrxLTModule(NeuronLTModule):
                 and self.trainer.strategy.pipeline_parallel_rank == self.print_pp_rank
             ):
                 print(
-                    f"step {self.global_step} loss is {self.loss.detach().cpu().item()}, lr is {self.lr}, input_ids {torch.sum(self.input_ids.detach().cpu()).item()}, norm {self.global_norm}, global rank {xm.get_ordinal()}"
+                    f"step {self.global_step} loss is {self.loss.detach().cpu().item()}, lr is {self.lr}, input_ids {torch.sum(self.input_ids.detach().cpu()).item()}, norm {self.global_norm}, global rank {xr.global_ordinal()}"
                 )
 
             # Logging, need to revisit when automatic_optimization enabled

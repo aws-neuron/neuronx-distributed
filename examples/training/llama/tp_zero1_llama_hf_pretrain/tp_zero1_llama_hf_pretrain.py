@@ -28,6 +28,7 @@ from typing import Any, Dict, List
 import torch
 import torch.distributed as dist
 import torch_xla.core.xla_model as xm
+import torch_xla.runtime as xr
 import torch_xla.distributed.parallel_loader as pl
 import torch_xla.distributed.xla_multiprocessing as xmp
 from logger import Logger
@@ -148,17 +149,9 @@ def get_model(flags):
         config.selective_checkpoint_enabled = True
     if args.hidden_size != -1:
         config.hidden_size = args.hidden_size
+    config.head_dim = config.hidden_size // config.num_attention_heads
     xm.master_print(config)
     model = LlamaForCausalLM(config)
-
-    # Here we make sure we use the same sine and cosine matrices for all layers.
-    # Making use of same tensors would make the CSE algorithm eliminate the lookup call
-    # from layers, keeping only lookup from first layer.
-    with torch.no_grad():
-        cos, sin = get_sin_cos_matrix(config)
-        for layer in model.model.layers:
-            layer.self_attn.rotary_emb.cos_cached = cos
-            layer.self_attn.rotary_emb.sin_cached = sin
     xm.master_print(model)
     return model
 
@@ -261,7 +254,7 @@ def train_llama(flags):
             {
                 "Model": model.config.model_type,
                 "Model configuration": str(model.config),
-                "World size": xm.xrt_world_size(),
+                "World size": xr.world_size(),
                 "Data parallel degree": world_size,
                 "Batch size": flags.batch_size,
                 "Total steps": flags.steps_this_run,

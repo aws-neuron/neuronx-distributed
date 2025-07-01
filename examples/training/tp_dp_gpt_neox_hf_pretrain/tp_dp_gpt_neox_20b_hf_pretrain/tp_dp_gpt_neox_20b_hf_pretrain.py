@@ -32,6 +32,7 @@ import requests
 import torch
 import torch.distributed as dist
 import torch_xla.core.xla_model as xm
+import torch_xla.runtime as xr
 import torch_xla.distributed.parallel_loader as pl
 import torch_xla.distributed.xla_multiprocessing as xmp
 from adamw_fp32_optim_params import AdamW_FP32OptimParams
@@ -315,7 +316,7 @@ def train_gpt_neox(flags):
             {
                 "Model": model.name_or_path,
                 "Model configuration": str(model.config),
-                "World size": xm.xrt_world_size(),
+                "World size": xr.world_size(),
                 "Data parallel degree": world_size,
                 "Batch size": flags.batch_size,
                 "Total steps": flags.steps_this_run,

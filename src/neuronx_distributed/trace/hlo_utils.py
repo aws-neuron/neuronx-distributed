@@ -129,6 +129,8 @@ def apply_layout_transformation(
     """
     Apply the layout transformation suggestion from the priority HLO to the given non-priority model trace artifacts.
 
+    This is a no-op if weights are already in optimal shape.
+
     Args:
         hlo_module: The HLO module to apply the layout optimization to.
         flattener: Function to flatten inputs.
@@ -152,10 +154,16 @@ def apply_layout_transformation(
 
         # Generate key for logging and tracking
         key = generate_key(hlo_module, key)
-        logger.info(f"Applying layout transformation to {key}")
+
+        # Check if hlo_stub / wrapped_neff exists
+        if wlo_artifacts.wrapped_neff_hlo_filepath is None:
+            logger.info(f"No changes on weight layout, skip updating weight layout for {key}")
+            return
+
+        logger.info(f"Applying weight layout transformation for {key}")
 
         # Read the WLO stub
-        wlo_stub = read_hlo(wlo_artifacts.wrapped_neff_hlo_filename)
+        wlo_stub = read_hlo(wlo_artifacts.wrapped_neff_hlo_filepath)
         if not wlo_stub:
             raise ValueError("Failed to read WLO stub")
 
@@ -196,12 +204,10 @@ def apply_layout_transformation(
                 hlo_artifacts.hlo_module.frontend_attributes.map
             )
 
-            logger.info(f"Successfully applied layout optimization to {key}")
+            logger.info(f"Successfully applied weight layout transformation for {key}")
 
     except Exception as e:
-        raise RuntimeError(f"Layout transformation failed for {key}: {str(e)}") from e
-
-    logger.info(f"Completed layout optimization process for {key}")
+        raise RuntimeError(f"Weight layout transformation failed for {key}: {str(e)}") from e
 
 
 def get_layout_transform_map(hlo_stub: hlo_pb2.HloModuleProto, weight_name_to_idx: Dict[str, int]):

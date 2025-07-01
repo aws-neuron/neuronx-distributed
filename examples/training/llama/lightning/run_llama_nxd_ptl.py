@@ -47,6 +47,7 @@ from modeling_llama_nxd import (
     LlamaForCausalLM,
     LlamaRMSNorm,
     init_weights,
+    LlamaRotaryEmbedding
 )
 from module_llama import NeuronLlamaLTModule
 from training_utils import (
@@ -81,13 +82,14 @@ def train_llama(args):
     model_config.selective_checkpoint_enabled = args.use_selective_checkpoint > 0
     model_config.max_position_embeddings = max(model_config.max_position_embeddings, args.seq_len)
     model_config.use_flash_attention = args.use_flash_attention > 0
-    model_config.transpose_nki_inputs = args.transpose_nki_inputs > 0 
+    model_config.transpose_nki_inputs = args.transpose_nki_inputs > 0
     if args.pretrained_weight is not None:
         model_config.pretrained_ckpt = args.pretrained_weight
     if args.num_layers > 0:
         model_config.num_hidden_layers = args.num_layers
     if args.hidden_size != -1:
         model_config.hidden_size = args.hidden_size
+    model_config.head_dim = int(model_config.hidden_size / model_config.num_attention_heads)
     xm.master_print(model_config)
 
     pipeline_config = None
@@ -101,7 +103,7 @@ def train_llama(args):
             "deallocate_pipeline_outputs": args.deallocate_pipeline_outputs > 0,
             "trace_file_path": args.trace_file_path,
             "param_init_fn": None,
-            "leaf_module_cls": [LlamaRMSNorm.__name__],
+            "leaf_module_cls": [LlamaRMSNorm.__name__, LlamaRotaryEmbedding.__name__],
             "autowrap_modules": [mappings],
             "use_zero1_optimizer": args.use_zero1_optimizer > 0,
             "use_optimizer_wrapper": True,
@@ -480,7 +482,7 @@ if __name__ == "__main__":
     os.environ["NEURON_RT_STOCHASTIC_ROUNDING_EN"] = "0" if args.use_gpu_compatible_precision > 0 else "1"
     if args.use_fp32_optimizer:
         os.environ["XLA_DOWNCAST_BF16"] = "1"
-    else:
+    elif os.environ.get("XLA_DOWNCAST_BF16", "0") != "1":
         os.environ["XLA_USE_BF16"] = "1"
 
     # WORLD_SIZE is set by torchrun

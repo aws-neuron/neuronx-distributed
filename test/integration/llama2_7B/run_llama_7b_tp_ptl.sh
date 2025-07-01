@@ -9,7 +9,7 @@ then
     SEQ_LEN=4096
     n_layers=-1
     GBS=256
-    total_steps=150
+    total_steps=30
     TP_DEGREE=8
     use_flash_attention=0
     export NEURON_CC_FLAGS="--distribution-strategy=llm-training"
@@ -63,7 +63,7 @@ USE_ZERO_1=1
 # micro batch size
 MBS=1
 # number of steps to run
-TOTAL_STEPS=10000
+TOTAL_STEPS=1500
 # warmup steps
 WARMUP_STEPS=100
 # learning rate

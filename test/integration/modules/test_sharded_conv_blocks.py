@@ -12,6 +12,7 @@ from typing import Tuple
 import torch
 import torch.nn.init as init  # noqa: F401
 import torch_xla.core.xla_model as xm
+import torch_xla.runtime as xr
 import torch_xla.debug.metrics as met
 
 from neuronx_distributed.parallel_layers import layers, parallel_state
@@ -357,7 +358,7 @@ if __name__ == "__main__":
         torch.distributed.init_process_group("xla", init_method="pjrt://")
     else:
         torch.distributed.init_process_group("xla")
-    world_size = xm.xrt_world_size()
+    world_size = xr.world_size()
     # TODO: Data parallel disabled for now because of V1320578643
     # TODO: Iterate over other tensor parallel sizes like the other tests do. Ran into compiler issues when trying it
     #       while building the test.

@@ -26,6 +26,7 @@ from .checkpoint_io import NeuronCheckpointIO
 from .launcher import _NeuronXLALauncher
 import torch_xla
 import torch_xla.core.xla_model as xm
+import torch_xla.runtime as xr
 from torch_xla.distributed.parallel_loader import MpDeviceLoader
 
 if TYPE_CHECKING:
@@ -96,7 +97,7 @@ class NeuronXLAStrategy(XLAStrategy):
         if self.cluster_environment.creates_processes_externally:
             global_rank = int(os.environ["RANK"])
         else:
-            global_rank = xm.get_ordinal()
+            global_rank = xr.global_ordinal()
         if torch.__version__.startswith("2.0"):
             import torch_xla.experimental.pjrt_backend  # noqa
 

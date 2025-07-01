@@ -17,6 +17,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """ PyTorch LLaMA model."""
 import math
 import os
@@ -34,6 +37,7 @@ from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
     CausalLMOutputWithPast,
 )
+from transformers.cache_utils import Cache
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.llama.modeling_llama import (
     LLAMA_INPUTS_DOCSTRING,
@@ -48,14 +52,13 @@ from transformers.models.llama.modeling_llama import (
 )
 from transformers.models.llama.modeling_llama import (
     LlamaForSequenceClassification,
-    LlamaLinearScalingRotaryEmbedding,
 )
 from transformers.models.llama.modeling_llama import LlamaMLP as LlamaMLPHF
 from transformers.models.llama.modeling_llama import LlamaModel as LlamaModelHF
 from transformers.models.llama.modeling_llama import LlamaPreTrainedModel
 from transformers.models.llama.modeling_llama import LlamaRMSNorm as LlamaRMSNormHF
 from transformers.models.llama.modeling_llama import (
-    LlamaRotaryEmbedding,
+    LlamaRotaryEmbedding as LlamaRotaryEmbeddingHF, # noqa
     repeat_kv,
 )
 from transformers.utils import (
@@ -69,7 +72,6 @@ import neuronx_distributed.parallel_layers.utils as neuronx_dist_utils
 from neuronx_distributed.kernels.flash_attn import nki_flash_attn_func
 from neuronx_distributed.kernels.ring_attention_kernel import nki_ring_attn_func
 from neuronx_distributed.modules.qkv_linear import GQAQKVColumnParallelLinear
-from neuronx_distributed.overrides.transformer_overrides import apply_rotary_pos_emb
 from neuronx_distributed.parallel_layers import mappings
 from neuronx_distributed.parallel_layers.layers import (
     ColumnParallelLinear,
@@ -82,8 +84,8 @@ from neuronx_distributed.parallel_layers.parallel_state import (
     get_context_model_parallel_size,
     get_context_model_parallel_rank,
     get_context_model_parallel_src_tgt_pairs,
-    get_context_model_parallel_group,
 )
+from neuronx_distributed.overrides.transformer_overrides import apply_rotary_pos_emb
 
 def _init_normal(std, w):
     return nn.init.normal_(w, mean=0.0, std=std)
@@ -144,7 +146,7 @@ class LlamaRMSNorm(LlamaRMSNormHF):
 
     def forward(self, hidden_states):
         input_dtype = hidden_states.dtype
-
+        
         if os.environ.get("XLA_DOWNCAST_BF16", None) == "1":
             hidden_states = hidden_states.to(torch.double)
         else:
@@ -202,11 +204,11 @@ class LlamaMLP(LlamaMLPHF):
             down_proj = sum(down_proj)
         else:
             gate_proj, up_proj = self.gate_up_proj(x).split(self.split_size, dim=2)
-
+ 
             def activation_mlp(gate_proj, up_proj):
                 activation_output = self.act_fn(gate_proj)
                 return activation_output * up_proj
-
+ 
             # We checkpoint the MLP compute too, since we see extra data movement which is more
             # expensive than the recompute in this case.
             if self.config.selective_checkpoint_enabled:
@@ -259,13 +261,13 @@ class LlamaAttention(LlamaAttentionHF):
         self.rope_theta = config.rope_theta
 
         if not hasattr(config, "kv_shared_group_size"):
-            config.kv_shared_group_size = 1
+            self.config.kv_shared_group_size = 1
 
         if not hasattr(config, "qkv_linear"):
-            config.qkv_linear = False
+            self.config.qkv_linear = False
 
         if not hasattr(config, "fuse_qkv"):
-            config.fuse_qkv = False
+            self.config.fuse_qkv = False
 
         if not hasattr(config, "use_flash_attention"):
             self.use_flash_attention = False
@@ -277,6 +279,12 @@ class LlamaAttention(LlamaAttentionHF):
         else:
             self.use_ring_attention = False
             
+            
+        if get_context_model_parallel_size() > 1 and not self.use_ring_attention :
+            raise ValueError(
+                "Context parallelism is only supported with ring attention. Please set `use_ring_attention` to True to use context parallelism with ring attention"
+        )
+            
         if self.use_ring_attention and self.use_flash_attention:
             raise ValueError(
                 "Context parallelism is not supported with flash attention. Please set `use_flash_attention` to False to use context parallelism with ring attention"
@@ -287,7 +295,6 @@ class LlamaAttention(LlamaAttentionHF):
                 f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
                 f" and `num_heads`: {self.num_heads})."
             )
-        self._init_rope()
 
         init_method = partial(_init_normal, config.initializer_range)
         if self.config.qkv_linear:
@@ -362,11 +369,14 @@ class LlamaAttention(LlamaAttentionHF):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor] = None,
+        past_key_value: Optional[Cache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
+        **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         assert use_cache is False, "KV-Cache flow is not fully supported"
         bsz, q_len, _ = hidden_states.size()
@@ -411,20 +421,11 @@ class LlamaAttention(LlamaAttentionHF):
             self.num_key_value_heads, self.head_dim, self.config
         )
 
-        kv_seq_len = key_states.shape[seq_len_dim_index]
-        if past_key_value is not None:
-            kv_seq_len += past_key_value[0].shape[-2]
-        # Multiply by context parallel size as seq_len is sharded by context parallel size
-        kv_seq_len *= get_context_model_parallel_size()
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-        cos = self.get_position_embedding_on_this_context_parallel_rank(cos, 2)
-        sin = self.get_position_embedding_on_this_context_parallel_rank(sin, 2)
-        
-        # The first two dimensions of cos and sin are always 1, so we can `squeeze` them.
-        cos = cos.squeeze(1).squeeze(0)  # [seq_len, dim]
-        sin = sin.squeeze(1).squeeze(0)  # [seq_len, dim]
-        
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids, self.use_flash_attention, self.config.transpose_nki_inputs)
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(
+            query_states, key_states, cos, sin, None, 
+            self.use_flash_attention, self.config.transpose_nki_inputs
+        )
 
         if past_key_value is not None:
             # reuse k, v, self_attention
@@ -437,13 +438,7 @@ class LlamaAttention(LlamaAttentionHF):
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-        # Use Ring attention for CP
-        if self.use_ring_attention:
-            attn_output = nki_ring_attn_func(query_states, key_states, value_states, torch.distributed.get_rank(), get_context_model_parallel_src_tgt_pairs())
-        elif self.use_flash_attention:
-            attn_output = nki_flash_attn_func(query_states, key_states, value_states, transpose_nki_inputs=self.config.transpose_nki_inputs)
-        else:
-            attn_output = self.core_attn(query_states, key_states, value_states)
+        attn_output = self.call_attn_impln(query_states, key_states, value_states)
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
             raise ValueError(
@@ -467,24 +462,18 @@ class LlamaAttention(LlamaAttentionHF):
 
         if not output_attentions:
             attn_weights = None
-
-        return attn_output, attn_weights, past_key_value
-    
-    def get_position_embedding_on_this_context_parallel_rank(self, position_embedding, seq_dim):
-        cp_size = get_context_model_parallel_size()
-        cp_rank = get_context_model_parallel_rank()
-        seq_len = position_embedding.shape[seq_dim]
-        assert seq_len%cp_size==0, f"seq_len {seq_len} is not divisible by CP size {cp_size}"        
-        position_embedding = position_embedding.view(
-            *position_embedding.shape[:seq_dim], cp_size, seq_len // cp_size, *position_embedding.shape[(seq_dim + 1) :]
-        )
-        cp_idx = torch.tensor([cp_rank], device=position_embedding.device)
-        position_embedding = position_embedding.index_select(seq_dim, cp_idx)
-        position_embedding = position_embedding.view(
-            *position_embedding.shape[:seq_dim], -1, *position_embedding.shape[(seq_dim + 2) :]
-        )
-        return position_embedding
         
+        return attn_output, attn_weights#, past_key_value
+    
+    def call_attn_impln(self, query_states, key_states, value_states):
+        if self.use_ring_attention:
+            attn_output = nki_ring_attn_func(query_states, key_states, value_states, torch.distributed.get_rank(), get_context_model_parallel_src_tgt_pairs())
+        elif self.use_flash_attention:
+            attn_output = nki_flash_attn_func(query_states, key_states, value_states, transpose_nki_inputs=self.config.transpose_nki_inputs)
+        else:
+            attn_output = self.core_attn(query_states, key_states, value_states)
+        return attn_output
+
     def reshape_and_permute_states_for_fa(self, states, bsz, q_len, num_heads, head_dim, use_sequence_parallel):
         if use_sequence_parallel:
             return states.view(q_len, bsz, num_heads, head_dim).permute(1, 2, 3, 0)
@@ -512,7 +501,7 @@ class LlamaAttention(LlamaAttentionHF):
             dim_index = -2
         
         return query_states, key_states, value_states, dim_index
-
+    
 
 class LlamaDecoderLayer(LlamaDecoderLayerHF):
     def __init__(self, config: LlamaConfig):
@@ -554,7 +543,7 @@ class LlamaModel(LlamaModelHF):
         self.norm = LlamaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps, sequence_parallel_enabled=config.sequence_parallel_enabled
         )
-
+        self.rotary_emb = LlamaRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
         # Initialize weights and apply final processing
         self.post_init()
@@ -589,6 +578,7 @@ class LlamaModel(LlamaModelHF):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -617,9 +607,14 @@ class LlamaModel(LlamaModelHF):
 
         if position_ids is None:
             device = input_ids.device if input_ids is not None else inputs_embeds.device
-            position_ids = torch.arange(
-                past_key_values_length, seq_length + past_key_values_length, dtype=torch.long, device=device
-            )
+            cp_rank = get_context_model_parallel_rank()
+            cp_size = get_context_model_parallel_size()
+            if cp_size>1:
+                # offset when context parallel size is > 1
+                start = cp_rank * (seq_length + past_key_values_length)
+            else:
+                start = past_key_values_length
+            position_ids = torch.arange(start, start + seq_length, dtype=torch.long, device=device)
             position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
         else:
             position_ids = position_ids.view(-1, seq_length).long()
@@ -637,6 +632,9 @@ class LlamaModel(LlamaModelHF):
 
         hidden_states = inputs_embeds
 
+        # create position embeddings to be shared across the decoder layers
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
         if self.gradient_checkpointing and self.training:
             if use_cache:
                 logger.warning_once(
@@ -648,7 +646,6 @@ class LlamaModel(LlamaModelHF):
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
         next_decoder_cache = () if use_cache else None
-
 
         for idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
@@ -668,6 +665,7 @@ class LlamaModel(LlamaModelHF):
                 layer_outputs = checkpoint_method(
                     create_custom_forward(decoder_layer),
                     hidden_states,
+                    position_embeddings,
                     attention_mask,
                     position_ids,
                     None,
@@ -680,6 +678,7 @@ class LlamaModel(LlamaModelHF):
                     past_key_value=past_key_value,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
+                    position_embeddings=position_embeddings,
                 )
 
             hidden_states = layer_outputs[0]
@@ -743,6 +742,8 @@ class LlamaForCausalLM(LlamaForCausalLMHF):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        num_logits_to_keep: int = 0,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
         Args:
@@ -787,6 +788,7 @@ class LlamaForCausalLM(LlamaForCausalLMHF):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            cache_position=cache_position,
         )
 
         hidden_states = outputs[0]
@@ -798,7 +800,6 @@ class LlamaForCausalLM(LlamaForCausalLMHF):
             logits = self.lm_head(hidden_states)
             if self.config.sequence_parallel_enabled:
                 logits = logits.transpose(0, 1).contiguous()
-
 
         if os.environ.get("XLA_DOWNCAST_BF16", None) == "1":
             logits = logits.double()
@@ -837,6 +838,32 @@ class LlamaForCausalLM(LlamaForCausalLMHF):
             attentions=outputs.attentions,
         )
 
+class LlamaRotaryEmbedding(LlamaRotaryEmbeddingHF):
+    """
+    Wrapper for HF Llama Rotary Embedding.
+    The forward function is overriden to use `double()` instead of `float()` for numerical precision,
+    because NxD is using downcast. See https://github.com/huggingface/transformers/pull/29285.
+    """
+    @torch.no_grad()
+    def forward(self, x, position_ids):
+        if "dynamic" in self.rope_type:
+            self._dynamic_frequency_update(position_ids, device=x.device)
+        # Core RoPE block
+        inv_freq_expanded = self.inv_freq[None, :, None].double().expand(position_ids.shape[0], -1, 1)
+        position_ids_expanded = position_ids[:, None, :].double()
+        device_type = x.device.type
+        device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):
+            freqs = (inv_freq_expanded.double() @ position_ids_expanded.double()).transpose(1, 2)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos()
+            sin = emb.sin()
+        # Advanced RoPE types (e.g. yarn) apply a post-processing scaling factor, equivalent to scaling attention
+        cos = cos * self.attention_scaling
+        sin = sin * self.attention_scaling
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
+
 def init_weights(module, device):
     """
     Re-init weights after partition
@@ -844,9 +871,7 @@ def init_weights(module, device):
     """
     for key, nested_module in module._modules.items():
         if isinstance(nested_module, LlamaRotaryEmbedding):
-            module._modules[key] = LlamaRotaryEmbedding(
-                nested_module.dim, nested_module.max_position_embeddings, nested_module.base, device
-                )
+            module._modules[key] = LlamaRotaryEmbedding(nested_module.config)
     if isinstance(module, LlamaRMSNorm):
         module.weight.data.fill_(1.0)
     elif isinstance(module, (ParallelEmbedding, RowParallelLinear, ColumnParallelLinear)):

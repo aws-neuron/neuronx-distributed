@@ -1,7 +1,9 @@
 import dataclasses
 from typing import List
 import torch
+from neuronxcc.nki._private_kernels.blockwise_mm import BlockShardStrategy, SkipMode
 
+from neuronx_distributed.utils.model_utils import get_platform_lnc, LogicalNCConfig
 # Imports from MoE unit tests (for this import to succeed, test/unit_test/modules/moe must be added to PYTHONPATH)
 from utils_testing import ExptCfg, get_random_activations
 
@@ -32,6 +34,21 @@ TEST_MODEL_CONFIGS = {
         "intermediate_size": 10752,
         "num_experts": 16,
         "top_k": 4,
+    },
+    # not full name due to ip scanner requirement 
+    "llama4-m": {
+        "hidden_size": 5120,
+        "intermediate_size": 8192,
+        "num_experts": 128,
+        "top_k": 1,
+        "num_shared_experts": 1
+    },
+    "llama4-s": {
+        "hidden_size": 5120,
+        "intermediate_size": 8192,
+        "num_experts": 16,
+        "top_k": 1,
+        "num_shared_experts": 1
     }
 }
 
@@ -218,6 +235,15 @@ def get_device_correctness_test_configs(dtype) -> List[ExptCfg]:
                 **get_model_config("dbrx", scale_down_factor=4),
                 **test_cfg
             ),
+            #shared_experts
+            ExptCfg(
+                seq_len=128,
+                batch_size=1,
+                capacity_factor=None,
+                num_shared_experts=1,
+                **get_model_config("mixtral", scale_down_factor=1),
+                **test_cfg
+            ),
         ]
     )
 
@@ -295,6 +321,100 @@ def get_device_correctness_parallel_test_configs(dtype, test_mode, tp_degree, ep
         ]
     )
 
+    if get_platform_lnc() == LogicalNCConfig.LNC_2:
+        test_configs.extend(
+            [
+                # non block parallel basic
+                ExptCfgParallel(
+                    seq_len=512,
+                    batch_size=1,
+                    capacity_factor=None,
+                    block_size=128,
+                    use_expert_mlps_v2=True,
+                    block_sharding_strategy=BlockShardStrategy.PING_PONG,
+                    **get_model_config("sbase-large", scale_down_factor=4),
+                    **test_cfg
+                ),
+                ExptCfgParallel(
+                    seq_len=256,
+                    batch_size=1,
+                    capacity_factor=None,
+                    block_size=128,
+                    block_sharding_strategy=BlockShardStrategy.HI_LO,
+                    **get_model_config("sbase-large", scale_down_factor=4),
+                    **test_cfg
+                ),
+                # block parallel with different block size
+                ExptCfgParallel(
+                    seq_len=512,
+                    batch_size=1,
+                    capacity_factor=None,
+                    block_size=512,
+                    use_block_parallel=True,
+                    use_expert_mlps_v2=True,
+                    block_sharding_strategy=BlockShardStrategy.PING_PONG,
+                    **get_model_config("sbase-large", scale_down_factor=2),
+                    **test_cfg
+                ),
+                ExptCfgParallel(
+                    seq_len=512,
+                    batch_size=1,
+                    capacity_factor=None,
+                    block_size=512,
+                    use_block_parallel=True,
+                    use_expert_mlps_v2=True,
+                    block_sharding_strategy=BlockShardStrategy.HI_LO,
+                    **get_model_config("sbase-large", scale_down_factor=2),
+                    **test_cfg
+                ),
+                # block size 256
+                ExptCfgParallel(
+                    seq_len=512,
+                    batch_size=1,
+                    capacity_factor=None,
+                    block_size=256,
+                    use_block_parallel=True,
+                    use_expert_mlps_v2=True,
+                    block_sharding_strategy=BlockShardStrategy.PING_PONG,
+                    **get_model_config("sbase-large", scale_down_factor=2),
+                    **test_cfg
+                ),
+                ExptCfgParallel(
+                    seq_len=512,
+                    batch_size=1,
+                    capacity_factor=None,
+                    block_size=256,
+                    use_block_parallel=True,
+                    use_expert_mlps_v2=True,
+                    block_sharding_strategy=BlockShardStrategy.HI_LO,
+                    **get_model_config("sbase-large", scale_down_factor=2),
+                    **test_cfg
+                ),
+                # block_size 128 failed with sequence parallel on bf16 trn2
+                ExptCfgParallel(
+                    seq_len=512,
+                    batch_size=1,
+                    capacity_factor=None,
+                    block_size=128,
+                    use_block_parallel=True,
+                    use_expert_mlps_v2=True,
+                    block_sharding_strategy=BlockShardStrategy.HI_LO,
+                    **get_model_config("sbase-large", scale_down_factor=2),
+                    **test_cfg
+                ),
+                ExptCfgParallel(
+                    seq_len=512,
+                    batch_size=1,
+                    capacity_factor=None,
+                    block_size=128,
+                    use_torch_block_wise=True,
+                    use_expert_mlps_v2=True,
+                    **get_model_config("sbase-large", scale_down_factor=2),
+                    **test_cfg
+                ),
+            ]
+        )
+
     # TopK test cases
     test_cfg = {
         "dtype": dtype,
@@ -330,7 +450,7 @@ def get_device_correctness_parallel_test_configs(dtype, test_mode, tp_degree, ep
     test_cfg["test_mode"] = "inference"
     test_configs.extend(
         [
-            # Context-encoding
+            #Context-encoding
             ExptCfgParallel(
                 seq_len=256,
                 batch_size=1,
@@ -342,9 +462,134 @@ def get_device_correctness_parallel_test_configs(dtype, test_mode, tp_degree, ep
                 seq_len=256,
                 batch_size=1,
                 capacity_factor=None,
+                use_expert_mlps_v2=True,
                 **get_model_config("dbrx", scale_down_factor=2),
                 **test_cfg
             ),
+            ExptCfgParallel(
+                seq_len=512,
+                batch_size=1,
+                capacity_factor=None,
+                use_expert_mlps_v2=True,
+                skip_dma=SkipMode(True, True),
+                **get_model_config("mixtral", scale_down_factor=1),
+                **test_cfg
+            ),
+            ExptCfgParallel(
+                seq_len=512,
+                batch_size=1,
+                capacity_factor=None,
+                use_expert_mlps_v2=True,
+                skip_dma=SkipMode(True, False),
+                **get_model_config("mixtral", scale_down_factor=1),
+                **test_cfg
+            ),
+            ExptCfgParallel(
+                seq_len=512,
+                batch_size=1,
+                capacity_factor=None,
+                use_expert_mlps_v2=True,
+                skip_dma=SkipMode(True, False),
+                **get_model_config("mixtral", scale_down_factor=1),
+                **test_cfg
+            ),
+            ExptCfgParallel(
+                seq_len=512,
+                batch_size=1,
+                capacity_factor=None,
+                use_expert_mlps_v2=True,
+                skip_dma=SkipMode(False, True),
+                always_augment_inputs_for_blockwise_matmul=True,
+                **get_model_config("mixtral", scale_down_factor=1),
+                **test_cfg
+            ),
+            ExptCfgParallel(
+                seq_len=512,
+                batch_size=1,
+                capacity_factor=None,
+                use_expert_mlps_v2=True,
+                skip_dma=SkipMode(True, True),
+                always_augment_inputs_for_blockwise_matmul=True,
+                **get_model_config("mixtral", scale_down_factor=1),
+                **test_cfg
+            ),
+            ExptCfgParallel(
+                seq_len=256,
+                batch_size=1,
+                capacity_factor=None,
+                # using torch blockwise matmul
+                use_torch_block_wise=True,
+                # Testing without parallelizing token to block mapping
+                parallelize_token_to_block_mapping=False,
+                **get_model_config("mixtral", scale_down_factor=1),
+                **test_cfg
+            ),
+            ExptCfgParallel(
+                seq_len=256,
+                batch_size=1,
+                capacity_factor=None,
+                use_torch_block_wise=True,
+                parallelize_token_to_block_mapping=False,
+                **get_model_config("dbrx", scale_down_factor=2),
+                **test_cfg
+            ),
+            ExptCfgParallel(
+                seq_len=256,
+                batch_size=1,
+                capacity_factor=None,
+                parallelize_token_to_block_mapping=False,
+                **get_model_config("mixtral", scale_down_factor=1),
+                **test_cfg
+            ),
+            ExptCfgParallel(
+                seq_len=256,
+                batch_size=1,
+                capacity_factor=None,
+                parallelize_token_to_block_mapping=False,
+                **get_model_config("dbrx", scale_down_factor=2),
+                **test_cfg
+            ),
+            # test early_expert_affinity_modulation
+            # fix: this is failing on Mismatched elements: 2082 / 16384 (12.7%) with kernel, but pass with torch blockwise
+            ExptCfgParallel(
+                seq_len=256,
+                batch_size=1,
+                capacity_factor=None,
+                parallelize_token_to_block_mapping=False,
+                early_expert_affinity_modulation=True,
+                **get_model_config("mixtral", scale_down_factor=1),
+                **test_cfg
+            ),
+            ExptCfgParallel(
+                seq_len=256,
+                batch_size=1,
+                capacity_factor=None,
+                parallelize_token_to_block_mapping=False,
+                early_expert_affinity_modulation=True,
+                **get_model_config("dbrx", scale_down_factor=2),
+                **test_cfg
+            ),
+            ExptCfgParallel(
+                seq_len=256,
+                batch_size=1,
+                capacity_factor=None,
+                parallelize_token_to_block_mapping=False,
+                early_expert_affinity_modulation=True,
+                use_torch_block_wise=True,
+                **get_model_config("mixtral", scale_down_factor=1),
+                **test_cfg
+            ),
+            ExptCfgParallel(
+                seq_len=256,
+                batch_size=1,
+                capacity_factor=None,
+                parallelize_token_to_block_mapping=False,
+                early_expert_affinity_modulation=True,
+                use_torch_block_wise=True,
+                **get_model_config("dbrx", scale_down_factor=2),
+                **test_cfg
+            ),
+
             # Token-generation
             ExptCfgParallel(
                 seq_len=1,
@@ -358,6 +603,64 @@ def get_device_correctness_parallel_test_configs(dtype, test_mode, tp_degree, ep
                 batch_size=4,
                 capacity_factor=None,
                 **get_model_config("dbrx", scale_down_factor=2),
+                **test_cfg
+            ),
+            ExptCfgParallel(
+                seq_len=1,
+                batch_size=1,
+                capacity_factor=None,
+                early_expert_affinity_modulation=True,
+                **get_model_config("mixtral", scale_down_factor=1),
+                **test_cfg
+            ),
+            # fix: this is failing on Mismatched elements: 2 / 12288 (0.0%)
+            ExptCfgParallel(
+                seq_len=1,
+                batch_size=4,
+                capacity_factor=None,
+                early_expert_affinity_modulation=True,
+                **get_model_config("dbrx", scale_down_factor=2),
+                **test_cfg
+            ),
+
+            ExptCfgParallel(
+                seq_len=128,
+                batch_size=1,
+                capacity_factor=None,
+                num_shared_experts=1,
+                **get_model_config("mixtral", scale_down_factor=1),
+                **test_cfg
+            ),
+            ExptCfgParallel(
+                seq_len=128,
+                batch_size=1,
+                capacity_factor=None,
+                fused_gate_up_shared_expert=True,
+                **get_model_config("llama4-m", scale_down_factor=1),
+                **test_cfg
+            ),
+            ExptCfgParallel(
+                seq_len=512,
+                batch_size=1,
+                capacity_factor=None,
+                fused_gate_up_shared_expert=True,
+                **get_model_config("llama4-m", scale_down_factor=1),
+                **test_cfg
+            ),
+            ExptCfgParallel(
+                seq_len=128,
+                batch_size=1,
+                capacity_factor=None,
+                fused_gate_up_shared_expert=True,
+                **get_model_config("llama4-s", scale_down_factor=1),
+                **test_cfg
+            ),
+            ExptCfgParallel(
+                seq_len=512,
+                batch_size=1,
+                capacity_factor=None,
+                fused_gate_up_shared_expert=True,
+                **get_model_config("llama4-s", scale_down_factor=1),
                 **test_cfg
             ),
         ]

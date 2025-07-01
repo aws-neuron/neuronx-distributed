@@ -4,6 +4,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch_xla.core.xla_model as xm
+import torch_xla.runtime as xr
 from modeling_llama_nxd import LlamaForCausalLM
 from training_utils import Throughput, get_sin_cos_matrix
 from transformers import GenerationConfig
@@ -37,14 +38,6 @@ class NeuronLlamaLTModule(NeuronLTModule):
                 model = deferred_init.deferred_init(LlamaForCausalLM, model_config)
             else:
                 model = LlamaForCausalLM(model_config)
-            # Here we make sure we use the same sine and cosine matrices for all layers.
-            # Making use of same tensors would make the CSE algorithm eliminate the lookup call
-            # from layers, keeping only lookup from first layer.
-            with torch.no_grad():
-                cos, sin = get_sin_cos_matrix(model_config)
-                for layer in model.model.layers:
-                    layer.self_attn.rotary_emb.cos_cached = cos
-                    layer.self_attn.rotary_emb.sin_cached = sin
             num_params = sum([np.prod(p.size()) for p in model.parameters()])
             if dist.get_rank() == 0:
                 print(f"# total parameters: {num_params}")
@@ -193,7 +186,7 @@ class NeuronLlamaLTModule(NeuronLTModule):
         ):
             if self.should_print:
                 print(
-                    f"step {self.global_step} loss is {self.loss.detach().cpu().item()}, lr is {self.lr}, throughput {self.tps} seq/s,  input_ids {torch.sum(self.input_ids.detach().cpu()).item()}, norm {self.global_norm}, global rank {xm.get_ordinal()}"
+                    f"step {self.global_step} loss is {self.loss.detach().cpu().item()}, lr is {self.lr}, throughput {self.tps} seq/s,  input_ids {torch.sum(self.input_ids.detach().cpu()).item()}, norm {self.global_norm}, global rank {xr.global_ordinal()}"
                 )
 
         # # Logging, need to revisit when automatic_optimization enabled

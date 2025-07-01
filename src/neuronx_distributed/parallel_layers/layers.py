@@ -21,6 +21,7 @@ from .mappings import (
     gather_from_tensor_model_parallel_region_with_dim,
     reduce_from_tensor_model_parallel_region,
     reduce_scatter_to_sequence_parallel_region,
+    reduce_scatter_to_sequence_parallel_region_tiled,
     scatter_input_channels_to_tensor_model_parallel_region,
     scatter_to_tensor_model_parallel_region,
 )
@@ -162,6 +163,8 @@ class ParallelEmbedding(torch.nn.Module):
         init_method: method to initialize weights.
         shard_along_embedding: set true to parallelize across embedding dimension (default False)
         pad: set true to pad weights such that its divisible by tensor parallel degree
+        rank_ordering: indicates how sharded weights are mapped, the i'th element 
+            in the list corresponds to the original rank which is mapped to rank_ordering[i]
     """
 
     def __init__(
@@ -182,6 +185,8 @@ class ParallelEmbedding(torch.nn.Module):
         tensor_model_parallel_group: Optional[ProcessGroup] = None,
         use_spmd_rank: bool = False,
         sequence_dimension: Optional[int] = None,
+        tile_cc: bool = False,
+        rank_ordering: Optional[list] = None,
     ):
         super().__init__()
         # Keep the input dimensions.
@@ -199,10 +204,11 @@ class ParallelEmbedding(torch.nn.Module):
         self.pad = pad
         self.sequence_parallel_enabled = sequence_parallel_enabled
         self.sequence_dim = sequence_dimension
-
+        self.tile_cc = tile_cc
         self.rank_util: Optional[SPMDRank] = None
         if use_spmd_rank:
             self.rank_util = SPMDRank(self.tensor_model_parallel_size)
+        self.rank_ordering = rank_ordering
 
         if shard_across_embedding:
             # Divide the weight matrix along the embedding dimension.
@@ -260,6 +266,7 @@ class ParallelEmbedding(torch.nn.Module):
                     dim=self.weight_partition_dim,
                     stride=1,
                     num_partitions=self.tensor_model_parallel_size,
+                    rank_ordering=self.rank_ordering
                 )
         else:
             assert device.type == "xla", "Currently only xla device type is supported"
@@ -525,6 +532,8 @@ class ColumnParallelLinear(BaseParallelLinear):
                        which is Y_i = XA_i
         dtype: dtype of the weights
         device: Device on which the weights should be initialized.
+        rank_ordering: indicates how sharded weights are mapped, the i'th element 
+            in the list corresponds to the original rank which is mapped to rank_ordering[i]
     """
 
     def __init__(
@@ -544,6 +553,7 @@ class ColumnParallelLinear(BaseParallelLinear):
         pad: bool = False,
         tensor_model_parallel_group: Optional[ProcessGroup] = None,
         reduce_dtype: torch.dtype = torch.float32,
+        rank_ordering: Optional[list] = None,
     ):
         super().__init__()
 
@@ -553,6 +563,7 @@ class ColumnParallelLinear(BaseParallelLinear):
         self.add_bias = bias
         self.gather_output = gather_output
         self.arg_init_method = init_method
+        self.rank_ordering = rank_ordering
 
         self.tensor_parallel_group = tensor_model_parallel_group if \
             tensor_model_parallel_group is not None else cast(ProcessGroup, get_tensor_model_parallel_group())
@@ -592,7 +603,7 @@ class ColumnParallelLinear(BaseParallelLinear):
             raise RuntimeError(
                 "`async_tensor_model_parallel_allreduce` and `sequence_parallel_enabled` cannot be enabled at the same time."
             )
-        self.reduce_dtype = reduce_dtype
+        self.reduce_dtype = reduce_dtype if reduce_dtype is not None else dtype
         self._forward_impl = linear_with_async_allreduce
 
     def set_weight_and_bias_config(self) -> None:
@@ -623,6 +634,7 @@ class ColumnParallelLinear(BaseParallelLinear):
             set_tensor_model_parallel_attributes(
                 tensor=self.weight, is_parallel=True, dim=self.weight_partition_dim,
                 stride=self.stride, num_partitions=self.tensor_parallel_group.size(),
+                rank_ordering=self.rank_ordering,
             )
         else:
             _initialize_affine_weight_neuron(
@@ -642,6 +654,7 @@ class ColumnParallelLinear(BaseParallelLinear):
             if not self.gather_output:
                 set_tensor_model_parallel_attributes(
                     self.bias, True, 0, stride=self.stride, num_partitions=self.tensor_parallel_group.size(),
+                    rank_ordering=self.rank_ordering,
                 )
         else:
             self.register_parameter("bias", None)
@@ -757,6 +770,8 @@ class RowParallelLinear(BaseParallelLinear):
                            again.
         dtype: dtype of the weights
         device: Device on which the weights should be initialized.
+        rank_ordering: indicates how sharded weights are mapped, the i'th element 
+            in the list corresponds to the original rank which is mapped to rank_ordering[i]
     """
 
     def __init__(
@@ -777,6 +792,8 @@ class RowParallelLinear(BaseParallelLinear):
         reduce_output: bool = True,
         tensor_model_parallel_group: Optional[ProcessGroup] = None,
         reduce_dtype: torch.dtype = torch.float32,
+        tile_cc: bool = False,
+        rank_ordering: Optional[list] = None,
     ):
         super().__init__()
 
@@ -789,7 +806,9 @@ class RowParallelLinear(BaseParallelLinear):
         self.reduce_output = reduce_output
         self.tensor_parallel_group = tensor_model_parallel_group if \
             tensor_model_parallel_group is not None else cast(ProcessGroup, get_tensor_model_parallel_group())
-        self.reduce_dtype = reduce_dtype
+        self.reduce_dtype = reduce_dtype if reduce_dtype is not None else dtype
+        self.tile_cc = tile_cc
+        self.rank_ordering = rank_ordering
 
         world_size = self.tensor_parallel_group.size()
         if self.pad:
@@ -816,7 +835,6 @@ class RowParallelLinear(BaseParallelLinear):
         self.skip_bias_add = skip_bias_add
         self.bias_shape: Optional[Tuple[int]]
         self.initialize_weight_and_bias()
-        self.reduce_dtype = reduce_dtype
         self._forward_impl = linear_with_async_allreduce
 
     def set_weight_and_bias_config(self) -> None:
@@ -845,6 +863,7 @@ class RowParallelLinear(BaseParallelLinear):
             set_tensor_model_parallel_attributes(
                 tensor=self.weight, is_parallel=True, dim=self.weight_partition_dim,
                 stride=self.stride, num_partitions=self.tensor_parallel_group.size(),
+                rank_ordering=self.rank_ordering,
             )
         else:
             _initialize_affine_weight_neuron(
@@ -936,9 +955,15 @@ class RowParallelLinear(BaseParallelLinear):
             output_ = output_.to(self.reduce_dtype)
 
             if self.sequence_parallel_enabled:
-                output_ = reduce_scatter_to_sequence_parallel_region(
-                    output_, self.sequence_dimension, process_group=self.tensor_parallel_group, dtype=original_dtype,
-                )
+                if self.tile_cc:
+                    output_ = reduce_scatter_to_sequence_parallel_region_tiled(
+                        output_, self.sequence_dimension, process_group=self.tensor_parallel_group,
+                    )
+                else:
+                    output_ = reduce_scatter_to_sequence_parallel_region(
+                        output_, self.sequence_dimension, process_group=self.tensor_parallel_group, dtype=original_dtype,
+                    )
+
             else:
                 output_ = reduce_from_tensor_model_parallel_region(
                     output_, process_group=self.tensor_parallel_group,
@@ -1454,9 +1479,10 @@ class SPMDRank(torch.nn.Module):
         >>> self.spmd_rank = SPMDRank(world_rank)
         >>> ckpt['spmd_rank.rank'] = torch.arange(0, world_size, dtype=torch.int32)
     """
-    def __init__(self, world_size: int):
+    def __init__(self, world_size: int, tensor_model_parallel_size: Optional[int] = None):
         super().__init__()
         self.world_size = world_size
+        self.tensor_model_parallel_size = tensor_model_parallel_size if tensor_model_parallel_size is not None else get_tensor_model_parallel_size()
         self.rank = torch.nn.Parameter(torch.zeros(1, dtype=torch.int32), requires_grad=False)
         set_tensor_model_parallel_attributes(
             self.rank,
@@ -1468,3 +1494,31 @@ class SPMDRank(torch.nn.Module):
 
     def get_rank(self) -> torch.Tensor:
         return self.rank
+    
+    def initialize_expert_indices(self, num_local_experts) -> torch.Tensor:
+        """Initialize parameter tensor for tracking local expert indices.
+
+        Args:
+            num_local_experts (int): Number of experts on local device.
+
+        Returns:
+            torch.Tensor: Parameter tensor for local expert indices.
+        """
+
+        self.local_expert_indices = torch.nn.Parameter(torch.zeros((1, num_local_experts), dtype=torch.int32), requires_grad=False)
+        set_tensor_model_parallel_attributes(
+            self.local_expert_indices,
+            is_parallel=True,
+            dim=0,
+            stride=1,
+            num_partitions=self.world_size,
+        )
+
+    def get_local_expert_indices(self) -> torch.Tensor:
+        """Get Parameter tensor containing local expert indices.
+
+        Returns:
+            torch.Tensor: Local expert indices tensor.
+        """
+
+        return self.local_expert_indices

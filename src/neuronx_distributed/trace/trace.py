@@ -8,7 +8,7 @@ import shutil
 from collections import defaultdict
 from typing import Any, Callable, List, Optional, Union, Tuple, cast
 from unittest.mock import MagicMock
-
+import warnings
 
 import torch
 import torch_neuronx
@@ -637,6 +637,7 @@ def preprocess_checkpoint(model, checkpoint):
 
     # Remove redundant keys in checkpoints that don't exist in model's state_dict
     keys_to_delete = [key for key in checkpoint.keys() if key not in model.state_dict()]
+    warnings.warn(f"Removing redundant keys from checkpoint: {keys_to_delete}")
     for key in keys_to_delete:
         checkpoint.pop(key, None)
 
@@ -742,15 +743,25 @@ def shard_children(module, checkpoint, prefix, dtype, rank, tp_degree):
         # If a few cases, the module parameter name might not appear exactly in the state dict
         # This is true especially for pytorch quantized models. In that case add the attribute,
         # get_tensor_from_state_dict, for that parameter
+        #TODO: Get tensor from state dict should be now part of each class to make shard_children not have single-point-responsibilty
+        #TODO: See how torch handles _load_from_state_dict
         if hasattr(module_parameter, "get_tensor_from_state_dict"):
             tensor = module_parameter.get_tensor_from_state_dict(prefix, checkpoint)
+        elif hasattr(module_parameter, "expert_model_parallel"):
+            ep_rank = parallel_state.get_expert_parallel_rank_from_global_rank(rank=rank, expert_parallel_group=parallel_state.get_expert_model_parallel_group())
+            local_expert_indices = parallel_state.get_experts_for_expert_parallel_rank(
+                expert_parallel_rank=ep_rank,
+                total_number_of_experts=checkpoint[parameter_name].shape[0],
+                expert_model_parallel_size=parallel_state.get_expert_model_parallel_size()
+                )
+            tensor = checkpoint[parameter_name][local_expert_indices, : , :]
         else:
             if parameter_name not in checkpoint:
-                return
-            if dtype and checkpoint[parameter_name].dtype != dtype \
-                and torch.is_floating_point(checkpoint[parameter_name]):  # only cast float types
-                    checkpoint[parameter_name] = checkpoint[parameter_name].to(dtype)
+                continue
             tensor = checkpoint[parameter_name]
+        
+        if hasattr(module_parameter, "rank_ordering") and module_parameter.rank_ordering is not None:
+            rank = module_parameter.rank_ordering[rank]
 
         if hasattr(module_parameter, "tensor_model_parallel") and module_parameter.tensor_model_parallel:
             partition_dim = module_parameter.partition_dim
@@ -772,3 +783,6 @@ def shard_children(module, checkpoint, prefix, dtype, rank, tp_degree):
                 )
         else:
             checkpoint[parameter_name] = tensor
+    
+        if checkpoint[parameter_name].shape != module_parameter.shape:
+            raise RuntimeError(f"expected shape {module_parameter.shape} for {parameter_name} but found {checkpoint[parameter_name].shape}")

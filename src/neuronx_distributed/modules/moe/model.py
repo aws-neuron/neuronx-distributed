@@ -4,6 +4,7 @@ import torch
 from torch.distributed import ProcessGroup
 
 from neuronx_distributed.modules.moe import expert_mlps, routing, token_shuffling
+from neuronx_distributed.modules.moe.shared_experts import SharedExperts
 from neuronx_distributed.parallel_layers import mappings, parallel_state
 
 
@@ -48,10 +49,21 @@ class MoE(torch.nn.Module):
             output_layer_init_method=init_method,
         )
 
+         # Initialize shared experts
+        shared_experts = SharedExperts(
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_shared_experts=num_shared_experts,
+            hidden_act=hidden_act,
+            dtype=dtype,
+            reduce_dtype=reduce_dtype
+        )
+
         # Initial moe_layer
         moe_layer = MoE(
             router=router,
             expert_mlps=expert_mlps,
+            shared_experts=shared_experts,
             return_router_logits=True,  # Required downstream for the load balancing loss function
             sequence_parallel_enabled=sequence_parallel_enabled,
         )
@@ -73,7 +85,8 @@ class MoE(torch.nn.Module):
     def __init__(
         self,
         router: routing.RouterBase,
-        expert_mlps: expert_mlps.ExpertMLPs,
+        expert_mlps: expert_mlps.ExpertMLPsV2,
+        shared_experts: Optional[SharedExperts] = None,
         sequence_parallel_enabled: bool = False,
         sequence_dimension: Optional[int] = None,
         return_router_logits: bool = False,
@@ -84,7 +97,7 @@ class MoE(torch.nn.Module):
         super().__init__()
 
         for attr in ["num_experts", "top_k", "hidden_size"]:
-            if getattr(router, attr) != getattr(expert_mlps, attr):
+            if getattr(router, attr) != getattr(expert_mlps.routed_experts_mlp_config, attr):
                 raise ValueError("Inconsistent {attr} across the router and expert_mlps")
 
         if router.sequence_parallel_enabled:
@@ -95,6 +108,7 @@ class MoE(torch.nn.Module):
 
         self.router = router
         self.expert_mlps = expert_mlps
+        self.shared_experts = shared_experts
 
         self.sequence_parallel_enabled = sequence_parallel_enabled
         if sequence_dimension is None:
@@ -176,6 +190,11 @@ class MoE(torch.nn.Module):
             # All-Reduce expert_affinities gradients in backward pass, to account for delayed output All-Reduce
             expert_affinities = mappings.copy_to_tensor_model_parallel_region(expert_affinities)
 
+        shared_output = torch.zeros_like(full_hidden_states)
+        if self.shared_experts:
+            assert not self.training, 'Shared + Routed experts are not yet supported in MoE module for training'
+            shared_output = self.shared_experts(full_hidden_states)
+
         # full_hidden_states: (S, B, H) or (B, S, H) -> (T, H)
         full_hidden_states = full_hidden_states.reshape(-1, full_hidden_states_shape[-1])
 
@@ -189,6 +208,7 @@ class MoE(torch.nn.Module):
 
         # output: (T, H) -> (S, B, H) or (B, S, H)
         output = output.view(full_hidden_states_shape)
+        output = output + shared_output
 
         if self.sequence_parallel_enabled and self.ep_enabled:
             # Reduction is done earlier in the case of EP

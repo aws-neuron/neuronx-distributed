@@ -1,5 +1,6 @@
 import torch
 from neuronx_distributed.kernels.kernel_utils import get_seed, move_seed, permute, cast
+from neuronxcc.nki.kernels.attention import FlashConfig
 
 # FIXME: not capturing runtimeerror
 def _ring_attn_placeholder(*args, **kwargs):
@@ -9,13 +10,11 @@ def _ring_attn_placeholder(*args, **kwargs):
         "python3 -m pip install --extra-index-url=https://pip.repos.neuron.amazonaws.com neuronx-cc torch_neuronx"
     )
 
-
 try:
     from neuronxcc.nki._pre_prod_kernels.ring_attention import (
         ring_attention_bwd,
         ring_attention_fwd,
     )
-    from neuronxcc.nki.kernels.attention import FlashConfig
 
     _ring_fwd_nki_call = ring_attention_fwd
     _ring_bwd_nki_call = ring_attention_bwd

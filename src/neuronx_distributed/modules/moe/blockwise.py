@@ -1,27 +1,102 @@
+import warnings
 import torch
 import torch_xla.core.xla_model as xm
 import torch.nn.functional as F
+
+from neuronx_distributed.modules.moe.model_utils import DEFAULT_PADDING_VALUE
+from neuronx_distributed.modules.moe.moe_configs import BlockwiseMatmulConfig
 from neuronx_distributed.parallel_layers import mappings
 from neuronxcc.nki.compiler.backends.neuron.dimensions import VNC
+from neuronx_distributed.utils.model_utils import LogicalNCConfig
+from torch_neuronx.xla_impl.ops import nki_jit
+from torch_neuronx.xla_impl.base import xla_call
 
-try:
-    from neuronxcc.nki._private_kernels.blockwise_mm import (
-        blockwise_mm as blockwise_mm_nki,
-        blockwise_mm_baseline as blockwise_mm_training_nki,
-        check_blockwise_mm_kernel_compatibility,
-    )
-    from neuronxcc.nki._private_kernels.blockwise_mm_bwd import blockwise_mm_bwd as blockwise_mm_bwd_nki
-    from torch_neuronx.xla_impl.ops import nki_jit
-    from torch_neuronx.xla_impl.base import xla_call
+from dataclasses import dataclass
+from typing import Any, Optional, Tuple
+import importlib
 
-    _blockwise_mm_nki_call = nki_jit()(blockwise_mm_nki)
-    _blockwise_mm_training_nki_call = nki_jit()(blockwise_mm_training_nki)
-    _blockwise_mm_nki_bwd_call = nki_jit()(blockwise_mm_bwd_nki)
-except ImportError as e:
-    import_error_msg = str(e)
-    _blockwise_mm_nki_call = None
-    _blockwise_mm_nki_bwd_call = None
+@dataclass
+class NKIImport:
+    """Configuration for NKI imports."""
+    name: str
+    is_nki_jit: bool = True
+    module_name: str = "blockwise_mm"
 
+def import_nki(import_config: NKIImport) -> Tuple[Optional[Any], Optional[str]]:
+    """
+    Import NKI module with default and fallback paths.
+    Args:
+        import_config: NKIImport configuration dataclass
+
+    Returns:
+        tuple: (imported_module, error_message)
+            - imported_module: The imported module or None if import failed
+            - error_message: Error description if import failed, None otherwise
+    """
+    import_paths = [
+        f"neuronxcc.nki._pre_prod_kernels.{import_config.module_name}",
+        f"neuronxcc.nki._private_kernels.{import_config.module_name}"
+    ]
+    last_error = None
+    for path in import_paths:
+        try:
+            module = importlib.import_module(path)
+            attr = getattr(module, import_config.name)
+            if import_config.is_nki_jit:
+                return nki_jit()(attr), None
+            return attr, None
+        except ImportError as e:
+            last_error = str(e)
+            continue
+        except AttributeError as e:
+            last_error = f"Attribute {import_config.name} not found in {path}: {str(e)}"
+            continue
+
+    return None, f"Failed to import {import_config.name}: {last_error}"
+
+
+def initialize_nki_components() -> dict:
+    """
+    Initialize all NKI components.
+
+    Returns:
+        dict: Mapping of component names to their imported values
+    """
+    imports = {
+        "blockwise_mm": NKIImport("blockwise_mm"),
+        "blockwise_mm_baseline_shard_hidden": NKIImport("blockwise_mm_baseline_shard_hidden"),
+        "blockwise_mm_baseline_block_parallel": NKIImport("blockwise_mm_baseline_block_parallel", module_name="blockwise_matmul"),
+        "blockwise_mm_bwd": NKIImport("blockwise_mm_bwd", module_name="blockwise_mm_bwd"),
+        "blockwise_mm_baseline": NKIImport("blockwise_mm_baseline"),
+        "check_compatibility": NKIImport("check_blockwise_mm_kernel_compatibility", is_nki_jit=False),
+        "block_shard_strategy": NKIImport("BlockShardStrategy", is_nki_jit=False),
+        "affinity_scale_mode": NKIImport("ExpertAffinityScaleMode", is_nki_jit=False),
+        "skip_mode": NKIImport("SkipMode", is_nki_jit=False),
+    }
+
+    components = {}
+    for name, config in imports.items():
+        component, error = import_nki(config)
+        if error:
+            warnings.warn(f"Warning: {error}")
+        components[name] = component
+
+    return components
+
+
+# Initialize all components
+nki_components = initialize_nki_components()
+
+# Assign to module-level variables
+_blockwise_mm_nki_call = nki_components["blockwise_mm"]
+_blockwise_mm_baseline_shard_hidden_nki_call = nki_components["blockwise_mm_baseline_shard_hidden"]
+_blockwise_mm_baseline_block_parallel_nki_call = nki_components["blockwise_mm_baseline_block_parallel"]
+_blockwise_mm_nki_bwd_call = nki_components["blockwise_mm_bwd"]
+_blockwise_mm_training_nki_call = nki_components["blockwise_mm_baseline"]
+check_blockwise_mm_kernel_compatibility = nki_components["check_compatibility"]
+BlockShardStrategy = nki_components["block_shard_strategy"]
+ExpertAffinityScaleMode = nki_components["affinity_scale_mode"]
+SkipMode = nki_components["skip_mode"]
 
 
 def dynamic_slice_3D(tensor, start0, start1, start2, size0, size1, size2):
@@ -400,24 +475,83 @@ class TorchBlockwiseTraining(torch.autograd.Function):
             down_weight_grad,
         )
 
+@dataclass
+class KernelConfig:
+    logical_nc_config: LogicalNCConfig
+    use_block_parallel: bool
+
+class KernelAvailabilityError(Exception):
+    pass
+
+def check_kernel_availability(config: KernelConfig) -> None:
+    """
+    Check if required NKI kernels are available based on configuration.
+
+    Args:
+        config: KernelConfig object containing logical_nc_config and use_block_parallel
+
+    Raises:
+        KernelAvailabilityError: If the required kernel is not available
+    """
+    if config.logical_nc_config == LogicalNCConfig.LNC_2:
+        if config.use_block_parallel:
+            if _blockwise_mm_baseline_block_parallel_nki_call is None:
+                raise KernelAvailabilityError("Block parallel NKI kernel not available")
+        elif _blockwise_mm_baseline_shard_hidden_nki_call is None:
+            raise KernelAvailabilityError("Shard hidden NKI kernel not available")
+    elif config.logical_nc_config == LogicalNCConfig.LNC_1:
+        if config.use_block_parallel:
+            raise KernelAvailabilityError("Block parallel mode not supported with logical_nc_config=1")
+        elif _blockwise_mm_nki_call is None:
+            raise KernelAvailabilityError("Base NKI kernel not available")
+    else:
+        raise ValueError(f"Invalid logical_nc_config: {config.logical_nc_config}")
 
 def can_use_blockwise_matmul_nki(
-    hidden_size,
-    intermediate_size_tp,
-    block_size,
-    glu_mlp,
-    device,
-):
-    if device.type == "cpu":
-        print("Cannot run blockwise NKI kernel on cpu")
-        return False
+        hidden_size: int,
+        intermediate_size_tp: int,
+        block_size: int,
+        glu_mlp: bool,
+        use_torch_block_wise: bool,
+        device: torch.device,
+        logical_nc_config: int,
+        use_block_parallel: bool = False,
+) -> bool:
+    """
+    Determine if blockwise NKI kernel can be used based on configuration.
 
-    if not glu_mlp:
-        print("Blockwise NKI kernel incompatible with glu_mlp=False")
-        return False
+    Args:
+        hidden_size: Size of the hidden layer
+        intermediate_size_tp: Intermediate size with tensor parallelism
+        block_size: Block size for matrix multiplication
+        glu_mlp: Whether GLU MLP is enabled
+        use_torch_block_wise: Whether to use torch implementation
+        device: Target device
+        logical_nc_config: LNC size (1 or 2)
+        use_block_parallel: Whether to use block parallel mode
 
-    if _blockwise_mm_nki_call is None:
-        print(f"Failed to load Blockwise NKI kernel. Error: {str(import_error_msg)}")
+    Returns:
+        bool: True if NKI kernel can be used, False otherwise
+    """
+    pre_validation_conditions = [
+        (device.type == "cpu", "Cannot run blockwise NKI kernel on CPU"),
+        (not glu_mlp, "Blockwise NKI kernel incompatible with glu_mlp=False"),
+        (use_torch_block_wise, "use_torch_block_wise set, using torch implementation"),
+    ]
+
+    for condition, warning in pre_validation_conditions:
+        if condition:
+            warnings.warn(warning)
+            return False
+
+    try:
+        kernel_config = KernelConfig(
+            logical_nc_config=LogicalNCConfig(logical_nc_config),
+            use_block_parallel=use_block_parallel
+        )
+        check_kernel_availability(kernel_config)
+    except (KernelAvailabilityError, ValueError) as e:
+        warnings.warn(f"Failed to load Blockwise NKI kernel. Error: {str(e)}")
         return False
 
     try:
@@ -427,10 +561,63 @@ def can_use_blockwise_matmul_nki(
             intermediate_size_tp=intermediate_size_tp,
         )
     except AssertionError as e:
-        print(f"Blockwise kernel not compatible with model config. Reason: {str(e)}")
+        warnings.warn(f"Blockwise kernel not compatible with model config. Reason: {str(e)}")
         return False
 
     return True
+
+
+def augment_inputs_for_padded_blockwise_matmul(
+        output: torch.Tensor,
+        hidden_states: torch.Tensor,
+        token_position_to_id: torch.Tensor,
+        expert_affinities_masked: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Pads the inputs to blockwise NKI matmul when skip_tokens or skip_dma is false. When skip_tokens is true,
+    the kernel will handle -1s in token_position_to_id, and padding of an extra row of zeros is not needed.
+
+    Args:
+        output: Tensor of shape (T, H) where T is number of tokens and H is hidden size
+        hidden_states: Tensor of shape (T, H)
+        token_position_to_id: Tensor of shape (N*B,) containing token positions
+        expert_affinities_masked: Tensor of shape (T, E) where E is number of experts
+
+    Returns:
+        Tuple of padded tensors in same order as inputs:
+        - output padded to (T+1, H)
+        - hidden_states padded to (T+1, H)
+        - token_position_to_id with -1s replaced by T
+        - expert_affinities_masked padded to (T+1, E)
+    """
+    total_tokens, hidden_size = hidden_states.shape
+    num_experts = expert_affinities_masked.shape[1]
+    device = hidden_states.device
+    dtype = hidden_states.dtype
+
+    # Create padding tensors
+    output_pad = torch.zeros(1, hidden_size, device=device, dtype=dtype)
+    hidden_pad = output_pad.clone()  # Same shape/dtype/device
+    expert_pad = torch.zeros(1, num_experts, device=device, dtype=dtype)
+
+    # Pad tensors
+    padded_output = torch.cat([output, output_pad])
+    padded_hidden_states = torch.cat([hidden_states, hidden_pad])
+    padded_expert_affinities = torch.cat([expert_affinities_masked, expert_pad])
+
+    # Update token positions
+    updated_token_positions = token_position_to_id.masked_fill(
+        token_position_to_id == DEFAULT_PADDING_VALUE,
+        total_tokens
+    )
+
+    return (
+        padded_output,
+        padded_hidden_states,
+        updated_token_positions,
+        padded_expert_affinities,
+    )
+
 
 class BlockwiseMatmulNKIFunc(torch.autograd.Function):
     @staticmethod
@@ -440,13 +627,14 @@ class BlockwiseMatmulNKIFunc(torch.autograd.Function):
         expert_affinities_masked,
         gate_up_proj_weight,
         down_proj_weight,
-        block_size,
         token_position_to_id,
         block_to_expert,
         gate_up_proj_scale,
         down_proj_scale,
         is_training,
-        logical_nc_config=1
+        blockwise_matmul_config:BlockwiseMatmulConfig,
+        multi_expert_per_token=True,
+        expert_affinities_scaling_mode=ExpertAffinityScaleMode.POST_SCALE,
     ):
         """
         Forward pass using the blockwise matmul NKI kernel.
@@ -467,8 +655,27 @@ class BlockwiseMatmulNKIFunc(torch.autograd.Function):
             block_size: int
             token_position_to_id: (N*B,)
             block_to_expert: (N,)
+
+        multi_expert_per_token: Indicates if a single token will be computed on multiple experts.
+	                            If not (top_k = 1), we pass in an argument to the kernel for optimizations.
+
+        expert_affinities_scaling_mode: Enable No, PRE or POST affinities scaling using this.
+                                        Pass in int values or type <ExpertAffinityScaleMode>
+                                        0 = ExpertAffinityScaleMode.NO_SCALE
+                                        1 = ExpertAffinityScaleMode.POST_SCALE
+                                        2 = ExpertAffinityScaleMode.PRE_SCALE
+
+
         """
-        assert _blockwise_mm_nki_call is not None
+        skip_dma = getattr(blockwise_matmul_config, 'skip_dma')
+        block_size = blockwise_matmul_config.block_size
+        logical_nc_config = blockwise_matmul_config.logical_nc_config
+        use_block_parallel = blockwise_matmul_config.use_block_parallel
+        always_augment_inputs_for_blockwise_matmul = blockwise_matmul_config.always_augment_inputs_for_blockwise_matmul
+        block_sharding_strategy = blockwise_matmul_config.block_sharding_strategy
+        if use_block_parallel:
+            assert logical_nc_config == LogicalNCConfig.LNC_2, "use_block_parallel is currently only supported for LNC=2"
+            assert not multi_expert_per_token, "use_block_parallel is currently not supported for multi_expert_per_token"
 
         total_tokens, hidden_size = hidden_states.shape
         ctx.total_tokens = total_tokens
@@ -476,29 +683,19 @@ class BlockwiseMatmulNKIFunc(torch.autograd.Function):
         ctx.intermediate_size = down_proj_weight.shape[1]
         if is_training:
             num_block = block_to_expert.shape[0]
-            gate_up_activations = torch.empty(num_block, 2, ctx.intermediate_size, block_size, dtype=gate_up_proj_weight.dtype, device=gate_up_proj_weight.device)
-            down_activations = torch.empty(num_block, block_size, hidden_size, dtype=down_proj_weight.dtype, device=down_proj_weight.device)
+            gate_up_activations = torch.empty(num_block, 2, ctx.intermediate_size, block_size,
+                                              dtype=gate_up_proj_weight.dtype, device=gate_up_proj_weight.device)
+            down_activations = torch.empty(num_block, block_size, hidden_size, dtype=down_proj_weight.dtype,
+                                           device=down_proj_weight.device)
         else:
             gate_up_activations = None
             down_activations = None
-
         # Add extra row to hidden_states and output for padding tokens (i.e. tokens which have -1 index)
-        # TODO: Change this to (T, H) once the compiler issue with NaNs in skipped DMAs is fixed
-        output = torch.zeros(total_tokens + 1, hidden_size, device=hidden_states.device, dtype=hidden_states.dtype)
-        # hidden_states: (T, H) -> (T+1, H)
-        hidden_states = torch.cat([
-            hidden_states,
-            torch.zeros(1, hidden_size, device=hidden_states.device, dtype=hidden_states.dtype)
-        ])
-        # expert_affinities_masked: (T+1, E)
-        expert_affinities_masked = torch.cat([
-            expert_affinities_masked,
-            torch.zeros(1, ctx.num_experts, device=expert_affinities_masked.device, dtype=expert_affinities_masked.dtype)
-        ])
-
-        # TODO: Disable skipping DMAs until compiler issue is fixed
-        token_position_to_id = token_position_to_id.masked_fill(torch.eq(token_position_to_id, -1), total_tokens)
-
+        output = torch.zeros(total_tokens, hidden_size, device=hidden_states.device, dtype=hidden_states.dtype)
+        if always_augment_inputs_for_blockwise_matmul or not skip_dma.skip_token:
+            output, hidden_states, token_position_to_id, expert_affinities_masked = (
+                augment_inputs_for_padded_blockwise_matmul(output, hidden_states, token_position_to_id,
+                                                                     expert_affinities_masked))
         # Reshape gate_up_proj_weight to (E, H, 2, I) as expected by the kernel
         gate_up_proj_weight = gate_up_proj_weight.view(ctx.num_experts, hidden_size, 2, -1)
         # Flatten expert_affinities_masked: ((T+1)*E, 1)
@@ -509,7 +706,7 @@ class BlockwiseMatmulNKIFunc(torch.autograd.Function):
             # (1, 1, 2I) -> (2, I)
             assert gate_up_proj_scale.shape[0] == 1 and gate_up_proj_scale.shape[1] == 1
             gate_up_proj_scale = gate_up_proj_scale.view(2, -1)
- 
+
         if down_proj_scale is not None:
             # (1, 1, H) -> (H)
             assert down_proj_scale.shape[0] == 1 and down_proj_scale.shape[1] == 1
@@ -531,25 +728,50 @@ class BlockwiseMatmulNKIFunc(torch.autograd.Function):
                 output=output,
                 gate_up_activations_T=gate_up_activations,
                 down_activations=down_activations,
+                is_tensor_update_accumulating=multi_expert_per_token,
             )
         elif logical_nc_config == 2:
-            _blockwise_mm_nki_call[VNC(2)](
-                # Inputs
-                hidden_states=hidden_states,
-                expert_affinities_masked=expert_affinities_masked,
-                # MLP weights
-                gate_up_proj_weight=gate_up_proj_weight,
-                down_proj_weight=down_proj_weight,
-                # Block related
-                block_size=block_size,
-                token_position_to_id=token_position_to_id.to(dtype=torch.int32),
-                block_to_expert=block_to_expert.to(dtype=torch.int32),
-                # Output
-                output=output,
-                gate_up_proj_scale=gate_up_proj_scale,
-                down_proj_scale=down_proj_scale,
-                lnc=2,
-            )
+            if use_block_parallel:
+                _blockwise_mm_baseline_block_parallel_nki_call[VNC(2)](
+                    # Inputs
+                    hidden_states=hidden_states,
+                    expert_affinities_masked=expert_affinities_masked,
+                    # MLP weights
+                    gate_up_proj_weight=gate_up_proj_weight,
+                    down_proj_weight=down_proj_weight,
+                    # Block related
+                    block_size=block_size,
+                    token_position_to_id=token_position_to_id.to(dtype=torch.int32),
+                    block_to_expert=block_to_expert.to(dtype=torch.int32),
+                    # Output
+                    output=output,
+                    # Meta parameters
+                    skip_dma=skip_dma,
+                    is_tensor_update_accumulating=multi_expert_per_token,
+                    expert_affinities_scaling_mode=expert_affinities_scaling_mode,
+                    block_sharding_strategy=block_sharding_strategy
+                )
+            else:
+                _blockwise_mm_baseline_shard_hidden_nki_call[VNC(2)](
+                    # Inputs
+                    hidden_states=hidden_states,
+                    expert_affinities_masked=expert_affinities_masked,
+                    # MLP weights
+                    gate_up_proj_weight=gate_up_proj_weight,
+                    down_proj_weight=down_proj_weight,
+                    # Block related
+                    block_size=block_size,
+                    token_position_to_id=token_position_to_id.to(dtype=torch.int32),
+                    block_to_expert=block_to_expert.to(dtype=torch.int32),
+                    # Output
+                    output=output,
+                    # Meta parameters
+                    gate_up_activations_T=gate_up_activations,
+                    down_activations=down_activations,
+                    skip_dma=skip_dma,
+                    is_tensor_update_accumulating=multi_expert_per_token,
+                    expert_affinities_scaling_mode=expert_affinities_scaling_mode
+                )
         else:
             _blockwise_mm_nki_call(
                 # Inputs
@@ -564,15 +786,17 @@ class BlockwiseMatmulNKIFunc(torch.autograd.Function):
                 block_to_expert=block_to_expert.to(dtype=torch.int32),
                 # Output
                 output=output,
+                skip_dma=skip_dma,
                 gate_up_proj_scale=gate_up_proj_scale,
                 down_proj_scale=down_proj_scale,
+                is_tensor_update_accumulating=multi_expert_per_token,
             )
 
-        # Drop the last row
         output = output[:total_tokens, :]
         ctx.save_for_backward(
             hidden_states,
-            expert_affinities_masked.view(total_tokens + 1, ctx.num_experts),
+            expert_affinities_masked.view(total_tokens + 1 if always_augment_inputs_for_blockwise_matmul
+                                                            or not skip_dma.skip_token else total_tokens, ctx.num_experts),
             token_position_to_id,
             block_to_expert,
             gate_up_proj_weight,
@@ -580,7 +804,7 @@ class BlockwiseMatmulNKIFunc(torch.autograd.Function):
             gate_up_activations,
             down_activations,
         )
-
+        ctx.multi_expert_per_token = multi_expert_per_token
         return output
 
     @staticmethod
@@ -624,6 +848,7 @@ class BlockwiseMatmulNKIFunc(torch.autograd.Function):
             token_position_to_id.to(dtype=torch.int32),
             block_to_expert.to(dtype=torch.int32),
             grad_output_padded,
+            is_tensor_update_accumulating=ctx.multi_expert_per_token,
         )
         # FIXME: Compiler error without .clone()
         hidden_states_grad = hidden_states_grad[:T].clone()
@@ -634,7 +859,7 @@ class BlockwiseMatmulNKIFunc(torch.autograd.Function):
         return (
             hidden_states_grad[:T],
             affinities_grad[:T],
-            gate_up_proj_weight_grad.reshape(E, H, 2*ctx.intermediate_size),
+            gate_up_proj_weight_grad.reshape(E, H, 2 * ctx.intermediate_size),
             down_weight_grad,
             None,
             None,
@@ -643,5 +868,5 @@ class BlockwiseMatmulNKIFunc(torch.autograd.Function):
             None,
             None,
             None,
+            None,
         )
-

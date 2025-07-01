@@ -80,6 +80,5 @@ def mock_distributed(world_size: int) -> Iterator[Any]:
         >>>     torch.distributed.destroy_process_group()
     """
     with patch('torch.distributed', MockDistributed(world_size=world_size)) as m1, \
-        patch("torch_xla.core.xla_model.xrt_world_size", return_value=world_size) as m2, \
-        patch('torch_xla.runtime.world_size', return_value=world_size) as m3:
-        yield (m1, m2, m3)
+        patch('torch_xla.runtime.world_size', return_value=world_size) as m2:
+        yield (m1, m2)

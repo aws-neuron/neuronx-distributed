@@ -25,6 +25,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch_xla.core.xla_model as xm
+import torch_xla.runtime as xr
 import torch_xla.distributed.xla_multiprocessing as xmp
 import transformers.modeling_utils as modeling_utils
 from transformers import LlamaConfig
@@ -61,6 +62,7 @@ from modeling_llama_nxd import (
     LlamaDecoderLayer,
     LlamaForCausalLM,
     LlamaRMSNorm,
+    LlamaRotaryEmbedding,
     LlamaMLP,
     init_weights,
 )
@@ -105,7 +107,7 @@ def train_llama(args):
         config.num_hidden_layers = args.num_layer
     if args.hidden_size != -1:
         config.hidden_size = args.hidden_size
-
+    config.head_dim = config.hidden_size // config.num_attention_heads
     # Create model with different options
     # Either deferred_init or meta device initialization will be required to avoid host OOM for 70B model
     if args.use_meta_device_init > 0:
@@ -135,7 +137,7 @@ def train_llama(args):
             "auto_partition": True,
             "trace_file_path": args.trace_file_path,
             "param_init_fn": None,
-            "leaf_module_cls": [LlamaRMSNorm.__name__],
+            "leaf_module_cls": [LlamaRMSNorm.__name__, LlamaRotaryEmbedding.__name__],
             "autowrap_modules": [mappings],
             "use_zero1_optimizer": args.use_zero1_optimizer > 0,
             "use_optimizer_wrapper": True,
@@ -158,14 +160,6 @@ def train_llama(args):
             model = deferred_init.deferred_init(LlamaForCausalLM, config)
         else:
             model = LlamaForCausalLM(config)
-        # Here we make sure we use the same sine and cosine matrices for all layers.
-        # Making use of same tensors would make the CSE algorithm eliminate the lookup call
-        # from layers, keeping only lookup from first layer.
-        with torch.no_grad():
-            cos, sin = get_sin_cos_matrix(config)
-            for layer in model.model.layers:
-                layer.self_attn.rotary_emb.cos_cached = cos
-                layer.self_attn.rotary_emb.sin_cached = sin
         num_params = sum([np.prod(p.size()) for p in model.parameters()])
         if dist.get_rank() == 0:
             print(f"# total parameters: {num_params}")
@@ -256,7 +250,7 @@ def train_llama(args):
     # "Model configuration": config,
     param_contents = {
         "Model": config.model_type,
-        "World size": xm.xrt_world_size(),
+        "World size": xr.world_size(),
         "Data parallel degree": world_size,
         "Batch size": args.train_batch_size,
         "Total steps": args.max_steps,

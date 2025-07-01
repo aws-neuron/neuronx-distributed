@@ -43,6 +43,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch_xla.core.xla_model as xm
+import torch_xla.runtime as xr
 import torch_xla.distributed.parallel_loader as pl
 import torch_xla.distributed.xla_multiprocessing as xmp
 from torch.utils.data import Dataset, DistributedSampler
@@ -402,7 +403,7 @@ def get_dtype(model) -> str:
 
 def train_bert_hdf5(flags):
     parallel_state.initialize_model_parallel(tensor_model_parallel_size=flags.tensor_parallel_size)
-    rank = xm.get_ordinal()
+    rank = xr.global_ordinal()
     world_size = parallel_state.get_data_parallel_size()
     is_root = xm.is_master_ordinal(local=False)
     extract_graphs_only = os.environ.get("NEURON_EXTRACT_GRAPHS_ONLY", None)
@@ -466,7 +467,7 @@ def train_bert_hdf5(flags):
             {
                 "Model": model.name_or_path,
                 "Model configuration": str(model.config),
-                "World size": xm.xrt_world_size(),
+                "World size": xr.world_size(),
                 "Data parallel degree": world_size,
                 "Batch size": flags.batch_size,
                 "Total steps": flags.steps_this_run,

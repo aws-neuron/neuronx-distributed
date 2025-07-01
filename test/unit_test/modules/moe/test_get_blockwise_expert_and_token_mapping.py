@@ -32,6 +32,13 @@ class TestGetBlockwiseExpertAndTokenMapping(unittest.TestCase):
             [1, 0, 0],  # token 4 goes to expert 0
             [0, 1, 0],  # token 5 goes to expert 1
         ])
+        expert_index = torch.tensor([
+            [0], [1], [0], [2], [0], [1]
+        ])
+        # expert_affinities = torch.rand(seq_len, num_experts)
+        # _, expert_index = torch.topk(expert_affinities, top_k)
+        # expert_mask = ExpertMLPsV2.get_expert_mask(expert_index, num_experts)
+
         block_to_expert, token_position_to_id = ExpertMLPs.get_blockwise_expert_and_token_mapping(
             total_tokens=expert_mask.shape[0],
             num_blocks=4,
@@ -41,6 +48,7 @@ class TestGetBlockwiseExpertAndTokenMapping(unittest.TestCase):
             enable_spmd_rank=False,
             spmd_rank=None,
             tensor_parallel_group=parallel_state.get_tensor_model_parallel_group(),
+            expert_index=expert_index,
         )
         expected_block_to_expert = torch.tensor([0, 0, 1, 2])
         expected_token_position_to_id = torch.tensor([0, 2, 4, -1, 1, 5, 3, -1])

@@ -41,6 +41,7 @@ import h5py
 import numpy as np
 import torch
 import torch_xla.core.xla_model as xm
+import torch_xla.runtime as xr
 import torch_xla.distributed.parallel_loader as pl
 import torch_xla.distributed.xla_multiprocessing as xmp
 from torch.utils.data import Dataset, DistributedSampler
@@ -424,7 +425,7 @@ def train_bert_hdf5(flags):
         optimizer_config={"zero_one_enabled": flags.use_zero1, "grad_clipping": True, "max_grad_norm": 1.0},
     )
 
-    rank = xm.get_ordinal()
+    rank = xr.global_ordinal()
     world_size = parallel_state.get_data_parallel_size()
     is_root = xm.is_master_ordinal(local=False)
     extract_graphs_only = os.environ.get("NEURON_EXTRACT_GRAPHS_ONLY", None)
@@ -479,7 +480,7 @@ def train_bert_hdf5(flags):
         if not extract_graphs_only:
             logger = Logger(flags, world_size, model_dtype)
         metric_writer = TrainingMetrics(flags.metrics_file)
-        throughput = Throughput(flags.batch_size, xm.xrt_world_size(), flags.grad_accum_usteps)
+        throughput = Throughput(flags.batch_size, xr.world_size(), flags.grad_accum_usteps)
         print("--------TRAINING CONFIG----------")
         print(flags)
         print("--------MODEL CONFIG----------")
@@ -489,7 +490,7 @@ def train_bert_hdf5(flags):
             {
                 "Model": model.name_or_path,
                 "Model configuration": str(model.config),
-                "World size": xm.xrt_world_size(),
+                "World size": xr.world_size(),
                 "Data parallel degree": world_size,
                 "Batch size": flags.batch_size,
                 "Total steps": flags.steps_this_run,

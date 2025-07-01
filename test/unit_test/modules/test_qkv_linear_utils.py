@@ -222,11 +222,20 @@ class TestCustomFunction(unittest.TestCase):
         mock_ctx.async_grad_allreduce = False
         mock_ctx.reduce_dtype = torch.bfloat16
 
+        mock_group = MagicMock()
+        mock_group.size.return_value = 1  # tp_size = 1 for this test
+
         with (
-            patch('neuronx_distributed.modules.qkv_linear_utils.get_tensor_model_parallel_size', return_value = 1) as mock_tensor_parallel_size,
-            patch('neuronx_distributed.modules.qkv_linear_utils.xm.reduce_scatter', return_value = grad_input) as mock_reduce_scatter,
-            patch('neuronx_distributed.modules.qkv_linear_utils.get_tensor_model_parallel_replica_groups',return_value = [0]) as mock_parallel_replica_groups,
-            patch('torch.empty', return_value = torch.zeros(grad_input.shape)) as mock_torch_empty,
+            patch('neuronx_distributed.modules.qkv_linear_utils.get_tensor_model_parallel_group',
+                  return_value=mock_group),
+            patch('neuronx_distributed.modules.qkv_linear_utils.get_tensor_model_parallel_size', 
+                  return_value=1) as mock_tensor_parallel_size,
+            patch('neuronx_distributed.modules.qkv_linear_utils.xm.reduce_scatter', 
+                  return_value=grad_input) as mock_reduce_scatter,
+            patch('neuronx_distributed.modules.qkv_linear_utils.get_tensor_model_parallel_replica_groups',
+                  return_value=[0]) as mock_parallel_replica_groups,
+            patch('torch.empty', 
+                  return_value=torch.zeros(grad_input.shape)) as mock_torch_empty,
         ):
             sub_grad_input = mock_torch_empty(
                 torch.Size(grad_input.shape),
@@ -240,16 +249,52 @@ class TestCustomFunction(unittest.TestCase):
             mock_reduce_scatter.assert_called_once_with(
                 xm.REDUCE_SUM,
                 grad_input,
-                output = sub_grad_input,
-                groups = mock_parallel_replica_groups(),
-                shard_count = mock_tensor_parallel_size(),
-                scatter_dim = 0,
-                scale = 1,
-                pin_layout = False,
+                output=sub_grad_input,
+                groups=mock_parallel_replica_groups(),
+                shard_count=mock_tensor_parallel_size(),
+                scatter_dim=0,
+                scale=1,
+                pin_layout=False,
             )
 
             self.assertTrue(torch.equal(result, sub_grad_input))
 
+    def test_qkvlinear_autograd_bwd_input_grad_multiple_shapes(self):
+        test_cases = [
+            ((8, 4, 3), 2, [4, 4, 3]),    # First dim divided by 2
+            ((16, 8, 4), 4, [4, 8, 4]),   # First dim divided by 4
+            ((32, 2, 2), 8, [4, 2, 2]),   # First dim divided by 8
+        ]
+
+        for input_shape, tp_size, expected_shape in test_cases:
+            with self.subTest(input_shape=input_shape, tp_size=tp_size):
+                mock_ctx = MagicMock()
+                mock_ctx.reduce_dtype = torch.bfloat16
+                grad_input = torch.randn(*input_shape)
+                original_dtype = grad_input.dtype
+
+                mock_group = MagicMock()
+                mock_group.size.return_value = tp_size
+
+                with (
+                    patch('neuronx_distributed.modules.qkv_linear_utils.get_tensor_model_parallel_group',
+                        return_value=mock_group),
+                    patch('neuronx_distributed.modules.qkv_linear_utils.get_tensor_model_parallel_size', 
+                        return_value=tp_size),
+                    patch('neuronx_distributed.modules.qkv_linear_utils.xm.reduce_scatter'),
+                    patch('neuronx_distributed.modules.qkv_linear_utils.get_tensor_model_parallel_replica_groups',
+                        return_value=[0]),
+                    patch('torch.empty') as mock_torch_empty,
+                ):
+                    _qkvlinear_autograd_bwd_input_grad(mock_ctx, grad_input, original_dtype)
+
+                    # Verify that torch.empty was called with the correct shape
+                    mock_torch_empty.assert_called_once()
+                    args, kwargs = mock_torch_empty.call_args
+                    self.assertEqual(args[0], expected_shape)  # First argument should be the shape
+    
+
+    
 
 if __name__ == "__main__":
     unittest.main()

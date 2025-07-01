@@ -89,12 +89,14 @@ def train_llama(flags):
     model_config.kv_shared_group_size = flags.kv_replicator
     model_config.qkv_linear = flags.qkv_linear
     model_config.max_position_embeddings = max(model_config.max_position_embeddings, flags.seq_len)
+    model_config.use_flash_attention = flags.use_flash_attention > 0
     if flags.num_layers > 0:
         model_config.num_hidden_layers = flags.num_layers
     if flags.sequence_parallel_enabled:
         model_config.sequence_parallel_enabled = True
     if flags.selective_checkpoint_enabled:
         model_config.selective_checkpoint_enabled = True
+    model_config.head_dim = int(model_config.hidden_size / model_config.num_attention_heads)
     xm.master_print(model_config)
 
     if flags.use_mix_precision:
@@ -195,6 +197,7 @@ def evaluate(model, tokenizer, test_loader, golden_rouge_score_path):
     with torch.no_grad():
         for step, batch in enumerate(test_loader):
             input_ids = batch["input_ids"]
+            input_ids = input_ids.to("xla")
             labels = batch["labels"]
             input_length = input_ids.shape[-1]
             output_sequences = model.generate(
@@ -378,7 +381,12 @@ if __name__ == "__main__":
         default=1, 
         help="Whether to transpose inputs to nki kernel for better perf when using FlashAttention"
     )
-
+    parser.add_argument(
+        "--use_flash_attention", 
+        type=int, 
+        default=0, 
+        help="Whether to use NKI FlashAttention"
+    )
     parser.add_argument("--do_eval", action="store_true", help="Do evaluation after fine-tuning.")
     parser.add_argument(
         "--golden_rouge_score_path", default=None, type=str, help="Path to golden eval rouge score file."

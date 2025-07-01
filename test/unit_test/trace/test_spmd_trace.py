@@ -1,5 +1,6 @@
 import copy
 import unittest
+from collections import OrderedDict
 
 import torch
 
@@ -14,6 +15,7 @@ from neuronx_distributed.trace.trace import (
     _validate_traceable,
     shard_children,
 )
+from neuronx_distributed.trace.model_builder import ModelBuilder, BaseModelInstance
 
 
 class TestCheckpoint(unittest.TestCase):
@@ -81,7 +83,7 @@ class TestCheckpoint(unittest.TestCase):
                     self.cpl = ColumnParallelLinear(8, 128)
                     self.rpl = RowParallelLinear(128, 8)
                 else:
-                    self.embed_tokens = torch.nn.Embedding(8, 32)
+                    self.embed_tokens = torch.nn.Embedding(10, 32)
                     self.cpl = torch.nn.Linear(8, 128)
                     self.rpl = torch.nn.Linear(128, 8)
 
@@ -116,6 +118,52 @@ class TestCheckpoint(unittest.TestCase):
 
                 validate_shard_weight("")
                 validate_shard_weight("lay1.")
+
+
+class TestDefaultCompilerFlags(unittest.TestCase):
+    def test_autocast_none_flag(self):
+
+        class Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+
+            def forward(self, x: torch.Tensor):
+                return x
+
+
+        def get_checkpoint():
+            return OrderedDict()
+
+        input_t = torch.ones(1, dtype=torch.float32)
+
+        builder = ModelBuilder(router=None, tp_degree=1, checkpoint_loader=get_checkpoint)
+        # test if auto-cast=none flag is added
+        builder.add(
+            key="model_a",
+            model_instance=BaseModelInstance(Model, input_output_aliases={}),
+            example_inputs=[(input_t,)],
+        )
+        self.assertTrue("--auto-cast=none" in builder.model_collection["model_a"].compiler_args)
+
+        # test if auto-cast=none flag added to user provided compiler args
+        builder.add(
+            key="model_b",
+            model_instance=BaseModelInstance(Model, input_output_aliases={}),
+            example_inputs=[(input_t,)],
+            compiler_args="--model-type=transformer",
+        )
+        self.assertTrue("--auto-cast=none" in builder.model_collection["model_b"].compiler_args)
+
+        # test if user defined auto-cast flag is preserved
+        builder.add(
+            key="model_c",
+            model_instance=BaseModelInstance(Model, input_output_aliases={}),
+            example_inputs=[(input_t,)],
+            compiler_args="--auto-cast=matmult",
+        )
+        self.assertTrue("--auto-cast=matmult" in builder.model_collection["model_c"].compiler_args)
+        self.assertTrue("--auto-cast=none" not in builder.model_collection["model_c"].compiler_args)
+
 
 
 if __name__ == "__main__":

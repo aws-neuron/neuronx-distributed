@@ -2,8 +2,9 @@
 
 #############################################
 # Override transformers and Optimum-Neuron packages, can be removed once ON released changes in https://github.com/huggingface/optimum-neuron/pull/370
-pip install git+https://github.com/huggingface/optimum-neuron.git
-pip install --no-warn-conflicts transformers==4.32.1 nltk
+pip install git+https://github.com/huggingface/optimum-neuron.git 
+pip install -U transformers==4.48.0 # reinstall transformers due to optimum neuron override
+pip install --no-warn-conflicts nltk
 
 #############################################
 # User defined parameters and env vars

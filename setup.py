@@ -71,6 +71,9 @@ setup(
         "safetensors",
         "tenacity",
     ],
+    extras_require={
+        "test": ["pytest", "pytest-forked", "pytest-cov", "pytest-xdist", "transformers==4.51.*"],
+    },
     distclass=BinaryDistribution,
     cmdclass={
         'bdist_wheel': bdist_wheel_plat_only,

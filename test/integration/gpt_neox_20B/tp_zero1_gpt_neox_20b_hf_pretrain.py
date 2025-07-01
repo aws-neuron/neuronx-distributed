@@ -33,6 +33,7 @@ import torch
 import torch.distributed as dist
 import torch_xla
 import torch_xla.core.xla_model as xm
+import torch_xla.runtime as xr
 import torch_xla.distributed.parallel_loader as pl
 import torch_xla.distributed.xla_backend
 import torch_xla.distributed.xla_multiprocessing as xmp
@@ -323,7 +324,7 @@ def train_gpt_neox(flags):
             {
                 "Model": model.config.model_type,
                 "Model configuration": str(model.config),
-                "World size": xm.xrt_world_size(),
+                "World size": xr.world_size(),
                 "Data parallel degree": world_size,
                 "Batch size": flags.batch_size,
                 "Total steps": flags.steps_this_run,

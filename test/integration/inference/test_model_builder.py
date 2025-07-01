@@ -7,12 +7,25 @@ import safetensors.torch
 from functools import partial
 
 from neuronx_distributed.trace.model_builder import ModelBuilder, BaseModelInstance
-from neuronx_distributed.parallel_layers.layers import ColumnParallelLinear, RowParallelLinear
+from neuronx_distributed.parallel_layers.layers import ColumnParallelLinear, RowParallelLinear, ParallelEmbedding
+from neuronx_distributed.quantization.quantization_layers import QuantizedColumnParallel, QuantizedRowParallel, QuantizedExpertFusedColumnParallel, QuantizedExpertFusedRowParallel
 from torch_neuronx import BucketModelConfig
 
 from typing import List
 
 ckpt_path = "/tmp/test_model_builder_ckpt.pt"
+
+class EmbeddingModel(torch.nn.Module):
+    def __init__(self, num_embeddings, embedding_dim, is_distributed, rank_ordering=None):
+        super().__init__()
+        if is_distributed:
+            self.emb = ParallelEmbedding(num_embeddings=num_embeddings, embedding_dim=embedding_dim, rank_ordering=rank_ordering)
+        else:
+            self.emb = torch.nn.Embedding(num_embeddings=num_embeddings, embedding_dim=embedding_dim)
+    
+    def forward(self, x):
+        return self.emb(x)
+
 
 class CPLOnlyModel(torch.nn.Module):
     def __init__(self,
@@ -23,8 +36,8 @@ class CPLOnlyModel(torch.nn.Module):
             self.lay1 = ColumnParallelLinear(input_size=hidden_dim, output_size=hidden_dim, bias=False, gather_output=True, dtype=torch.float32)
             self.lay2 = ColumnParallelLinear(input_size=hidden_dim, output_size=hidden_dim, bias=False, gather_output=True, dtype=torch.float32)
         else:
-            self.lay1 = torch.nn.Linear(hidden_dim,hidden_dim, bias=False, dtype=torch.float32)
-            self.lay2 = torch.nn.Linear(hidden_dim,hidden_dim, bias=False, dtype=torch.float32)
+            self.lay1 = torch.nn.Linear(hidden_dim, hidden_dim, bias=False, dtype=torch.float32)
+            self.lay2 = torch.nn.Linear(hidden_dim, hidden_dim, bias=False, dtype=torch.float32)
 
     def forward(self, x):
         rx = self.lay1(x)
@@ -35,14 +48,49 @@ class CPLOnlyModel(torch.nn.Module):
 class CPLRPLModel(torch.nn.Module):
     def __init__(self,
                  hidden_dim,
-                 is_distributed):
+                 is_distributed,
+                 rank_ordering=None):
         super().__init__()
         if is_distributed:
-            self.lay1 = ColumnParallelLinear(input_size=hidden_dim, output_size=hidden_dim, bias=False, gather_output=False, dtype=torch.float32)
-            self.lay2 = RowParallelLinear(input_size=hidden_dim, output_size=hidden_dim, bias=False, input_is_parallel=True, dtype=torch.float32)
+            self.lay1 = ColumnParallelLinear(input_size=hidden_dim, output_size=hidden_dim, bias=False, gather_output=False, rank_ordering=rank_ordering, dtype=torch.float32)
+            self.lay2 = RowParallelLinear(input_size=hidden_dim, output_size=hidden_dim, bias=False, input_is_parallel=True, rank_ordering=rank_ordering, dtype=torch.float32)
         else:
-            self.lay1 = torch.nn.Linear(hidden_dim,hidden_dim, bias=False, dtype=torch.float32)
-            self.lay2 = torch.nn.Linear(hidden_dim,hidden_dim, bias=False, dtype=torch.float32)
+            self.lay1 = torch.nn.Linear(hidden_dim, hidden_dim, bias=False, dtype=torch.float32)
+            self.lay2 = torch.nn.Linear(hidden_dim, hidden_dim, bias=False, dtype=torch.float32)
+
+    def forward(self, x):
+        rx = self.lay1(x)
+        ry = self.lay2(rx)
+        return ry
+
+
+class QuantizedCPLRPLModel(torch.nn.Module):
+    def __init__(self,
+                 hidden_dim,
+                 is_distributed,
+                 rank_ordering=None):
+        super().__init__()
+        if is_distributed:
+            self.lay1 = QuantizedColumnParallel(input_size=hidden_dim, output_size=hidden_dim, bias=False, gather_output=False, rank_ordering=rank_ordering, dtype=torch.float32)
+            self.lay2 = QuantizedRowParallel(input_size=hidden_dim, output_size=hidden_dim, bias=False, input_is_parallel=True, rank_ordering=rank_ordering, dtype=torch.float32)
+        else:
+            self.lay1 = torch.nn.Linear(hidden_dim, hidden_dim, bias=False, dtype=torch.float32)
+            self.lay2 = torch.nn.Linear(hidden_dim, hidden_dim, bias=False, dtype=torch.float32)
+
+    def forward(self, x):
+        rx = self.lay1(x)
+        ry = self.lay2(rx)
+        return ry
+
+class QuantizedExpertFusedCPLRPLModel(torch.nn.Module):
+    def __init__(self,
+                 num_experts,
+                 hidden_dim,
+                 rank_ordering=None):
+
+        super().__init__()
+        self.lay1 = QuantizedExpertFusedColumnParallel(num_experts=num_experts, input_size=hidden_dim, output_size=hidden_dim, rank_ordering=rank_ordering, dtype=torch.float32)
+        self.lay2 = QuantizedExpertFusedRowParallel(num_experts=num_experts, input_size=hidden_dim, output_size=hidden_dim, rank_ordering=rank_ordering, dtype=torch.float32)
 
     def forward(self, x):
         rx = self.lay1(x)
@@ -60,8 +108,8 @@ class StatefulModel(torch.nn.Module):
             self.lay1 = ColumnParallelLinear(input_size=hidden_dim, output_size=hidden_dim, bias=False, gather_output=False, dtype=torch.float32)
             self.lay2 = RowParallelLinear(input_size=hidden_dim, output_size=hidden_dim, bias=False, input_is_parallel=True, dtype=torch.float32)
         else:
-            self.lay1 = torch.nn.Linear(hidden_dim,hidden_dim, bias=False, dtype=torch.float32)
-            self.lay2 = torch.nn.Linear(hidden_dim,hidden_dim, bias=False, dtype=torch.float32)
+            self.lay1 = torch.nn.Linear(hidden_dim, hidden_dim, bias=False, dtype=torch.float32)
+            self.lay2 = torch.nn.Linear(hidden_dim, hidden_dim, bias=False, dtype=torch.float32)
 
         self.state = torch.nn.Parameter(torch.zeros(batch_size, hidden_dim), requires_grad=False)
 
@@ -579,6 +627,174 @@ def test_shard_on_load():
         nxd_result = traced_model(x)
         torch.testing.assert_close(cpu_result, nxd_result)
 
+def test_rank_ordering_cpl_rpl():
+    hidden_dim = 4
+    batch_size = 2
+    tp_degree = 2
+
+    model = CPLRPLModel(hidden_dim=hidden_dim, is_distributed=False)
+    torch.save(model.state_dict(), ckpt_path)
+
+    x = torch.randn((batch_size, hidden_dim))
+
+    builder = ModelBuilder(router=None,
+                           tp_degree=tp_degree,
+                           checkpoint_loader=partial(torch.load, ckpt_path),
+                           compiler_workdir="new_compiler_workdir/")
+    builder.add(key = "main",
+                model_instance = BaseModelInstance(partial(CPLRPLModel, hidden_dim=hidden_dim, is_distributed=True), input_output_aliases={}),
+                example_inputs=[(x,)],
+                compiler_args="--auto-cast=none")
+
+    traced_model = builder.trace(initialize_model_weights=True)
+
+    rank_ordering = [1, 0] # rank 0 gets rank 1 weights, rank 1 gets rank 0 weights
+
+    builder = ModelBuilder(router=None,
+                           tp_degree=tp_degree,
+                           checkpoint_loader=partial(torch.load, ckpt_path),
+                           compiler_workdir="new_compiler_workdir/")
+    builder.add(key = "main",
+                model_instance = BaseModelInstance(partial(CPLRPLModel, hidden_dim=hidden_dim, is_distributed=True, rank_ordering=rank_ordering), input_output_aliases={}),
+                example_inputs=[(x,)],
+                compiler_args="--auto-cast=none")
+
+    reordered_traced_model = builder.trace(initialize_model_weights=True)
+
+    torch.testing.assert_close(traced_model.nxd_model.weights[0]["lay1.weight"].to("cpu"), reordered_traced_model.nxd_model.weights[1]["lay1.weight"].to("cpu"))
+    torch.testing.assert_close(traced_model.nxd_model.weights[0]["lay2.weight"].to("cpu"), reordered_traced_model.nxd_model.weights[1]["lay2.weight"].to("cpu"))
+
+
+def test_rank_ordering_quantized_cpl_rpl():
+    hidden_dim = 4
+    batch_size = 2
+    tp_degree = 2
+
+    model = QuantizedCPLRPLModel(hidden_dim=hidden_dim, is_distributed=False)
+    
+    sd = model.state_dict()
+    sd["lay1.scale"] = torch.randn(1)
+    sd["lay2.scale"] = torch.randn(1)
+
+    torch.save(sd, ckpt_path)
+
+    x = torch.randn((batch_size, hidden_dim))
+
+    builder = ModelBuilder(router=None,
+                           tp_degree=tp_degree,
+                           checkpoint_loader=partial(torch.load, ckpt_path),
+                           compiler_workdir="new_compiler_workdir/")
+    builder.add(key = "main",
+                model_instance = BaseModelInstance(partial(QuantizedCPLRPLModel, hidden_dim=hidden_dim, is_distributed=True), input_output_aliases={}),
+                example_inputs=[(x,)],
+                compiler_args="--auto-cast=none")
+
+    traced_model = builder.trace(initialize_model_weights=True)
+
+    rank_ordering = [1, 0] # rank 0 gets rank 1 weights, rank 1 gets rank 0 weights
+
+    builder = ModelBuilder(router=None,
+                           tp_degree=tp_degree,
+                           checkpoint_loader=partial(torch.load, ckpt_path),
+                           compiler_workdir="new_compiler_workdir/")
+    builder.add(key = "main",
+                model_instance = BaseModelInstance(partial(QuantizedCPLRPLModel, hidden_dim=hidden_dim, is_distributed=True, rank_ordering=rank_ordering), input_output_aliases={}),
+                example_inputs=[(x,)],
+                compiler_args="--auto-cast=none")
+
+    reordered_traced_model = builder.trace(initialize_model_weights=True)
+
+    torch.testing.assert_close(traced_model.nxd_model.weights[0]["lay1.weight"].to("cpu"), reordered_traced_model.nxd_model.weights[1]["lay1.weight"].to("cpu"))
+    torch.testing.assert_close(traced_model.nxd_model.weights[0]["lay2.weight"].to("cpu"), reordered_traced_model.nxd_model.weights[1]["lay2.weight"].to("cpu"))
+
+def test_rank_ordering_quantized_expert_fused_cpl_rpl():
+    hidden_dim = 4
+    num_experts = 2
+    batch_size = 2
+    tp_degree = 2
+    
+    sd = {
+        "lay1.weight": torch.randn(num_experts, hidden_dim, hidden_dim),
+        "lay2.weight": torch.randn(num_experts, hidden_dim, hidden_dim),
+        "lay1.scale": torch.randn(1),
+        "lay2.scale": torch.randn(1),
+    }
+
+    torch.save(sd, ckpt_path)
+
+    x = torch.randn((batch_size, hidden_dim))
+
+    builder = ModelBuilder(router=None,
+                           tp_degree=tp_degree,
+                           checkpoint_loader=partial(torch.load, ckpt_path),
+                           compiler_workdir="new_compiler_workdir/")
+    builder.add(key="main",
+                model_instance=BaseModelInstance(partial(QuantizedExpertFusedCPLRPLModel, num_experts=num_experts,
+                                                         hidden_dim=hidden_dim), input_output_aliases={}),
+                example_inputs=[(x,)],
+                compiler_args="--auto-cast=none")
+
+    traced_model = builder.trace(initialize_model_weights=True)
+
+    rank_ordering = [1, 0] # rank 0 gets rank 1 weights, rank 1 gets rank 0 weights
+
+    builder = ModelBuilder(router=None,
+                           tp_degree=tp_degree,
+                           checkpoint_loader=partial(torch.load, ckpt_path),
+                           compiler_workdir="new_compiler_workdir/")
+    builder.add(key = "main",
+                model_instance=BaseModelInstance(partial(QuantizedExpertFusedCPLRPLModel, num_experts=num_experts, 
+                                                        hidden_dim=hidden_dim, rank_ordering=rank_ordering), input_output_aliases={}),
+                example_inputs=[(x,)],
+                compiler_args="--auto-cast=none")
+
+    reordered_traced_model = builder.trace(initialize_model_weights=True)
+
+    torch.testing.assert_close(traced_model.nxd_model.weights[0]["lay1.weight"].to("cpu"), reordered_traced_model.nxd_model.weights[1]["lay1.weight"].to("cpu"))
+    torch.testing.assert_close(traced_model.nxd_model.weights[0]["lay2.weight"].to("cpu"), reordered_traced_model.nxd_model.weights[1]["lay2.weight"].to("cpu"))
+
+
+def test_rank_ordering_embedding():
+    batch_size = 2
+    num_embeddings = 10
+    embedding_dim = 32
+    tp_degree = 2
+
+    model = EmbeddingModel(num_embeddings=num_embeddings, embedding_dim=embedding_dim, is_distributed=False)
+    torch.save(model.state_dict(), ckpt_path)
+
+    x = torch.randint(0, num_embeddings, (batch_size, 4))
+
+    builder = ModelBuilder(router=None,
+                           tp_degree=tp_degree,
+                           checkpoint_loader=partial(torch.load, ckpt_path),
+                           compiler_workdir="new_compiler_workdir/")
+    builder.add(key="main",
+                model_instance=BaseModelInstance(partial(EmbeddingModel, num_embeddings=num_embeddings, 
+                                                        embedding_dim=embedding_dim, is_distributed=True), 
+                                                        input_output_aliases={}),
+                example_inputs=[(x,)],
+                compiler_args="--auto-cast=none")
+
+    traced_model = builder.trace(initialize_model_weights=True)
+
+    rank_ordering = [1, 0] # rank 0 gets rank 1 weights, rank 1 gets rank 0 weights
+
+    builder = ModelBuilder(router=None,
+                           tp_degree=tp_degree,
+                           checkpoint_loader=partial(torch.load, ckpt_path),
+                           compiler_workdir="new_compiler_workdir/")
+    builder.add(key="main",
+                model_instance=BaseModelInstance(partial(EmbeddingModel, num_embeddings=num_embeddings, 
+                                                        embedding_dim=embedding_dim, rank_ordering=rank_ordering,
+                                                        is_distributed=True), input_output_aliases={}),
+                example_inputs=[(x,)],
+                compiler_args="--auto-cast=none")
+
+    reordered_traced_model = builder.trace(initialize_model_weights=True)
+
+    torch.testing.assert_close(traced_model.nxd_model.weights[0]["emb.weight"].to("cpu"), reordered_traced_model.nxd_model.weights[1]["emb.weight"].to("cpu"))
+
 
 if __name__ == "__main__":
     test_list = [
@@ -592,6 +808,10 @@ if __name__ == "__main__":
         test_stateful_model,
         test_batch_bucketed_model,
         test_loading_checkpoint,
+        test_rank_ordering_cpl_rpl,
+        test_rank_ordering_quantized_cpl_rpl,
+        test_rank_ordering_quantized_expert_fused_cpl_rpl,
+        test_rank_ordering_embedding,
     ]
     # Run tests in a separate process so it can init and release runtime properly
     for test in test_list:

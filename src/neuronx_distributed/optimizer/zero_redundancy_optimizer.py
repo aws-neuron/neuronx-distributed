@@ -5,6 +5,7 @@ from typing import Union, Optional, Callable, List, Any, Dict, Tuple
 
 import torch
 import torch_xla.core.xla_model as xm
+import torch_xla.runtime as xr
 from torch_xla.distributed.zero_redundancy_optimizer import ZeroRedundancyOptimizer
 
 from ..parallel_layers.checkpointing import ensure_directory_exists
@@ -122,7 +123,7 @@ class NeuronZero1Optimizer(ZeroRedundancyOptimizer):
         )
         ensure_directory_exists(chkpt_path)
 
-        local_rank = xm.get_local_ordinal()
+        local_rank = xr.local_ordinal()
         for worker in range(math.ceil(get_local_world_size() / num_workers_per_step)):
             if local_rank // num_workers_per_step == worker:
                 logger.debug("optimizer.worker %d saving checkpoint %s", local_rank, chkpt_path)
@@ -148,7 +149,7 @@ class NeuronZero1Optimizer(ZeroRedundancyOptimizer):
 
         logger.debug("optimizer.loading checkpoint from %s", chkpt_path)
 
-        local_rank = xm.get_local_ordinal()
+        local_rank = xr.local_ordinal()
         for worker in range(math.ceil(get_local_world_size() / num_workers_per_step)):
             if local_rank // num_workers_per_step == worker:
                 logger.debug("optimizer.worker %d resuming from checkpoint %s", local_rank, chkpt_path)
