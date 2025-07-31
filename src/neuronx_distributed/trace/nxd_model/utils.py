@@ -5,6 +5,39 @@ import torch_neuronx
 
 from neuronx_distributed.trace.model_builder_utils import ProvidedArgInfo
 
+# All available torch dtypes
+TORCH_DTYPES = [getattr(torch, attr) for attr in dir(torch) if isinstance(getattr(torch, attr), torch.dtype)]
+
+@torch.jit.script
+def get_dtype_enum(dtype: torch.dtype) -> int:
+    """
+    Get the TorchScript enum value for a torch.dtype.
+
+    Args:
+        dtype: A torch.dtype object
+
+    Returns:
+        The corresponding integer enum value
+    """
+    return dtype  # TorchScript automatically converts this to the enum value
+
+def get_dtype_from_enum(dtype_enum: int) -> torch.dtype:
+    """
+    Get the torch.dtype corresponding to an enum value.
+
+    Args:
+        dtype_enum: An integer representing a torch.dtype enum value
+
+    Returns:
+        The corresponding torch.dtype object
+    """
+    for dtype in TORCH_DTYPES:
+        if get_dtype_enum(dtype) == dtype_enum:
+            return dtype
+
+    raise ValueError(f"Could not find torch.dtype corresponding to enum value: {dtype_enum}")
+
+
 def retrieve_artifact_from_model(
     model: torch.classes.neuron.SPMDModel,
     artifact: str) -> Union[None, bytes]:

@@ -35,8 +35,8 @@ from modeling_mixtral_moe_nxd import (  # noqa: E402
     init_weights,  # noqa: E402
 )  # noqa: E402
 from module_mixtral import NeuronMixtralLTModule, NeuronMixtralPPLTModule  # noqa: E402
-from pytorch_lightning import Trainer  # noqa: E402
-from pytorch_lightning.callbacks import ModelCheckpoint, ModelSummary  # noqa: E402
+from lightning.pytorch.trainer.trainer import Trainer  # noqa: E402
+from lightning.pytorch.callbacks import ModelCheckpoint, ModelSummary  # noqa: E402
 from training_utils import (  # noqa: E402
     create_mixtral_pretraining_dataset,  # noqa: E402
     get_learning_rate_scheduler,  # noqa: E402

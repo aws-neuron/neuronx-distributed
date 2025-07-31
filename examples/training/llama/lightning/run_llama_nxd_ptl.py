@@ -21,8 +21,8 @@ import sys
 
 import torch
 import torch_xla.core.xla_model as xm
-from pytorch_lightning import Trainer
-from pytorch_lightning.callbacks import ModelCheckpoint
+from lightning.pytorch.trainer.trainer import Trainer
+from lightning.pytorch.callbacks import ModelCheckpoint
 from transformers import LlamaConfig, set_seed
 # Workaround for NaNs seen with transformers version >= 4.21.0
 # https://github.com/aws-neuron/aws-neuron-sdk/issues/593

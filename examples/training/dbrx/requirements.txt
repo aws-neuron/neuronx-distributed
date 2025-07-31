@@ -1,5 +1,6 @@
 transformers==4.48.0
 pytorch-lightning==2.5.0
+lightning==2.5.0
 regex
 tensorboard
 datasets

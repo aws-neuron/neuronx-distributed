@@ -143,6 +143,29 @@ class GeneratePaddingMaskTest(unittest.TestCase):
                 hardware_type="trn999",
             )
 
+    def test_mask_generation_tp_degree_less_than_kv_heads(self):
+        # Test case where tp_degree < num_kv_heads..
+        # This would cause kv_replicator to be 0.
+        
+        num_heads = 24
+        num_heads_with_pad = 32
+        num_kv_heads = 8
+        tp_degree = 4
+        num_heads_per_tp_rank = num_heads_with_pad // tp_degree
+
+        expected_mask = torch.ones((tp_degree, num_heads_per_tp_rank), dtype=torch.bool)
+        expected_mask[:, 6:] = False
+
+        for tp_rank in range(tp_degree):
+            padding_mask = generate_padding_mask(
+                num_heads=num_heads,
+                num_heads_with_pad=num_heads_with_pad,
+                num_kv_heads=num_kv_heads,
+                tp_degree=tp_degree,
+                tp_rank=tp_rank,
+                hardware_type=hardware.TRN2,
+            )
+            assert (padding_mask == expected_mask[tp_rank]).all()
 
 if __name__ == "__main__":
     unittest.main(verbosity=3, failfast=False)

@@ -900,10 +900,12 @@ def compile_layout_transformer(
         )
 
         # Set compiler flags
+        # TODO: HloVerifier is disabled for this compilation temporarily until
+        # the long term solution to fix mismatch between input and output shapes is implemented.
         compiler_args = (
             "--model-type=transformer" +
             f" --lnc={logical_nc_config}" +
-            " --internal-hlo2tensorizer-options=--experimental-unsafe-fp8e4m3fn-as-fp8e4m3" +
+            " --internal-hlo2tensorizer-options='--experimental-unsafe-fp8e4m3fn-as-fp8e4m3 --verify-hlo=false'" +
             f" --logfile={os.path.join(output_dir, 'log-neuron-cc.txt')}"
         )
 
@@ -1042,7 +1044,7 @@ class ModelBuilderV2:
         self,
         priority_model_key: Optional[str] = None,
         compiler_workdir: Optional[Union[str, pathlib.Path]] = None,
-        compiler_args: Optional[str] = None,
+        compiler_args: Optional[Union[str, Dict[str, str]]] = None,
         max_workers: Optional[int] = None,
     ) -> NxDModelV2:
         """
@@ -1054,7 +1056,10 @@ class ModelBuilderV2:
                 If provided, weight layout optimization will be suggested based on this model,
                 and then it will be applied to all the other models.
             compiler_workdir (Optional[Union[str, pathlib.Path]]): Path to store compiler artifacts.
-            compiler_args (Optional[str]): Compiler flags for neuronx-cc.
+            compiler_args (Optional[Union[str, Dict[str, str]]]): Either compiler flags for neuronx-cc as a string
+                to use for all buckets, or a dictionary mapping bucket tags to their specific compiler flags. 
+                When using a dictionary, all bucket tags must have corresponding compiler flags.
+                If None, default compiler flags will be used from the compile()/compile_wlo() fundamental unit.
             max_workers (Optional[int]): Maximum number of worker threads for parallel compilation.
                 If None, uses the default value from ThreadPoolExecutor.
 
@@ -1070,6 +1075,19 @@ class ModelBuilderV2:
 
         if priority_model_key and priority_model_key not in self.trace_artifacts_collection:
             raise ValueError(f"Invalid priority_model_key: {priority_model_key}")
+
+        # Handle compiler args
+        if isinstance(compiler_args, dict):
+            # When dict is provided, ensure all buckets have compiler args
+            missing_tags = set(self.trace_artifacts_collection.keys()) - set(compiler_args.keys())
+            if missing_tags:
+                raise ValueError(f"Missing compiler args for buckets: {missing_tags}")
+        elif isinstance(compiler_args, str):
+            # When string is provided, use same args for all buckets
+            compiler_args = {tag: compiler_args for tag in self.trace_artifacts_collection.keys()}
+        elif compiler_args is None:
+            # When None is provided, let compile() fundamental unit handle default args
+            compiler_args = None
 
         compilation_results: Dict[str, Any] = {}
         compile_start_time = time.time()
@@ -1111,7 +1129,7 @@ class ModelBuilderV2:
         self,
         priority_model_key: Optional[str],
         compiler_workdir: Optional[Union[str, pathlib.Path]],
-        compiler_args: Optional[str],
+        compiler_args: Optional[Dict[str, str]],
         compilation_results: Dict[str, Any]
     ) -> None:
         """Handles compilation of the priority model if specified."""
@@ -1120,6 +1138,7 @@ class ModelBuilderV2:
             return None
 
         priority_trace = self.trace_artifacts_collection[priority_model_key]
+        priority_model_compiler_args = compiler_args[priority_model_key] if compiler_args else None
 
         # Mark weights for WLO
         hlo_utils.mark_weights_for_wlo(
@@ -1133,7 +1152,7 @@ class ModelBuilderV2:
             hlo_module=priority_trace.hlo,
             metaneff=priority_trace.metaneff,
             compiler_workdir=compiler_workdir,
-            compiler_args=compiler_args,
+            compiler_args=priority_model_compiler_args,
             key=priority_model_key
         )
         compilation_results[priority_model_key] = wlo_artifacts
@@ -1151,7 +1170,7 @@ class ModelBuilderV2:
         self,
         priority_model_key: Optional[str],
         compiler_workdir: Optional[Union[str, pathlib.Path]],
-        compiler_args: Optional[str],
+        compiler_args: Optional[Dict[str, str]],
         max_workers: Optional[int],
         compilation_results: Dict[str, Any]
     ) -> None:
@@ -1175,7 +1194,7 @@ class ModelBuilderV2:
                     trace_artifacts.hlo,
                     trace_artifacts.metaneff,
                     compiler_workdir,
-                    compiler_args,
+                    compiler_args[key] if compiler_args else None,
                     key,
                 )
                 future_to_key[future] = key
@@ -2014,10 +2033,12 @@ class ModelBuilder:
             weight_name_to_idx=weight_name_to_idx,
         )
 
+        # TODO: HloVerifier is disabled for this compilation temporarily until
+        # the long term solution to fix mismatch between input and output shapes is implemented.
         compiler_args = (
             "--model-type=transformer -O1" +
             f" --lnc={self.logical_nc_config}" +
-            " --internal-hlo2tensorizer-options=--experimental-unsafe-fp8e4m3fn-as-fp8e4m3" +
+            " --internal-hlo2tensorizer-options='--experimental-unsafe-fp8e4m3fn-as-fp8e4m3 --verify-hlo=false'" +
             f" --logfile={os.path.join(layout_dir, 'log-neuron-cc.txt')}"
         )
 

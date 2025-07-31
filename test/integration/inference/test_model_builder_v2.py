@@ -2,14 +2,48 @@ import unittest
 import torch
 import math
 import torch.nn as nn
+import os
+import glob
+import shutil
+
 from torch_neuronx.proto import metaneff_pb2
 
+from neuronx_distributed import NxDParallelState
 import neuronx_distributed.trace.nxd_model
-from neuronx_distributed.trace.model_builder import ModelBuilderV2
-from neuronx_distributed.trace.model_builder_utils import TraceArtifacts
+from neuronx_distributed.trace.hlo_utils import apply_layout_transformation
+from neuronx_distributed.trace.model_builder import ModelBuilderV2, trace, compile, compile_wlo
+from neuronx_distributed.trace.model_builder_utils import TraceArtifacts, ModelBuilderConstants
 from neuronx_distributed.parallel_layers.layers import ColumnParallelLinear, RowParallelLinear
 from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.trace.mock_torchdist import mock_distributed
+
+
+def _fetch_latest_command_file(bucket_name, base_dir=ModelBuilderConstants.DEFAULT_COMPILER_WORKDIR):
+    """Fetch the most recent command.txt file for a specific bucket."""
+    bucket_path = os.path.join(base_dir, bucket_name)
+    if not os.path.exists(bucket_path):
+        return ""
+
+    dirs_with_timestamps = []
+    for d in os.listdir(bucket_path):
+        dir_path = os.path.join(bucket_path, d)
+        if os.path.isdir(dir_path):
+            mtime = os.path.getmtime(dir_path)
+            dirs_with_timestamps.append((mtime, d))
+
+    if not dirs_with_timestamps:
+        return ""
+
+    # Get the directory with the most recent modification time
+    latest_dir = os.path.join(bucket_path, max(dirs_with_timestamps)[1])
+    command_file = os.path.join(latest_dir, "command.txt")
+
+    if os.path.exists(command_file):
+        with open(command_file, 'r') as f:
+            return f.read().strip()
+
+    return ""
+
 
 class TestModelBuilderV2(unittest.TestCase):
 
@@ -165,6 +199,8 @@ class TestModelBuilderV2(unittest.TestCase):
         
         self.assertIsInstance(nxd_model, neuronx_distributed.trace.nxd_model.NxDModel)
 
+        shutil.rmtree(os.path.join(ModelBuilderConstants.DEFAULT_COMPILER_WORKDIR, "key1"))
+
         torch.classes.neuron.Runtime().unsafe_close()
 
     def test_compile_with_priority_model(self):
@@ -187,24 +223,113 @@ class TestModelBuilderV2(unittest.TestCase):
         
         self.assertIsInstance(nxd_model, neuronx_distributed.trace.nxd_model.NxDModel)
 
+        for key in ['priority', 'secondary']:
+            shutil.rmtree(os.path.join(ModelBuilderConstants.DEFAULT_COMPILER_WORKDIR, key))
+
+        torch.classes.neuron.Runtime().unsafe_close()
+
+    def test_compile_with_different_compiler_args(self):
+        """Test compilation of a simple model with different compiler args per bucket."""
+        class SimpleModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = nn.Linear(10, 5)
+            def forward(self, x):
+                return self.linear(x)
+        
+        # ModelBuilder flow
+        model = SimpleModel()
+        example_inputs1 = torch.rand(3, 10)
+        example_inputs2 = torch.rand(2, 10)
+        example_inputs3 = torch.rand(4, 10)
+
+        # Trace multiple buckets
+        builder = ModelBuilderV2(model) \
+            .trace(args=example_inputs1, tag="bucket1") \
+            .trace(args=example_inputs2, tag="bucket2") \
+            .trace(args=example_inputs3, tag="bucket3")
+        
+        # Compile with different compiler args for each bucket
+        compiler_args = {
+            "bucket1": "--model-type=transformer -O2",
+            "bucket2": "--model-type=transformer -O3",
+            "bucket3": "--model-type=transformer -O1"
+        }
+        
+        nxd_model = builder.compile(
+            compiler_args=compiler_args,
+            priority_model_key="bucket1"
+        )
+        
+        self.assertIsInstance(nxd_model, neuronx_distributed.trace.nxd_model.NxDModel)
+
+        command_txt_from_mb_flow = {
+            "bucket1": _fetch_latest_command_file("bucket1"),
+            "bucket2": _fetch_latest_command_file("bucket2"),
+            "bucket3": _fetch_latest_command_file("bucket3"),
+        }
+
+        # Fundamental units flow
+        model = SimpleModel()
+        trace_artifacts = {
+            "bucket1": trace(model, args=example_inputs1),
+            "bucket2": trace(model, args=example_inputs2),
+            "bucket3": trace(model, args=example_inputs3),
+        }
+        wlo_artifacts = compile_wlo(
+            hlo_module=trace_artifacts["bucket1"].hlo,
+            metaneff=trace_artifacts["bucket1"].metaneff,
+            compiler_args=compiler_args["bucket1"],
+            key="bucket1",
+        )
+
+        for key in ["bucket2", "bucket3"]:
+            apply_layout_transformation(
+                hlo_module=trace_artifacts[key].hlo,
+                flattener=trace_artifacts[key].flattener,
+                packer=trace_artifacts[key].packer,
+                metaneff=trace_artifacts[key].metaneff,
+                weight_name_to_idx=trace_artifacts[key].weight_name_to_idx,
+                wlo_artifacts=wlo_artifacts,
+                key=key
+            )
+
+            compile(
+                hlo_module=trace_artifacts[key].hlo,
+                metaneff=trace_artifacts[key].metaneff,
+                compiler_args=compiler_args[key],
+                key=key,
+            )
+        
+        command_txt_from_fundamental_units_flow = {
+            "bucket1": _fetch_latest_command_file("bucket1"),
+            "bucket2": _fetch_latest_command_file("bucket2"),
+            "bucket3": _fetch_latest_command_file("bucket3"),
+        }
+
+        # Comparing command.txt generated through ModelBuilder flow and fundamental units flow
+        for key in ["bucket1", "bucket2", "bucket3"]:
+            self.assertEqual(
+                command_txt_from_mb_flow[key],
+                command_txt_from_fundamental_units_flow[key],
+                f"command.txt mismatch for {key}"
+            )
+
+        for key in ["bucket1", "bucket2", "bucket3"]:
+            shutil.rmtree(os.path.join(ModelBuilderConstants.DEFAULT_COMPILER_WORKDIR, key))
+
         torch.classes.neuron.Runtime().unsafe_close()
 
 
 class TestModelBuilderV2Distributed(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.mock_dist = mock_distributed(world_size=32)
-        cls.mock_dist.__enter__()
-        torch.distributed.init_process_group(backend="xla", rank=0, world_size=32)
-        parallel_state.initialize_model_parallel(tensor_model_parallel_size=32, skip_collective_init=True)
-        parallel_state.set_aot_mode(True)
+        cls.parallel_state_init = NxDParallelState(world_size=32, tensor_model_parallel_size=32)
+        cls.parallel_state_init.__enter__()
 
     @classmethod
     def tearDownClass(cls):
-        parallel_state.set_aot_mode(False)
-        parallel_state.destroy_model_parallel()
-        torch.distributed.destroy_process_group()
-        cls.mock_dist.__exit__(None, None, None)
+        cls.parallel_state_init.__exit__(None, None, None)
 
     def test_single_trace_CPL(self):
         class ColumnParallelModel(torch.nn.Module):
@@ -436,6 +561,8 @@ class TestModelBuilderV2Distributed(unittest.TestCase):
         
         self.assertIsInstance(nxd_model, neuronx_distributed.trace.nxd_model.NxDModel)
 
+        shutil.rmtree(os.path.join(ModelBuilderConstants.DEFAULT_COMPILER_WORKDIR, "key1"))
+
         torch.classes.neuron.Runtime().unsafe_close()
 
     def test_compile_distributed_with_priority(self):
@@ -459,6 +586,9 @@ class TestModelBuilderV2Distributed(unittest.TestCase):
             .compile(priority_model_key="priority")
         
         self.assertIsInstance(nxd_model, neuronx_distributed.trace.nxd_model.NxDModel)
+
+        for key in ["priority", "secondary"]:
+            shutil.rmtree(os.path.join(ModelBuilderConstants.DEFAULT_COMPILER_WORKDIR, key))
 
         torch.classes.neuron.Runtime().unsafe_close()
 
@@ -593,6 +723,9 @@ class TestModelBuilderV2Distributed(unittest.TestCase):
 
         self.assertIsInstance(nxd_model, neuronx_distributed.trace.nxd_model.NxDModel)
 
+        for idx in range(1, len(input_configs) + 1):
+            shutil.rmtree(os.path.join(ModelBuilderConstants.DEFAULT_COMPILER_WORKDIR, f"bucket{idx}"))
+
         torch.classes.neuron.Runtime().unsafe_close()
 
     def test_compile_with_weight_to_skip_layout_optimization(self):
@@ -679,8 +812,144 @@ class TestModelBuilderV2Distributed(unittest.TestCase):
             priority_trace.weight_names_to_skip,
             "Mismatch in weights marked for skipping layout optimization"
         )
+
+        for idx in range(1, len(input_configs) + 1):
+            shutil.rmtree(os.path.join(ModelBuilderConstants.DEFAULT_COMPILER_WORKDIR, f"bucket{idx}"))
         
         torch.classes.neuron.Runtime().unsafe_close()
+
+    def test_compile_distributed_with_different_compiler_args(self):
+        """Test compilation of a distributed model with different compiler args per bucket."""
+        class DistributedModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layer1 = ColumnParallelLinear(1024, 1024, gather_output=False)
+                self.layer2 = RowParallelLinear(1024, 1024, input_is_parallel=True)
+            def forward(self, x, attention_mask=None):
+                x = self.layer1(x)
+                if attention_mask is not None:
+                    x = x * attention_mask
+                return self.layer2(x)
+        
+        # ModelBuilder flow
+        model = DistributedModel()
+        
+        # Different input configurations
+        inputs1 = (torch.rand(32, 1024),)
+        inputs2 = (torch.rand(16, 1024),)
+        inputs3 = (
+            torch.rand(24, 1024),
+            {"attention_mask": torch.rand(24, 1)}
+        )
+        
+        # Trace multiple buckets
+        builder = ModelBuilderV2(model) \
+            .trace(args=inputs1[0], tag="bucket1") \
+            .trace(args=inputs2[0], tag="bucket2") \
+            .trace(args=inputs3[0], kwargs=inputs3[1], tag="bucket3")
+        
+        # Compile with different compiler args for each bucket
+        compiler_args = {
+            "bucket1": "--model-type=transformer -O2",
+            "bucket2": "--model-type=transformer -O1",
+            "bucket3": "--model-type=transformer -O3 --enable-mixed-precision-accumulation"
+        }
+        
+        nxd_model = builder.compile(
+            compiler_args=compiler_args,
+            priority_model_key="bucket1"
+        )
+
+        self.assertIsInstance(nxd_model, neuronx_distributed.trace.nxd_model.NxDModel)
+
+        command_txt_from_mb_flow = {
+            "bucket1": _fetch_latest_command_file("bucket1"),
+            "bucket2": _fetch_latest_command_file("bucket2"),
+            "bucket3": _fetch_latest_command_file("bucket3"),
+        }
+
+        # Fundamental units flow
+        model = DistributedModel()
+        trace_artifacts = {
+            "bucket1": trace(model, args=inputs1[0]),
+            "bucket2": trace(model, args=inputs2[0]),
+            "bucket3": trace(model, args=inputs3[0], kwargs={"attention_mask": torch.rand(24, 1)}),
+        }
+        wlo_artifacts = compile_wlo(
+            hlo_module=trace_artifacts["bucket1"].hlo,
+            metaneff=trace_artifacts["bucket1"].metaneff,
+            compiler_args=compiler_args["bucket1"],
+            key="bucket1",
+        )
+
+        for key in ["bucket2", "bucket3"]:
+            apply_layout_transformation(
+                hlo_module=trace_artifacts[key].hlo,
+                flattener=trace_artifacts[key].flattener,
+                packer=trace_artifacts[key].packer,
+                metaneff=trace_artifacts[key].metaneff,
+                weight_name_to_idx=trace_artifacts[key].weight_name_to_idx,
+                wlo_artifacts=wlo_artifacts,
+                key=key
+            )
+
+            compile(
+                hlo_module=trace_artifacts[key].hlo,
+                metaneff=trace_artifacts[key].metaneff,
+                compiler_args=compiler_args[key],
+                key=key,
+            )
+        
+        command_txt_from_fundamental_units_flow = {
+            "bucket1": _fetch_latest_command_file("bucket1"),
+            "bucket2": _fetch_latest_command_file("bucket2"),
+            "bucket3": _fetch_latest_command_file("bucket3"),
+        }
+
+        # Comparing command.txt generated through ModelBuilder flow and fundamental units flow
+        for key in ["bucket1", "bucket2", "bucket3"]:
+            self.assertEqual(
+                command_txt_from_mb_flow[key],
+                command_txt_from_fundamental_units_flow[key],
+                f"command.txt mismatch for {key}"
+            )
+
+        for key in ["bucket1", "bucket2", "bucket3"]:
+            shutil.rmtree(os.path.join(ModelBuilderConstants.DEFAULT_COMPILER_WORKDIR, key))
+
+        torch.classes.neuron.Runtime().unsafe_close()
+
+
+class TestModelBuilderV2WithNxDParallelState(unittest.TestCase):
+
+    def test_compile_distributed_with_priority(self):
+        """Test compilation of a distributed model with priority model."""
+        class DistributedModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layer1 = ColumnParallelLinear(1024, 1024, gather_output=False)
+                self.layer2 = RowParallelLinear(1024, 1024, input_is_parallel=True)
+            def forward(self, x):
+                x = self.layer1(x)
+                return self.layer2(x)
+
+        with NxDParallelState(world_size=32, tensor_model_parallel_size=32):
+            model = DistributedModel()
+            example_inputs1 = torch.rand(32, 1024)
+            example_inputs2 = torch.rand(16, 1024)
+            
+            nxd_model = ModelBuilderV2(model) \
+                .trace(args=example_inputs1, tag="priority") \
+                .trace(args=example_inputs2, tag="secondary") \
+                .compile(priority_model_key="priority")
+            
+            self.assertIsInstance(nxd_model, neuronx_distributed.trace.nxd_model.NxDModel)
+
+        for key in ["priority", "secondary"]:
+            shutil.rmtree(os.path.join(ModelBuilderConstants.DEFAULT_COMPILER_WORKDIR, key))
+
+        torch.classes.neuron.Runtime().unsafe_close()
+
 
 if __name__ == '__main__':
     unittest.main()

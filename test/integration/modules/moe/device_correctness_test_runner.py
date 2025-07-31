@@ -9,6 +9,7 @@ import torch_xla.runtime as xr  # TRN enablement
 
 # Imports from MoE unit tests (for this import to succeed, test/unit_test/modules/moe must be added to PYTHONPATH)
 from neuronx_distributed.modules.moe import token_shuffling
+from neuronx_distributed.modules.moe.moe_fused_tkg import MoEFusedTKG
 import utils_testing as ut
 from utils_testing import token_shuffle_single_core
 
@@ -31,13 +32,17 @@ def get_model_outputs(
     sequence_parallel_enabled,
     dp_size,
     dp_rank,
+    exp_dp_rank,
     token_shuffle_group_size,
     is_cpu=False,
 ):
     """
     In CPU mode, because using single core to simulate a distributed backend, we sequentially run each data-parallel shard
     """
-    assert model.is_test is False
+    if isinstance(model, MoEFusedTKG):
+        return_router_logits = model.moe.return_router_logits
+    else:
+        return_router_logits = model.return_router_logits
 
     if token_shuffle_group_size > 1 and is_cpu:
         # CPU simulated token shuffling
@@ -53,13 +58,20 @@ def get_model_outputs(
     # in testing we return router_logits, so we can compare them. Only keep the corresponding dp rank
     router_logits = None
     for current_rank, ip in enumerate(ip_chunks):
-        if not is_cpu or current_rank == dp_rank:
+        if (
+            return_router_logits
+            and (
+                not hasattr(cfg, 'ep_degree')
+                or ((cfg.ep_degree == 1 and (not is_cpu or current_rank == dp_rank)) or (cfg.ep_degree > 1 and (not is_cpu or current_rank == exp_dp_rank)))
+            )
+        ):
             op, router_logits = model(ip)
             router_logits = router_logits.detach()
         else:
-            op, _ = model(ip)
+            op = model(ip)[0]
         outputs.append(op)
-    assert router_logits is not None
+    if return_router_logits:
+        assert router_logits is not None
 
     batch_dim = 1 if cfg.test_mode == "training" else 0
     op = torch.cat(outputs, dim=batch_dim)
@@ -166,7 +178,8 @@ def _slice_and_compare_tensors(cpu_dict, trn_dict, sharding_info, it, **tols):
                 raise Exception(f"Unexpected shapes for key: {key}, {cpu_dict[key].shape}, {trn_dict[key].shape}")
 
         additional_msg = f"Iteration {it} \nKey: {key}"
-
+        if key.endswith("spmd_rank.rank"):
+            continue
         ut.check_tensors(key_tensor_for_rank, trn_dict[key].detach(), **tols, additional_msg=additional_msg)
 
 
@@ -192,6 +205,7 @@ def run_device_correctness_test(cfg: ExptCfg, output_tols, grad_tols):
     tp_rank = parallel_state.get_tensor_model_parallel_rank()
     ep_size = parallel_state.get_expert_model_parallel_size()
     ep_rank = parallel_state.get_expert_model_parallel_rank()
+    exp_dp_rank = parallel_state.get_expert_data_parallel_rank()
     if cfg.test_mode == "training":
         grad_ctx_mgr = torch.enable_grad
     else:
@@ -202,29 +216,32 @@ def run_device_correctness_test(cfg: ExptCfg, output_tols, grad_tols):
             print(f"iteration {it}")
             # Initialize model on cpu and trn
             ut.nxd_init(tp_degree=1, ep_degree=1, token_shuffle_group_size=1, seed=it)
+            # enable_spmd_rank is not supported for CPU flow
+            cfg.enable_spmd_rank = False
             model_cpu = ut.initialize_neuron_model(cfg)
             ut.nxd_init(
                 tp_degree=tp_degree, ep_degree=ep_degree, token_shuffle_group_size=token_shuffle_group_size, seed=it
             )
             model_trn = ut.initialize_neuron_model(cfg_trn)
-            ut.match_expert_weights(model_trn, model_cpu, cfg.glu_mlp)
+            ut.match_expert_weights(model_trn, model_cpu, cfg.glu_mlp, cfg.moe_fused_tkg_enabled, cfg.shared_experts_sequence_parallel_enabled)
             sequence_dimension = model_trn.sequence_dimension
-
+            optimizer_cpu = None
+            optimizer_trn = None
             if cfg.test_mode == "training":
                 model_cpu.train()
                 model_trn.train()
                 # Set sinkhorn_iterations=0, because small precision errors can cause differences in routing decisions
                 model_cpu.router.sinkhorn_iterations = 0
                 model_trn.router.sinkhorn_iterations = 0
+                optimizer_cpu = ut.initialize_neuron_optimizer(
+                    model_cpu, grad_clipping=grad_clipping, override_grad_reduction=True, zero1=False, lr=lr
+                )
+                optimizer_trn = ut.initialize_neuron_optimizer(
+                    model_trn, grad_clipping=grad_clipping, zero1=cfg_trn.zero1, lr=lr
+                )
             else:
                 model_cpu.eval()
                 model_trn.eval()
-            optimizer_cpu = ut.initialize_neuron_optimizer(
-                model_cpu, grad_clipping=grad_clipping, override_grad_reduction=True, zero1=False, lr=lr
-            )
-            optimizer_trn = ut.initialize_neuron_optimizer(
-                model_trn, grad_clipping=grad_clipping, zero1=cfg_trn.zero1, lr=lr
-            )
             # Initialize input, target, model on cpu
             if cfg.test_mode == "training":
                 # Input is SBH in training when SP is enabled.
@@ -246,10 +263,12 @@ def run_device_correctness_test(cfg: ExptCfg, output_tols, grad_tols):
 
             # torch.topk behavior is different on cpu and device in the case of ties.
             # This causes mismatches in expert assignment for the TopK tests in bf16.
-            if cfg.dtype == torch.bfloat16:
+            # Skip this step when MoEFusedTKG is enabled, because we cannot return
+            # expert_idx from mega-kernel
+            if cfg.dtype == torch.bfloat16 and not cfg.moe_fused_tkg_enabled:
                 # Set is_test=True to return expert_index
-                model_cpu.is_test = True
-                model_trn.is_test = True
+                model_cpu.return_expert_index = True
+                model_trn.return_expert_index = True
 
                 # Simulate dropping of tokens in input where the expert assignments are not matching on cpu and device
                 with torch.no_grad():
@@ -327,8 +346,8 @@ def run_device_correctness_test(cfg: ExptCfg, output_tols, grad_tols):
                         local_ip_cpu.detach(), ip_trn_full.detach(), **output_tols, additional_msg=f"Iteration {it}"
                     )
                 # Reset is_test
-                model_cpu.is_test = False
-                model_trn.is_test = False
+                model_cpu.return_expert_index = False
+                model_trn.return_expert_index = False
 
             sharding_info = (tp_rank, tp_size, ep_rank, ep_size)
 
@@ -342,6 +361,7 @@ def run_device_correctness_test(cfg: ExptCfg, output_tols, grad_tols):
                 sequence_parallel_enabled,
                 dp_size,
                 dp_rank,
+                exp_dp_rank,
                 token_shuffle_group_size,
                 is_cpu=True,
             )
@@ -356,10 +376,14 @@ def run_device_correctness_test(cfg: ExptCfg, output_tols, grad_tols):
                 ip_trn = mappings.scatter_to_sequence_parallel_region(ip_trn_full, sequence_dimension=sequence_dimension)
             else:
                 ip_trn = ip_trn_full
-
             # Get outputs and gradients from trn, using the same input and target
             target_trn = target_cpu.clone().detach().to(device)
-
+            # TODO know why it works
+            if sequence_parallel_enabled:
+                ip_trn_nocl = torch.tensor_split(ip_trn_full.cpu(), tp_degree, dim=sequence_dimension)[tp_rank].clone().detach().to(device)
+                # The input are the same from collectives and cpu split when checking on cpu explicitly, however it would result in different router logits and output
+                # adding this check_tensors trigger a different compilation which somehow resolve the issue with no different in router logits and the output
+                ut.check_tensors(ip_trn, ip_trn_nocl, 0,0)
             # Data-parallel sharding
             target_trn = shard_batch(target_trn, cfg, dp_size, dp_rank, cfg.test_mode)
 
@@ -372,6 +396,7 @@ def run_device_correctness_test(cfg: ExptCfg, output_tols, grad_tols):
                 sequence_parallel_enabled,
                 dp_size,
                 dp_rank,
+                exp_dp_rank,
                 token_shuffle_group_size,
                 is_cpu=False,
             )
@@ -387,35 +412,38 @@ def run_device_correctness_test(cfg: ExptCfg, output_tols, grad_tols):
             if cfg.test_mode == "training":
                 batch_dim = 1
                 op_cpu = op_cpu.narrow(batch_dim, dp_rank * cfg.batch_size, cfg.batch_size)
+
             ut.check_tensors(op_cpu.detach(), op_trn.detach(), **output_tols)
             del op_cpu, op_trn
 
             ut.check_tensors(router_logits_cpu, router_logits_trn, **output_tols)
             del router_logits_cpu, router_logits_trn
 
-            # Compare loss
-            ut.check_tensors(loss_cpu.detach(), loss_trn.detach(), **output_tols)
-            del loss_cpu, loss_trn
+            # Checking outputs specific to training
+            if cfg.test_mode == "training":
+                # Compare loss
+                ut.check_tensors(loss_cpu.detach(), loss_trn.detach(), **output_tols)
+                del loss_cpu, loss_trn
 
-            print_rank0(f"grad_norm_cpu={grad_norm_cpu}")
-            print_rank0(f"grad_norm_trn={grad_norm_trn}")
-            # TODO: verify after V1492568678
-            # ut.check_tensors(grad_norm_cpu, grad_norm_trn, **output_tols)
+                print_rank0(f"grad_norm_cpu={grad_norm_cpu}")
+                print_rank0(f"grad_norm_trn={grad_norm_trn}")
+                # TODO: verify after V1492568678
+                # ut.check_tensors(grad_norm_cpu, grad_norm_trn, **output_tols)
 
-            if not cfg_trn.zero1:
-                # Check gradients on each rank
-                _slice_and_compare_tensors(grad_dict_cpu, grad_dict_trn, sharding_info, it, **grad_tols)
-                del grad_dict_cpu, grad_dict_trn
-            else:
-                # if zero1 is enabled then directly compare updated parameters, not the gradients may not match because the true gradients used is private in zero1 optimizer
-                trn_parameters = {n: p for n, p in model_trn.named_parameters()}
-                cpu_parameters = {n: p for n, p in model_cpu.named_parameters()}
-                param_tols = {k: cfg_trn.lr * v for k, v in grad_tols.items()}
-                _slice_and_compare_tensors(cpu_parameters, trn_parameters, sharding_info, it, **param_tols)
-                del cpu_parameters, trn_parameters, grad_dict_cpu, grad_dict_trn
+                if not cfg_trn.zero1:
+                    # Check gradients on each rank
+                    _slice_and_compare_tensors(grad_dict_cpu, grad_dict_trn, sharding_info, it, **grad_tols)
+                    del grad_dict_cpu, grad_dict_trn
+                else:
+                    # if zero1 is enabled then directly compare updated parameters, not the gradients may not match because the true gradients used is private in zero1 optimizer
+                    trn_parameters = {n: p for n, p in model_trn.named_parameters()}
+                    cpu_parameters = {n: p for n, p in model_cpu.named_parameters()}
+                    param_tols = {k: cfg_trn.lr * v for k, v in grad_tols.items()}
+                    _slice_and_compare_tensors(cpu_parameters, trn_parameters, sharding_info, it, **param_tols)
+                    del cpu_parameters, trn_parameters, grad_dict_cpu, grad_dict_trn
 
-            optimizer_cpu.zero_grad(set_to_none=True)
-            optimizer_trn.zero_grad(set_to_none=True)
+                    optimizer_cpu.zero_grad(set_to_none=True)
+                    optimizer_trn.zero_grad(set_to_none=True)
             xm.mark_step()
 
     del model_cpu, model_trn

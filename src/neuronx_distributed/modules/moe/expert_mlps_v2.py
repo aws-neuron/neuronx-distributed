@@ -1,5 +1,5 @@
 import math
-from typing import Optional
+from typing import Optional, Any, Dict
 
 import torch
 import torch.nn.functional as F
@@ -7,7 +7,7 @@ import torch_xla.core.xla_model as xm
 from torch.distributed import ProcessGroup
 
 from neuronx_distributed.modules.moe.experts import Experts
-from neuronx_distributed.modules.moe.model_utils import ACT2FN, DEFAULT_SELECTIVE_LOADING_THRESHOLD
+from neuronx_distributed.modules.moe.model_utils import ACT2FN, DEFAULT_SELECTIVE_LOADING_THRESHOLD, create_spmd_ranks
 from neuronx_distributed.modules.moe.blockwise import (
     BlockwiseMatmulNKIFunc,
     can_use_blockwise_matmul_nki,
@@ -28,7 +28,7 @@ from neuronx_distributed.parallel_layers.parallel_state import (
     rmsg,
 )
 from neuronx_distributed.utils.logger import get_logger
-
+from neuronx_distributed.quantization.quantization_config import QuantizationType
 from neuronx_distributed.modules.moe.blockwise import augment_inputs_for_padded_blockwise_matmul
 
 logger = get_logger()
@@ -94,9 +94,18 @@ class ExpertMLPsV2(torch.nn.Module):
         self.dtype = dtype
         self.device = device
 
-        if self.expert_model_parallel_group.size() > 1 and not self.training:
+        if self.expert_model_parallel_group.size() > 1:
             self.spmd_rank.initialize_expert_indices(num_local_experts=self.mlp_op.gate_up_proj._n_local_experts)
-            
+
+    def preshard_hook(self, model_state_dict: Dict[str, Any], prefix: str) -> None:
+        if self.routed_experts_mlp_config.enable_spmd_rank :
+            prefix = prefix.removesuffix("weight")
+            create_spmd_ranks(
+                model_state_dict=model_state_dict,
+                prefix=prefix,
+                world_size=parallel_state.get_world_group().size(),
+            )
+
     @staticmethod
     def validate_routed_experts_configs(routed_experts_mlp_config: RoutedExpertsMLPOpsConfig):
         if not (0 < routed_experts_mlp_config.top_k <= routed_experts_mlp_config.num_experts):
@@ -436,6 +445,11 @@ class ExpertMLPsV2(torch.nn.Module):
                 if self.blockwise_matmul_config.blockwise_nki_autograd_cls \
                 else BlockwiseMatmulNKIFunc
 
+            gate_up_proj_scale, down_proj_scale = getattr(self.mlp_op.gate_up_proj, "scale", None), getattr(self.mlp_op.down_proj, "scale", None)
+            if (gate_up_proj_scale is not None or down_proj_scale is not None) and \
+            QuantizationType.EXPERT_WISE_PER_CHANNEL_SYMMETRIC == self.mlp_op.gate_up_proj.quantization_type:
+                assert self.blockwise_matmul_config.logical_nc_config == 2, "EXPERT_WISE_PER_CHANNEL_SYMMETRIC only supported for LNC=2"
+
             return blockwise_nki_autograd_cls.apply(
                 hidden_states,
                 local_expert_affinities_masked,
@@ -443,23 +457,15 @@ class ExpertMLPsV2(torch.nn.Module):
                 self.mlp_op.down_proj.weight,
                 token_position_to_id,
                 block_to_expert,
-                getattr(self.mlp_op.gate_up_proj, "scale", None),
-                getattr(self.mlp_op.down_proj, "scale", None),
+                gate_up_proj_scale,
+                down_proj_scale,
                 self.training,
                 self.blockwise_matmul_config,
                 self.routed_experts_mlp_config.top_k > 1,
                 expert_affinities_scaling_mode,
             )
         elif self.training:
-            # we split training/inference torch blockwise because training backward pass implements a simplified version of mlp_op.
-            return TorchBlockwiseTraining.apply(
-                hidden_states,
-                expert_affinities_masked,
-                token_position_to_id,
-                block_to_expert,
-                self.mlp_op.gate_up_proj.weight,
-                self.mlp_op.down_proj.weight,
-            )
+            return self.forward_all_experts(hidden_states, expert_affinities, expert_index)
         else:
             return self.torch_blockwise_matmul_inference(
                 block_size=self.blockwise_matmul_config.block_size,
@@ -468,7 +474,7 @@ class ExpertMLPsV2(torch.nn.Module):
                 expert_affinities_masked=local_expert_affinities_masked,
                 token_position_to_id=token_position_to_id,
                 block_to_expert=block_to_expert,
-                pad_inputs_for_matmul=not self.blockwise_matmul_config.skip_dma.skip_token,
+                pad_inputs_for_matmul=not self.blockwise_matmul_config.skip_dma_token,
             )
 
     @staticmethod
@@ -565,45 +571,45 @@ class ExpertMLPsV2(torch.nn.Module):
             # token_position_to_id contains -1 as the index of 'padding' tokens
             token_position_to_id[token_position_by_id_and_expert] = tokens_idx.unsqueeze(1)
             token_position_to_id = token_position_to_id[1:]
-            return block_to_expert, token_position_to_id
         # Distribute computation by splitting token_position_by_id_and_expert and tokens_idx across TP ranks
         # The same token_position_by_id_and_expert and tokens_idx is present at all ranks, so we can use any of MIN/MAX/AVG to as the reduce operation
-        if enable_spmd_rank:
-            # use rank information is available at runtime in inference
-            # get tp_rank from global rank
-            # note: we use `get_tensor_model_parallel_group()` here to parallelize within a single node
-            #       but may get replicated in multi-node case
-            tp_rank = torch.remainder(spmd_rank.get_rank(), get_tensor_model_parallel_size())
-            token_position_by_id_and_expert = mappings.scatter_to_process_group_spmd(
-                token_position_by_id_and_expert, partition_dim=0, rank=tp_rank, process_group=get_tensor_model_parallel_group(),
-            )
-            tokens_idx = mappings.scatter_to_process_group_spmd(
-                tokens_idx, partition_dim=0, rank=tp_rank, process_group=get_tensor_model_parallel_group(),
-            )
-            # Assemble token_position_to_id using chunk of token_position_by_id_and_expert and tokens_idx at each TP rank
-            # This generates small DMA transfers because of discontinuous writes, and benefits from distributing across TP ranks
-            token_position_to_id[token_position_by_id_and_expert] = tokens_idx.unsqueeze(1)
-            token_position_to_id = token_position_to_id[1:]
-            # Accumulate results across TP ranks (use MAX to correctly account for the -1 index initialization)
-            token_position_to_id = mappings._reduce(
-                token_position_to_id, computation=xm.REDUCE_MAX, process_group=get_tensor_model_parallel_group(),
-            )
         else:
-            # To avoid rank-specific computations, we do a reduce-scatter instead of a simple split
-            token_position_by_id_and_expert = mappings._reduce_scatter_along_first_dim(
-                token_position_by_id_and_expert, computation=xm.REDUCE_MIN, process_group=tensor_parallel_group,
-            )
-            tokens_idx = mappings._reduce_scatter_along_first_dim(
-                tokens_idx, computation=xm.REDUCE_MIN, process_group=tensor_parallel_group,
-            )
-            # Assemble token_position_to_id using chunk of token_position_by_id_and_expert and tokens_idx at each TP rank
-            # This generates small DMA transfers because of discontinuous writes, and benefits from distributing across TP ranks
-            token_position_to_id[token_position_by_id_and_expert] = tokens_idx.unsqueeze(1)
-            token_position_to_id = token_position_to_id[1:]
-            # Accumulate results across TP ranks (use MAX to correctly account for the -1 index initialization)
-            token_position_to_id = mappings._reduce(
-                token_position_to_id, computation=xm.REDUCE_MAX, process_group=tensor_parallel_group,
-            )
+            if enable_spmd_rank:
+                # use rank information is available at runtime in inference
+                # get world_rank from global rank
+                # note: we use `get_tensor_model_parallel_group()` here to parallelize within a single node
+                #       but may get replicated in multi-node case
+                world_rank = torch.remainder(spmd_rank.get_rank(), parallel_state.get_world_group().size())
+                token_position_by_id_and_expert = mappings.scatter_to_process_group_spmd(
+                    token_position_by_id_and_expert, partition_dim=0, rank=world_rank, process_group=parallel_state.get_world_group(),
+                )
+                tokens_idx = mappings.scatter_to_process_group_spmd(
+                    tokens_idx, partition_dim=0, rank=world_rank, process_group=parallel_state.get_world_group(),
+                )
+                # Assemble token_position_to_id using chunk of token_position_by_id_and_expert and tokens_idx at each TP rank
+                # This generates small DMA transfers because of discontinuous writes, and benefits from distributing across TP ranks
+                token_position_to_id[token_position_by_id_and_expert] = tokens_idx.unsqueeze(1)
+                token_position_to_id = token_position_to_id[1:]
+                # Accumulate results across TP ranks (use MAX to correctly account for the -1 index initialization)
+                token_position_to_id = mappings._reduce(
+                    token_position_to_id, computation=xm.REDUCE_MAX, process_group=parallel_state.get_world_group(),
+                )
+            else:
+                # To avoid rank-specific computations, we do a reduce-scatter instead of a simple split
+                token_position_by_id_and_expert = mappings._reduce_scatter_along_first_dim(
+                    token_position_by_id_and_expert, computation=xm.REDUCE_MIN, process_group=tensor_parallel_group,
+                )
+                tokens_idx = mappings._reduce_scatter_along_first_dim(
+                    tokens_idx, computation=xm.REDUCE_MIN, process_group=tensor_parallel_group,
+                )
+                # Assemble token_position_to_id using chunk of token_position_by_id_and_expert and tokens_idx at each TP rank
+                # This generates small DMA transfers because of discontinuous writes, and benefits from distributing across TP ranks
+                token_position_to_id[token_position_by_id_and_expert] = tokens_idx.unsqueeze(1)
+                token_position_to_id = token_position_to_id[1:]
+                # Accumulate results across TP ranks (use MAX to correctly account for the -1 index initialization)
+                token_position_to_id = mappings._reduce(
+                    token_position_to_id, computation=xm.REDUCE_MAX, process_group=tensor_parallel_group,
+                )
         return block_to_expert, token_position_to_id
 
     def torch_blockwise_matmul_inference(

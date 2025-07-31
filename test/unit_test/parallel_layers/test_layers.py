@@ -435,5 +435,65 @@ class TestCustomFunction(unittest.TestCase):
             mock_scatter.assert_called_once_with(hidden_states)
             mock_assertions.assert_called_once()
 
+    def test_lm_head_padding(self):
+        batch_size = 2
+        input_size = 16
+        output_size = 1500
+        world_size = 64
+        padded_output_size_per_rank = 24
+        padded_output_size = world_size * padded_output_size_per_rank
+        pad_size = padded_output_size - output_size
+
+        with (
+            patch("neuronx_distributed.parallel_layers.layers.ColumnParallelLinear.initialize_weight_and_bias") as mock_init,
+            patch("torch.distributed.get_world_size") as mock_world_size,
+            patch("neuronx_distributed.parallel_layers.layers.linear_with_async_allreduce") as mock_linear,
+            patch("neuronx_distributed.parallel_layers.layers.gather_from_tensor_model_parallel_region") as mock_output_gather,
+        ):
+            mock_world_size.return_value = world_size
+            mock_init.return_value = None
+            mock_linear.return_value = torch.rand(batch_size, padded_output_size_per_rank)
+            mock_output_gather.return_value = torch.ones(batch_size, padded_output_size)
+
+            model= ColumnParallelLinear(
+                input_size=input_size,
+                output_size=output_size,
+                pad=True,
+                bias=True,
+                pad_alignment_size_per_rank=padded_output_size_per_rank, 
+	            keep_padded_output=True,                
+                tensor_model_parallel_group=torch.arange(world_size)
+            )
+
+            model.weight = torch.rand(24, 16)
+            model.bias = torch.zeros((1536,))
+            model.eval()
+
+            # Validate padding shapes
+            model.set_weight_and_bias_config()
+            assert(model.weight_shape == (24, 16)) 
+            assert(model.bias_shape == (1536,))
+
+            # Validate sharding and padding
+            model_state_dict = {
+                'layer.weight': torch.ones(output_size, input_size), 
+                'layer.bias': torch.ones(output_size,)
+            }
+            orig_weight = model_state_dict['layer.weight'].clone()
+            orig_bias = model_state_dict['layer.bias'].clone()
+            model.preshard_hook(model_state_dict, 'layer.weight')
+            model.preshard_hook(model_state_dict, 'layer.bias')
+            new_weight = model_state_dict['layer.weight']
+            new_bias = model_state_dict['layer.bias']
+            assert(new_weight.shape == (padded_output_size, input_size))
+            assert(torch.equal(new_weight, torch.nn.functional.pad(orig_weight, (0, 0, 0, pad_size))))
+            assert(new_bias.shape == (padded_output_size,))
+            min_value = torch.finfo(orig_bias.dtype).min
+            assert(torch.equal(new_bias, torch.nn.functional.pad(orig_bias, (0, pad_size), 'constant', min_value)))
+
+            # Validate the output is kept padded
+            final_output = model(torch.ones(2, 16))
+            assert(final_output.shape == (2, 1536))
+
 if __name__ == "__main__":
     unittest.main()

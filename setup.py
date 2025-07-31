@@ -59,7 +59,7 @@ setup(
     package_dir={"": "src"},
     package_data={
         "": [
-            "LICENSE.txt",
+            "LICENSE",
         ]
     },
     entry_points={

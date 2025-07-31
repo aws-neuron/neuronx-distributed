@@ -339,7 +339,7 @@ def parallel_model_trace(
         )
     else:
         logging.warn(
-            "Using non SPMD mode. Set spmd_mode=True if the worlkload is SPMD for a faster trace. Tracing in non SPMD mode for large models can run into OOM errors as we compile all ranks"
+            "Using non SPMD mode. Set spmd_mode=True if the workload is SPMD for a faster trace. Tracing in non SPMD mode for large models can run into OOM errors as we compile all ranks"
         )
         xmp.spawn(
             _trace,
@@ -712,6 +712,8 @@ def invoke_preshard_hook(module, checkpoint, prefix):
     # This is temporary until we formailze the preshard_hook in src
     if hasattr(module, "preshard_hook"):
         module.preshard_hook(checkpoint, prefix + "weight")
+        if getattr(module, "add_bias", False):
+            module.preshard_hook(checkpoint, prefix + "bias")
         return
 
     for name, child in module._modules.items():

@@ -1,11 +1,11 @@
 from typing import Any, Callable, TYPE_CHECKING
 
-from lightning_fabric.accelerators.xla import _XLA_AVAILABLE
-from lightning_fabric.utilities.types import Optimizable
-from pytorch_lightning.plugins.precision import XLAPrecisionPlugin
+from lightning.fabric.accelerators.xla import _XLA_AVAILABLE
+from lightning.fabric.utilities.types import Optimizable
+from lightning.pytorch.plugins.precision import XLAPrecisionPlugin
 
 if TYPE_CHECKING:
-    import pytorch_lightning as pl
+    import lightning.pytorch as pl
 
 
 class NeuronXLAPrecisionPlugin(XLAPrecisionPlugin):

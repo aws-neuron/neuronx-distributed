@@ -282,3 +282,32 @@ def verify_casted_dtype(value: Any) -> None:
         else:
             return
 
+def indices_split_along_dim(tensor: torch.Tensor, dim: int, rank: int, num_partitions: int) -> Optional[torch.Tensor]:
+    """
+    Calculates indices for partitioning a tensor along a specified dimension.
+
+    Args:
+        tensor (torch.Tensor): Input tensor to be partitioned.
+        dim (int): Dimension along which to split the tensor.
+        rank (int): Process rank determining which partition to create (0 to num_partitions-1).
+        num_partitions (int): Total number of partitions to create.
+
+    Returns:
+        Optional[torch.Tensor]: Tensor containing indices for the specified partition,
+                              or None if input tensor is None.
+
+    Example:
+        For a tensor of size 8 along dim with num_partitions=4:
+        - rank 0: returns indices [0, 1]
+        - rank 1: returns indices [2, 3]
+        - rank 2: returns indices [4, 5]
+        - rank 3: returns indices [6, 7]
+    """
+    if tensor is None:
+        return None
+
+    partition_size = divide(tensor.size(dim), num_partitions)
+    start_idx = rank * partition_size
+    indices = torch.arange(partition_size, device=tensor.device) + start_idx
+
+    return indices

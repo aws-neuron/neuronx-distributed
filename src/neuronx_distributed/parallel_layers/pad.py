@@ -165,7 +165,7 @@ def generate_padding_mask(
         # We need to mask out the query heads associated with the last replicate
         # kv head in each 4 replicates.
         # Note that LNC is irrelevant to attention head padding / masking.
-        kv_replicator = tp_degree // num_kv_heads
+        kv_replicator = max(tp_degree // num_kv_heads, 1)
         replicate_id = tp_rank % kv_replicator
 
         # Low and high query head index of the local query heads among all query heads
@@ -175,7 +175,8 @@ def generate_padding_mask(
             num_heads_with_pad_per_rank * (replicate_id + 1),
         )
 
-        padding_mask = torch.arange(low_idx, high_idx) < num_heads_per_kv_head
+        num_kv_heads_per_rank = (num_kv_heads * kv_replicator) // tp_degree
+        padding_mask = torch.arange(low_idx, high_idx) < num_heads_per_kv_head * num_kv_heads_per_rank
     else:
         raise RuntimeError(
             f"Unexpected hardware_type {hardware_type} received in padding mask generation."

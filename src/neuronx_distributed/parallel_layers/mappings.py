@@ -185,7 +185,7 @@ def tiled_nki_rs(src_tensor, dst_tensor, cc_dim, tp_rank, op=xm.REDUCE_SUM):
     cc = nccl.reduce_scatter(
         op=xm_compute_to_np[op], srcs=[src_tensor], dsts=[dst_tensor],
         replica_groups=[list(range(tp_rank))], reduce_scatter_dim=cc_dim)
-    cc.attrs['tile_outermost_dim'] = 1
+    cc.set_attr('tile_outermost_dim', 1)
     return
 
 
@@ -217,7 +217,7 @@ def tiled_nki_ag(src_tensor, dst_tensor, cc_dim, tp_rank):
     cc = nccl.all_gather(
         op=np.max, srcs=[src_tensor], dsts=[dst_tensor],
         replica_groups=[list(range(tp_rank))], all_gather_dim=cc_dim)
-    cc.attrs['tile_outermost_dim'] = 1
+    cc.set_attr('tile_outermost_dim', 1)
     return
 
 

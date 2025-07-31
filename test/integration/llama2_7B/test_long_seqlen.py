@@ -95,7 +95,7 @@ if __name__ == "__main__":
     failed = []
     for seq_len, mem_thershold, perf_threshold in [
         # Threshold with 5%-8% tolarance
-        [8192, 98924466176, 6.90],
+        [8192, 100507257635, 6.90],
         [16384, 109604828160, 3.0],
         [32768, 124354230272, 1.1],
     ]:

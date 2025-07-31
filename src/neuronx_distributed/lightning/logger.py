@@ -1,12 +1,12 @@
 import os
 from typing import Any, Callable, Mapping, Optional, TYPE_CHECKING, cast, Union, Tuple, Dict
 
-from lightning_fabric.utilities.cloud_io import _is_dir
-from lightning_fabric.utilities.logger import _add_prefix
-import pytorch_lightning as pl
-from pytorch_lightning.core.saving import save_hparams_to_yaml
-from pytorch_lightning.loggers.tensorboard import TensorBoardLogger
-from pytorch_lightning.utilities.rank_zero import rank_zero_warn
+from lightning.fabric.utilities.cloud_io import _is_dir 
+from lightning.fabric.utilities.logger import _add_prefix 
+import lightning.pytorch as pl 
+from lightning.pytorch.core.saving import save_hparams_to_yaml 
+from lightning.pytorch.loggers.tensorboard import TensorBoardLogger 
+from lightning.pytorch.utilities.rank_zero import rank_zero_warn 
 from torch import Tensor
 
 from neuronx_distributed.parallel_layers.parallel_state import (

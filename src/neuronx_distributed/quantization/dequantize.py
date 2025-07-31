@@ -27,6 +27,6 @@ def scale_dequantize(tensor: torch.Tensor, scale: torch.Tensor, upcast_dtype: to
         torch.Tensor: upcasted tensor multiplied with scale
     """
     upcast_tensor = tensor.to(torch.float32)
-    upcast_tensor *= scale
+    upcast_tensor *= scale.unsqueeze(len(scale.shape)-1)
     upcast_tensor = upcast_tensor.to(upcast_dtype)
     return upcast_tensor

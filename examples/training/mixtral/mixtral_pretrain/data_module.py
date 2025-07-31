@@ -1,6 +1,6 @@
 from typing import Callable, Dict, Tuple
 
-from pytorch_lightning import LightningDataModule
+from lightning.pytorch import LightningDataModule
 
 
 class NeuronLightningDataModule(LightningDataModule):

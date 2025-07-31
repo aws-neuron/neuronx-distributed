@@ -1,8 +1,7 @@
-from typing import Dict, Callable
+from typing import Dict, Callable, Any
 
 import torch
 import torch.nn.functional as F
-from neuronxcc.nki._private_kernels.blockwise_mm import SkipMode
 
 from neuronx_distributed.utils.model_utils import get_platform_lnc
 
@@ -21,3 +20,13 @@ DEFAULT_BLOCK_SIZE = 512
 DEFAULT_SKIP_MODE = (False, False)
 DEFAULT_LNC_SIZE = get_platform_lnc()
 DEFAULT_PADDING_VALUE = -1
+
+def create_spmd_ranks(
+    model_state_dict: Dict[str, Any],
+    prefix: str,
+    world_size,
+):
+    # add weight for spmd rank
+    model_state_dict[f"{prefix}spmd_rank.rank"] = torch.arange(
+        0, world_size, dtype=torch.int32
+    )

@@ -18,7 +18,8 @@ from .utils import (
     retrieve_artifact_from_model,
     generate_route_key_from_provided_args,
     ts_convert_dict_to_ordered_list_type_tensor,
-    ts_convert_dict_to_ordered_list_type_list_tensor
+    ts_convert_dict_to_ordered_list_type_list_tensor,
+    get_dtype_from_enum,
 )
 
 logger = logging.getLogger("Neuron")
@@ -178,7 +179,10 @@ class NxDModel(torch.nn.Module, BaseNxDModel):
 
         # create reserved example outputs, which is necessary for packer tracing
         example_outputs = []
-        for out_tensor in metaneff.output_tensors:
+        for out_idx, out_tensor in enumerate(metaneff.output_tensors):
+            # skip output tensors that are aliases
+            if out_idx in metaneff.output_aliases_to:
+                continue
             torch_dtype = get_torch_dtype(out_tensor.data_type)
             shape = out_tensor.shape
             tensor = torch.zeros(list(shape), dtype=torch_dtype)
@@ -633,14 +637,19 @@ class NxDModel(torch.nn.Module, BaseNxDModel):
                 torchscript_model.nxd_model.start_rank = start_rank
                 torchscript_model.nxd_model.local_ranks_size = local_ranks_size
 
+            converted_dtypes = {}
+            if torchscript_model.nxd_model.state_initializer is not None:
+                for name, dtype in torchscript_model.nxd_model.state_initializer.dtypes.items():
+                    converted_dtypes[name] = get_dtype_from_enum(dtype)
+
             nxd_model = NxDModel(
                 world_size,
                 start_rank,
                 local_ranks_size,
                 StateInitializer(
                     torchscript_model.nxd_model.state_initializer.shapes,
-                    torchscript_model.nxd_model.state_initializer.dtypes,
-                    local_ranks_size
+                    converted_dtypes,
+                    torchscript_model.nxd_model.local_ranks_size,
                 ) if torchscript_model.nxd_model.state_initializer is not None else None,
                 torchscript_model.nxd_model.layout_transformer # these can remain opaque under torchscript, since it's opaque to python anyways
             )
@@ -686,7 +695,7 @@ class NxDModel(torch.nn.Module, BaseNxDModel):
 
         except Exception as e:
             warnings.warn("Unable to reconstruct NxDModel from torchscript model, will return loaded torchscript model.")
-            traceback_str = traceback.format_exception(etype=type(e), value=e, tb=e.__traceback__)
+            traceback_str = ''.join(traceback.format_exception(None, e, e.__traceback__))
             logger.debug(traceback_str)
             return torchscript_model
 

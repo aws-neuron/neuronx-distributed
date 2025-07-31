@@ -1,5 +1,5 @@
 from typing import cast
-import pytorch_lightning as pl
+import lightning.pytorch as pl
 
 from neuronx_distributed.parallel_layers.parallel_state import (
     get_pipeline_model_parallel_size,

@@ -4,14 +4,14 @@ from typing import Any, Callable, Dict, Optional, Tuple, Union
 import torch
 import torch_xla.core.xla_model as xm
 from lightning_utilities.core.apply_func import apply_to_collection
-from lightning_utilities.core.rank_zero import rank_zero_warn
-from pytorch_lightning import LightningModule
-from pytorch_lightning.trainer.connectors.logger_connector.fx_validator import (
-    _FxValidator,
-)
-from pytorch_lightning.utilities.exceptions import MisconfigurationException
-from pytorch_lightning.utilities.signature_utils import is_param_in_hook_signature
-from pytorch_lightning.utilities.types import _METRIC
+from lightning_utilities.core.rank_zero import rank_zero_warn 
+from lightning.pytorch import LightningModule 
+from lightning.pytorch.trainer.connectors.logger_connector.fx_validator import ( 
+    _FxValidator, 
+) 
+from lightning.pytorch.utilities.exceptions import MisconfigurationException 
+from lightning.pytorch.utilities.signature_utils import is_param_in_hook_signature 
+from lightning.pytorch.utilities.types import _METRIC 
 from torch import Tensor
 from torchmetrics import Metric
 
@@ -114,8 +114,8 @@ class NeuronLTModule(LightningModule):
     def state_dict(self):
         return self.model.state_dict()
 
-    def load_state_dict(self, state_dict):
-        self.model.load_state_dict(state_dict)
+    def load_state_dict(self, state_dict, strict = True):
+        self.model.load_state_dict(state_dict, strict=strict)
 
     def get_param_groups_by_weight_decay(self):
         """Get param groups. Customers can override this to have their own way of weight_decay"""

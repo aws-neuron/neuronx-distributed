@@ -1,16 +1,20 @@
-import copy
-import json
 import os
 import re
+import copy
+import json
+import subprocess
+import fire
 from functools import partial
 from typing import List
 
-import fire
 import torch
 import torch_neuronx
-from neuronx_distributed.trace import ModelBuilder
-from neuronx_distributed.trace.model_builder import BaseModelInstance
 from safetensors.torch import load_file
+
+from neuronx_distributed import ModelBuilder, shard_checkpoint, NxDModel, NxDParallelState
+from neuronx_distributed.parallel_layers import parallel_state
+from neuronx_distributed.trace.mock_torchdist import mock_distributed
+from neuronx_distributed.utils.model_utils import init_on_device
 
 # TODO load config from path
 from config import Llama3_2_1B
@@ -67,12 +71,63 @@ def generate(model: torch.nn.Module, max_len: int, prompt_tokens: List[List[int]
     return prompt_tokens
 
 
+def _load_model_config(compiled_model_path, prompts):
+    if not compiled_model_path.endswith("/"):
+        compiled_model_path += "/"
+
+    with open(compiled_model_path + "config.json", "r") as file:
+        cfg = json.load(file)
+
+    bs, seq_len, tp_degree = cfg["batch_size"], cfg["seq_len"], cfg["tp_degree"]
+    shard_on_load = cfg.get("shard_on_load", True)
+
+    if len(prompts) != bs:
+        raise ValueError(f"Prompts size does not match batch size {cfg['batch_size']}")
+
+    return bs, seq_len, tp_degree, shard_on_load
+
+
+def _save_model_config(output_path, batch_size, seq_len, tp_degree, shard_on_load):
+    config = {
+        "batch_size": batch_size,
+        "seq_len": seq_len,
+        "tp_degree": tp_degree,
+        "shard_on_load": shard_on_load
+    }
+
+    with open(os.path.join(output_path, "config.json"), "w") as f:
+        json.dump(config, f, indent=4)
+
+
+def _load_sharded_weights(model_path, compiled_model_path, shard_on_load, tp_degree, bs, seq_len):
+    if shard_on_load:
+        # Shard weights during loading
+        checkpoint = load_llama_checkpoint(Llama3_2_1B, model_path, tp_degree)
+
+        with NxDParallelState(world_size=tp_degree, tensor_model_parallel_size=tp_degree), \
+                init_on_device(torch.device("meta")):
+            sharded_weights = shard_checkpoint(
+                checkpoint=checkpoint,
+                model=Transformer(Llama3_2_1B, bs, seq_len),
+                start_rank=0,
+                end_rank=tp_degree-1,
+            )
+    else:
+        # Load pre-sharded weights
+        sharded_weights = []
+        for rank in range(tp_degree):
+            ckpt = load_file(os.path.join(compiled_model_path, f"weights/tp{rank}_sharded_checkpoint.safetensors"))
+            sharded_weights.append(ckpt)
+
+    return sharded_weights
+
+
 @torch.inference_mode()
 def generate_cpu(
     batch_size=2,
     seq_len=128,
-    model_path="/home/ubuntu/.llama/checkpoints/Llama3.2-1B-Instruct/consolidated.00.pth",
-    tokenizer_path="/home/ubuntu/.llama/checkpoints/Llama3.2-1B-Instruct/tokenizer.model",
+    model_path="~/.llama/checkpoints/Llama3.2-1B-Instruct/consolidated.00.pth",
+    tokenizer_path="~/.llama/checkpoints/Llama3.2-1B-Instruct/tokenizer.model",
     prompts=["How tall is the Space Needle?", "What is the capital of France?"],
 ):
 
@@ -91,167 +146,282 @@ def generate_cpu(
 
 @torch.inference_mode()
 def generate_nxd(
-    compiled_model_path="/home/ubuntu/neuron_models/Llama3.2-1B-Instruct",
-    tokenizer_path="/home/ubuntu/.llama/checkpoints/Llama3.2-1B-Instruct/tokenizer.model",
+    compiled_model_path="~/neuron_models/Llama3.2-1B-Instruct",
+    model_path="~/.llama/checkpoints/Llama3.2-1B-Instruct/consolidated.00.pth",
+    tokenizer_path="~/.llama/checkpoints/Llama3.2-1B-Instruct/tokenizer.model",
     prompts=["How tall is the Space Needle?", "What is the capital of France?"],
 ):
-    if not compiled_model_path.endswith("/"):
-        compiled_model_path += "/"
-    with open(compiled_model_path + "config.json", "r") as file:
-        cfg = json.load(file)
+    compiled_model_path = os.path.expanduser(compiled_model_path)
+    model_path = os.path.expanduser(model_path)
+    tokenizer_path = os.path.expanduser(tokenizer_path)
+    
+    # Load model config
+    bs, seq_len, tp_degree, shard_on_load = _load_model_config(compiled_model_path, prompts)
 
-    bs, seq_len, tp_degree = cfg["batch_size"], cfg["seq_len"], cfg["tp_degree"]
+    # Load NxD model
+    nxd_model = NxDModel.load(os.path.join(compiled_model_path, "nxd_model.pt"))
+    sharded_weights = _load_sharded_weights(model_path, compiled_model_path, shard_on_load, tp_degree, bs, seq_len)
+    nxd_model.set_weights(sharded_weights)
+    nxd_model.to_neuron()
 
-    if len(prompts) != bs:
-        raise ValueError(f"Prompts size does not match batch size {cfg['batch_size']}")
-
-    weights = []
-    for rank in range(tp_degree):
-        ckpt = load_file(os.path.join(compiled_model_path, f"weights/tp{rank}_sharded_checkpoint.safetensors"))
-        weights.append(ckpt)
-
-    model = torch.jit.load(compiled_model_path + "nxd_model.pt")
-    start_rank_tensor = torch.tensor([0], dtype=torch.int32, device="cpu")
-    model.nxd_model.initialize(weights, start_rank_tensor)
-
-    tokenizer = Tokenizer(model_path=tokenizer_path)
+    # Generate text
+    tokenizer = Tokenizer(model_path=os.path.expanduser(tokenizer_path))
     prompt_tokens = [tokenizer.encode(x, bos=True, eos=False) for x in prompts]
-
-    output_tokens = generate(model, seq_len, prompt_tokens, stop_tokens=tokenizer.stop_tokens)
+    output_tokens = generate(nxd_model, seq_len, prompt_tokens, stop_tokens=tokenizer.stop_tokens)
 
     return [tokenizer.decode(tokens) for tokens in output_tokens]
+
+
+def _compile_no_mock(
+    batch_size=2,
+    seq_len=128,
+    tp_degree=32,
+    model_path="~/.llama/checkpoints/Llama3.2-1B-Instruct/consolidated.00.pth",
+    output_path="~/neuron_models/Llama3.2-1B-Instruct",
+    shard_on_load=True,
+):
+    rank = int(os.environ["RANK"])
+    torch.distributed.init_process_group(backend="xla", rank=0, world_size=tp_degree)
+    parallel_state.initialize_model_parallel(tensor_model_parallel_size=tp_degree)
+    torch.multiprocessing.set_sharing_strategy("file_system")
+    parallel_state.set_aot_mode(True)
+
+    if rank == 0:
+        model = Transformer(Llama3_2_1B, batch_size, seq_len)
+
+        # Initialize ModelBuilder
+        builder = ModelBuilder(
+            model=model,
+        )
+
+        # Add prefill trace
+        builder.trace(
+            kwargs={
+                "tokens": torch.ones((batch_size, seq_len), dtype=torch.int32),
+                "last_pos": torch.tensor([0] * batch_size, dtype=torch.int32),
+                "attention_mask": torch.ones((batch_size, seq_len), dtype=torch.int32),
+            },
+            tag="prefill",
+        )
+
+        # Add decode trace
+        builder.trace(
+            kwargs={
+                "tokens": torch.ones((batch_size, 1), dtype=torch.int32),
+                "last_pos": torch.tensor([0] * batch_size, dtype=torch.int32),
+                "attention_mask": torch.ones((batch_size, seq_len), dtype=torch.int32),
+            },
+            tag="decode",
+        )
+
+        # Compile
+        traced_model = builder.compile()
+
+        # Save model and config
+        os.makedirs(output_path, exist_ok=True)
+        traced_model.save(os.path.join(output_path, "nxd_model.pt"))
+        _save_model_config(output_path, batch_size, seq_len, tp_degree, shard_on_load)
+        print(f"Saved compiled model to {output_path}")
+
+    parallel_state.set_aot_mode(False)
+    parallel_state.destroy_model_parallel()
+    torch.distributed.destroy_process_group()
+
+    if not shard_on_load and rank == 0:
+        serialize_path = os.path.join(output_path, "weights/")
+
+        with init_on_device(torch.device("meta")):
+            torch.distributed.init_process_group(backend="xla", rank=0, world_size=tp_degree)
+            parallel_state.initialize_model_parallel(tensor_model_parallel_size=tp_degree)
+
+            shard_checkpoint(
+                checkpoint=load_llama_checkpoint(Llama3_2_1B, model_path, tp_degree),
+                model=Transformer(Llama3_2_1B, batch_size, seq_len),
+                start_rank=0,
+                end_rank=tp_degree-1,
+                serialize_path=serialize_path
+            )
+
+            parallel_state.destroy_model_parallel()
+            torch.distributed.destroy_process_group()
+
+        print(f"Saved sharded checkpoints to {serialize_path}")
+
+
+def compile_no_mock(
+    batch_size=2,
+    seq_len=128,
+    tp_degree=32,
+    model_path="~/.llama/checkpoints/Llama3.2-1B-Instruct/consolidated.00.pth",
+    output_path="~/neuron_models/Llama3.2-1B-Instruct",
+    shard_on_load=True,
+):
+    script_path = os.path.abspath(__file__)
+    cmd = [
+        "torchrun",
+        f"--nproc_per_node={tp_degree}",
+        script_path,
+        "_compile_no_mock",
+        f"--batch_size={batch_size}",
+        f"--seq_len={seq_len}",
+        f"--tp_degree={tp_degree}",
+        f"--model_path={model_path}",
+        f"--output_path={output_path}",
+        f"--shard_on_load={shard_on_load}"
+    ]
+
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    stdout, stderr = process.communicate()
+
+    print(stdout.decode())
+    if process.returncode != 0:
+        print("Error:", stderr.decode())
+        raise RuntimeError("Compilation failed")
+
+
+def compile_with_mock(
+    batch_size=2,
+    seq_len=128,
+    tp_degree=32,
+    model_path="~/.llama/checkpoints/Llama3.2-1B-Instruct/consolidated.00.pth",
+    output_path="~/neuron_models/Llama3.2-1B-Instruct",
+    shard_on_load=True,
+):
+    with mock_distributed(world_size=tp_degree):
+        torch.distributed.init_process_group(backend="xla", rank=0, world_size=tp_degree)
+        parallel_state.initialize_model_parallel(tensor_model_parallel_size=tp_degree, skip_collective_init=True)
+        parallel_state.set_aot_mode(True)
+
+        model = Transformer(Llama3_2_1B, batch_size, seq_len)
+
+        # Initialize ModelBuilder
+        builder = ModelBuilder(model=model)
+
+        # Add prefill trace
+        builder.trace(
+            kwargs={
+                "tokens": torch.ones((batch_size, seq_len), dtype=torch.int32),
+                "last_pos": torch.tensor([0] * batch_size, dtype=torch.int32),
+                "attention_mask": torch.ones((batch_size, seq_len), dtype=torch.int32),
+            },
+            tag="prefill",
+        )
+
+        # Add decode trace
+        builder.trace(
+            kwargs={
+                "tokens": torch.ones((batch_size, 1), dtype=torch.int32),
+                "last_pos": torch.tensor([0] * batch_size, dtype=torch.int32),
+                "attention_mask": torch.ones((batch_size, seq_len), dtype=torch.int32),
+            },
+            tag="decode",
+        )
+
+        # Compile
+        traced_model = builder.compile()
+
+        # Save model and config
+        os.makedirs(output_path, exist_ok=True)
+        traced_model.save(os.path.join(output_path, "nxd_model.pt"))
+        _save_model_config(output_path, batch_size, seq_len, tp_degree, shard_on_load)
+        print(f"Saved compiled model to {output_path}")
+
+        parallel_state.set_aot_mode(False)
+        parallel_state.destroy_model_parallel()
+        torch.distributed.destroy_process_group()
+
+    if not shard_on_load:
+        # Pre-shard weights and save them
+        serialize_path = os.path.join(output_path, "weights/")
+
+        with mock_distributed(world_size=tp_degree), init_on_device(torch.device("meta")):
+            torch.distributed.init_process_group(backend="xla", rank=0, world_size=tp_degree)
+            parallel_state.initialize_model_parallel(tensor_model_parallel_size=tp_degree, skip_collective_init=True)
+
+            shard_checkpoint(
+                checkpoint=load_llama_checkpoint(Llama3_2_1B, model_path, tp_degree),
+                model=Transformer(Llama3_2_1B, batch_size, seq_len),
+                start_rank=0,
+                end_rank=tp_degree-1,
+                serialize_path=serialize_path
+            )
+
+            parallel_state.destroy_model_parallel()
+            torch.distributed.destroy_process_group()
+
+        print(f"Saved sharded checkpoints to {serialize_path}")
 
 
 def compile(
     batch_size=2,
     seq_len=128,
     tp_degree=32,
-    model_path="/home/ubuntu/.llama/checkpoints/Llama3.2-1B-Instruct/consolidated.00.pth",
-    output_path="/home/ubuntu/neuron_models/Llama3.2-1B-Instruct",
+    model_path="~/.llama/checkpoints/Llama3.2-1B-Instruct/consolidated.00.pth",
+    output_path="~/neuron_models/Llama3.2-1B-Instruct",
+    shard_on_load=True,
 ):
+    with NxDParallelState(world_size=tp_degree, tensor_model_parallel_size=tp_degree):
+        model = Transformer(Llama3_2_1B, batch_size, seq_len)
 
-    # ModelBuilder takes in a object of type BaseModelInstance. This object
-    # should have two functions `load_module` and `get`. The object declares
-    # how the object can be initialized so the tracing function can create its own
-    # instance.
-    #
-    # What is an alias? and why do I need it?
-    # If you have any state that you want to use across model invocations
-    # you would want to use an alias. Aliasing tells the compiler that
-    # the output can be written to the same input buffer. This avoids
-    # the creation of duplicate memory allocations for the output.
-    #
-    # On NxD, all output tensors are copied back from device to CPU
-    # after a model invocation. But the aliased tensors are not returned
-    # and are retained on device.
-    #
-    # So if you have a buffer that is expensive to repeatedly copy
-    # to and from the device, you should use an alias. KV Cache is a good
-    # candidate for aliasing.
-    #
-    # How do I define an alias?
-    # Alias is a map. It maps buffer -> output index.
-    #
-    # Say we have Module defined as,
-    #
-    #  Module(torch.nn.Module):
-    #
-    #    def __init__(self):
-    #      self.register_buffer("cache", torch.zeros(...))
-    #
-    #    def forward(input_A, input_B):
-    #       ...
-    #       return output, output_A
-    #
-    # And we want to alias input_A and output_A. The alias would say,
-    #
-    #  module = Module()
-    #  alias = { module.cache : 1 }
-    #
-    #  This means `cache` is aliased to the output number 1 which is `output_A`
-    class Instance(BaseModelInstance):
+        # Initialize ModelBuilder
+        builder = ModelBuilder(model=model)
 
-        def __init__(self):
-            self.module = None
+        # Add prefill trace
+        builder.trace(
+            kwargs={
+                "tokens": torch.ones((batch_size, seq_len), dtype=torch.int32),
+                "last_pos": torch.tensor([0] * batch_size, dtype=torch.int32),
+                "attention_mask": torch.ones((batch_size, seq_len), dtype=torch.int32),
+            },
+            tag="prefill",
+        )
 
-        def load_module(self):
-            self.module = Transformer(Llama3_2_1B, batch_size, seq_len)
+        # Add decode trace
+        builder.trace(
+            kwargs={
+                "tokens": torch.ones((batch_size, 1), dtype=torch.int32),
+                "last_pos": torch.tensor([0] * batch_size, dtype=torch.int32),
+                "attention_mask": torch.ones((batch_size, seq_len), dtype=torch.int32),
+            },
+            tag="decode",
+        )
 
-        def get(self, bucket_rank, **kwargs):
+        # Compile
+        traced_model = builder.compile()
 
-            # The Transformer model return logits as index 0. We want to start
-            # aliasing from output index 1
-            #
-            # Transformer() -> (logits,
-            #                   k_cache_lay1, .., k_cache_layN,
-            #                   v_cache_lay1, ... v_cache_layN)
+        # Save model and config
+        os.makedirs(output_path, exist_ok=True)
+        traced_model.save(os.path.join(output_path, "nxd_model.pt"))
+        _save_model_config(output_path, batch_size, seq_len, tp_degree, shard_on_load)
+        print(f"Saved compiled model to {output_path}")
 
-            aliases = {}
-            output_index = 1
-            for i, layer in enumerate(self.module.layers):
-                aliases[layer.attention.cache_k] = output_index
-                output_index = output_index + 1
-            for i, layer in enumerate(self.module.layers):
-                aliases[layer.attention.cache_v] = output_index
-                output_index = output_index + 1
+    if not shard_on_load:
+        # Pre-shard weights and save them
+        serialize_path = os.path.join(output_path, "weights/")
 
-            return self.module, aliases
-
-    builder = ModelBuilder(
-        router=None,
-        tp_degree=tp_degree,
-        checkpoint_loader=partial(load_llama_checkpoint, Llama3_2_1B, model_path, tp_degree),
-        debug=True,
-    )
-    builder.add(
-        key="prefill",
-        model_instance=Instance(),
-        example_inputs=[
-            (
-                torch.ones((batch_size, seq_len), dtype=torch.int32),  # input tokens
-                torch.tensor([0] * batch_size, dtype=torch.int32),
-                torch.ones((batch_size, seq_len), dtype=torch.int32),  # attention mask
+        with NxDParallelState(world_size=tp_degree, tensor_model_parallel_size=tp_degree), \
+                init_on_device(torch.device("meta")):
+            shard_checkpoint(
+                checkpoint=load_llama_checkpoint(Llama3_2_1B, model_path, tp_degree),
+                model=Transformer(Llama3_2_1B, batch_size, seq_len),
+                start_rank=0,
+                end_rank=tp_degree-1,
+                serialize_path=serialize_path
             )
-        ],  # last_pos
-        compiler_args="--auto-cast=none",
-    )
-    builder.add(
-        key="decode",
-        model_instance=Instance(),
-        example_inputs=[
-            (
-                torch.ones((batch_size, 1), dtype=torch.int32),  # input tokens
-                torch.tensor([0] * batch_size, dtype=torch.int32),
-                torch.ones((batch_size, seq_len), dtype=torch.int32),  # attention mask
-            )
-        ],  # last_pos
-        compiler_args="--auto-cast=none",
-    )
 
-    traced_model = builder.trace(initialize_model_weights=False)
-
-    if not output_path.endswith("/"):
-        output_path += "/"
-    builder.shard_checkpoint(serialize_path=output_path + "weights/")
-    torch.jit.save(traced_model, output_path + "nxd_model.pt")
-
-    # Lets store the config along with the saved model
-    data = {"batch_size": batch_size, "seq_len": seq_len, "tp_degree": tp_degree}
-    with open(output_path + "config.json", "w") as f:
-        json.dump(data, f, indent=4)
-
-    print(f"Saved compiled model to {output_path}")
+        print(f"Saved sharded checkpoints to {serialize_path}")
 
 
 def test_attention(
-    model_path="/home/ubuntu/.llama/checkpoints/Llama3.2-1B-Instruct",
+    model_path="~/.llama/checkpoints/Llama3.2-1B-Instruct/consolidated.00.pth",
+    output_path="~/neuron_models/Llama3.2-1B-Instruct_test_attention",
     tp_degree=32,
     batch_size=2,
     seq_len=128,
 ):
     torch.manual_seed(0)
 
-    # Lets test with float32
+    # Let's test with float32
     cfg = copy.deepcopy(Llama3_2_1B)
     cfg.dtype = torch.float32
 
@@ -262,41 +432,42 @@ def test_attention(
     mask = torch.full((seq_len, seq_len), True).tril(diagonal=0)
     rope_cache = precompute_rope("cpu", 500000.0, head_dim, seq_len)
 
+    # Save weights for testing
     neuron_attn_state_dict = _load_attn_state_dict(cfg, model_path, tp_degree)
     cpu_attn_state_dict = _load_attn_state_dict(cfg, model_path, 1)
 
-    class Instance(BaseModelInstance):
+    with NxDParallelState(world_size=tp_degree, tensor_model_parallel_size=tp_degree):
+        attn = Attention(cfg, batch_size, seq_len)
+        neuron_attn = ModelBuilder(model=attn) \
+                        .trace(args=(hidden, start_pos, mask, rope_cache), tag="prefill") \
+                        .compile()
 
-        def __init__(self):
-            self.module = None
+        # Save the traced model
+        os.makedirs(output_path, exist_ok=True)
+        neuron_attn.save(os.path.join(output_path, "nxd_model.pt"))
 
-        def load_module(self):
-            self.module = Attention(cfg, batch_size, seq_len)
-
-        def get(self, bucket_rank, **kwargs):
-            return self.module, {self.module.cache_k: 1, self.module.cache_v: 2}
-
-    builder = ModelBuilder(
-        router=None, tp_degree=tp_degree, checkpoint_loader=lambda: neuron_attn_state_dict, debug=True
-    )
-    builder.add(
-        key="prefill",
-        model_instance=Instance(),
-        example_inputs=[(hidden, start_pos, mask, rope_cache)],
-        compiler_args="--auto-cast=none",
-    )
-    neuron_attn = builder.trace()
-
-    start_rank_tensor = torch.tensor([0], dtype=torch.int32, device="cpu")
-    neuron_attn.nxd_model.initialize_with_saved_weights(start_rank_tensor)
-
+    # Test CPU version
     attn = Attention(cfg, batch_size, seq_len)
     attn.load_state_dict(cpu_attn_state_dict, strict=False)
+    cpu_o = attn(hidden, start_pos, mask, rope_cache)
+    # Capture CPU cache_k and cache_v for comparison
+    cpu_cache_k = attn.cache_k
+    cpu_cache_v = attn.cache_v
 
-    cpu_o, cpu_cache_k, cpu_cache_v = attn(hidden, start_pos, mask, rope_cache)
-
-    # Note: If you alias the tensors, the compiled model will not return it.
-    # They are kept on device. We cannot return a single tensor is because
+    # Test Neuron version
+    with NxDParallelState(world_size=tp_degree, tensor_model_parallel_size=tp_degree), init_on_device(torch.device("meta")):
+        sharded_ckpts = shard_checkpoint(
+            checkpoint=neuron_attn_state_dict,
+            model=Attention(cfg, batch_size, seq_len),
+            start_rank=0,
+            end_rank=tp_degree-1,
+        )
+    
+    neuron_attn = NxDModel.load(os.path.join(output_path, "nxd_model.pt"))
+    neuron_attn.set_weights(sharded_ckpts)
+    neuron_attn.to_neuron()
+    
+    # Note: We cannot return a single tensor is because
     # each core has its own copy of the tensor. As we are SPMD the output
     # is assumed to be the same, so return the output of the first core.
     neuron_o = neuron_attn(hidden, start_pos, mask, rope_cache)
@@ -305,8 +476,8 @@ def test_attention(
     # But we can access them this way per rank. This is how you do it.
     if tp_degree == 1:
         rank = 0
-        neuron_cache_k_n = neuron_attn.nxd_model.state[rank]["cache_k"].to("cpu")
-        neuron_cache_v_n = neuron_attn.nxd_model.state[rank]["cache_v"].to("cpu")
+        neuron_cache_k_n = neuron_attn.states[rank]["cache_k"].to("cpu")
+        neuron_cache_v_n = neuron_attn.states[rank]["cache_v"].to("cpu")
         neuron_cache_k = neuron_cache_k_n.expand(batch_size, seq_len, cfg.n_kv_heads, head_dim)
         neuron_cache_v = neuron_cache_v_n.expand(batch_size, seq_len, cfg.n_kv_heads, head_dim)
         torch_neuronx.testing.assert_close(cpu_cache_k, neuron_cache_k, rtol=1e-5, atol=1e-5)
@@ -316,15 +487,21 @@ def test_attention(
 
 
 def _load_attn_state_dict(cfg, model_path, tp_degree):
-    if not model_path.endswith("/"):
-        model_path += "/"
-    state_dict = load_llama_checkpoint(model_path=model_path + "consolidated.00.pth", cfg=cfg, tp_degree=tp_degree)
+    model_path = os.path.expanduser(model_path)
+
+    state_dict = load_llama_checkpoint(
+        cfg=cfg,
+        model_path=model_path,
+        tp_degree=tp_degree
+    )
+
     # Use the weights from the first layer.
     attn_dict = {
         re.sub(r"layers\.0\.attention\.", "", k): v.to(cfg.dtype)
         for (k, v) in state_dict.items()
         if re.search(r"layers\.0\.attention\.", k)
     }
+
     return attn_dict
 
 
@@ -341,6 +518,9 @@ if __name__ == "__main__":
             "generate_cpu": partial(_print_string_list_output, generate_cpu),
             "generate_nxd": partial(_print_string_list_output, generate_nxd),
             "compile": compile,
+            "compile_with_mock": compile_with_mock,
+            "compile_no_mock": compile_no_mock,
+            "_compile_no_mock": _compile_no_mock,
             "test_attention": test_attention,
         }
     )

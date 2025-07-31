@@ -1,3 +1,4 @@
+import os
 import math
 from contextlib import contextmanager
 from enum import IntEnum
@@ -374,4 +375,8 @@ def get_platform_lnc():
     """
     Get the Logical NeuronCore Configuration (LNC) for the current platform.
     """
-    return LogicalNCConfig.LNC_2 if get_platform_target() == "trn2" else LogicalNCConfig.LNC_1
+    env_lnc = int(os.environ.get("NEURON_LOGICAL_NC_CONFIG", -1))
+    if env_lnc != -1:
+        return LogicalNCConfig(env_lnc)
+    else:
+        return LogicalNCConfig.LNC_2 if get_platform_target() == "trn2" else LogicalNCConfig.LNC_1

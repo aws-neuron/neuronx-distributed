@@ -3,15 +3,15 @@ from typing import List, Union
 
 import torch
 import torch_xla
-from lightning_fabric.accelerators.registry import _AcceleratorRegistry
-from lightning_fabric.accelerators.xla import (
-    _XLA_AVAILABLE,
-    _parse_tpu_devices_str,
-    _using_pjrt,
-)
-from lightning_fabric.utilities.device_parser import _check_data_type
-from lightning_fabric.accelerators.accelerator import Accelerator
-from pytorch_lightning.accelerators import XLAAccelerator
+from lightning.fabric.accelerators.registry import _AcceleratorRegistry
+from lightning.fabric.accelerators.xla import ( 
+    _XLA_AVAILABLE, 
+    _parse_tpu_devices_str, 
+    _using_pjrt, 
+) 
+from lightning.fabric.utilities.device_parser import _check_data_type 
+from lightning.fabric.accelerators.accelerator import Accelerator 
+from lightning.pytorch.accelerators import XLAAccelerator 
 from packaging import version
 from typing import Any
 

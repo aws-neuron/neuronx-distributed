@@ -6,6 +6,7 @@ from torch.distributed import ProcessGroup
 from neuronx_distributed.modules.moe import expert_mlps, routing, token_shuffling
 from neuronx_distributed.modules.moe.shared_experts import SharedExperts
 from neuronx_distributed.parallel_layers import mappings, parallel_state
+from neuronx_distributed.parallel_layers.utils import indices_split_along_dim
 
 
 class MoE(torch.nn.Module):
@@ -72,15 +73,14 @@ class MoE(torch.nn.Module):
     Arguments:
         router: Determines expert routing for input tokens
         expert_mlps: Obtains the output of the MoE layer by passing tokens through the chosen experts
-        sequence_parallel_enabled: Whether the model is running in sequence parallel or not
-        return_router_logits: Whether to return the router logits in the forward pass
+        sequence_parallel_enabled: Whether the model is running in sequence parallel or not, input will be split along sequence dimension if true.
+        sequence_dimension: sequence dimension of the input.
+        return_expert_index: Whether to return the expert index from router in the forward pass
+        return_router_logits: Whether to return the router logits in the forward pass. This flag is usually only enabled dor debugging.
         token_shuffle_group_size: Size of token shuffling group. If size=1, token shuffling is disabled.
         1 <= token_shuffle_group_size <= dp_size.
         token_shuffle_seed: Seed for token shuffling. If None, a random seed is used.
     """
-
-    # Flag used in testing. Should not be used in production.
-    is_test = False
 
     def __init__(
         self,
@@ -90,6 +90,7 @@ class MoE(torch.nn.Module):
         sequence_parallel_enabled: bool = False,
         sequence_dimension: Optional[int] = None,
         return_router_logits: bool = False,
+        return_expert_index: bool = True,
         token_shuffle_group_size: int = 1,  # disable token shuffle by default
         token_shuffle_seed=None,
         tensor_model_parallel_group: Optional[ProcessGroup] = None,
@@ -109,7 +110,6 @@ class MoE(torch.nn.Module):
         self.router = router
         self.expert_mlps = expert_mlps
         self.shared_experts = shared_experts
-
         self.sequence_parallel_enabled = sequence_parallel_enabled
         if sequence_dimension is None:
             # Default to 0
@@ -117,6 +117,7 @@ class MoE(torch.nn.Module):
         self.sequence_dimension = sequence_dimension
 
         self.return_router_logits = return_router_logits
+        self.return_expert_index = return_expert_index
         self.ep_enabled = parallel_state.get_expert_model_parallel_size() > 1
         self.token_shuffle_group_size = token_shuffle_group_size
         self.token_shuffle_seed = token_shuffle_seed
@@ -177,6 +178,7 @@ class MoE(torch.nn.Module):
 
         # full_hidden_states: (S, B, H) or (B, S, H)
         full_hidden_states_shape = full_hidden_states.shape
+        hidden_states_shape = hidden_states.shape
         seq_len = full_hidden_states_shape[self.sequence_dimension]
 
         # Get the router_logits, expert_affinities and expert_index from the router
@@ -189,15 +191,8 @@ class MoE(torch.nn.Module):
         if not self.ep_enabled:
             # All-Reduce expert_affinities gradients in backward pass, to account for delayed output All-Reduce
             expert_affinities = mappings.copy_to_tensor_model_parallel_region(expert_affinities)
-
-        shared_output = torch.zeros_like(full_hidden_states)
-        if self.shared_experts:
-            assert not self.training, 'Shared + Routed experts are not yet supported in MoE module for training'
-            shared_output = self.shared_experts(full_hidden_states)
-
         # full_hidden_states: (S, B, H) or (B, S, H) -> (T, H)
         full_hidden_states = full_hidden_states.reshape(-1, full_hidden_states_shape[-1])
-
         # Get the output from the ExpertMLPs
         output = self.expert_mlps(
             hidden_states=full_hidden_states,
@@ -205,36 +200,99 @@ class MoE(torch.nn.Module):
             expert_index=expert_index,
             seq_len=seq_len,
         )
-
+        output = self._apply_shared_experts(output, full_hidden_states, hidden_states, hidden_states_shape, seq_len)
         # output: (T, H) -> (S, B, H) or (B, S, H)
         output = output.view(full_hidden_states_shape)
-        output = output + shared_output
 
-        if self.sequence_parallel_enabled and self.ep_enabled:
-            # Reduction is done earlier in the case of EP
-            output = mappings.scatter_to_sequence_parallel_region(
+        if self.sequence_parallel_enabled:
+            if self.ep_enabled:
+                # Reduction is done earlier in the case of EP
+                output = mappings.scatter_to_sequence_parallel_region(
                 output, self.sequence_dimension, process_group=self.tensor_parallel_group,
             )
-        elif self.sequence_parallel_enabled:
-            # Delayed reduce-scatter back to sequence parallel (as the hidden_states were in SP)
-            output = mappings.reduce_scatter_to_sequence_parallel_region(
+            else:
+                # Delayed reduce-scatter back to sequence parallel (as the hidden_states were in SP)
+                output = mappings.reduce_scatter_to_sequence_parallel_region(
                 output, self.sequence_dimension, process_group=self.tensor_parallel_group,
             )
-        elif not self.ep_enabled:
-            # Delayed All-Reduce
-            output = mappings.reduce_from_tensor_model_parallel_region(
+        else:
+            if self.ep_enabled:
+                output = mappings.reduce_from_tensor_model_parallel_region(
+                output, process_group=parallel_state.get_world_group()
+            )
+            else:
+                # Delayed All-Reduce
+                output = mappings.reduce_from_tensor_model_parallel_region(
                 output, process_group=self.tensor_parallel_group
             )
 
         if self.token_shuffle_group_size > 1:
             output = token_shuffling.token_unshuffle(output, shuffle_permutation)
 
-        return_op = (output,)
+        return_op = (output, )
+
         if self.expert_mlps.return_bias:
             return_op += (None,)
         if self.return_router_logits:
             return_op += (router_logits,)
-        if self.is_test:
+        if self.return_expert_index:
             return_op += (expert_index,)
-
         return return_op
+
+    def _apply_shared_experts(self, output, full_hidden_states, hidden_states, hidden_states_shape, seq_len):
+        """
+        Applies shared experts processing if enabled. The shared experts may run in sequence parallel where weights are
+        replicated on each core, or tensor parallel where weights are sharded.
+
+        Args:
+            output (torch.Tensor): Current output from expert MLPs
+            full_hidden_states (torch.Tensor): Gathered hidden states
+            hidden_states (torch.Tensor): Original input tensor
+            hidden_states_shape (torch.Size): Original shape
+            seq_len (int): Sequence length being processed
+
+        Returns:
+            torch.Tensor: Output with shared experts processing applied
+
+        Raises:
+            AssertionError: If called during training or without sequence parallel when required
+        """
+        # Early exit if shared experts are not enabled
+        if not self.shared_experts:
+            return output
+
+        hidden_states_flattened = hidden_states.reshape(-1, hidden_states_shape[-1])
+
+        # Handle single token generation case (seq_len == 1)
+        if seq_len == 1:
+            # Process using tensor parallelism with either sliced or sharded weights
+            shared_output = self.shared_experts(full_hidden_states, seq_len)
+            output = output + shared_output
+
+        # Handle context encoding case (seq_len > 1)
+        else:
+            # Case 1: Run shared experts in SP where weights are replicated at each core
+            if self.shared_experts.sequence_parallel_enabled:
+                # Verify sequence parallelism is enabled for input
+                assert self.sequence_parallel_enabled, ('Shared experts can run in sequence parallel '
+                                                        'when input is in sequence parallel for context encoding')
+
+                # Process flattened hidden states
+                shared_output = self.shared_experts(hidden_states_flattened, seq_len)
+
+                # Calculate indices for proper tensor splitting across ranks
+                indices = indices_split_along_dim(
+                    output, 0,
+                    rank=self.shared_experts.spmd_rank.get_rank(),
+                    num_partitions=parallel_state.get_tensor_model_parallel_group().size()
+                )
+
+                # Add shared expert output to total output at specific indices corresponding to the current rank
+                output = torch.index_add(output, 0, indices, shared_output)
+
+            # Case 2: Using tensor parallelism
+            else:
+                shared_output = self.shared_experts(full_hidden_states, seq_len)
+                output = output + shared_output
+
+        return output

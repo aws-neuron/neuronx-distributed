@@ -1,3 +1,8 @@
+import os
+import time
+import subprocess
+
+from botocore.utils import IMDSFetcher
 import torch
 import torch_xla.core.xla_model as xm
 import random
@@ -264,3 +269,38 @@ def test_modules(
 
     # If we got here compilation passed
     return (True, output_pass, grads_pass)
+
+def get_dir_size(dir):
+    total_size = 0
+    for dirpath, dirnames, filenames in os.walk(dir):
+        for f in filenames:
+            fp = os.path.join(dirpath, f)
+            # skip if it is symbolic link
+            if not os.path.islink(fp):
+                total_size += os.path.getsize(fp)
+    return total_size
+
+def download_from_s3(s3_file, local_file):
+    # track download time and size
+    start_time = time.time()
+
+    # download weights from s3
+    sync_cmd = ["aws", "s3", "cp", s3_file, local_file, "--only-show-errors"]
+    try:
+        print(f"Downloading from s3 <{s3_file}> to local <{local_file}>")
+        result = subprocess.run(sync_cmd, capture_output=True, text=True)
+
+        if result.returncode != 0:
+            raise Exception(f"{result.stderr}")
+
+    except Exception as e:
+        raise Exception(f"Weight download from s3 failed: {e}")
+
+    # calculate download statistics
+    total_time = time.time() - start_time
+    downloaded_bytes = os.path.getsize(local_file)
+    if downloaded_bytes == 0:
+        raise Exception("Weight download from s3 failed: downloaded ckpt file is empty")
+    print(f"Download duration: {round(total_time, 2)}s")
+    print(f"Download size: {round(downloaded_bytes / 1000000000, 2)}GB")
+    print(f"Download speed: {round(downloaded_bytes * 8 / 1000000000 / total_time, 2)}Gbps")

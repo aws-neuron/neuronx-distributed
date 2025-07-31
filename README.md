@@ -19,3 +19,9 @@ It should place the wheel at `build/`
 For a detailed API reference guide, please refer to: https://awsdocs-neuron.readthedocs-hosted.com/en/latest/libraries/neuronx-distributed/api_guide.html#api-guide
 
 
+### Formatting code
+
+To format the code, use the following command:
+```
+pre-commit run --all-files
+```

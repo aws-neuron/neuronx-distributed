@@ -39,6 +39,7 @@ class DtypeBound(Enum):
 class QuantizationType(Enum, metaclass=MyEnumMeta):
     PER_TENSOR_SYMMETRIC = "per_tensor_symmetric"
     PER_CHANNEL_SYMMETRIC = "per_channel_symmetric"
+    EXPERT_WISE_PER_CHANNEL_SYMMETRIC = "expert_wise_per_channel_symmetric"
 
 class ActivationQuantizationType(Enum, metaclass=MyEnumMeta):
     DYNAMIC = "dynamic"
@@ -73,6 +74,8 @@ class BASE_QCONFIG_DICT_TYPE(TypedDict):
 class PER_CHANNEL_QCONFIG_DICT_TYPE(BASE_QCONFIG_DICT_TYPE):
     quantization_per_channel_axis: Optional[int]
 
+class EXPERT_WISE_PER_CHANNEL_QCONFIG_DICT_TYPE(BASE_QCONFIG_DICT_TYPE):
+    quantization_per_channel_axis: Optional[int]
 
 _DEFAULT_CUSTOM_QCONFIG_DICT: BASE_QCONFIG_DICT_TYPE = {
     "quantization_type": QuantizationType.PER_TENSOR_SYMMETRIC,
@@ -90,6 +93,15 @@ _DEFAULT_PER_CHANNEL_QCONFIG_DICT: PER_CHANNEL_QCONFIG_DICT_TYPE = {
     "clamp_bound": float('inf'),
 }
 
+_DEFAULT_EXPERT_WISE_PER_CHANNEL_QCONFIG_DICT: EXPERT_WISE_PER_CHANNEL_QCONFIG_DICT_TYPE = {
+    "quantization_type": QuantizationType.EXPERT_WISE_PER_CHANNEL_SYMMETRIC,
+    "quantized_dtype": QuantizedDtype.F8E4M3,
+    # Each quantized layer sets its own the default channel
+    "quantization_per_channel_axis": None,
+    "activation_quantization_type": ActivationQuantizationType.NONE,
+    "clamp_bound": float('inf'),
+}
+
 
 def get_default_custom_qconfig_dict() -> BASE_QCONFIG_DICT_TYPE:
     r"""Defines the default custom config dict."""
@@ -99,3 +111,13 @@ def get_default_custom_qconfig_dict() -> BASE_QCONFIG_DICT_TYPE:
 def get_default_per_channel_custom_qconfig_dict() -> PER_CHANNEL_QCONFIG_DICT_TYPE:
     """Defines the default custom per channel config dict"""
     return PER_CHANNEL_QCONFIG_DICT_TYPE(**_DEFAULT_PER_CHANNEL_QCONFIG_DICT)
+
+def get_default_expert_wise_per_channel_custom_qconfig_dict() -> EXPERT_WISE_PER_CHANNEL_QCONFIG_DICT_TYPE:
+    """
+    Defines the default custom expert wise per channel config dict
+    Limitations:
+        - Cannot run multiple quantization type with expert wise per channel quantization
+        - Does not work with lnc=1 kernel 
+        - lnc=2 blockwise kernel does not support multi expert per token
+    """
+    return PER_CHANNEL_QCONFIG_DICT_TYPE(**_DEFAULT_EXPERT_WISE_PER_CHANNEL_QCONFIG_DICT)

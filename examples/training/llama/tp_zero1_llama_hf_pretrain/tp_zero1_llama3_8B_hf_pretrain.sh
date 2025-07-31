@@ -103,7 +103,7 @@ elif [ -v OMPI_COMM_WORLD_RANK ]; then
 
     JOB_ID=$POD_UID
     export EXPLICIT_LOGDIR=null
-    LOG_PATH="$SARTIFACT_PATH/logs/$JOB_ID/$NODE_ID"
+    LOG_PATH="$ARTIFACT_PATH/logs/$JOB_ID/$NODE_ID"
     mkdir -p $LOG_PATH
 
     if [ $NEURON_EXTRACT_GRAPHS_ONLY -gt 0 ]; then

@@ -143,20 +143,8 @@ class Attention(nn.Module):
             self.wv = nn.Linear(cfg.hidden_size, self.n_kv_heads * cfg.head_dim, bias=False, dtype=cfg.dtype)
             self.wo = nn.Linear(self.n_heads * cfg.head_dim, cfg.hidden_size, bias=False, dtype=cfg.dtype)
 
-        # KV Caches
-        # On NxD, your caches need to be registered parameters. Only parameters
-        # can be aliased. Note, you cannot currently use `register_buffer`.
-        #
-        # What is aliasing?
-        # When an input and output tensors are aliased, they share the same memory
-        # location on the Neuron device, and the outputs don't need to be returned
-        # to CPU as with non-aliased tensors.
-        self.cache_k = nn.Parameter(
-            torch.zeros((batch_size, seq_len, self.n_kv_heads, cfg.head_dim), dtype=cfg.dtype), requires_grad=False
-        )
-        self.cache_v = nn.Parameter(
-            torch.zeros((batch_size, seq_len, self.n_kv_heads, cfg.head_dim), dtype=cfg.dtype), requires_grad=False
-        )
+        self.register_buffer('cache_k', torch.zeros(batch_size, seq_len, self.n_kv_heads, cfg.head_dim, requires_grad=False, dtype=cfg.dtype))
+        self.register_buffer('cache_v', torch.zeros(batch_size, seq_len, self.n_kv_heads, cfg.head_dim, requires_grad=False, dtype=cfg.dtype))
 
         self.n_rep = self.n_heads // self.n_kv_heads
         self.head_dim = cfg.head_dim
@@ -188,15 +176,9 @@ class Attention(nn.Module):
         else:
             indices = last_pos.view(bsz, 1, 1, 1).expand_as(k).to(torch.int64)
 
-        updated_kcache = torch.scatter(self.cache_k, 1, indices, k)
-        updated_vcache = torch.scatter(self.cache_v, 1, indices, v)
-
-        if q.is_cpu:
-            # CPU flow and XLA flow keeps a reference to the cache differently
-            # On CPU we change the cache to point to the updated cache.
-            # On XLA we expect aliasing to do this in place on device.
-            self.cache_k.data = updated_kcache
-            self.cache_v.data = updated_vcache
+        # Update KV cache
+        self.cache_k = torch.scatter(self.cache_k, 1, indices, k)
+        self.cache_v = torch.scatter(self.cache_v, 1, indices, v)
 
         # Note: We cannot just slice the cache to the current position. If we slice, we would change the
         # compute shape for every decode run. On Neuron we compile for fixed shapes. So the alternative is to
@@ -209,8 +191,8 @@ class Attention(nn.Module):
         # Yes fixed shape will cause us to waste compute. The way to work around that is to 'bucket' - compile for many
         # shapes. One way is to bucket along sequence length. Here we can slice the KV cache when you bucket along
         # sequence length. This is an easy optimization you could do. Note, this example does not bucket.
-        keys = updated_kcache
-        values = updated_vcache
+        keys = self.cache_k
+        values = self.cache_v
 
         # With GQA, k/v heads are shared amond different q heads
         # repeat k/v heads to match q heads
@@ -231,18 +213,7 @@ class Attention(nn.Module):
         output = torch.matmul(scores, values)
         output = output.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
 
-        # Note : As of 2.21.1, Aliased buffers on NxD has to be returned as an
-        # output tensor. This is to comply with the XLA's aliasing, which expects
-        # aliased input and output tensors to be aliased.
-        #
-        # On NxD, we want to trace & compile the Model forward(). So all cache
-        # buffers are passed all the way back for Model.forward() to return.
-        #
-        # Planned Improvement: NxD is working on Auto-Aliasing which will
-        # remove the need to return aliased buffers simplifying development.
-
-        # return self.wo(output)
-        return self.wo(output), updated_kcache, updated_vcache
+        return self.wo(output)
 
 
 class MLP(nn.Module):
@@ -284,17 +255,14 @@ class TransformerBlock(torch.nn.Module):
     ):
 
         norm_h = self.attention_norm(x)
-        attn_h, cache_k, cache_v = self.attention(norm_h, last_pos, mask, rope_cache)
+        attn_h = self.attention(norm_h, last_pos, mask, rope_cache)
         attn_h = x + attn_h
 
         norm_h = self.mlp_norm(attn_h)
         mlp_h = self.mlp(norm_h)
         out = attn_h + mlp_h
 
-        # Note: Relaying the cache buffers to Transformer.forward() as
-        # we want to return them as output tensors.
-
-        return out, cache_k, cache_v
+        return out
 
 
 class Transformer(torch.nn.Module):
@@ -342,31 +310,20 @@ class Transformer(torch.nn.Module):
         else:
             mask = attention_mask[:, None, None, :].expand(self.bs, 1, 1, self.seq_len).to(torch.bool)
 
-        k_caches = []
-        v_caches = []
-
         for layer in self.layers:
-            h, cache_k, cache_v = layer(h, last_pos, mask, self.rope_cache)
-            k_caches.append(cache_k)
-            v_caches.append(cache_v)
+            h = layer(h, last_pos, mask, self.rope_cache)
+
+        # We return the logits for the last token per batch.
+        # This is a simple optimization to stop moving sequence length long
+        # logits back from device to CPU for prefill.
+        if is_prefill:
+            last_pos = last_pos.view(self.bs, 1, 1).expand(self.bs, 1, self.hidden_size)
+            h = torch.gather(h, dim=1, index=last_pos.to(torch.int64))
 
         h = self.norm(h)
         output = self.output(h).float()
 
-        # We return the logits for the last token per batch.
-        # This is a simple optimization to stop moving sequence length long
-        # logits back from device to CPU for prefil.
-        if is_prefill:
-            last_pos = last_pos.view(self.bs, 1, 1).expand(self.bs, 1, self.vocab_size)
-            output = torch.gather(output, dim=1, index=last_pos.to(torch.int64))
-        # Note: We are returning K and V caches. The order in which the tensors
-        # are returned is important as you will need to register the alias when
-        # tracing the model.
-
-        if output.is_cpu:
-            return output
-        else:
-            return output, *k_caches, *v_caches
+        return output
 
 
 def load_llama_checkpoint(cfg: Config, model_path: str, tp_degree=1):

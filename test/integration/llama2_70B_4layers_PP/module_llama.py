@@ -2,7 +2,7 @@ import os
 
 import torch
 from module_llama_orig import NeuronLlamaLTModule as NeuronLlamaLTModuleOrigin
-from pytorch_lightning.trainer.connectors.logger_connector.fx_validator import (
+from lightning.pytorch.trainer.connectors.logger_connector.fx_validator import (
     _FxValidator,
 )
 

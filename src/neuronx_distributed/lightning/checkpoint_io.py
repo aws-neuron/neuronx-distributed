@@ -1,11 +1,11 @@
 import os
 from typing import Any, Dict, Optional
 
-from lightning_fabric.plugins.io import XLACheckpointIO
-from lightning_fabric.utilities.cloud_io import get_filesystem
-from lightning_fabric.utilities.types import _PATH
+from lightning.fabric.plugins.io import XLACheckpointIO 
+from lightning.fabric.utilities.cloud_io import get_filesystem 
+from lightning.fabric.utilities.types import _PATH 
 from lightning_utilities.core.apply_func import apply_to_collection
-from lightning_utilities.core.imports import RequirementCache
+from lightning_utilities.core.imports import RequirementCache 
 
 from neuronx_distributed.parallel_layers.checkpointing import load, save
 

@@ -3,56 +3,17 @@ import torch
 import torch_xla.core.xla_model as xm
 import torch.nn.functional as F
 
-from neuronx_distributed.modules.moe.model_utils import DEFAULT_PADDING_VALUE
+from neuronx_distributed.kernels.kernel_utils import torch_to_nki_dtype
+from neuronx_distributed.modules.moe.model_utils import DEFAULT_PADDING_VALUE, DEFAULT_BLOCK_SIZE
 from neuronx_distributed.modules.moe.moe_configs import BlockwiseMatmulConfig
+from neuronx_distributed.modules.moe.nki_import import NKIImport, import_nki
 from neuronx_distributed.parallel_layers import mappings
 from neuronxcc.nki.compiler.backends.neuron.dimensions import VNC
 from neuronx_distributed.utils.model_utils import LogicalNCConfig
-from torch_neuronx.xla_impl.ops import nki_jit
 from torch_neuronx.xla_impl.base import xla_call
 
 from dataclasses import dataclass
-from typing import Any, Optional, Tuple
-import importlib
-
-@dataclass
-class NKIImport:
-    """Configuration for NKI imports."""
-    name: str
-    is_nki_jit: bool = True
-    module_name: str = "blockwise_mm"
-
-def import_nki(import_config: NKIImport) -> Tuple[Optional[Any], Optional[str]]:
-    """
-    Import NKI module with default and fallback paths.
-    Args:
-        import_config: NKIImport configuration dataclass
-
-    Returns:
-        tuple: (imported_module, error_message)
-            - imported_module: The imported module or None if import failed
-            - error_message: Error description if import failed, None otherwise
-    """
-    import_paths = [
-        f"neuronxcc.nki._pre_prod_kernels.{import_config.module_name}",
-        f"neuronxcc.nki._private_kernels.{import_config.module_name}"
-    ]
-    last_error = None
-    for path in import_paths:
-        try:
-            module = importlib.import_module(path)
-            attr = getattr(module, import_config.name)
-            if import_config.is_nki_jit:
-                return nki_jit()(attr), None
-            return attr, None
-        except ImportError as e:
-            last_error = str(e)
-            continue
-        except AttributeError as e:
-            last_error = f"Attribute {import_config.name} not found in {path}: {str(e)}"
-            continue
-
-    return None, f"Failed to import {import_config.name}: {last_error}"
+from typing import Tuple, Any, Optional
 
 
 def initialize_nki_components() -> dict:
@@ -63,15 +24,17 @@ def initialize_nki_components() -> dict:
         dict: Mapping of component names to their imported values
     """
     imports = {
-        "blockwise_mm": NKIImport("blockwise_mm"),
-        "blockwise_mm_baseline_shard_hidden": NKIImport("blockwise_mm_baseline_shard_hidden"),
-        "blockwise_mm_baseline_block_parallel": NKIImport("blockwise_mm_baseline_block_parallel", module_name="blockwise_matmul"),
-        "blockwise_mm_bwd": NKIImport("blockwise_mm_bwd", module_name="blockwise_mm_bwd"),
-        "blockwise_mm_baseline": NKIImport("blockwise_mm_baseline"),
-        "check_compatibility": NKIImport("check_blockwise_mm_kernel_compatibility", is_nki_jit=False),
-        "block_shard_strategy": NKIImport("BlockShardStrategy", is_nki_jit=False),
-        "affinity_scale_mode": NKIImport("ExpertAffinityScaleMode", is_nki_jit=False),
-        "skip_mode": NKIImport("SkipMode", is_nki_jit=False),
+        "blockwise_mm": NKIImport("blockwise_mm", module_name="blockwise_mm", nki_jit_type="use_nki_jit_decorator"),
+        "blockwise_mm_baseline_shard_hidden": NKIImport("blockwise_mm_baseline_shard_hidden", module_name="blockwise_mm", nki_jit_type="use_nki_jit_decorator"),
+        "blockwise_mm_baseline_block_parallel": NKIImport("blockwise_mm_baseline_block_parallel", module_name="blockwise_matmul", nki_jit_type="use_nki_jit_decorator"),
+        "blockwise_mm_baseline_block_parallel_allocated": NKIImport("blockwise_mm_baseline_block_parallel_allocated", module_name="blockwise_matmul", nki_jit_type="use_jit_decorator"),
+        "blockwise_mm_bwd": NKIImport("blockwise_mm_bwd", module_name="blockwise_mm_bwd", nki_jit_type="use_nki_jit_decorator"),
+        "blockwise_mm_bwd_baseline_shard_hidden": NKIImport("blockwise_mm_bwd_baseline_shard_hidden", module_name="blockwise_mm_bwd", nki_jit_type="use_nki_jit_decorator"),
+        "blockwise_mm_baseline": NKIImport("blockwise_mm_baseline", module_name="blockwise_mm", nki_jit_type="use_nki_jit_decorator"),
+        "check_compatibility": NKIImport("check_blockwise_mm_kernel_compatibility", module_name="blockwise_mm"),
+        "block_shard_strategy": NKIImport("BlockShardStrategy", module_name="blockwise_mm"),
+        "affinity_scale_mode": NKIImport("ExpertAffinityScaleMode"),
+        "skip_mode": NKIImport("SkipMode", module_name="blockwise_mm"),
     }
 
     components = {}
@@ -91,7 +54,9 @@ nki_components = initialize_nki_components()
 _blockwise_mm_nki_call = nki_components["blockwise_mm"]
 _blockwise_mm_baseline_shard_hidden_nki_call = nki_components["blockwise_mm_baseline_shard_hidden"]
 _blockwise_mm_baseline_block_parallel_nki_call = nki_components["blockwise_mm_baseline_block_parallel"]
+_blockwise_mm_baseline_block_parallel_allocated_nki_call = nki_components["blockwise_mm_baseline_block_parallel_allocated"]
 _blockwise_mm_nki_bwd_call = nki_components["blockwise_mm_bwd"]
+_blockwise_mm_bwd_baseline_shard_hidden_nki_call = nki_components["blockwise_mm_bwd_baseline_shard_hidden"]
 _blockwise_mm_training_nki_call = nki_components["blockwise_mm_baseline"]
 check_blockwise_mm_kernel_compatibility = nki_components["check_compatibility"]
 BlockShardStrategy = nki_components["block_shard_strategy"]
@@ -122,6 +87,185 @@ def dynamic_slice_1D(tensor, start0, size0):
 
     return _dynamic_slice(tensor, start0)
 
+@dataclass
+class BlockwiseMatmulArgs:
+    """Dataclass to hold all possible arguments for blockwise matmul operations."""
+    # Input tensors
+    hidden_states: torch.Tensor
+    expert_affinities_masked: torch.Tensor
+    
+    # MLP weights
+    gate_up_proj_weight: torch.Tensor
+    down_proj_weight: torch.Tensor
+    
+    # Block related parameters
+    token_position_to_id: torch.Tensor
+    block_to_expert: torch.Tensor
+    block_size: int = DEFAULT_BLOCK_SIZE
+    
+    # scales for quantization
+    gate_up_proj_scale: Optional[torch.Tensor] = None
+    down_proj_scale: Optional[torch.Tensor] = None
+
+    # Output tensors
+    output: Optional[torch.Tensor] = None
+    gate_up_activations_T: Optional[torch.Tensor] = None
+    down_activations: Optional[torch.Tensor] = None
+    
+    # Meta parameters
+    skip_dma: Any = SkipMode(False, False)
+    is_tensor_update_accumulating: bool = False
+    expert_affinities_scaling_mode: Any = ExpertAffinityScaleMode.POST_SCALE
+    block_sharding_strategy: Any = BlockShardStrategy.HI_LO
+    dtype: torch.dtype = torch.bfloat16
+
+def _call_training_kernel(args: BlockwiseMatmulArgs):
+    """Call the training kernel for blockwise matmul."""
+    _blockwise_mm_training_nki_call(
+        hidden_states=args.hidden_states,
+        expert_affinities_masked=args.expert_affinities_masked,
+        gate_up_proj_weight=args.gate_up_proj_weight,
+        down_proj_weight=args.down_proj_weight,
+        block_size=args.block_size,
+        token_position_to_id=args.token_position_to_id.to(dtype=torch.int32),
+        block_to_expert=args.block_to_expert.to(dtype=torch.int32),
+        output=args.output,
+        gate_up_activations_T=args.gate_up_activations_T,
+        down_activations=args.down_activations,
+        is_tensor_update_accumulating=args.is_tensor_update_accumulating,
+    )
+    return args.output, args.gate_up_activations_T, args.down_activations
+
+
+def _call_training_shard_hidden_kernel(args: BlockwiseMatmulArgs):
+    """Call the training shard hidden kernel for blockwise matmul."""
+    _blockwise_mm_baseline_shard_hidden_nki_call[VNC(2)](
+        # Inputs
+        hidden_states=args.hidden_states,
+        expert_affinities_masked=args.expert_affinities_masked,
+        # MLP weights
+        gate_up_proj_weight=args.gate_up_proj_weight,
+        down_proj_weight=args.down_proj_weight,
+        # Block related
+        block_size=args.block_size,
+        token_position_to_id=args.token_position_to_id.to(dtype=torch.int32),
+        block_to_expert=args.block_to_expert.to(dtype=torch.int32),
+        # Output
+        output=args.output,
+        # Meta parameters
+        gate_up_activations_T=args.gate_up_activations_T,
+        down_activations=args.down_activations,
+        skip_dma=args.skip_dma,
+        is_tensor_update_accumulating=args.is_tensor_update_accumulating,
+        expert_affinities_scaling_mode=args.expert_affinities_scaling_mode
+    )
+    return args.output, args.gate_up_activations_T, args.down_activations
+
+
+def _call_block_parallel_allocated_kernel(args: BlockwiseMatmulArgs):
+    """Call the block parallel allocated kernel for blockwise matmul with quantization."""
+
+    down_proj_scale = args.down_proj_scale
+    if down_proj_scale is not None:
+        assert args.block_size in [128, 256], "Block size must be 128 or 256 for blockwise matmul Kernel with quantized checkpoints"
+        e, h = down_proj_scale.shape[0], down_proj_scale.shape[-1]
+        down_proj_scale = down_proj_scale.view(e,1,-1,128)
+        down_proj_scale = down_proj_scale.transpose(2,3)
+        down_proj_scale = down_proj_scale.view(e,1,h)
+
+    return _blockwise_mm_baseline_block_parallel_allocated_nki_call[VNC(2)](
+        hidden_states=args.hidden_states,
+        expert_affinities_masked=args.expert_affinities_masked,
+        gate_up_proj_weight=args.gate_up_proj_weight,
+        down_proj_weight=args.down_proj_weight,
+        gate_up_proj_scale=args.gate_up_proj_scale,
+        down_proj_scale=down_proj_scale,
+        block_size=args.block_size,
+        token_position_to_id=args.token_position_to_id.to(dtype=torch.int32),
+        block_to_expert=args.block_to_expert.to(dtype=torch.int32),
+        skip_dma=args.skip_dma,
+        is_tensor_update_accumulating=args.is_tensor_update_accumulating,
+        expert_affinities_scaling_mode=args.expert_affinities_scaling_mode,
+        block_sharding_strategy=args.block_sharding_strategy,
+        compute_dtype = torch_to_nki_dtype(args.dtype),
+    )
+
+
+def _call_block_parallel_kernel(args: BlockwiseMatmulArgs):
+    """Call the block parallel kernel for blockwise matmul."""
+    _blockwise_mm_baseline_block_parallel_nki_call[VNC(2)](
+        hidden_states=args.hidden_states,
+        expert_affinities_masked=args.expert_affinities_masked,
+        gate_up_proj_weight=args.gate_up_proj_weight,
+        down_proj_weight=args.down_proj_weight,
+        block_size=args.block_size,
+        token_position_to_id=args.token_position_to_id.to(dtype=torch.int32),
+        block_to_expert=args.block_to_expert.to(dtype=torch.int32),
+        output=args.output,
+        skip_dma=args.skip_dma,
+        is_tensor_update_accumulating=args.is_tensor_update_accumulating,
+        expert_affinities_scaling_mode=args.expert_affinities_scaling_mode,
+        block_sharding_strategy=args.block_sharding_strategy,
+        compute_dtype = torch_to_nki_dtype(args.dtype),
+    )
+
+    return args.output
+
+
+def _call_shard_hidden_kernel(args: BlockwiseMatmulArgs):
+    """Call the shard hidden kernel for blockwise matmul."""
+    _blockwise_mm_baseline_shard_hidden_nki_call[VNC(2)](
+        hidden_states=args.hidden_states,
+        expert_affinities_masked=args.expert_affinities_masked,
+        gate_up_proj_weight=args.gate_up_proj_weight,
+        down_proj_weight=args.down_proj_weight,
+        block_size=args.block_size,
+        token_position_to_id=args.token_position_to_id.to(dtype=torch.int32),
+        block_to_expert=args.block_to_expert.to(dtype=torch.int32),
+        output=args.output,
+        gate_up_activations_T=args.gate_up_activations_T,
+        down_activations=args.down_activations,
+        skip_dma=args.skip_dma,
+        is_tensor_update_accumulating=args.is_tensor_update_accumulating,
+        expert_affinities_scaling_mode=args.expert_affinities_scaling_mode,
+        compute_dtype=torch_to_nki_dtype(args.dtype),
+    )
+
+    return args.output, args.gate_up_activations_T, args.down_activations
+
+
+def _call_default_kernel(args: BlockwiseMatmulArgs):
+    """Call the default kernel for blockwise matmul."""
+
+    gate_up_proj_scale, down_proj_scale = args.gate_up_proj_scale, args.down_proj_scale
+
+    if gate_up_proj_scale is not None:
+        # (1, 1, 2I) -> (2, I)
+        assert gate_up_proj_scale.shape[0] == 1 and gate_up_proj_scale.shape[1] == 1
+        gate_up_proj_scale = gate_up_proj_scale.view(2, -1)
+
+    if down_proj_scale is not None:
+        # (1, 1, H) -> (H)
+        assert down_proj_scale.shape[0] == 1 and down_proj_scale.shape[1] == 1
+        down_proj_scale = down_proj_scale.view(-1)
+
+    _blockwise_mm_nki_call(
+        hidden_states=args.hidden_states,
+        expert_affinities_masked=args.expert_affinities_masked,
+        gate_up_proj_weight=args.gate_up_proj_weight,
+        down_proj_weight=args.down_proj_weight,
+        block_size=args.block_size,
+        token_position_to_id=args.token_position_to_id.to(dtype=torch.int32),
+        block_to_expert=args.block_to_expert.to(dtype=torch.int32),
+        output=args.output,
+        skip_dma=args.skip_dma,
+        gate_up_proj_scale=gate_up_proj_scale,
+        down_proj_scale=down_proj_scale,
+        is_tensor_update_accumulating=args.is_tensor_update_accumulating,
+        compute_type=torch_to_nki_dtype(args.dtype),
+    )
+
+    return args.output
 
 class TorchBlockwiseTraining(torch.autograd.Function):
     """
@@ -701,97 +845,42 @@ class BlockwiseMatmulNKIFunc(torch.autograd.Function):
         # Flatten expert_affinities_masked: ((T+1)*E, 1)
         # TODO: cannot refactor to (T+1, E) as we currently don't support dynamic slice on both axis.
         expert_affinities_masked = expert_affinities_masked.view(-1, 1)
+        
+        args = BlockwiseMatmulArgs(
+            hidden_states=hidden_states,
+            expert_affinities_masked=expert_affinities_masked,
+            gate_up_proj_weight=gate_up_proj_weight,
+            down_proj_weight=down_proj_weight,
+            gate_up_proj_scale=gate_up_proj_scale,
+            down_proj_scale=down_proj_scale,
+            block_size=block_size,
+            token_position_to_id=token_position_to_id,
+            block_to_expert=block_to_expert,
+            output=output,
+            gate_up_activations_T=gate_up_activations,
+            down_activations=down_activations,
+            skip_dma=skip_dma,
+            is_tensor_update_accumulating=multi_expert_per_token,
+            expert_affinities_scaling_mode=expert_affinities_scaling_mode,
+            block_sharding_strategy=block_sharding_strategy,
+            dtype=hidden_states.dtype,
+        )
 
-        if gate_up_proj_scale is not None:
-            # (1, 1, 2I) -> (2, I)
-            assert gate_up_proj_scale.shape[0] == 1 and gate_up_proj_scale.shape[1] == 1
-            gate_up_proj_scale = gate_up_proj_scale.view(2, -1)
-
-        if down_proj_scale is not None:
-            # (1, 1, H) -> (H)
-            assert down_proj_scale.shape[0] == 1 and down_proj_scale.shape[1] == 1
-            down_proj_scale = down_proj_scale.view(-1)
-
+        # Select and call the appropriate kernel function
         if is_training:
-            _blockwise_mm_training_nki_call(
-                # Inputs
-                hidden_states=hidden_states,
-                expert_affinities_masked=expert_affinities_masked,
-                # MLP weights
-                gate_up_proj_weight=gate_up_proj_weight,
-                down_proj_weight=down_proj_weight,
-                # Block related
-                block_size=block_size,
-                token_position_to_id=token_position_to_id.to(dtype=torch.int32),
-                block_to_expert=block_to_expert.to(dtype=torch.int32),
-                # Output
-                output=output,
-                gate_up_activations_T=gate_up_activations,
-                down_activations=down_activations,
-                is_tensor_update_accumulating=multi_expert_per_token,
-            )
-        elif logical_nc_config == 2:
-            if use_block_parallel:
-                _blockwise_mm_baseline_block_parallel_nki_call[VNC(2)](
-                    # Inputs
-                    hidden_states=hidden_states,
-                    expert_affinities_masked=expert_affinities_masked,
-                    # MLP weights
-                    gate_up_proj_weight=gate_up_proj_weight,
-                    down_proj_weight=down_proj_weight,
-                    # Block related
-                    block_size=block_size,
-                    token_position_to_id=token_position_to_id.to(dtype=torch.int32),
-                    block_to_expert=block_to_expert.to(dtype=torch.int32),
-                    # Output
-                    output=output,
-                    # Meta parameters
-                    skip_dma=skip_dma,
-                    is_tensor_update_accumulating=multi_expert_per_token,
-                    expert_affinities_scaling_mode=expert_affinities_scaling_mode,
-                    block_sharding_strategy=block_sharding_strategy
-                )
+            if logical_nc_config == 2:
+                output, gate_up_activations, down_activations = _call_training_shard_hidden_kernel(args)
             else:
-                _blockwise_mm_baseline_shard_hidden_nki_call[VNC(2)](
-                    # Inputs
-                    hidden_states=hidden_states,
-                    expert_affinities_masked=expert_affinities_masked,
-                    # MLP weights
-                    gate_up_proj_weight=gate_up_proj_weight,
-                    down_proj_weight=down_proj_weight,
-                    # Block related
-                    block_size=block_size,
-                    token_position_to_id=token_position_to_id.to(dtype=torch.int32),
-                    block_to_expert=block_to_expert.to(dtype=torch.int32),
-                    # Output
-                    output=output,
-                    # Meta parameters
-                    gate_up_activations_T=gate_up_activations,
-                    down_activations=down_activations,
-                    skip_dma=skip_dma,
-                    is_tensor_update_accumulating=multi_expert_per_token,
-                    expert_affinities_scaling_mode=expert_affinities_scaling_mode
-                )
+                output, gate_up_activations, down_activations = _call_training_kernel(args)
+        elif logical_nc_config == 2:
+            if down_proj_scale is not None:
+                output = _call_block_parallel_allocated_kernel(args)
+            elif use_block_parallel:
+                output = _call_block_parallel_kernel(args)
+            else:
+                output, gate_up_activations, down_activations = _call_shard_hidden_kernel(args)
         else:
-            _blockwise_mm_nki_call(
-                # Inputs
-                hidden_states=hidden_states,
-                expert_affinities_masked=expert_affinities_masked,
-                # MLP weights
-                gate_up_proj_weight=gate_up_proj_weight,
-                down_proj_weight=down_proj_weight,
-                # Block related
-                block_size=block_size,
-                token_position_to_id=token_position_to_id.to(dtype=torch.int32),
-                block_to_expert=block_to_expert.to(dtype=torch.int32),
-                # Output
-                output=output,
-                skip_dma=skip_dma,
-                gate_up_proj_scale=gate_up_proj_scale,
-                down_proj_scale=down_proj_scale,
-                is_tensor_update_accumulating=multi_expert_per_token,
-            )
-
+            output = _call_default_kernel(args)
         output = output[:total_tokens, :]
         ctx.save_for_backward(
             hidden_states,
@@ -805,6 +894,8 @@ class BlockwiseMatmulNKIFunc(torch.autograd.Function):
             down_activations,
         )
         ctx.multi_expert_per_token = multi_expert_per_token
+        ctx.block_size = block_size
+        ctx.logical_nc_config = logical_nc_config
         return output
 
     @staticmethod
@@ -834,22 +925,42 @@ class BlockwiseMatmulNKIFunc(torch.autograd.Function):
         grad_output_padded = torch.concat(
             [grad_output, torch.zeros(1, H, device=grad_output.device, dtype=grad_output.dtype)], dim=0
         )
-        _blockwise_mm_nki_bwd_call(
-            hidden_states,
-            hidden_states_grad,
-            expert_affinities_masked.reshape(-1, 1),
-            affinities_grad.view(-1, 1),
-            gate_up_proj_weight,
-            gate_up_proj_weight_grad,
-            gate_up_activations,
-            down_proj_weight,
-            down_weight_grad,
-            down_activations,
-            token_position_to_id.to(dtype=torch.int32),
-            block_to_expert.to(dtype=torch.int32),
-            grad_output_padded,
-            is_tensor_update_accumulating=ctx.multi_expert_per_token,
-        )
+        if ctx.logical_nc_config == 2:
+            _blockwise_mm_bwd_baseline_shard_hidden_nki_call[VNC(2)](
+                hidden_states,
+                hidden_states_grad,
+                expert_affinities_masked.reshape(-1, 1),
+                affinities_grad.view(-1, 1),
+                gate_up_proj_weight,
+                gate_up_proj_weight_grad,
+                gate_up_activations,
+                down_proj_weight,
+                down_weight_grad,
+                down_activations,
+                token_position_to_id.to(dtype=torch.int32),
+                block_to_expert.to(dtype=torch.int32),
+                grad_output_padded,
+                block_size=ctx.block_size,
+                is_tensor_update_accumulating=ctx.multi_expert_per_token,
+            )
+        else:
+            _blockwise_mm_nki_bwd_call(
+                hidden_states,
+                hidden_states_grad,
+                expert_affinities_masked.reshape(-1, 1),
+                affinities_grad.view(-1, 1),
+                gate_up_proj_weight,
+                gate_up_proj_weight_grad,
+                gate_up_activations,
+                down_proj_weight,
+                down_weight_grad,
+                down_activations,
+                token_position_to_id.to(dtype=torch.int32),
+                block_to_expert.to(dtype=torch.int32),
+                grad_output_padded,
+                block_size=ctx.block_size,
+                is_tensor_update_accumulating=ctx.multi_expert_per_token,
+            )
         # FIXME: Compiler error without .clone()
         hidden_states_grad = hidden_states_grad[:T].clone()
         torch.distributed.all_reduce(

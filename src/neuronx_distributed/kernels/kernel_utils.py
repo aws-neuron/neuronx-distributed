@@ -1,4 +1,6 @@
 import os
+import neuronxcc.nki.language as nl
+
 import numpy as np
 import torch
 import torch_xla.core.xla_model as xm
@@ -43,3 +45,12 @@ def cast(q, k, v):
 
         q, k, v = [t.clone() for t in (q, k, v)]
     return q, k, v
+
+def torch_to_nki_dtype(dtype: torch.dtype):
+    try:
+        dtype_str = str(dtype).split('.')[-1]
+        return getattr(nl, dtype_str)
+    except AttributeError:
+        raise ValueError(f"Invalid dtype '{dtype}'. Not supported in neuron.")
+    except  Exception as e:
+        raise ValueError(f"Error getting dtype '{dtype}': {str(e)}")

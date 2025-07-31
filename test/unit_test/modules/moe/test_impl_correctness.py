@@ -8,19 +8,18 @@ from types import SimpleNamespace
 # Third Party
 import torch
 import torch_neuronx.testing
-from parameterized import parameterized
-from transformers.models.llama4.modeling_llama4 import Llama4TextMLP
-
 from neuronx_distributed.modules.moe import (
     load_balancing_loss_func as neuron_load_balancing_loss_func,
 )
-from neuronx_distributed.modules.moe.shared_experts import SharedExperts
 from neuronx_distributed.modules.moe.routing import GroupLimitedRouter
+from neuronx_distributed.modules.moe.shared_experts import SharedExperts
+from parameterized import parameterized
+from transformers.models.llama4.modeling_llama4 import Llama4TextMLP
 
+from . import llama4_moe as llama4_moe
 from . import loss_fn_correctness_test_helper as lch
 from . import mixtral_model as m_mixtral
 from . import sbase_model as m_sbase
-from . import llama4_moe as llama4_moe
 from . import utils_testing as ut
 from .deepseek_v3_router import DeepSeekV3HFMoEGate
 from .utils_testing import ExptCfg
@@ -79,11 +78,11 @@ def get_impl_correctness_test_configs(test_modes):
                 ExptCfg(seq_len=128, batch_size=4, hidden_size=384, num_experts=8, capacity_factor=1.0, **test_cfg),
             ]
         )
-        # Inference tests 
+        # Inference tests
         test_cfg["test_mode"] = "inference"
         sbase_test_configs.extend(
             [
-                # Test context encoding  
+                # Test context encoding
                 ExptCfg(seq_len=128, batch_size=1, hidden_size=384, num_experts=2, capacity_factor=None, **test_cfg),
                 ExptCfg(seq_len=128, batch_size=4, hidden_size=384, num_experts=8, capacity_factor=None, **test_cfg),
                 ExptCfg(seq_len=128, batch_size=1, hidden_size=384, num_experts=4, capacity_factor=2.0, **test_cfg),
@@ -324,6 +323,7 @@ def get_impl_correctness_test_configs(test_modes):
                 num_experts=16,
                 top_k=1,
                 num_shared_experts=1,
+                fused_gate_up_shared_expert=False,
                 **test_cfg,
             ),
             ExptCfg(
@@ -334,6 +334,29 @@ def get_impl_correctness_test_configs(test_modes):
                 num_experts=16,
                 top_k=1,
                 num_shared_experts=1,
+                fused_gate_up_shared_expert=False,
+                **test_cfg,
+            ),
+            ExptCfg(
+                seq_len=1,
+                batch_size=1,
+                hidden_size=5120,
+                intermediate_size=7192,
+                num_experts=16,
+                top_k=1,
+                num_shared_experts=1,
+                moe_fused_tkg_enabled=True,
+                **test_cfg,
+            ),
+            ExptCfg(
+                seq_len=1,
+                batch_size=4,
+                hidden_size=5120,
+                intermediate_size=7192,
+                num_experts=16,
+                top_k=1,
+                num_shared_experts=1,
+                moe_fused_tkg_enabled=True,
                 **test_cfg,
             ),
         ]
@@ -536,10 +559,9 @@ class TestImplCorrectness(unittest.TestCase):
     def test_fwd_correctness(self, cfg):
         model_neuron, model_golden = initialize_neuron_and_golden_models(cfg)
 
-        # Set is_test=True
-        model_neuron.is_test = True
+        model_neuron.return_expert_index = True
         if cfg.implementation == "sbase":
-            model_golden.is_test = True
+            model_golden.return_expert_index = True
 
         is_token_gen = cfg.seq_len == 1
         if cfg.test_mode == "inference":
@@ -676,10 +698,9 @@ class TestImplCorrectness(unittest.TestCase):
     def test_bwd_correctness(self, cfg):
         model_neuron, model_golden = initialize_neuron_and_golden_models(cfg)
 
-        # Set is_test=True
-        model_neuron.is_test = True
+        model_neuron.return_expert_index = True
         if cfg.implementation == "sbase":
-            model_golden.is_test = True
+            model_golden.return_expert_index = True
 
         # Set models to train mode
         model_neuron.train()
@@ -826,7 +847,7 @@ class TestImplCorrectness(unittest.TestCase):
 
             # Compare outputs
             golden_output = golden_shared_expert(hidden_states)
-            neuron_output = neuron_shared_expert(hidden_states)
+            neuron_output = neuron_shared_expert(hidden_states, test_config["seq_len"])
             torch_neuronx.testing.assert_close(golden_output, neuron_output)
 
 

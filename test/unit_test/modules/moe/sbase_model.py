@@ -29,7 +29,7 @@ class SBaseMoE(torch.nn.Module):
     Adapted from https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/model/transformer.py
     """
 
-    is_test = False
+    return_expert_index = False
 
     def __init__(self, hidden_size, intermediate_size, num_experts, hidden_act, glu_mlp):
         super().__init__()
@@ -68,7 +68,7 @@ class SBaseMoE(torch.nn.Module):
         output_total = output_total * max_prob
         output_total = output_total.view(hidden_shape)
 
-        if self.is_test:
+        if self.return_expert_index:
             return output_total, None, max_ind.unsqueeze(1)
         else:
             return output_total, None  # no bias for MLP

@@ -1,31 +1,15 @@
+import functools
 import math
 import random
+import dataclasses
 from dataclasses import dataclass
-import functools
+from typing import Optional, Union
+
 import numpy as np
 import torch_neuronx
 import torch
-
-from neuronx_distributed.modules.moe.expert_mlps_v2 import ExpertMLPsV2
-
-from neuronx_distributed.modules.moe.model_utils import DEFAULT_BLOCK_SIZE
-from neuronx_distributed.modules.moe.moe_configs import RoutedExpertsMLPOpsConfig, BlockwiseMatmulConfig
-from neuronx_distributed.modules.moe.shared_experts import SharedExperts
-from neuronx_distributed.parallel_layers import parallel_state, random as nxd_random
-from neuronx_distributed.utils.model_utils import move_model_to_device, get_platform_lnc
-from neuronx_distributed.trainer.optimizer import NxDOptimizer
 import torch_xla.core.xla_model as xm
 import torch_xla.runtime as xr
-from neuronx_distributed.utils.logger import get_logger
-
-from neuronxcc.nki._private_kernels.blockwise_mm import SkipMode
-from torch.optim import Adam, SGD
-
-from neuronx_distributed.modules.moe.blockwise import (
-    BlockShardStrategy
-)
-
-from neuronx_distributed.optimizer import NeuronZero1Optimizer, NeuronEPZero1Optimizer
 from neuronx_distributed.modules.moe import (
     ACT2FN,
     ExpertMLPs,
@@ -33,7 +17,27 @@ from neuronx_distributed.modules.moe import (
     RouterSinkhorn,
     RouterTopK,
 )
-
+from neuronx_distributed.modules.moe.blockwise import BlockShardStrategy
+from neuronx_distributed.modules.moe.expert_mlps_v2 import ExpertMLPsV2
+from neuronx_distributed.modules.moe.model_utils import DEFAULT_BLOCK_SIZE
+from neuronx_distributed.modules.moe.moe_configs import (
+    BlockwiseMatmulConfig,
+    MoEFusedTKGConfig,
+    RoutedExpertsMLPOpsConfig,
+)
+from neuronx_distributed.modules.moe.moe_fused_tkg import MoEFusedTKG
+from neuronx_distributed.modules.moe.shared_experts import SharedExperts
+from neuronx_distributed.optimizer import NeuronEPZero1Optimizer, NeuronZero1Optimizer
+from neuronx_distributed.parallel_layers import parallel_state
+from neuronx_distributed.parallel_layers import random as nxd_random
+from neuronx_distributed.quantization.quantize import convert
+from neuronx_distributed.quantization.quantization_config import get_default_expert_wise_per_channel_custom_qconfig_dict
+from neuronx_distributed.trainer.optimizer import NxDOptimizer
+from neuronx_distributed.utils.logger import get_logger
+from neuronx_distributed.utils.model_utils import get_platform_lnc, move_model_to_device
+from neuronxcc.nki._private_kernels.blockwise_mm import SkipMode
+from torch import nn
+from torch.optim import SGD, Adam
 
 logger = get_logger()
 
@@ -130,11 +134,12 @@ class ExptCfg:
     batch_size: int
     hidden_size: int
     num_experts: int
-    capacity_factor: float
+    capacity_factor: Union[float|None]
     dtype: torch.dtype
     glu_mlp: bool
     test_mode: str  # Either 'training' or 'inference'
     implementation: str  # "sbase" or "topk"
+    test_module: str = None
     intermediate_size: int = None
     hidden_act: str = "silu"  # One of ACT2FN
     device: str = "cpu"
@@ -157,12 +162,38 @@ class ExptCfg:
     optimized_block_to_token_mapping: bool = True
     num_shared_experts: int = 0
     fused_gate_up_shared_expert: bool = False
+    shared_experts_sequence_parallel_enabled: bool = False
+    rms_norm_eps: int = 1e-5
+    moe_fused_tkg_enabled: bool = False
+    quantized: bool = False
+    moe_fused_tkg_kernel_enabled: Optional[bool] = None
+    router_topk_kernel_enabled: Optional[bool] = None
+    expert_mlp_kernel_enabled: Optional[bool] = None
+    shared_mlp_kernel_enabled: Optional[bool] = None
+    stack_size: int = 1
 
 def get_random_activations(num, seed=None):
     if seed is not None:
         random.seed(seed)
     return random.sample(ALL_ACTIVATIONS, num)
 
+class LlamaRMSNormV2(nn.Module):
+    def __init__(self, hidden_size, eps):
+        super().__init__()
+
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states: torch.Tensor):
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        # Critical difference with LlamaRMSNorm: We multiply in full precision and then convert
+        # to the target data type instead of converting hidden_states to the target data type and
+        # then multiplying in full precision.
+        output = self.weight * hidden_states
+        return output.to(input_dtype)
 
 class StackedModel(torch.nn.Module):
     def __init__(self, stack_size, cfg, return_router_logits):
@@ -171,24 +202,27 @@ class StackedModel(torch.nn.Module):
         self.stacks = torch.nn.ModuleList()
         self.return_router_logits = return_router_logits
 
+        cfg_one_layer = dataclasses.replace(cfg, stack_size=1)
         for i in range(stack_size):
-            neuron_model = initialize_neuron_model(cfg, seed=i)
+            neuron_model = initialize_neuron_model(cfg_one_layer, seed=i, move_to_device=False)
             self.stacks.append(neuron_model)
 
     def forward(self, hidden_states):
         ip = hidden_states
         router_logits_list = []
         for layer in self.stacks:
-            op, router_logits = layer(ip)
+            op = layer(ip)[0]
             if self.return_router_logits:
+                router_logits = layer(ip)[1]
                 router_logits_list.append(router_logits)
             ip = op
 
+        return_op = (op,)
         if self.return_router_logits:
             all_router_logits = torch.cat(router_logits_list, dim=0)
-            return op, all_router_logits
-        else:
-            return op
+            return_op += (all_router_logits,)
+
+        return return_op
 
 
 def custom_name_func(testcase_func, param_num, param):
@@ -263,14 +297,17 @@ def get_intermediate_size(cfg):
     return intermediate_size
 
 
-def match_expert_weights(model_trn, model_cpu, glu_mlp):
+def match_expert_weights(model_trn, model_cpu, glu_mlp, moe_fused_tkg_enabled, run_shared_expert_in_sp=False):
     """
     Copy expert weights from the CPU model to the TRN model. This is necessary
     under expert parallelism because NxD weight initialization currently does not
     take expert parallelism into account.
     """
 
-    module = model_cpu.expert_mlps.mlp_op.gate_up_proj if glu_mlp else model_cpu.expert_mlps.mlp_op.up_proj
+    if moe_fused_tkg_enabled:
+        module = model_cpu.moe.expert_mlps.mlp_op.gate_up_proj if glu_mlp else model_cpu.moe.expert_mlps.mlp_op.up_proj
+    else:
+        module = model_cpu.expert_mlps.mlp_op.gate_up_proj if glu_mlp else model_cpu.expert_mlps.mlp_op.up_proj
     num_experts = module.weight.shape[0]
     ep_degree = parallel_state.get_expert_model_parallel_size()
     ep_rank = parallel_state.get_expert_model_parallel_rank()
@@ -281,37 +318,79 @@ def match_expert_weights(model_trn, model_cpu, glu_mlp):
     input_dim = 1
     output_dim = 2
 
+    # Record trn params that does not exist in cpu params
+    missing_keys = []
     with torch.no_grad():
-        for (cpu_name, cpu_param), (trn_name, trn_param) in zip(
-            model_cpu.named_parameters(), model_trn.named_parameters()
-        ):
-            if "expert_mlps" not in cpu_name:
+        cpu_params_dict = dict(model_cpu.named_parameters())
+        for trn_name, trn_param in model_trn.named_parameters():
+            if trn_name not in cpu_params_dict:
+                missing_keys.append(trn_name)
                 continue
-            if "gate_up_proj" in cpu_name:
-                _, input_size, output_size = cpu_param.shape
-                stride = 2 if glu_mlp else 1
-                local_output_size = output_size // tp_degree // stride
-                single_output_size = output_size // stride
-                weight_slice = cpu_param.narrow(expert_dim, num_local_experts * ep_rank, num_local_experts)
-                gate_weight_slice = weight_slice.narrow(output_dim, local_output_size * tp_rank, local_output_size)
-                up_weight_slice = weight_slice.narrow(
-                    output_dim, local_output_size * tp_rank + single_output_size, local_output_size
-                )
-                gate_up_weight_slice = torch.cat((gate_weight_slice, up_weight_slice), dim=output_dim)
-                trn_param.copy_(gate_up_weight_slice.contiguous())
-            elif "up_proj" in cpu_name:
-                _, input_size, output_size = cpu_param.shape
-                stride = 1
-                local_output_size = output_size // tp_degree // stride
-                weight_slice = cpu_param.narrow(expert_dim, num_local_experts * ep_rank, num_local_experts)
-                up_weight_slice = weight_slice.narrow(output_dim, local_output_size * tp_rank, local_output_size)
-                trn_param.copy_(up_weight_slice.contiguous())
-            elif "down_proj" in cpu_name:
-                _, input_size, output_size = cpu_param.shape
-                local_input_size = input_size // tp_degree
-                weight_slice = cpu_param.narrow(expert_dim, num_local_experts * ep_rank, num_local_experts)
-                weight_slice = weight_slice.narrow(input_dim, local_input_size * tp_rank, local_input_size)
-                trn_param.copy_(weight_slice.contiguous())
+            # Find corresponding parameter in CPU model
+            cpu_param = cpu_params_dict[trn_name]
+            if "shared_experts" in trn_name and run_shared_expert_in_sp:
+                 trn_param.copy_(cpu_param.contiguous())
+
+            elif "expert_mlp" in trn_name:
+                if "gate_up_proj" in trn_name:
+                    _, input_size, output_size = cpu_param.shape
+                    stride = 2 if glu_mlp else 1
+                    local_output_size = output_size // tp_degree // stride
+                    single_output_size = output_size // stride
+                    weight_slice = cpu_param.narrow(expert_dim, num_local_experts * ep_rank, num_local_experts)
+                    gate_weight_slice = weight_slice.narrow(output_dim, local_output_size * tp_rank, local_output_size)
+                    up_weight_slice = weight_slice.narrow(
+                        output_dim, local_output_size * tp_rank + single_output_size, local_output_size
+                    )
+                    gate_up_weight_slice = torch.cat((gate_weight_slice, up_weight_slice), dim=output_dim)
+                    trn_param.copy_(gate_up_weight_slice.contiguous())
+
+                elif "up_proj" in trn_name:
+                    _, input_size, output_size = cpu_param.shape
+                    stride = 1
+                    local_output_size = output_size // tp_degree // stride
+                    weight_slice = cpu_param.narrow(expert_dim, num_local_experts * ep_rank, num_local_experts)
+                    up_weight_slice = weight_slice.narrow(output_dim, local_output_size * tp_rank, local_output_size)
+                    trn_param.copy_(up_weight_slice.contiguous())
+
+                elif "gate_proj" in trn_name:
+                    _, input_size, output_size = cpu_param.shape
+                    stride = 1
+                    local_output_size = output_size // tp_degree // stride
+                    weight_slice = cpu_param.narrow(expert_dim, num_local_experts * ep_rank, num_local_experts)
+                    up_weight_slice = weight_slice.narrow(output_dim, local_output_size * tp_rank, local_output_size)
+
+                elif "down_proj" in trn_name:
+                    _, input_size, output_size = cpu_param.shape
+                    local_input_size = input_size // tp_degree
+                    weight_slice = cpu_param.narrow(expert_dim, num_local_experts * ep_rank, num_local_experts)
+                    weight_slice = weight_slice.narrow(input_dim, local_input_size * tp_rank, local_input_size)
+                    trn_param.copy_(weight_slice.contiguous())
+
+        logger.info(parallel_state.rmsg(f"missing key: {missing_keys}"))
+        global_rank = torch.distributed.get_rank()
+        spmd_rank = torch.tensor([global_rank], dtype=torch.int32)
+
+        # local_indices is only computed when EP is enabled
+        if ep_degree > 1:
+            curr_expert_rank = parallel_state.get_expert_parallel_rank_from_global_rank(
+                rank=global_rank, expert_parallel_group=parallel_state.get_expert_model_parallel_group())
+            curr_expert_indices = parallel_state.get_experts_for_expert_parallel_rank(
+                curr_expert_rank,
+                total_number_of_experts=num_experts,
+                expert_model_parallel_size=ep_degree,
+            )
+            local_indices = torch.tensor([curr_expert_indices], dtype=torch.int32)
+
+        for trn_name, trn_param in model_trn.named_parameters():
+            if trn_name.endswith("spmd_rank.rank"):
+                trn_param.copy_(spmd_rank.contiguous())
+
+            if trn_name.endswith("experts.spmd_rank.rank"):
+                trn_param.copy_(spmd_rank.contiguous())
+
+            if trn_name.endswith("expert_mlps.spmd_rank.local_expert_indices") and ep_degree > 1:
+                trn_param.copy_(local_indices.contiguous())
 
     xm.mark_step()
 
@@ -432,13 +511,16 @@ def get_router_act_fn(cfg: ExptCfg):
         return "sigmoid"
     raise AssertionError(f"Unknown supported implementation for get router activation function: {cfg.implementation}")
 
-def initialize_neuron_model(cfg, seed=0):
+def initialize_neuron_model(cfg, seed=0, move_to_device=True):
     """
     Create a Neuron model, as specified in the config.
     """
 
     # Set random seed for reproducibility
     torch.manual_seed(seed)
+
+    return_router_logits = getattr(cfg, "return_router_logits", True)
+    return_expert_index = getattr(cfg, "return_expert_index", False)
 
     if cfg.sequence_parallel_enabled:
         assert cfg.seq_len > 1, "SP cannot be enabled for token-gen"
@@ -475,8 +557,8 @@ def initialize_neuron_model(cfg, seed=0):
     neuron_model = MoE(
         router=router,
         expert_mlps=expert_mlps,
-        # Always return router logits in testing
-        return_router_logits=True,
+        return_router_logits=return_router_logits,
+        return_expert_index=return_expert_index,
         sequence_parallel_enabled=cfg.sequence_parallel_enabled,
         sequence_dimension=sequence_dimension,
         shared_experts=shared_experts,
@@ -484,8 +566,31 @@ def initialize_neuron_model(cfg, seed=0):
         token_shuffle_seed=42,
     )
 
+    if cfg.moe_fused_tkg_enabled is True:
+        moe = neuron_model
+        post_attention_layernorm = LlamaRMSNormV2(hidden_size=cfg.hidden_size, eps=cfg.rms_norm_eps)
+        moe_fused_tkg_config = MoEFusedTKGConfig(
+            quantized=cfg.quantized,
+            moe_fused_kernel_enabled=cfg.moe_fused_tkg_kernel_enabled,
+            router_topk_kernel_enabled=cfg.router_topk_kernel_enabled,
+            expert_mlp_kernel_enabled=cfg.expert_mlp_kernel_enabled,
+            shared_mlp_kernel_enabled=cfg.shared_mlp_kernel_enabled,
+        )
+        neuron_model = MoEFusedTKG(
+            config=moe_fused_tkg_config,
+            post_attention_layernorm=post_attention_layernorm,
+            moe=moe,
+            return_expert_index=return_expert_index,
+            return_router_logits=return_router_logits,
+        )
+
+    stack_size = getattr(cfg, "stack_size", 1)
+    if stack_size > 1:
+        neuron_model = StackedModel(stack_size=stack_size, cfg=cfg, return_router_logits=return_router_logits)
+
     # Move model to required device
-    move_model_to_device(neuron_model, cfg.device)
+    if move_to_device:
+        move_model_to_device(neuron_model, cfg.device)
 
     return neuron_model
 
@@ -515,6 +620,7 @@ def init_expert_mlps(cfg:ExptCfg):
             use_block_parallel=cfg.use_block_parallel,
             early_expert_affinity_modulation=cfg.early_expert_affinity_modulation,
             block_sharding_strategy=cfg.block_sharding_strategy,
+            enable_spmd_rank=cfg.enable_spmd_rank,
         )
 
         if cfg.implementation == "topk":
@@ -547,6 +653,7 @@ def init_expert_mlps(cfg:ExptCfg):
             optimized_block_to_token_mapping=cfg.optimized_block_to_token_mapping,
             use_block_parallel=cfg.use_block_parallel,
             always_augment_inputs_for_blockwise_matmul=cfg.always_augment_inputs_for_blockwise_matmul,
+            block_sharding_strategy=cfg.block_sharding_strategy,
             skip_dma_token=cfg.skip_dma.skip_token,
             skip_dma_weight=cfg.skip_dma.skip_weight,
         )
@@ -557,6 +664,11 @@ def init_expert_mlps(cfg:ExptCfg):
             dtype=cfg.dtype,
             return_bias=False,
         )
+
+    if cfg.quantized:
+        q_config = get_default_expert_wise_per_channel_custom_qconfig_dict()
+        expert_mlps = convert(expert_mlps, q_config=q_config, inplace=True)
+
     # Workaround for when testing top_k=1 with topk
     if cfg.implementation == "topk":
         expert_mlps.routed_experts_mlp_config.normalize_top_k_affinities = True
@@ -566,6 +678,12 @@ def init_expert_mlps(cfg:ExptCfg):
 def init_shared_experts(cfg:ExptCfg):
     if cfg.num_shared_experts == 0:
         return None
+    if cfg.moe_fused_tkg_enabled:
+        transpose_weights = cfg.moe_fused_tkg_kernel_enabled or (
+            cfg.moe_fused_tkg_kernel_enabled is None and cfg.device == "xla"
+        ) or (cfg.moe_fused_tkg_kernel_enabled is False and cfg.shared_mlp_kernel_enabled is None and cfg.device == "xla")
+    else:
+        transpose_weights = False
     return SharedExperts(
         hidden_size=cfg.hidden_size,
         intermediate_size=cfg.intermediate_size,
@@ -573,4 +691,6 @@ def init_shared_experts(cfg:ExptCfg):
         fused_gate_up_projection=cfg.fused_gate_up_shared_expert,
         hidden_act=cfg.hidden_act,
         dtype=cfg.dtype,
+        sequence_parallel_enabled=cfg.shared_experts_sequence_parallel_enabled,
+        transpose_weights=transpose_weights,
     )

@@ -2,11 +2,11 @@ import os
 from multiprocessing.queues import SimpleQueue
 from typing import Any, Callable, Optional
 
-import pytorch_lightning as pl
+import lightning.pytorch as pl 
 import torch.multiprocessing as mp
-from lightning_fabric.strategies.launchers.xla import _rank_teardown
-from pytorch_lightning.strategies.launchers.multiprocessing import _GlobalStateSnapshot
-from pytorch_lightning.strategies.launchers.xla import _XLALauncher
+from lightning.fabric.strategies.launchers.xla import _rank_teardown 
+from lightning.pytorch.strategies.launchers.multiprocessing import _GlobalStateSnapshot 
+from lightning.pytorch.strategies.launchers.xla import _XLALauncher 
 
 
 class _NeuronXLALauncher(_XLALauncher):

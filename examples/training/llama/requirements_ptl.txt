@@ -1,1 +1,2 @@
 pytorch-lightning==2.4.0
+lightning==2.4.0

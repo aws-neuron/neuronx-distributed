@@ -26,8 +26,8 @@ import torch_xla.core.xla_model as xm
 from data_module import NeuronLightningDataModule
 from modeling_llama_nxd import CoreAttention, LlamaForCausalLM
 from module_llama import NeuronLlamaLTModule
-from pytorch_lightning import Trainer
-from pytorch_lightning.callbacks import ModelCheckpoint
+from lightning.pytorch.trainer.trainer import Trainer
+from lightning.pytorch.callbacks import ModelCheckpoint
 from torchmetrics.text.rouge import ROUGEScore
 from training_utils import create_instruction_based_dataset, get_mixed_precision_config
 from transformers import AdamW, LlamaConfig, LlamaTokenizer, set_seed, AutoTokenizer

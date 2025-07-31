@@ -58,6 +58,7 @@ from neuronx_distributed.quantization.quantization_config import (
     ActivationQuantizationType
 )
 from neuronx_distributed.quantization.quantization_utils import extract_q_scale, quantize_fp8_per_channel
+from neuronx_distributed.utils import cpu_mode
 from neuronx_distributed.utils.logger import get_logger
 
 logger = get_logger()
@@ -214,13 +215,16 @@ class BaseQuantizeParallelLinear(torch.nn.Module, metaclass=ABCMeta):
             set_tensor_model_parallel_attributes(
                 tensor=self.scale, is_parallel=False, dim=0, stride=1, num_partitions=1,
             )
-        elif quantization_type == QuantizationType.PER_CHANNEL_SYMMETRIC:
+        elif quantization_type in [QuantizationType.PER_CHANNEL_SYMMETRIC, QuantizationType.EXPERT_WISE_PER_CHANNEL_SYMMETRIC]:
             assert (
                 per_channel_axis is not None
             ), "per_channel_axis cannot be None for per_channel_symmetric quantization"
             scale_shape = [1] * len(weight_shape)
             scale_shape[per_channel_axis] = weight_shape[per_channel_axis]
 
+            ## For expert wise quantization, we need to set the scale shape dim 0 to num_experts
+            if quantization_type == QuantizationType.EXPERT_WISE_PER_CHANNEL_SYMMETRIC:
+                scale_shape[0] = self.num_experts
             self.scale = Parameter(torch.ones(scale_shape, device=self.weight.device), requires_grad=False)
 
             # Only when the weight partition dim is the per_channel_axis, we need to partition the scale
@@ -903,7 +907,7 @@ class QuantizedExpertFusedColumnParallel(QuantizedColumnParallel, ExpertFusedLin
         self.num_experts = num_experts
         self._n_local_experts = divide(num_experts, get_expert_model_parallel_size())
 
-        if quantization_type == QuantizationType.PER_CHANNEL_SYMMETRIC:
+        if quantization_type in [QuantizationType.PER_CHANNEL_SYMMETRIC, QuantizationType.EXPERT_WISE_PER_CHANNEL_SYMMETRIC]:
             if quantization_per_channel_axis is None:
                 quantization_per_channel_axis = 2  # Default to 2
             # For post-matmul output dequantization, we need the per_channel_axis = output_dim
@@ -951,8 +955,18 @@ class QuantizedExpertFusedColumnParallel(QuantizedColumnParallel, ExpertFusedLin
                 input, process_group=self.tensor_parallel_group,
             )
 
+
+        if expert_indices is not None:
+            # Currently, CPU does not support indexing for FP8 tensor types, so we need to view it as int8 first and index it before converting it back to FP8.
+            if cpu_mode() and self.weight.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
+                weight_dtype = self.weight.dtype
+                weight, scale = self.weight.view(torch.int8)[expert_indices, :, :].view(weight_dtype), self.scale[expert_indices, :, :]
+            else:
+                weight, scale = self.weight[expert_indices, :, :], self.scale[expert_indices, :, :]
+        else:
+            weight, scale = self.weight, self.scale
+
         # Matrix multiply.
-        weight = self.weight[expert_indices, :, :] if expert_indices is not None else self.weight
         weight_for_matmul = direct_cast_dequantize(tensor=weight, upcast_dtype=input_parallel.dtype)
         output = self._forward_impl(
             input=input_parallel,
@@ -964,7 +978,7 @@ class QuantizedExpertFusedColumnParallel(QuantizedColumnParallel, ExpertFusedLin
             save_for_backward=False,
             process_group=self.tensor_parallel_group,
         )
-        output = scale_dequantize(tensor=output, scale=self.scale, upcast_dtype=output.dtype)
+        output = scale_dequantize(tensor=output, scale=scale, upcast_dtype=output.dtype)
         return output
 
     @classmethod
@@ -1018,7 +1032,7 @@ class QuantizedExpertFusedRowParallel(QuantizedRowParallel, ExpertFusedLinear):
         self.num_experts = num_experts
         self._n_local_experts = divide(num_experts, get_expert_model_parallel_size())
 
-        if quantization_type == QuantizationType.PER_CHANNEL_SYMMETRIC:
+        if quantization_type in [QuantizationType.PER_CHANNEL_SYMMETRIC, QuantizationType.EXPERT_WISE_PER_CHANNEL_SYMMETRIC]:
             if quantization_per_channel_axis is None:
                 quantization_per_channel_axis = 2  # Default to 2
             # For post-matmul output dequantization, we need the per_channel_axis = output_dim
@@ -1060,9 +1074,20 @@ class QuantizedExpertFusedRowParallel(QuantizedRowParallel, ExpertFusedLinear):
         """Same as the forward of ExpertFusedRowParallelLinear, except with weight dequantization,
         and save_for_backward=False."""
 
-        # Matrix multiply.
-        weight = self.weight[expert_indices, :, :] if expert_indices is not None else self.weight
+
+        if expert_indices is not None:
+            # Currently, CPU does not support indexing for FP8 tensor types, so we need to view it as int8 first and index it before converting it back to FP8.
+            if cpu_mode() and self.weight.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
+                weight_dtype = self.weight.dtype
+                weight, scale = self.weight.view(torch.int8)[expert_indices, :, :].view(weight_dtype), self.scale[expert_indices, :, :]
+                
+            else:
+                weight, scale = self.weight[expert_indices, :, :], self.scale[expert_indices, :, :]
+        else:
+            weight, scale = self.weight, self.scale
         weight_for_matmul = direct_cast_dequantize(tensor=weight, upcast_dtype=input_.dtype)
+
+        # Matrix multiply.
         output_parallel = self._forward_impl(
             input=input_,
             weight=weight_for_matmul,
@@ -1073,7 +1098,7 @@ class QuantizedExpertFusedRowParallel(QuantizedRowParallel, ExpertFusedLinear):
             save_for_backward=False,
             process_group=self.tensor_parallel_group,
         )
-        output_parallel = scale_dequantize(tensor=output_parallel, scale=self.scale, upcast_dtype=output_parallel.dtype)
+        output_parallel = scale_dequantize(tensor=output_parallel, scale=scale, upcast_dtype=output_parallel.dtype)
 
         if self.reduce_output:
             output = reduce_from_tensor_model_parallel_region(

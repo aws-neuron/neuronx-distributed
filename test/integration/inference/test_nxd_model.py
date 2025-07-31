@@ -8,10 +8,10 @@ import torch
 
 from torch_neuronx.proto import metaneff_pb2
 from torch_neuronx.pyhlo import hlo_pb2
+from torch_neuronx.xla_impl.trace import get_torch_dtype
 
 from neuronx_distributed.parallel_layers import ColumnParallelLinear, RowParallelLinear, parallel_state
 from neuronx_distributed.trace.nxd_model import NxDModel
-from neuronx_distributed.trace.nxd_model.utils import ts_convert_dict_to_ordered_list_type_tensor
 from neuronx_distributed.trace.mock_torchdist import mock_distributed
 from neuronx_distributed.trace.model_builder import trace, compile, compile_wlo, compile_layout_transformer
 from neuronx_distributed.trace.hlo_utils import mark_weights_for_wlo, apply_layout_transformation
@@ -101,7 +101,7 @@ class DenseMLP(torch.nn.Module):
             self.lin2 = ColumnParallelLinear(10, 1024, bias=False, gather_output=True)
         else:
             self.lin1 = torch.nn.Linear(10, 1024, bias=False)
-            self.lin2 = torch.nn.Linear(1024, 10, bias=False)
+            self.lin2 = torch.nn.Linear(1024, 2, bias=False)
 
         self.relu = torch.nn.ReLU()
 
@@ -188,8 +188,6 @@ def build_nxd_model(
     inputs: MultiInputType,
     world_size: int = 1,
     use_wlo: bool = False,
-    init_zero_weights: bool = False,
-    init_weights_on_cpu: bool = True
 ):
     trace_artifacts, compile_artifacts, layout_transformer = trace_and_compile_model(
         mod,
@@ -205,23 +203,11 @@ def build_nxd_model(
             compile_artifacts[key]
         ) # this should run with no errors
 
-    if init_zero_weights:
-        get_device = lambda rank: 'cpu' if init_weights_on_cpu else f'privateuseone:{rank}'  # noqa: E731
-        my_new_weights = [
-            {
-                'lin1.weight': torch.zeros((1024,10 // world_size)).to(get_device(rank)),
-                'lin2.weight': torch.zeros((1024 // world_size, 10)).to(get_device(rank))
-            }
-            for rank in range(world_size)
-        ]
-        nxd_model.set_weights(my_new_weights)
-        return nxd_model, my_new_weights
     return nxd_model
 
 def validate_ordering(nxd_model, model_params, args, kwargs, names_to_skip=None):
     names_to_skip = set() if names_to_skip is None else names_to_skip
-    ordered_list, ordered_names = ts_convert_dict_to_ordered_list_type_tensor(
-        nxd_model.model_params,
+    ordered_list, ordered_names = nxd_model.convert_dict_to_ordered_list(
         kwargs,
         len(args)
     )
@@ -381,17 +367,54 @@ def test_add_aliased_model(use_kwargs):
         'key3': generate_example_input((3,1), kwarg_names),
     }
     world_size = 1
-    nxd_model = build_nxd_model(
+    
+    # Build model and extract artifacts for inspection
+    trace_artifacts, compile_artifacts, _ = trace_and_compile_model(
         SimpleAliasedModel,
         inputs,
         world_size
-    ) # this should run with no errors
+    )
+    
+    nxd_model = NxDModel(world_size)
+    keys = ['key1', 'key2', 'key3']
+
+    for key in keys:
+        nxd_model.add(key, trace_artifacts[key], compile_artifacts[key])
 
     assert nxd_model.state_initializer is not None
+
     available_keys = nxd_model.input_shape_map.keys()
     assert "(x: [1, 1])" in available_keys
     assert "(x: [2, 1])" in available_keys
     assert "(x: [3, 1])" in available_keys
+
+    for key in keys:
+        # Verify metaneff structure
+        metaneff = trace_artifacts[key].metaneff
+        assert len(metaneff.output_tensors) > 1, "Expected multiple output tensors in metaneff"
+        assert len(metaneff.output_aliases_to) > 0, "Expected at least one output alias"
+        
+        # Verify ``reserved_example_outputs`` has correct number of tensors (excluding aliases)
+        assert key in nxd_model.reserved_example_outputs
+        num_expected_outputs = len(metaneff.output_tensors) - len(metaneff.output_aliases_to)
+        assert len(nxd_model.reserved_example_outputs[key]) == num_expected_outputs, \
+            f"Expected {num_expected_outputs} reserved output tensors (aliased outputs should be skipped)"
+
+        # Verify the shapes and dtypes of the ``reserved_example_outputs``
+        for i, reserved_output in enumerate(nxd_model.reserved_example_outputs[key]):
+            output_idx = 0
+            for j, out_tensor in enumerate(metaneff.output_tensors):
+                if j not in metaneff.output_aliases_to:
+                    if output_idx == i:
+                        expected_shape = list(out_tensor.shape)
+                        expected_dtype = get_torch_dtype(out_tensor.data_type)
+                        break
+                    output_idx += 1
+
+            assert list(reserved_output.shape) == expected_shape, \
+                f"Output {i}: Expected shape {expected_shape}, got {list(reserved_output.shape)}"
+            assert reserved_output.dtype == expected_dtype, \
+                f"Output {i}: Expected dtype {expected_dtype}, got {reserved_output.dtype}"
 
     torch.classes.neuron.Runtime().unsafe_close()
 
@@ -795,94 +818,45 @@ def test_forward_specific_model_name(mode):
         assert torch.equal(output[0][0], a + 1)
         assert torch.equal(output[0][1], b + 1)
 
-@pytest.mark.parametrize('save_weights',[(False,),(True,)])
-def test_save_load(save_weights):
+
+def test_nxd_model_load_dtype_conversion():
+    # Model with mixed dtypes
+    class MixedDtypeAliasedModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+
+            self.register_buffer('float32_counter', torch.tensor([0.0], dtype=torch.float32), persistent=True)
+            self.register_buffer('int32_counter', torch.tensor([0], dtype=torch.int32), persistent=True)
+
+        def forward(self, x):
+            self.float32_counter = self.float32_counter + torch.max(x)
+            self.int32_counter = self.int32_counter + torch.tensor(x.shape[0], dtype=torch.int32)
+
+            return x + 1
+
     inputs = {
-        'key1': (torch.rand(1,10), None),
+        'key1': (torch.rand(1, 10), None),
     }
-    world_size = 2
-    nxd_model, weights = build_nxd_model(
-        partial(DenseMLP, True),
+    world_size = 1
+
+    original_model = build_nxd_model(
+        MixedDtypeAliasedModel,
         inputs,
-        world_size,
-        init_zero_weights=True
+        world_size
     )
-    nxd_model.to_neuron()
-    with tempfile.NamedTemporaryFile(suffix='.pt') as pt_file:
-        pt_file_name = pt_file.name
-        nxd_model.save(pt_file_name, save_weights)
-        loaded_mod = NxDModel.load(pt_file_name)
-        assert isinstance(loaded_mod, NxDModel)
 
-        if not save_weights:
-            loaded_mod.set_weights(weights)
-            loaded_mod.to_neuron()
+    # Save and load the model
+    with tempfile.NamedTemporaryFile(suffix='.pt') as tmp:
+        original_model.save(tmp.name)
+        loaded_model = NxDModel.load(tmp.name)
 
-        assert torch.equal(
-            loaded_mod(inputs['key1'][0]),
-            nxd_model(inputs['key1'][0])
-        )
+        assert loaded_model.state_initializer is not None
 
-    torch.classes.neuron.Runtime().unsafe_close()
-
-@pytest.mark.parametrize('save_weights',[(False,),(True,)])
-def test_pure_torchscript_save_load_with_kwargs(save_weights):
-    inputs = {
-        'key1': (torch.rand(1,10), None),
-    }
-    world_size = 2
-    nxd_model, weights = build_nxd_model(
-        partial(DenseMLP, True),
-        inputs,
-        world_size,
-        init_zero_weights=True
-    )
-    nxd_model.to_neuron()
-    with tempfile.NamedTemporaryFile(suffix='.pt') as pt_file:
-        pt_file_name = pt_file.name
-        nxd_model.save(pt_file_name, save_weights)
-        # loaded_mod = NxDModel.load(pt_file_name)
-        loaded_mod = torch.jit.load(pt_file_name)
-        assert isinstance(loaded_mod, torch.jit.ScriptModule)
-
-        if not save_weights:
-            loaded_mod.set_weights(weights)
-
-        loaded_mod.to_neuron()
-
-        assert torch.equal(
-            loaded_mod(None, {'x': inputs['key1'][0]}),
-            nxd_model(x=inputs['key1'][0])
-        )
-
-    torch.classes.neuron.Runtime().unsafe_close()
-
-@pytest.mark.xfail(raises=RuntimeError)
-def test_pure_torchscript_save_load_with_specific_invalid_model_name():
-    try:
-        inputs = {
-            'key1': (torch.rand(1,10), None),
+        expected_dtypes = {
+            'float32_counter': torch.float32,
+            'int32_counter': torch.int32,
         }
-        world_size = 2
-        nxd_model, weights = build_nxd_model(
-            partial(DenseMLP, True),
-            inputs,
-            world_size,
-            init_zero_weights=True
-        )
-        nxd_model.to_neuron()
-        with tempfile.NamedTemporaryFile(suffix='.pt') as pt_file:
-            pt_file_name = pt_file.name
-            nxd_model.save(pt_file_name, False)
-            # loaded_mod = NxDModel.load(pt_file_name)
-            loaded_mod = torch.jit.load(pt_file_name)
-            assert isinstance(loaded_mod, torch.jit.ScriptModule)
 
-            loaded_mod.set_weights(weights)
-            loaded_mod.to_neuron()
-            loaded_mod.model_name = 'key2'
-            _ = loaded_mod([inputs['key1'][0]])
-    except Exception as e:
-        raise e
-    finally:
-        torch.classes.neuron.Runtime().unsafe_close()
+        for name, dtype in expected_dtypes.items():
+            assert name in loaded_model.state_initializer.dtypes
+            assert loaded_model.state_initializer.dtypes[name] == dtype

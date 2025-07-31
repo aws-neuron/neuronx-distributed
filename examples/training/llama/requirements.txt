@@ -1,7 +1,7 @@
 transformers==4.48.0
 regex
 tensorboard
-datasets
+datasets<=3.6.0
 sentencepiece
 tenacity
 s3transfer

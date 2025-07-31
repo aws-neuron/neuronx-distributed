@@ -3,10 +3,10 @@ import os
 import json
 from typing import Union, Dict, Any
 
-
 class hardware(Enum):
     TRN1 = "trn1"
     TRN2 = "trn2"
+    CUSTOM = os.environ.get("NEURON_PLATFORM_TARGET_OVERRIDE") 
 
 
 def get_dict_from_json(json_file: Union[str, os.PathLike]) -> Dict[Any, Any]:

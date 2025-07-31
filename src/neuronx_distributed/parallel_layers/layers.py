@@ -3,19 +3,17 @@ import warnings
 from typing import (
     Optional, Tuple, Union, Any, Callable, Dict, Type, cast
 )
-import os
 
 import torch
 import torch.distributed
 import torch.nn.functional as F
 import torch.nn.grad as grad
 import torch.nn.init as init
-import torch_xla.core.xla_model as xm
 from torch.distributed import ProcessGroup
 from torch.nn.parameter import Parameter
 from .mappings import (
-    _gather_along_dim,
     _reduce_scatter_along_dim,
+    _gather_along_dim,
     copy_to_tensor_model_parallel_region,
     gather_from_tensor_model_parallel_region,
     gather_from_tensor_model_parallel_region_with_dim,
@@ -163,7 +161,7 @@ class ParallelEmbedding(torch.nn.Module):
         init_method: method to initialize weights.
         shard_along_embedding: set true to parallelize across embedding dimension (default False)
         pad: set true to pad weights such that its divisible by tensor parallel degree
-        rank_ordering: indicates how sharded weights are mapped, the i'th element 
+        rank_ordering: indicates how sharded weights are mapped, the i'th element
             in the list corresponds to the original rank which is mapped to rank_ordering[i]
     """
 
@@ -440,12 +438,14 @@ class LinearWithAsyncCommunication(torch.autograd.Function):
                 assert handle
                 handle.wait()
                 grad_input = grad_input.to(original_dtype)
-                
+
             return grad_input, None, None, None, None, None, None, None, None
 
         # Convert the tensor shapes to 2D for execution compatibility
-        grad_output = grad_output.view(grad_output.shape[0] * grad_output.shape[1], grad_output.shape[2])
-        total_input = total_input.view(total_input.shape[0] * total_input.shape[1], total_input.shape[2])
+        if len(grad_output.shape) == 3:
+            grad_output = grad_output.view(grad_output.shape[0] * grad_output.shape[1], grad_output.shape[2])
+        if len(total_input.shape) == 3:
+            total_input = total_input.view(total_input.shape[0] * total_input.shape[1], total_input.shape[2])
 
         grad_weight = grad_output.t().matmul(total_input)
         grad_bias = grad_output.sum(dim=0) if ctx.use_bias else None
@@ -511,7 +511,7 @@ class BaseParallelLinear(torch.nn.Module):
         if self.pad and self.training:
             raise RuntimeError("`pad=True` is only supported for inference. Set model.eval()")
 
-    
+
 class ColumnParallelLinear(BaseParallelLinear):
     """Linear layer with column parallelism.
 
@@ -532,8 +532,10 @@ class ColumnParallelLinear(BaseParallelLinear):
                        which is Y_i = XA_i
         dtype: dtype of the weights
         device: Device on which the weights should be initialized.
-        rank_ordering: indicates how sharded weights are mapped, the i'th element 
+        rank_ordering: indicates how sharded weights are mapped, the i'th element
             in the list corresponds to the original rank which is mapped to rank_ordering[i]
+        pad_alignment_size_per_rank: The padded shape need to be divisible by pad_alignment_size_per_rank * world_size.
+        keep_padded_output: If true, the layer output will keep the padded shape and will not be sliced to output_size.
     """
 
     def __init__(
@@ -551,6 +553,8 @@ class ColumnParallelLinear(BaseParallelLinear):
         keep_master_weight: bool = False,
         skip_bias_add: bool = False,
         pad: bool = False,
+        pad_alignment_size_per_rank: int = 1,
+        keep_padded_output: bool = False,
         tensor_model_parallel_group: Optional[ProcessGroup] = None,
         reduce_dtype: torch.dtype = torch.float32,
         rank_ordering: Optional[list] = None,
@@ -570,8 +574,9 @@ class ColumnParallelLinear(BaseParallelLinear):
 
         world_size = torch.distributed.get_world_size(group=self.tensor_parallel_group)
         self.pad = pad
+        self.keep_padded_output = keep_padded_output
         if self.pad:
-            self.pad_size = get_padding_length(self.output_size, world_size)
+            self.pad_size = get_padding_length(self.output_size, pad_alignment_size_per_rank * world_size)
             self.output_size = self.output_size + self.pad_size
 
         # Divide the weight matrix along the last dimension.
@@ -670,35 +675,45 @@ class ColumnParallelLinear(BaseParallelLinear):
             return_master_param=self.keep_master_weight,
         )
 
-    def forward(self, input: torch.Tensor, *_: Any) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        """Forward of ColumnParallelLinear
-
-        Args:
-            input_: 3D tensor whose order of dimension is [batch, sequence, hidden]
-
-        Returns:
-            - output
+    def forward(self, input: torch.Tensor, slice_indices: Optional[torch.Tensor] = None) -> Union[
+        torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
-        
+            Performs forward pass through the ColumnParallelLinear layer.
+
+            Args:
+                input (torch.Tensor): Input tensor of shape [batch, sequence, hidden]
+                slice_indices (Optional[torch.Tensor], optional): Indices for slicing the weight matrix on the partition dimension.
+                    Defaults to None.
+
+            Returns:
+                Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+                    - If skip_bias_add is True, returns (output, bias) tuple
+                    - If skip_bias_add is False, returns output tensor with bias added
+
+            Note:
+                Output shape matches input shape but with last dimension transformed
+                according to the weight matrix dimensions.
+            """
+
         self._check_pad_false_for_training()
 
         input_parallel = self._cpl_maybe_input_copy_to_tp_region(input)
-
+        weight = self.weight[slice_indices, :] if slice_indices is not None else self.weight
         # Matrix multiply.
         output_parallel = self._forward_impl(
             input=input_parallel,
-            weight=self.weight,
+            weight=weight,
             bias=None,
             async_grad_allreduce=self.async_tensor_model_parallel_allreduce,
             sequence_parallel_enabled=self.sequence_parallel_enabled,
             sequence_dimension=self.sequence_dimension,
             autograd_func_class=self.autograd_func_class,
             process_group=self.tensor_parallel_group,
-            reduce_dtype = self.reduce_dtype,
+            reduce_dtype=self.reduce_dtype,
         )
-        
+
         output = self._cpl_maybe_gather_output(output_parallel)
-        
+
         if self.skip_bias_add:
             return output, self.bias
         output = (output + self.bias) if self.bias is not None else output
@@ -711,7 +726,14 @@ class ColumnParallelLinear(BaseParallelLinear):
         if self.output_size != model_state_dict[prefix].shape[0] + self.pad_size:
             size = model_state_dict[prefix].shape[0]
             raise RuntimeError(f"State dict {prefix} is of an unexpected size {size} expected {size - self.pad_size}")
-        model_state_dict[prefix] = torch.nn.functional.pad(model_state_dict[prefix], (0, 0, 0, self.pad_size))
+        
+        if prefix.endswith("weight"):
+            model_state_dict[prefix] = torch.nn.functional.pad(model_state_dict[prefix], (0, 0, 0, self.pad_size))
+        elif prefix.endswith("bias"):
+            min_value = torch.finfo(model_state_dict[prefix].dtype).min
+            model_state_dict[prefix] = torch.nn.functional.pad(model_state_dict[prefix], (0, self.pad_size), 'constant', min_value)
+        else:
+            raise RuntimeError(f"Could not decide the sharding logic for prefix: {prefix}, must end with weight or bias")
 
     def _cpl_maybe_gather_output(
         self,
@@ -723,7 +745,7 @@ class ColumnParallelLinear(BaseParallelLinear):
             # All-gather across the partitions.
             assert not self.sequence_parallel_enabled
             output = gather_from_tensor_model_parallel_region(output_parallel, process_group=self.tensor_parallel_group)
-            if self.pad and self.pad_size > 0:
+            if not self.keep_padded_output and self.pad and self.pad_size > 0:
                 output = torch.narrow(output, -1, 0, self.output_size - self.pad_size)
         else:
             output = output_parallel
@@ -770,7 +792,7 @@ class RowParallelLinear(BaseParallelLinear):
                            again.
         dtype: dtype of the weights
         device: Device on which the weights should be initialized.
-        rank_ordering: indicates how sharded weights are mapped, the i'th element 
+        rank_ordering: indicates how sharded weights are mapped, the i'th element
             in the list corresponds to the original rank which is mapped to rank_ordering[i]
     """
 
@@ -899,25 +921,34 @@ class RowParallelLinear(BaseParallelLinear):
         bound = 1 / math.sqrt(self.input_size_per_partition) if self.input_size_per_partition > 0 else 0
         torch.nn.init.uniform_(self.bias, -bound, bound)
 
-    def forward(self, input_: torch.Tensor) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        """Forward of RowParallelLinear
-
-        Args:
-            input_: 3D tensor whose order of dimension is [batch, sequence, hidden]
-
-        Returns:
-            - output
+    def forward(self, input_: torch.Tensor, slice_indices: Optional[torch.Tensor] = None) -> Union[
+        torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
+            Performs forward pass through the RowParallelLinear layer.
 
+            Args:
+                input_ (torch.Tensor): Input tensor of shape [batch, sequence, hidden]
+                slice_indices (Optional[torch.Tensor], optional): Indices for slicing the weight matrix columns on the partition dimension.
+                    Defaults to None.
+
+            Returns:
+                Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+                    - If skip_bias_add is True, returns (output, bias) tuple
+                    - If skip_bias_add is False, returns output tensor with bias added
+
+            Note:
+                The input is scattered across the parallel dimension before computation,
+                and the output is reduced across parallel workers after the linear transformation.
+            """
         self._check_pad_false_for_training()
 
         # Set up backprop all-reduce.
         input_parallel = self._rpl_maybe_scatter_input(input_)
-
+        weight = self.weight[:, slice_indices] if slice_indices is not None else self.weight
         # Matrix multiply.
         output_ = self._forward_impl(
             input=input_parallel,
-            weight=self.weight,
+            weight=weight,
             bias=None,
             async_grad_allreduce=False,
             sequence_parallel_enabled=False,
@@ -970,15 +1001,15 @@ class RowParallelLinear(BaseParallelLinear):
                 )
 
             output_ = output_.to(original_dtype)
-        
+
         return output_
-    
+
     def _rpl_maybe_scatter_input(
         self,
         input_
     ) -> torch.Tensor:
         """This function scatters the input to the tensor model parallel region conditionally"""
-        
+
         if self.input_is_parallel:
                 input_parallel = input_
         else:
@@ -986,7 +1017,7 @@ class RowParallelLinear(BaseParallelLinear):
                 input_ = torch.nn.functional.pad(input_, (0, self.pad_size))
             assert not self.sequence_parallel_enabled
             input_parallel = scatter_to_tensor_model_parallel_region(input_, process_group=self.tensor_parallel_group)
-        
+
         return input_parallel
 
 
@@ -1494,7 +1525,7 @@ class SPMDRank(torch.nn.Module):
 
     def get_rank(self) -> torch.Tensor:
         return self.rank
-    
+
     def initialize_expert_indices(self, num_local_experts) -> torch.Tensor:
         """Initialize parameter tensor for tracking local expert indices.
 

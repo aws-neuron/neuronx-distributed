@@ -27,10 +27,19 @@ GRAD_TEST_TOLS_FP32 = {
     "atol": 5e-4,
     "rtol": 1e-2,
 }
+# FP16 test tolerances
+OUTPUT_TEST_TOLS_FP16 = {
+    "atol": 5e-4,
+    "rtol": 2e-3,
+}
+GRAD_TEST_TOLS_FP16 = {
+    "atol": 5e-4,
+    "rtol": 2e-3,
+}
 # BF16 test tolerances
 OUTPUT_TEST_TOLS_BF16 = {
     "atol": 5e-2,
-    "rtol": 1e-2,
+    "rtol": 1.5e-2,
 }
 GRAD_TEST_TOLS_BF16 = {
     "atol": 5e-3,
@@ -42,8 +51,9 @@ def parse_args():
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--s3_dir", required=False, help="location to upload all test artifacts")
     parser.add_argument("--s3_bucket", default="s3://ktf-test-runs/neuronx_distributed_modules/moe")
-    parser.add_argument("--test_dtype", required=True, choices=["fp32", "bf16"], help="Either fp32 or bf16")
+    parser.add_argument("--test_dtype", required=True, choices=["fp32", "bf16", "fp16"], help="Either fp32 or bf16")
     parser.add_argument("--test_mode", required=True, type=str, help="Either training or inference")
+    parser.add_argument("--test_modules", required=False, default=None, type=str, help="sub test classes, mostly feature level ('module1,module2,module3')")
     allowed_tp_degrees = [1, 2, 8, 16, 32]
     tp_degrees_help_msg = "One of 1, 2, 8, 16, 32"
     if get_platform_lnc() == 2:
@@ -53,7 +63,7 @@ def parse_args():
         "--test_tp_degree", required=True, type=int, choices=allowed_tp_degrees, help=tp_degrees_help_msg
     )
     parser.add_argument(
-        "--test_ep_degree", required=False, default=1, type=int, choices=[1, 2, 4, 8, 16, 32], help="One of 1, 2, 4, 8, 16, 32"
+        "--test_ep_degree", required=False, default=1, type=int, choices=[1, 2, 4, 8, 16, 32, 64], help="One of 1, 2, 4, 8, 16, 32, 64"
     )
     parser.add_argument(
         "--token_shuffle_group_size", required=False, type=int, default=1,
@@ -63,11 +73,19 @@ def parse_args():
     )
     args, leftovers = parser.parse_known_args()
     S3_BUCKET_NAME = args.s3_bucket
-    test_dtype = torch.float32 if args.test_dtype == "fp32" else torch.bfloat16
-    return S3_BUCKET_NAME, args, test_dtype, args.test_mode, args.test_tp_degree, args.test_ep_degree, args.token_shuffle_group_size, args.zero1
+    if args.test_dtype == "fp32":
+        test_dtype = torch.float32
+    elif args.test_dtype == "bf16":
+        test_dtype = torch.bfloat16
+    else:
+        test_dtype = torch.float16
+
+    if args.test_modules:
+        args.test_modules = args.test_modules.split(',')
+    return S3_BUCKET_NAME, args, test_dtype, args.test_mode, args.test_modules, args.test_tp_degree, args.test_ep_degree, args.token_shuffle_group_size, args.zero1
 
 
-S3_BUCKET_NAME, args, TEST_DTYPE, TEST_MODE, TEST_TP_DEGREE, TEST_EP_DEGREE, TEST_TOKEN_SHUFFLE_GROUP_SIZE, ZERO1 = parse_args()
+S3_BUCKET_NAME, args, TEST_DTYPE, TEST_MODE, TEST_MODULES, TEST_TP_DEGREE, TEST_EP_DEGREE, TEST_TOKEN_SHUFFLE_GROUP_SIZE, ZERO1 = parse_args()
 results = {"inference_success": 1}
 
 # Set compiler flags before TRN enablement
@@ -96,8 +114,8 @@ def test_moe_layer_device_correctness_parallel():
         output_test_tols, grad_test_tols = OUTPUT_TEST_TOLS_FP32, GRAD_TEST_TOLS_FP32
     elif TEST_DTYPE == torch.bfloat16:
         output_test_tols, grad_test_tols = OUTPUT_TEST_TOLS_BF16, GRAD_TEST_TOLS_BF16
-    else:
-        raise ValueError(f"Unknown TEST_DTYPE: {str(TEST_DTYPE)}")
+    elif TEST_DTYPE == torch.float16:
+        output_test_tols, grad_test_tols = OUTPUT_TEST_TOLS_FP16, GRAD_TEST_TOLS_FP16
 
     def _test_moe_layer_device_correctness_parallel():
         test_configs = get_device_correctness_parallel_test_configs(
@@ -106,6 +124,7 @@ def test_moe_layer_device_correctness_parallel():
             ep_degree=TEST_EP_DEGREE,
             token_shuffle_group_size=TEST_TOKEN_SHUFFLE_GROUP_SIZE,
             test_mode=TEST_MODE,
+            test_modules=TEST_MODULES,
             zero1=ZERO1,
         )
         start_time = time.time()

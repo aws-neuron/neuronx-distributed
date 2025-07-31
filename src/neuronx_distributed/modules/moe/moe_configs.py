@@ -1,5 +1,5 @@
 import torch
-from typing import Union, Any
+from typing import Union, Any, Optional
 
 from neuronxcc.nki._private_kernels.blockwise_mm import BlockShardStrategy
 
@@ -70,7 +70,7 @@ class BlockwiseMatmulConfig:
         skip_dma_weight = kwargs.pop("skip_dma_weight", DEFAULT_SKIP_MODE[1])
         optimized_block_to_token_mapping = kwargs.pop("optimized_block_to_token_mapping", True)
         use_torch_block_wise = kwargs.pop("use_torch_block_wise", False)
-        parallelize_token_to_block_mapping = kwargs.pop("parallelize_token_to_block_mapping", False)
+        parallelize_token_to_block_mapping = kwargs.pop("parallelize_token_to_block_mapping", True)
         always_augment_inputs_for_blockwise_matmul = kwargs.pop(
             "always_augment_inputs_for_blockwise_matmul", False)
         if isinstance(block_sharding_strategy, str):
@@ -153,8 +153,8 @@ class RouterConfig:
         dtype: Router dtype
     """
     def __init__(
-            self, 
-            act_fn: str = "softmax", 
+            self,
+            act_fn: str = "softmax",
             dtype: torch.dtype = torch.float32):
         self.act_fn = act_fn
         self.dtype = dtype
@@ -163,6 +163,21 @@ class RouterConfig:
     def from_kwargs(**kwargs):
         act_fn = kwargs.pop("router_act_fn", "softmax")
         dtype = kwargs.pop("router_dtype", torch.float32)
-        if isinstance(dtype, str): 
+        if isinstance(dtype, str):
             dtype = to_torch_dtype(dtype)
         return RouterConfig(act_fn=act_fn, dtype=dtype)
+
+class MoEFusedTKGConfig:
+    def __init__(
+        self,
+        quantized: bool,
+        moe_fused_kernel_enabled: Optional[bool] = None,
+        router_topk_kernel_enabled: Optional[bool] = None,
+        expert_mlp_kernel_enabled: Optional[bool] = None,
+        shared_mlp_kernel_enabled: Optional[bool] = None,
+    ):
+        self.quantized = quantized
+        self.moe_fused_kernel_enabled = moe_fused_kernel_enabled
+        self.router_topk_kernel_enabled = router_topk_kernel_enabled
+        self.expert_mlp_kernel_enabled = expert_mlp_kernel_enabled
+        self.shared_mlp_kernel_enabled = shared_mlp_kernel_enabled
