@@ -7,7 +7,7 @@ assignees: ''
 ---
 ## Hardware Used
 
-[Trainium/Inferentia, along with the specific instance used]
+[Trainium, along with the specific instance used]
 
 ## Training/Inference
 
@@ -15,7 +15,7 @@ assignees: ''
 
 ## Instance type
 
-[Inf2.xlarge/trn1.32xlarge/trn2.48xlarge etc]
+[trn1.32xlarge/trn2.48xlarge etc]
 
 ## Release Artifacts
 
