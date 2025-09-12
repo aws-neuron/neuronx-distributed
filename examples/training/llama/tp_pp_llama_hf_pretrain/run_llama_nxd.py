@@ -191,7 +191,7 @@ def train_llama(args):
         args.training_dir, args.train_batch_size, dp_size, dp_rank, args.seed
     )
 
-    print("Creating sample dataloader finised")
+    print("Creating sample dataloader finished")
 
     # Only print/logging on the last PP rank of the first PP group
     # Since loss is only in the last PP rank
