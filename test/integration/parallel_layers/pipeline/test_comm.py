@@ -4,6 +4,7 @@ import json
 import os
 import traceback
 from datetime import datetime
+import time
 
 # Third Party
 import torch
@@ -77,12 +78,14 @@ def test_send_and_recv():
             t = send(recv_a) #noqa
             mark_step()
             recv_a_cpu = recv_a.to(torch.device("cpu"))
+            time.sleep(5)
             a = torch.load("tensor.pt", map_location=torch.device("cpu"))
             assert torch.equal(a, recv_a_cpu)
         else:
             recv_a = recv_from(tensor_meta)
             mark_step()
             recv_a_cpu = recv_a.to(torch.device("cpu"))
+            time.sleep(5)
             a = torch.load("tensor.pt", map_location=torch.device("cpu"))
             assert torch.equal(a, recv_a_cpu)
 

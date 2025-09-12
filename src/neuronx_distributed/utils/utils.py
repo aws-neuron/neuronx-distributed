@@ -8,6 +8,21 @@ class hardware(Enum):
     TRN2 = "trn2"
     CUSTOM = os.environ.get("NEURON_PLATFORM_TARGET_OVERRIDE") 
 
+    @classmethod
+    def _missing_(cls, value):
+        _value_map = {
+            "trn1": cls.TRN1,
+            "trn1n": cls.TRN1,
+            "inf2": cls.TRN1,
+            "trn2": cls.TRN2,
+        }
+        if value in _value_map:
+            return _value_map[value]
+        elif value == cls.CUSTOM.value:
+            return cls.CUSTOM
+
+        return None
+
 
 def get_dict_from_json(json_file: Union[str, os.PathLike]) -> Dict[Any, Any]:
     """Reads a JSON file and returns its contents as a Python dictionary.

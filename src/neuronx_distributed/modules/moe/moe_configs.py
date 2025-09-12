@@ -1,10 +1,13 @@
 import torch
-from typing import Union, Any, Optional
+from typing import Union, Optional
 
 from neuronxcc.nki._private_kernels.blockwise_mm import BlockShardStrategy
 
+from neuronx_distributed.modules.moe.model_utils import GLUType, ACTFunc
 from neuronx_distributed.modules.moe.model_utils import DEFAULT_BLOCK_SIZE, DEFAULT_SKIP_MODE, DEFAULT_LNC_SIZE
-from neuronx_distributed.utils.model_utils import get_platform_lnc
+from neuronx_distributed.utils.logger import get_logger
+
+logger = get_logger()
 
 def to_torch_dtype(dtype_str: str) -> torch.dtype:
     dtype_mapping = {
@@ -32,6 +35,10 @@ class BlockwiseMatmulConfig:
         block_sharding_strategy: corresponds to different block parallel blockwise matmul kernel
         skip_dma: kernel optimizations for skip tokens and skip weights. When skip token is true, inputs to blockwise kernel do not need to be padded.
                   always_augment_inputs_for_blockwise_matmul: always pad the inputs to blockwise kernel regardless of the value of skip dma.
+        use_shard_on_intermediate_dynamic_while: flag to enable shard-on-intermediate dynamic while kernel in forward_blockwise
+        use_shard_on_block_dynamic_while: flag to enable shard-on-block dynamic while kernel in forward_blockwise
+        num_static_blocks: number of static blocks will be computed in dynamic kernel. The dynamic kernel will have static block and dynamic block where static
+                           block computation will be fixed, and dynamic block computation can be skipped
     """
     def __init__(self,
                  block_size: int,
@@ -44,7 +51,11 @@ class BlockwiseMatmulConfig:
                  use_torch_block_wise: bool,
                  parallelize_token_to_block_mapping:bool,
                  optimized_block_to_token_mapping: bool,
-                 always_augment_inputs_for_blockwise_matmul: bool):
+                 always_augment_inputs_for_blockwise_matmul: bool,
+                 use_shard_on_intermediate_dynamic_while: bool,
+                 use_shard_on_block_dynamic_while: bool,
+                 num_static_blocks: int,
+                 ):
         self.block_size = block_size
         self.logical_nc_config = logical_nc_config
         self.use_block_parallel = use_block_parallel
@@ -56,6 +67,9 @@ class BlockwiseMatmulConfig:
         self.blockwise_nki_autograd_cls = blockwise_nki_autograd_cls
         self.parallelize_token_to_block_mapping = parallelize_token_to_block_mapping
         self.always_augment_inputs_for_blockwise_matmul = always_augment_inputs_for_blockwise_matmul
+        self.use_shard_on_intermediate_dynamic_while = use_shard_on_intermediate_dynamic_while
+        self.use_shard_on_block_dynamic_while = use_shard_on_block_dynamic_while
+        self.num_static_blocks = num_static_blocks
 
     #TODO: refactor this function
     @staticmethod
@@ -73,6 +87,12 @@ class BlockwiseMatmulConfig:
         parallelize_token_to_block_mapping = kwargs.pop("parallelize_token_to_block_mapping", True)
         always_augment_inputs_for_blockwise_matmul = kwargs.pop(
             "always_augment_inputs_for_blockwise_matmul", False)
+        use_shard_on_intermediate_dynamic_while = kwargs.pop(
+            "use_shard_on_intermediate_dynamic_while", False)
+        use_shard_on_block_dynamic_while = kwargs.pop(
+            "use_shard_on_block_dynamic_while", False)
+        num_static_blocks = kwargs.pop(
+            "num_static_blocks", None)
         if isinstance(block_sharding_strategy, str):
             if block_sharding_strategy == "HI_LO":
                 block_sharding_strategy = BlockShardStrategy.HI_LO
@@ -92,6 +112,9 @@ class BlockwiseMatmulConfig:
                                     use_torch_block_wise=use_torch_block_wise,
                                     parallelize_token_to_block_mapping=parallelize_token_to_block_mapping,
                                     always_augment_inputs_for_blockwise_matmul=always_augment_inputs_for_blockwise_matmul,
+                                    use_shard_on_intermediate_dynamic_while=use_shard_on_intermediate_dynamic_while,
+                                    use_shard_on_block_dynamic_while=use_shard_on_block_dynamic_while,
+                                    num_static_blocks=num_static_blocks,
                                     )
 
     @staticmethod
@@ -125,25 +148,37 @@ class RoutedExpertsMLPOpsConfig:
         top_k: int,
         hidden_act: str,
         glu_mlp: bool,
+        bias: bool = False,
+        glu_type: Optional[GLUType] = GLUType.GLU,
+        hidden_act_scaling_factor: float = 1.,
+        hidden_act_bias: float = 0.,
         normalize_top_k_affinities: bool = False,
         early_expert_affinity_modulation: bool = False,
         input_layer_init_method = None,
         output_layer_init_method = None,
         capacity_factor: Union[None, float] = None,
         enable_spmd_rank = False,
+        is_prefill = None,
         ):
         self.num_experts = num_experts
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.hidden_act = hidden_act
         self.glu_mlp = glu_mlp
+        if self.glu_mlp:
+            glu_type = GLUType.validate(glu_type)
+        self.glu_type = glu_type
+        self.hidden_act_scaling_factor = hidden_act_scaling_factor
+        self.hidden_act_bias = hidden_act_bias
         self.input_layer_init_method = input_layer_init_method
         self.output_layer_init_method = output_layer_init_method
         self.capacity_factor = capacity_factor
         self.top_k = top_k
+        self.bias = bias
         self.normalize_top_k_affinities = normalize_top_k_affinities
         self.early_expert_affinity_modulation = early_expert_affinity_modulation
         self.enable_spmd_rank = enable_spmd_rank
+        self.is_prefill = is_prefill
 
 class RouterConfig:
     """

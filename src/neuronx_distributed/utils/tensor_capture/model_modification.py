@@ -45,7 +45,7 @@ def modify_model_for_tensor_capture(model: nn.Module,
     model_info = registry.model_info
 
     def make_hook(module_name: str) -> Callable:
-        def hook(module: nn.Module, input: Any, output: Any) -> None:
+        def hook(module: nn.Module, args: tuple, kwargs: dict, output: Any) -> None:
             # Get registry
             registry = TensorRegistry.get_instance()
 
@@ -56,6 +56,9 @@ def modify_model_for_tensor_capture(model: nn.Module,
                 elif isinstance(obj, tuple):
                     for i, item in enumerate(obj):
                         register_tensor_object(f"{prefix}.{i}", item)
+                elif isinstance(obj, dict):
+                    for key, value in obj.items():
+                        register_tensor_object(f"{prefix}.{key}", value)
                 elif hasattr(obj, '__dataclass_fields__') or (hasattr(obj, '__dict__') and not isinstance(obj, type)):
                     # For dataclass objects or any object with attributes
                     for attr_name in dir(obj):
@@ -66,20 +69,26 @@ def modify_model_for_tensor_capture(model: nn.Module,
                                 registry.register_tensor(f"{prefix}.{attr_name}", attr_value)
 
             # Register input tensors if enabled
-            if capture_inputs and input:
-                register_tensor_object(f"{module_name}.inputs", input)
-            
+            if capture_inputs:
+                # Register args as "inputs" (same as old API)
+                if args:
+                    register_tensor_object(f"{module_name}.inputs", args)
+
+                # Register keyword arguments
+                if kwargs:
+                    register_tensor_object(f"{module_name}.inputs.kwargs", kwargs)
+
             # Register output tensors
             register_tensor_object(f"{module_name}.outputs", output)
         return hook
-    
+
     # Register forward hooks for targeted modules
     for name, module in dict(model.named_modules()).items():
         if name in modules_to_capture:
-            hook_handle = module.register_forward_hook(make_hook(name))
+            hook_handle = module.register_forward_hook(make_hook(name), with_kwargs=True)
             model_info.hooks.append(hook_handle)
             logger.info(f"Registered forward hook for module {name} for tensor capture")
-    
+
     return model
 
 

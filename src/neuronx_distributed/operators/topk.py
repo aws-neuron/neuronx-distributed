@@ -14,7 +14,7 @@ from neuronx_distributed.utils.utils import hardware
 import logging
 
 try:
-    from neuronxcc.nki._pre_prod_kernels.topk import topk as nki_topk
+    from neuronxcc.nki._pre_prod_kernels.topk.topk import topk as nki_topk
 except ImportError:
     logging.warning("Use a more recent neuron compiler version to enable nki_topk")
     nki_topk = None
@@ -30,7 +30,7 @@ def _nki_topk_wrapper(tensor, k, dim):
     1. neuronxcc.nki._pre_prod_kernels.topk import topk (this method is a wrapper over this variant)
     2. torch_neuronx.xla_impl.ops.TopK
     3. neuronx_distributed.kernels.topk.topk_rotated
-    
+
     (2) and (3) take a dim parameter whereas (1) does not.
     This wrapper function helps us to invoke all the above implementations with a common interface.
     """
@@ -58,15 +58,15 @@ def topk(tensor, k, dim, gather_dim, process_group=None, stages=1, rank_id=None,
     3. gather_dim: the dimension to gather on. This
     should be the dimension the tensor was sharded on.
 
-    Note: stages > 1 enables cascaded reduction. However, 
-    if nki topk kernel is available, this is always 
+    Note: stages > 1 enables cascaded reduction. However,
+    if nki topk kernel is available, this is always
     overwritten to 1 as nki kernel does internal cascading
     without global cc overhead.
 
     Note: This method can use different underlying implementations
-    for per shard topk calculation based on the the parameters provided 
+    for per shard topk calculation based on the the parameters provided
     and nki kernel availability on hardware.
-    Refer to the method source code to understand 
+    Refer to the method source code to understand
     when the different implementations will be used
     and the constraints around using those implementations.
 
@@ -84,7 +84,7 @@ def topk(tensor, k, dim, gather_dim, process_group=None, stages=1, rank_id=None,
         lnc = lnc if is_trn1 else nl.nc(lnc)
         topk_implementation = topk_rotated[(lnc,)]
         assert stages == 1, "stages other than 1 is not supported when using topk_rotated kernel"
-    else:    
+    else:
         # check if nki topk kernel is available, if so, always prefer 1 stage (k%8==0 will be removed after kernel update)
         can_use_nki_topk = dim in (-1, len(tensor.shape) - 1) and _is_nki_topk_available()
         if can_use_nki_topk:
@@ -158,8 +158,8 @@ def topk(tensor, k, dim, gather_dim, process_group=None, stages=1, rank_id=None,
             local_value = _gather_along_dim(local_value, gather_dim, process_group=stage_pg[i])
             local_index_ = _gather_along_dim(local_index, gather_dim, process_group=stage_pg[i])
 
-            local_value, local_index = topk_implementation(local_value, k, dim=dim) 
-            
+            local_value, local_index = topk_implementation(local_value, k, dim=dim)
+
             local_index = torch.gather(local_index_, dim, local_index)
 
         return local_value, local_index

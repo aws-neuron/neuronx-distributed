@@ -107,10 +107,10 @@ class TensorRegistry:
             # Direct match with monitored module
             if name in self.model_info.modules_to_capture:
                 is_monitored = True
-            # Check if name contains any monitored module
+            # Check if name starts with any monitored module followed by a dot
             else:
                 for module in self.model_info.modules_to_capture:
-                    if module in name:
+                    if name.startswith(f"{module}."):
                         is_monitored = True
                         break
         
@@ -125,10 +125,16 @@ class TensorRegistry:
                 
             # Create a unique key for this tensor
             if isinstance(name, str):
-                key = f"manual_{name}"
-                if self.model_info.manual_tensors_keys[key] > 0:
-                    key = f"{key}_{self.model_info.manual_tensors_keys[key]}"
-                self.model_info.manual_tensors_keys[key] += 1
+                base_key = f"manual_{name}"
+                # Check if this base key already exists in manual_tensors
+                if base_key in self.model_info.manual_tensors:
+                    # Generate a unique key with counter
+                    key = f"{base_key}_{self.model_info.manual_tensors_keys[base_key]}"
+                else:
+                    # First occurrence, use the base key
+                    key = base_key
+                # Increment counter for this base key for future registrations
+                self.model_info.manual_tensors_keys[base_key] += 1
             else:
                 key = f"manual_tensor_{len(self.model_info.manual_tensors)}"
                 

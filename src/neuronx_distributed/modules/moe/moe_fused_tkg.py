@@ -1,16 +1,27 @@
 import logging
 import warnings
+from typing import Any, Dict, Optional
 
 import neuronxcc.nki.language as nl
 import torch
+from torch.distributed import ProcessGroup
 from neuronxcc import nki
 from neuronxcc.nki.language import nc
 
-from neuronx_distributed.modules.moe import MoE
-from neuronx_distributed.modules.moe.model_utils import DEFAULT_LNC_SIZE
+from neuronx_distributed.modules.moe.model_utils import (
+    ACTFunc,
+    DEFAULT_HIDDEN_ACT_SCALING_FACTOR,
+    DEFAULT_LNC_SIZE,
+    DEFAULT_SELECTIVE_LOADING_THRESHOLD,
+    get_kernel_activation_func_id,
+    GLUType,
+)
 from neuronx_distributed.modules.moe.moe_configs import MoEFusedTKGConfig
 from neuronx_distributed.modules.moe.nki_import import NKIImport, import_nki
-from neuronx_distributed.parallel_layers import mappings
+from neuronx_distributed.parallel_layers import mappings, parallel_state, utils
+from neuronx_distributed.modules.moe.routing import RouterBase
+from neuronx_distributed.modules.moe.expert_mlps import ExpertMLPsV2
+from neuronx_distributed.modules.moe.shared_experts import SharedExperts
 
 
 def initialize_nki_components() -> dict:
@@ -25,7 +36,8 @@ def initialize_nki_components() -> dict:
         "mlp": NKIImport("mlp_isa_kernel", module_name="mlp", nki_jit_type="use_nki_jit_decorator"),
         "quant_mlp": NKIImport("quant_mlp_isa_kernel", module_name="mlp", nki_jit_type="use_nki_jit_decorator"),
         "expert_mlps": NKIImport("expert_mlps_isa_inline_kernel", module_name="expert_mlps"),
-        "moe_token_gen": NKIImport("moe_token_gen_kernel", module_name="moe_token_gen"),
+        "moe_token_gen_selective_loading": NKIImport("moe_token_gen_kernel", module_name="moe_token_gen"),
+        "moe_token_gen_forward_all_experts": NKIImport("moe_token_gen_all_experts_kernel", module_name="moe_token_gen"),
         "affinity_scale_mode": NKIImport("ExpertAffinityScaleMode"),
         "act_fn_type": NKIImport("ActFnType"),
         "router_act_fn_type": NKIImport("RouterActFnType"),
@@ -47,7 +59,8 @@ nki_components = initialize_nki_components()
 _router_topk_nki_call = nki_components["router_topk"]
 _mlp_nki_call = nki_components["mlp"]
 _quant_mlp_nki_call = nki_components["quant_mlp"]
-_moe_tkg_nki_call = nki_components["moe_token_gen"]
+_moe_tkg_selective_loading_nki_call = nki_components["moe_token_gen_selective_loading"]
+_moe_tkg_forward_all_experts_nki_call = nki_components["moe_token_gen_forward_all_experts"]
 ExpertAffinityScaleMode = nki_components["affinity_scale_mode"]
 ActFnType = nki_components["act_fn_type"]
 RouterActFnType = nki_components["router_act_fn_type"]
@@ -61,7 +74,6 @@ ROUTER_ACT_FN_MAPPING = {
     "sigmoid": RouterActFnType.SIGMOID,
     "softmax": RouterActFnType.SOFTMAX,
 }
-
 
 def expert_isa_kernel_wrapper(
     inp: nl.ndarray,
@@ -87,6 +99,13 @@ def expert_isa_kernel_wrapper(
     )  # [T, H]
     return out
 
+def _post_create_quantized_module_hook(layer):
+    # This is a workaround in order to avoid loading weights for MoEFusedTKG during tracing.
+    # Quantized modules implement these functions so they will always attempt to load these
+    # weights. We need to delete these methods to avoid loading.
+    delattr(layer.scale, "get_tensor_from_state_dict")
+    delattr(layer.weight, "get_tensor_from_state_dict")
+    delattr(layer.weight, "set_tensor_to_state_dict")
 
 class MoEFusedTKG(torch.nn.Module):
     """
@@ -95,17 +114,24 @@ class MoEFusedTKG(torch.nn.Module):
 
     def __init__(
         self,
-        moe: MoE,
+        router: RouterBase,
+        expert_mlps: ExpertMLPsV2,
         config: MoEFusedTKGConfig,
-        post_attention_layernorm: torch.nn.Module = None,
+        sequence_dimension: int,
+        shared_experts: Optional[SharedExperts] = None,
+        post_attention_layernorm: Optional[torch.nn.Module] = None,
+        tensor_model_parallel_group: Optional[ProcessGroup] = None,
         logical_nc_config: int = DEFAULT_LNC_SIZE,
         return_router_logits: bool = False,
         return_expert_index: bool = False,
     ):
         """
         Arguments:
-            moe: MoE module object.
+            router: RouterBase object.
+            expert_mlps: ExpertMLPsV2 object.
             config: Module config object.
+            sequence_dimension: Sequence dimension of the input.
+            shared_experts: SharedExperts object, optional.
             post_attention_layernorm: Optional. If passed, forward method will forward hidden_states through
                                       post_attention_layernorm before moe.
             logical_nc_config: LNC size (1 or 2).
@@ -114,19 +140,29 @@ class MoEFusedTKG(torch.nn.Module):
         """
         super().__init__()
         self.post_attention_layernorm = post_attention_layernorm
-        self.moe = moe
+        self.router = router
+        self.expert_mlps = expert_mlps
+        self.shared_experts = shared_experts
         self.config = config
         self.return_router_logits = return_router_logits
         self.return_expert_index = return_expert_index
 
-        routed_experts_mlp_config = self.moe.expert_mlps.routed_experts_mlp_config
+        routed_experts_mlp_config = self.expert_mlps.routed_experts_mlp_config
         self.hidden_size = routed_experts_mlp_config.hidden_size
-        self.num_local_experts = routed_experts_mlp_config.num_experts
+
         self.num_experts_per_tok = routed_experts_mlp_config.top_k
         self.hidden_act = routed_experts_mlp_config.hidden_act
-        self.sequence_dimension = self.moe.sequence_dimension
+        self.sequence_dimension = sequence_dimension
 
+        expert_model_parallel_size = self.expert_mlps.moe_expert_model_parallel_group.size()
+        self.ep_enabled = expert_model_parallel_size > 1
+        self.num_local_experts = utils.divide(routed_experts_mlp_config.num_experts, expert_model_parallel_size)
         self.logical_nc_config = logical_nc_config
+
+        if self.config.quantized:
+            # This is a workaround in order to avoid loading weights for MoEFusedTKG during tracing.
+            setattr(self.expert_mlps.mlp_op.gate_up_proj, "post_create_quantized_module_hook", _post_create_quantized_module_hook)
+            setattr(self.expert_mlps.mlp_op.down_proj, "post_create_quantized_module_hook", _post_create_quantized_module_hook)
 
     def _can_use_nki_kernel(self, kernel_type, hidden_states):
         """
@@ -143,24 +179,46 @@ class MoEFusedTKG(torch.nn.Module):
             return False
 
         if kernel_type in ["moe_fused", "expert_mlp"]:
-            if not self.moe.expert_mlps.routed_experts_mlp_config.glu_mlp:
+            if not self.expert_mlps.routed_experts_mlp_config.glu_mlp:
                 logger.info(f"Conditions not met for {kernel_type} NKI kernel: disabling GLU not supported")
                 return False
-            if self.moe.expert_mlps.routed_experts_mlp_config.normalize_top_k_affinities:
+            if self.expert_mlps.routed_experts_mlp_config.normalize_top_k_affinities:
                 logger.info(f"Conditions not met for {kernel_type} NKI kernel: normalize top k affinities not supported")
                 return False
 
-        if kernel_type in ["moe_fused", "shared_mlp"]:
-            if self.moe.shared_experts is None:
+        if kernel_type in ["shared_mlp"]:
+            if self.shared_experts is None:
                 logger.info(f"Conditions not met for {kernel_type} NKI kernel: module does not contain shared experts")
                 return False
 
         if kernel_type == "moe_fused":
-            if _moe_tkg_nki_call is None:
-                logger.info("Failed to load MoE Fused NKI kernel")
+            batch_dimension = 1 - self.sequence_dimension  # hidden states are [B, S, H] or [S, B, H]
+            if hidden_states.shape[batch_dimension] > 32:
+                logger.info(f"Conditions not met for {kernel_type} NKI kernel: bs > 32 not yet supported")
                 return False
-            if hidden_states.shape[1 - self.sequence_dimension] > 4:
-                logger.info(f"Conditions not met for {kernel_type} NKI kernel: bs > 4 not supported")
+            batch_size = hidden_states.shape[batch_dimension]
+            seq_len = hidden_states.shape[self.sequence_dimension]
+            total_tokens = batch_size * seq_len
+            perc_experts_loaded = total_tokens * self.num_experts_per_tok / self.num_local_experts
+            if perc_experts_loaded >= DEFAULT_SELECTIVE_LOADING_THRESHOLD:
+                logger.info(f"perc_experts_loaded={perc_experts_loaded} >= DEFAULT_SELECTIVE_LOADING_THRESHOLD={DEFAULT_HIDDEN_ACT_SCALING_FACTOR}")
+                glu_type = GLUType.validate(self.expert_mlps.routed_experts_mlp_config.glu_type)
+                if glu_type == GLUType.SWIGLU and self.expert_mlps.routed_experts_mlp_config.hidden_act_scaling_factor != DEFAULT_HIDDEN_ACT_SCALING_FACTOR:
+                    logger.info(f"Conditions not met for {kernel_type} NKI kernel: NKI kernel only supports scaling factor = 1.702 for SWIGLU")
+                    return False
+                kernel_call = _moe_tkg_forward_all_experts_nki_call
+            else:
+                logger.info(f"perc_experts_loaded={perc_experts_loaded} < DEFAULT_SELECTIVE_LOADING_THRESHOLD={DEFAULT_HIDDEN_ACT_SCALING_FACTOR}")
+                # selective loading kernel does not support optional shared experts at the moment
+                if self.shared_experts is None:
+                    logger.info(f"Conditions not met for {kernel_type} NKI kernel: module does not contain shared experts")
+                    return False
+                if self.ep_enabled:
+                    logger.info(f"Conditions not met for {kernel_type} NKI kernel: EP not supported")
+                    return False
+                kernel_call = _moe_tkg_selective_loading_nki_call
+            if kernel_call is None:
+                logger.info("Failed to load MoE Fused NKI kernel")
                 return False
         elif kernel_type == "expert_mlp" and nki_components["expert_mlps"] is None:
             logger.info("Failed to load ExpertMLP NKI kernel")
@@ -174,8 +232,12 @@ class MoEFusedTKG(torch.nn.Module):
         In TKG, they will still run TP hence the weights need to be sliced.
         :return:
         """
-        shared_experts = self.moe.shared_experts
-        if shared_experts.sequence_parallel_enabled:
+        shared_experts = self.shared_experts
+        if shared_experts is None:
+            shared_experts_gate_proj_weight = None
+            shared_experts_up_proj_weight = None
+            shared_experts_down_proj_weight = None
+        elif shared_experts.sequence_parallel_enabled:
             # slicing transposed weights
             shared_experts_up_proj_weight = shared_experts.up_proj.weight[:, shared_experts.get_split_indices(shared_experts.up_proj.weight, 1)]
             shared_experts_gate_proj_weight = shared_experts.gate_proj.weight[:, shared_experts.get_split_indices(shared_experts.gate_proj.weight, 1)]
@@ -226,20 +288,18 @@ class MoEFusedTKG(torch.nn.Module):
             grid = (nc(self.logical_nc_config),)
             _router_topk_nki_call[grid](
                 x=hidden_states,  # input tensor, [H, T]
-                w=self.moe.router.linear_router.weight.transpose(
-                    0, 1
-                ),  # weight tensor, [H, E]
+                w=self.router.weight_T,  # weight tensor, [H, E]
                 k=self.num_experts_per_tok,
                 router_logits=router_logits,
                 expert_affinities=expert_affinities,
                 expert_index=expert_index,
-                act_fn=ROUTER_ACT_FN_MAPPING[self.moe.router.act_fn],
+                act_fn=ROUTER_ACT_FN_MAPPING[self.router.act_fn],
                 shard_on_hidden=True,
             )
             router_logits = router_logits.to(hidden_states.dtype)
         else:
             logger.info("Running RouterTopK without kernel")
-            router_logits, expert_affinities, expert_index = self.moe.router(
+            router_logits, expert_affinities, expert_index = self.router(
                 hidden_states
             )
         return router_logits, expert_affinities, expert_index
@@ -261,13 +321,13 @@ class MoEFusedTKG(torch.nn.Module):
         if self._can_use_nki_kernel("expert_mlp", hidden_states):
             logger.info("Running ExpertMLP NKI kernel")
             grid = (nc(self.logical_nc_config),)
-            if self.moe.expert_mlps.routed_experts_mlp_config.early_expert_affinity_modulation:
+            if self.expert_mlps.routed_experts_mlp_config.early_expert_affinity_modulation:
                 expert_affinities_scaling_mode = ExpertAffinityScaleMode.PRE_SCALE
             else:
                 expert_affinities_scaling_mode = ExpertAffinityScaleMode.POST_SCALE
 
             # Reshape gate_up_proj_weight to (E, H, 2, I) as expected by the kernel
-            gate_up_weights = self.moe.expert_mlps.mlp_op.gate_up_proj.weight  # [E, H, 2I]
+            gate_up_weights = self.expert_mlps.mlp_op.gate_up_proj.weight  # [E, H, 2I]
             gate_up_weights = gate_up_weights.view(
                 self.num_local_experts, self.hidden_size, 2, -1
             )
@@ -276,7 +336,7 @@ class MoEFusedTKG(torch.nn.Module):
             output = _expert_mlp_nki_call[grid](
                 inp=hidden_states,  # [T, H]
                 gate_up_weights=gate_up_weights,  # [E, H, 2, I]
-                down_weights=self.moe.expert_mlps.mlp_op.down_proj.weight,  # [E, I, H]
+                down_weights=self.expert_mlps.mlp_op.down_proj.weight,  # [E, I, H]
                 expert_affinities=expert_affinities,  # [T, E]
                 expert_index=expert_index,  # [T, k]
                 expert_affinities_scaling_mode=expert_affinities_scaling_mode,
@@ -285,7 +345,7 @@ class MoEFusedTKG(torch.nn.Module):
         else:
             logger.info("Running ExpertMLP without kernel")
             seq_len = hidden_states_shape[self.sequence_dimension]
-            output = self.moe.expert_mlps(
+            output = self.expert_mlps(
                 hidden_states=hidden_states,
                 expert_affinities=expert_affinities,
                 expert_index=expert_index,
@@ -329,9 +389,9 @@ class MoEFusedTKG(torch.nn.Module):
             if self.config.quantized is True:
                 _quant_mlp_nki_call[grid](
                     **common_args,
-                    gate_w_scale=self.moe.shared_experts.gate_proj.scale,
-                    up_w_scale=self.moe.shared_experts.up_proj.scale,
-                    down_w_scale=self.moe.shared_experts.down_proj.scale,
+                    gate_w_scale=self.shared_experts.gate_proj.scale,
+                    up_w_scale=self.shared_experts.up_proj.scale,
+                    down_w_scale=self.shared_experts.down_proj.scale,
                 )
             else:
                 _mlp_nki_call[grid](**common_args)
@@ -340,7 +400,7 @@ class MoEFusedTKG(torch.nn.Module):
             logger.info("Running SharedMLP without kernel")
             hidden_states_shape = hidden_states.shape
             seq_len = hidden_states_shape[self.sequence_dimension]
-            shared_output = self.moe.shared_experts(hidden_states, seq_len)
+            shared_output = self.shared_experts(hidden_states, seq_len)
 
         return shared_output
 
@@ -353,40 +413,69 @@ class MoEFusedTKG(torch.nn.Module):
             output: original shape
         """
         hidden_states_shape = hidden_states.shape
-        if self.moe.expert_mlps.routed_experts_mlp_config.early_expert_affinity_modulation:
+        if self.expert_mlps.routed_experts_mlp_config.early_expert_affinity_modulation:
             expert_affinities_scaling_mode = ExpertAffinityScaleMode.PRE_SCALE
         else:
             expert_affinities_scaling_mode = ExpertAffinityScaleMode.POST_SCALE
 
         grid = (nc(self.logical_nc_config),)
         shared_experts_gate_proj_weight, shared_experts_up_proj_weight, shared_experts_down_proj_weight = self._slice_shared_experts_weights()
-        out, router_logits = _moe_tkg_nki_call[grid](
+        common_args = dict(
             inp=hidden_states,  # [B, S, H]
             gamma=self.post_attention_layernorm.weight.unsqueeze(0),  # [1, H]
-            router_weights=self.moe.router.linear_router.weight.transpose(
-                0, 1
-            ),  # [H, E]
+            router_weights=self.router.weight_T,  # [H, E]
             shared_expert_gate_w=shared_experts_gate_proj_weight,  # [H, I]
             shared_expert_up_w=shared_experts_up_proj_weight,  # [H, I]
             shared_expert_down_w=shared_experts_down_proj_weight,  # [I, H]
-            expert_gate_up_weights=self.moe.expert_mlps.mlp_op.gate_up_proj.weight.view(
+            expert_gate_up_weights=self.expert_mlps.mlp_op.gate_up_proj.weight.view(
                 self.num_local_experts, self.hidden_size, 2, -1
             ),  # [E, H, 2, I]
-            expert_down_weights=self.moe.expert_mlps.mlp_op.down_proj.weight,  # [E, I, H]
+            expert_down_weights=self.expert_mlps.mlp_op.down_proj.weight,  # [E, I, H]
             expert_gate_up_weights_scale=(
-                self.moe.expert_mlps.mlp_op.gate_up_proj.scale.view(self.num_local_experts, 2, -1)
+                self.expert_mlps.mlp_op.gate_up_proj.scale.view(self.num_local_experts, 2, -1)
                 if self.config.quantized else None
             ),  # [E, 2, I]
             expert_down_weights_scale=(
-                self.moe.expert_mlps.mlp_op.down_proj.scale.view(self.num_local_experts, -1)
+                self.expert_mlps.mlp_op.down_proj.scale.view(self.num_local_experts, -1)
                 if self.config.quantized else None
             ),  # [E, H]
             eps=self.post_attention_layernorm.variance_epsilon,
             top_k=self.num_experts_per_tok,
-            router_act_fn=ROUTER_ACT_FN_MAPPING[self.moe.router.act_fn],
+            router_act_fn=ROUTER_ACT_FN_MAPPING[self.router.act_fn],
             expert_affinities_scaling_mode=expert_affinities_scaling_mode,
             router_mm_dtype=nl.float32,
         )
+
+        total_tokens = hidden_states_shape[0] * hidden_states_shape[1]
+        perc_experts_loaded = total_tokens * self.num_experts_per_tok / self.num_local_experts
+        if perc_experts_loaded >= DEFAULT_SELECTIVE_LOADING_THRESHOLD:
+            logger.info("Percentage of experts loaded >= selective loading threshod, run forward all experts kernel")
+            routed_experts_mlp_config = self.expert_mlps.routed_experts_mlp_config
+            kernel_activation_func_id = get_kernel_activation_func_id(
+                ACTFunc.validate(routed_experts_mlp_config.hidden_act),
+                routed_experts_mlp_config.glu_type
+            )
+            logger.info(self.expert_mlps.spmd_rank.get_rank().item())
+            out, router_logits = _moe_tkg_forward_all_experts_nki_call[grid](
+                **common_args,
+                router_bias=self.router.linear_router.bias if self.router.bias else None,
+                expert_gate_up_bias=self.expert_mlps.mlp_op.gate_up_proj.bias if routed_experts_mlp_config.bias else None,
+                expert_down_bias=self.expert_mlps.mlp_op.down_proj.bias if routed_experts_mlp_config.bias else None,
+                shared_expert_gate_bias=None,  # kernel only supports None
+                shared_expert_up_bias=None,  # kernel only supports None
+                shared_expert_down_bias=None,  # kernel only supports None
+                router_pre_norm=True,
+                hidden_act_fn=kernel_activation_func_id,
+                hidden_act_scale_factor=None,  # kernel only supports None
+                hidden_act_bias=None,  # kernel only supports None
+                rank_id=self.expert_mlps.spmd_rank.get_rank().item(),
+            )
+        else:
+            logger.info("Percentage of experts loaded < selective loading threshod, run seletive loading kernel")
+            out, router_logits = _moe_tkg_selective_loading_nki_call[grid](
+                **common_args
+            )
+
         return out.view(hidden_states_shape), router_logits.to(hidden_states.dtype)
 
     def forward(self, hidden_states):
@@ -395,7 +484,7 @@ class MoEFusedTKG(torch.nn.Module):
         flat compiler / individual kernels.
 
         Conditions for MoE TKG mega-kernel:
-        - batch_size <= 4
+        - batch_size <= 32
         - must use RMSNorm, RouterTopK, ExpertMLPs, SharedExperts
 
         Args:
@@ -407,9 +496,7 @@ class MoEFusedTKG(torch.nn.Module):
         if self._can_use_nki_kernel("moe_fused", hidden_states):
             logger.info("Running MoE Fused NKI kernel")
             output, router_logits = self._moe_fused_tkg_kernel(hidden_states)
-            output = mappings.reduce_from_tensor_model_parallel_region(
-                output, process_group=self.moe.tensor_parallel_group
-            )
+
             if self.return_expert_index:
                 expert_index = None  # can't return expert_index from fused kernel
         else:
@@ -425,7 +512,7 @@ class MoEFusedTKG(torch.nn.Module):
             )
 
             shared_output = 0
-            if self.moe.shared_experts:
+            if self.shared_experts:
                 shared_output = self._shared_mlp(hidden_states)
             output = self._expert_mlp(
                 hidden_states=hidden_states,
@@ -434,10 +521,10 @@ class MoEFusedTKG(torch.nn.Module):
             )
             output = output + shared_output
 
-            # Delayed All-Reduce
-            output = mappings.reduce_from_tensor_model_parallel_region(
-                output, process_group=self.moe.tensor_parallel_group
-            )
+        # Delayed All-Reduce
+        output = mappings.reduce_from_tensor_model_parallel_region(
+            output, process_group=parallel_state.get_world_group()
+        )
 
         return_op = (output,)
         if self.return_router_logits:
@@ -446,3 +533,6 @@ class MoEFusedTKG(torch.nn.Module):
             return_op += (expert_index,)
 
         return return_op
+
+    def preshard_hook(self, model_state_dict: Dict[str, Any], prefix: str) -> None:
+        pass

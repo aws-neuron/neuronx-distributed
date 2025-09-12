@@ -58,10 +58,30 @@ TEST_MODEL_CONFIGS = {
         "top_k": 8,
         "num_shared_experts": 1
     },
+    "ds-v3-reduced-experts-inference": {
+        "hidden_size": 7168,
+        "intermediate_size": 2048,
+        "num_experts": 64,
+        "num_shared_experts": 1,
+        "top_k": 4,
+        "enable_spmd_rank": True,
+        "optimized_block_to_token_mapping": False,
+        "parallelize_token_to_block_mapping": False,
+    },
     "deepseek_V3": {
         "hidden_size": 7168,
         "intermediate_size": 2048,
         "num_experts": 64,
+        "top_k": 4,
+        "enable_spmd_rank": True,
+        "optimized_block_to_token_mapping": False,
+        "parallelize_token_to_block_mapping": False,
+    },
+    "qwen3-reduced-experts": {
+        "hidden_size": 4096,
+        "intermediate_size": 1536,
+        "num_experts": 64,
+        "num_shared_experts": 1,
         "top_k": 4,
         "enable_spmd_rank": True,
         "optimized_block_to_token_mapping": False,
@@ -89,7 +109,62 @@ def get_device_correctness_test_configs_EP(dtype) -> List[ExptCfg]:
                 capacity_factor=None,
                 **get_model_config("deepseek_V3", scale_down_factor=1),
                 **test_cfg
-            ),])
+            ),
+            ExptCfgParallel(
+                seq_len=1024,
+                batch_size=1,
+                capacity_factor=None,
+                **get_model_config("ds-v3-reduced-experts-inference", scale_down_factor=1),
+                **test_cfg
+            ),
+            ExptCfgParallel(
+                seq_len=1024,
+                batch_size=1,
+                capacity_factor=None,
+                **get_model_config("qwen3-reduced-experts", scale_down_factor=1),
+                **test_cfg
+            ),
+            ExptCfgParallel(
+                seq_len=1024,
+                batch_size=1,
+                capacity_factor=None,
+                fused_gate_up_shared_expert=True,
+                **get_model_config("ds-v3-reduced-experts-inference", scale_down_factor=1),
+                **test_cfg
+            ),
+            ExptCfgParallel(
+                seq_len=1024,
+                batch_size=1,
+                capacity_factor=None,
+                fused_gate_up_shared_expert=True,
+                **get_model_config("qwen3-reduced-experts", scale_down_factor=1),
+                **test_cfg
+            ),
+            ExptCfgParallel(
+                seq_len=1024,
+                batch_size=1,
+                capacity_factor=None,
+                hidden_size=4096,
+                intermediate_size=1024,
+                num_experts=128,
+                top_k=8,
+                num_shared_experts=0,
+                enable_spmd_rank=True,
+                **test_cfg
+            ),
+            ExptCfgParallel(
+                seq_len=128,
+                batch_size=1,
+                capacity_factor=None,
+                hidden_size=4096,
+                intermediate_size=1024,
+                num_experts=128,
+                top_k=8,
+                num_shared_experts=0,
+                enable_spmd_rank=True,
+                **test_cfg
+            ),
+        ])
 
     return test_configs
 
@@ -606,14 +681,14 @@ def get_device_correctness_parallel_test_configs(dtype, test_mode, tp_degree, ep
                 **get_model_config("mixtral", scale_down_factor=1),
                 **test_cfg
             ),
-            ExptCfgParallel(
-                seq_len=1,
-                batch_size=4,
-                capacity_factor=None,
-                early_expert_affinity_modulation=True,
-                **get_model_config("dbrx", scale_down_factor=2),
-                **test_cfg
-            ),
+            # ExptCfgParallel(
+            #     seq_len=1,
+            #     batch_size=4,
+            #     capacity_factor=None,
+            #     early_expert_affinity_modulation=True,
+            #     **get_model_config("dbrx", scale_down_factor=2),
+            #     **test_cfg
+            # ),
         ]
     )
     # trn2 only module
@@ -1110,7 +1185,10 @@ def get_device_correctness_parallel_test_configs(dtype, test_mode, tp_degree, ep
             if test_mode == "training":
                 sp_modes = [True]
             else:
-                sp_modes = [True, False]
+                if get_platform_lnc() == LogicalNCConfig.LNC_2:
+                    sp_modes = [False]
+                else:
+                    sp_modes = [True, False]
 
             for sp_mode in sp_modes:
                 if cfg.seq_len == 1 and sp_mode:

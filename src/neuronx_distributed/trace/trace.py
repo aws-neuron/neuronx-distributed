@@ -40,7 +40,8 @@ from neuronx_distributed.quantization.quantization_layers import (
     QuantizedRowParallel,
 )
 from neuronx_distributed.utils.model_utils import init_on_device
-from neuronx_distributed.utils.safetensors_utils import remove_duplicate_tensors
+from neuronx_distributed.utils.safetensors_utils import check_for_duplicate_tensors
+from neuronx_distributed.modules.moe.moe_process_group import get_moe_ep_group
 
 logger = logging.getLogger("Neuron")
 
@@ -625,8 +626,9 @@ def _load_weights(
         return traced_model
 
 def preprocess_checkpoint(model, checkpoint):
-    # to overcome tensors sharing memory issue
-    checkpoint = remove_duplicate_tensors(checkpoint)
+    # Deleting duplicated tensors is necessary when saving the checkpoint in safetensors format.
+    # When using shard on load, this is not strictly necessary because we don't save the weights to disk.
+    checkpoint = check_for_duplicate_tensors(checkpoint, False)
 
     # Load checkpoints for just modules with preshard hook into memory and apply transformation in preshard hook
     invoke_preshard_hook(model, checkpoint, "")
@@ -749,21 +751,34 @@ def shard_children(module, checkpoint, prefix, dtype, rank, tp_degree):
         #TODO: See how torch handles _load_from_state_dict
         if hasattr(module_parameter, "get_tensor_from_state_dict"):
             tensor = module_parameter.get_tensor_from_state_dict(prefix, checkpoint)
-        elif hasattr(module_parameter, "expert_model_parallel"):
-            ep_rank = parallel_state.get_expert_parallel_rank_from_global_rank(rank=rank, expert_parallel_group=parallel_state.get_expert_model_parallel_group())
-            local_expert_indices = parallel_state.get_experts_for_expert_parallel_rank(
-                expert_parallel_rank=ep_rank,
-                total_number_of_experts=checkpoint[parameter_name].shape[0],
-                expert_model_parallel_size=parallel_state.get_expert_model_parallel_size()
-                )
-            tensor = checkpoint[parameter_name][local_expert_indices, : , :]
         else:
             if parameter_name not in checkpoint:
                 continue
             tensor = checkpoint[parameter_name]
-        
+
         if hasattr(module_parameter, "rank_ordering") and module_parameter.rank_ordering is not None:
             rank = module_parameter.rank_ordering[rank]
+
+        if hasattr(module_parameter, "expert_model_parallel"):
+            #TODO: Refactor custom logic in sharding function
+            if hasattr(module_parameter, "is_prefill"):
+                expert_parallel_group=get_moe_ep_group(prefill=True)
+            else:
+                expert_parallel_group=get_moe_ep_group(prefill=False)
+            ep_rank = parallel_state.get_expert_parallel_rank_from_global_rank(rank=rank, expert_parallel_group=expert_parallel_group)
+            local_expert_indices = parallel_state.get_experts_for_expert_parallel_rank(
+                expert_parallel_rank=ep_rank,
+                total_number_of_experts=checkpoint[parameter_name].shape[0],
+                expert_model_parallel_size=expert_parallel_group.size()
+                )
+
+            # Assume Expert Dim is always dim 0
+            # Need check tensor_dtype for expert indexing due to float8_e4m3fn and float8_e5m2 are not supported indexing on CPU
+            tensor_dtype = checkpoint[parameter_name].dtype
+            if tensor_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
+                tensor = checkpoint[parameter_name].view(torch.int8)[local_expert_indices, ...].view(tensor_dtype)
+            else:
+                tensor = checkpoint[parameter_name][local_expert_indices, ...]
 
         if hasattr(module_parameter, "tensor_model_parallel") and module_parameter.tensor_model_parallel:
             partition_dim = module_parameter.partition_dim
@@ -785,6 +800,6 @@ def shard_children(module, checkpoint, prefix, dtype, rank, tp_degree):
                 )
         else:
             checkpoint[parameter_name] = tensor
-    
+
         if checkpoint[parameter_name].shape != module_parameter.shape:
             raise RuntimeError(f"expected shape {module_parameter.shape} for {parameter_name} but found {checkpoint[parameter_name].shape}")

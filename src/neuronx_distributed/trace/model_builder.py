@@ -57,7 +57,6 @@ from neuronx_distributed.trace.model_builder_utils import (
 )
 import neuronx_distributed.trace.hlo_utils as hlo_utils
 from neuronx_distributed.utils.model_utils import init_on_device
-from neuronx_distributed.utils.safetensors_utils import remove_duplicate_tensors
 
 ModelInputType = List[Union[Tuple[Union[torch.Tensor, List[torch.Tensor]]], torch.Tensor]]
 logger = logging.getLogger("Neuron")
@@ -108,11 +107,6 @@ def append_default_compiler_flags(compiler_args: Optional[str] = "") -> str:
     return compiler_args
 
 
-def _transpose_kernel_weights() -> bool:
-    """Check if TRANSPOSE_KERNEL_WEIGHTS env variable is set. It defaults to 0 (i.e., False)."""
-    return os.getenv("TRANSPOSE_KERNEL_WEIGHTS", '0') == '1'
-
-
 def _get_weight_names_to_skip(
     hlo_module: hlo_pb2.HloModuleProto,
     weight_name_to_idx: Dict[str, int],
@@ -130,27 +124,23 @@ def _get_weight_names_to_skip(
     """
     weight_names_to_skip = set(weights_to_skip_layout_optimization)
     
-    # Check if kernel weights should be marked as transposable or not
-    if not _transpose_kernel_weights():
-        # Get computation map for easy lookup
-        id_to_computation = {cpt.id: cpt for cpt in hlo_module.computations}
-        entry_computation = id_to_computation[hlo_module.entry_computation_id]
-        
-        # Create idx to weight name mapping
-        idx_to_weight_name = {
-            idx: weight_name 
-            for weight_name, idx in weight_name_to_idx.items()
-        }
-        
-        # Get NKI kernel weight names to skip
-        weight_names_to_skip = hlo_utils.get_nki_kernel_weight_names(
-            entry_cpt=entry_computation,
-            idx_to_weight_name=idx_to_weight_name,
-            nki_kernel_weight_names=weight_names_to_skip,
-            id_to_computation=id_to_computation
-        )
-    else:
-        logger.info("TRANSPOSE_KERNEL_WEIGHTS is set")
+    # Get computation map for easy lookup
+    id_to_computation = {cpt.id: cpt for cpt in hlo_module.computations}
+    entry_computation = id_to_computation[hlo_module.entry_computation_id]
+
+    # Create idx to weight name mapping
+    idx_to_weight_name = {
+        idx: weight_name
+        for weight_name, idx in weight_name_to_idx.items()
+    }
+
+    # Get NKI kernel weight names to skip
+    weight_names_to_skip = hlo_utils.get_nki_kernel_weight_names(
+        entry_cpt=entry_computation,
+        idx_to_weight_name=idx_to_weight_name,
+        nki_kernel_weight_names=weight_names_to_skip,
+        id_to_computation=id_to_computation
+    )
         
     return weight_names_to_skip
 
@@ -900,12 +890,10 @@ def compile_layout_transformer(
         )
 
         # Set compiler flags
-        # TODO: HloVerifier is disabled for this compilation temporarily until
-        # the long term solution to fix mismatch between input and output shapes is implemented.
         compiler_args = (
             "--model-type=transformer" +
             f" --lnc={logical_nc_config}" +
-            " --internal-hlo2tensorizer-options='--experimental-unsafe-fp8e4m3fn-as-fp8e4m3 --verify-hlo=false'" +
+            " --internal-hlo2tensorizer-options='--experimental-unsafe-fp8e4m3fn-as-fp8e4m3 --verify-hlo=true'" +
             f" --logfile={os.path.join(output_dir, 'log-neuron-cc.txt')}"
         )
 
@@ -1137,20 +1125,19 @@ class ModelBuilderV2:
             logger.info("Skipping weight layout optimization")
             return None
 
-        priority_trace = self.trace_artifacts_collection[priority_model_key]
+        priority_model_trace_artifacts = self.trace_artifacts_collection[priority_model_key]
         priority_model_compiler_args = compiler_args[priority_model_key] if compiler_args else None
 
         # Mark weights for WLO
         hlo_utils.mark_weights_for_wlo(
-            priority_model_trace_hlo=priority_trace.hlo,
-            priority_model_weight_name_to_idx=priority_trace.weight_name_to_idx,
-            weights_to_skip_layout_optimization=priority_trace.weight_names_to_skip,
+            trace_artifacts=priority_model_trace_artifacts,
+            weights_to_skip_layout_optimization=priority_model_trace_artifacts.weight_names_to_skip,
         )
 
         # Compile priority model with WLO
         wlo_artifacts = compile_wlo(
-            hlo_module=priority_trace.hlo,
-            metaneff=priority_trace.metaneff,
+            hlo_module=priority_model_trace_artifacts.hlo,
+            metaneff=priority_model_trace_artifacts.metaneff,
             compiler_workdir=compiler_workdir,
             compiler_args=priority_model_compiler_args,
             key=priority_model_key
@@ -1160,7 +1147,7 @@ class ModelBuilderV2:
         # Compile layout transformer
         layout_transformer_artifacts = compile_layout_transformer(
             wlo_artifacts=wlo_artifacts,
-            priority_model_weight_name_to_idx=priority_trace.weight_name_to_idx,
+            priority_model_weight_name_to_idx=priority_model_trace_artifacts.weight_name_to_idx,
             compiler_workdir=compiler_workdir
         )
         compilation_results[ModelBuilderConstants.LAYOUT_TRANSFORMER_KEY] = layout_transformer_artifacts
@@ -1185,14 +1172,36 @@ class ModelBuilderV2:
 
         logger.info(f"Starting parallel compilation of {len(models_to_compile)} models")
 
+        def compile_with_layout_transformation(trace_artifacts, compiler_workdir, compiler_args, key):
+            # Apply layout transformation
+            if priority_model_key and \
+                priority_model_key in self.trace_artifacts_collection and \
+                priority_model_key in compilation_results:
+                priority_model_trace_artifacts = self.trace_artifacts_collection[priority_model_key]
+                wlo_artifacts = compilation_results[priority_model_key]
+                hlo_utils.apply_layout_transformation(
+                    trace_artifacts=trace_artifacts,
+                    priority_model_trace_artifacts=priority_model_trace_artifacts,
+                    wlo_artifacts=wlo_artifacts,
+                    key=key
+                )
+            
+            # Compile
+            return compile(
+                trace_artifacts.hlo,
+                trace_artifacts.metaneff,
+                compiler_workdir,
+                compiler_args,
+                key,
+            )
+
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_key = {}
 
             for key, trace_artifacts in models_to_compile.items():
                 future = executor.submit(
-                    compile,
-                    trace_artifacts.hlo,
-                    trace_artifacts.metaneff,
+                    compile_with_layout_transformation,
+                    trace_artifacts,
                     compiler_workdir,
                     compiler_args[key] if compiler_args else None,
                     key,
@@ -1304,7 +1313,8 @@ class ModelBuilder:
             num_cores_per_group=1,
             init_custom_process_group_fn=None,
             logical_nc_config=1,
-            weights_to_skip_layout_optimization=set()
+            weights_to_skip_layout_optimization=set(),
+            compiler_flag_hook = None
     ):
         if not torch_neuronx.__version__.startswith("2"):
             raise AssertionError(
@@ -1338,6 +1348,7 @@ class ModelBuilder:
         self.init_custom_process_group_fn = init_custom_process_group_fn
         self.logical_nc_config = logical_nc_config
         self.weights_to_skip_layout_optimization = weights_to_skip_layout_optimization
+        self.compiler_flag_hook = compiler_flag_hook
 
     def add(
             self,
@@ -1428,13 +1439,12 @@ class ModelBuilder:
                 model_artifacts.num_params = len([i for i in entry_computation.instructions if i.opcode == "parameter"])
                 idx_to_weight_name = {idx: weight_name for weight_name, idx in hlo_artifact_collection[0].weight_name_to_idx.items()}
 
-                # Check if kernel weights should be marked as transposable or not
-                if not self.transpose_kernel_weights():
-                    weight_names_to_skip = hlo_utils.get_nki_kernel_weight_names(
-                        entry_computation, idx_to_weight_name, weight_names_to_skip, id_to_computation
-                    )
-                else:
-                    logger.info("TRANSPOSE_KERNEL_WEIGHTS is set")
+                # WLO will skip kernel weights, because compiler middle-end
+                # doesn't know the logics inside kernel, so it can't find the
+                # best layout for its weight.
+                weight_names_to_skip = hlo_utils.get_nki_kernel_weight_names(
+                    entry_computation, idx_to_weight_name, weight_names_to_skip, id_to_computation
+                )
 
             # clear up the parallel state and distributed group for next batch of tracing
             parallel_state.set_aot_mode(False)
@@ -1444,7 +1454,6 @@ class ModelBuilder:
         logger.info(f"Generated all HLOs in {time.time() - trace_start_time} seconds")
 
         self._mark_weight_in_priority_hlo(weight_names_to_skip)
-
         def submit_compilation_job_with_cache(key, bucket_rank, **kwargs):
             neuron_xla_compile_kwargs = {
                 "module_bytes": kwargs["module_bytes"],
@@ -1565,6 +1574,9 @@ class ModelBuilder:
                 compiler_args = model_artifacts.compiler_args
                 if '--logfile' not in compiler_args:
                     compiler_args += f" --logfile={Path(output_dir, LOG_FILE_DEFAULT_NAME).absolute()}"
+                # TODO: Deprecate once smart modularization (P255260635) is implemented in the compiler.Port these changes once ModelBuilder V2 is available (P261826019)
+                if self.compiler_flag_hook is not None:
+                    compiler_args = self.compiler_flag_hook(key, model_artifacts, bucket_rank, compiler_args) 
 
                 hlo_module = hlo_artifacts.hlo_module
                 module_bytes = hlo_module.SerializeToString()
@@ -2033,12 +2045,10 @@ class ModelBuilder:
             weight_name_to_idx=weight_name_to_idx,
         )
 
-        # TODO: HloVerifier is disabled for this compilation temporarily until
-        # the long term solution to fix mismatch between input and output shapes is implemented.
         compiler_args = (
             "--model-type=transformer -O1" +
             f" --lnc={self.logical_nc_config}" +
-            " --internal-hlo2tensorizer-options='--experimental-unsafe-fp8e4m3fn-as-fp8e4m3 --verify-hlo=false'" +
+            " --internal-hlo2tensorizer-options='--experimental-unsafe-fp8e4m3fn-as-fp8e4m3 --verify-hlo=true'" +
             f" --logfile={os.path.join(layout_dir, 'log-neuron-cc.txt')}"
         )
 
@@ -2160,8 +2170,3 @@ class ModelBuilder:
 
         else:
             raise ValueError(f"Unknown layout option: {overriden_option}")
-
-    @staticmethod
-    def transpose_kernel_weights() -> bool:
-        """ Check if TRANSPOSE_KERNEL_WEIGHTS env variable is set. It defaults to 0 (i.e., False). """
-        return (os.getenv("TRANSPOSE_KERNEL_WEIGHTS", '0') == '1')

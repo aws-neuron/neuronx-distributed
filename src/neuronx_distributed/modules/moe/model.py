@@ -5,9 +5,12 @@ from torch.distributed import ProcessGroup
 
 from neuronx_distributed.modules.moe import expert_mlps, routing, token_shuffling
 from neuronx_distributed.modules.moe.shared_experts import SharedExperts
+from neuronx_distributed.modules.moe.moe_fused_tkg import MoEFusedTKG
+from neuronx_distributed.modules.moe.moe_configs import MoEFusedTKGConfig
 from neuronx_distributed.parallel_layers import mappings, parallel_state
 from neuronx_distributed.parallel_layers.utils import indices_split_along_dim
 
+MAX_MEMORY_BOUND_SEQLEN = 1  # decides when to use the TKG kernel
 
 class MoE(torch.nn.Module):
     """Module which implements a Mixture-of-Experts layer.
@@ -87,13 +90,16 @@ class MoE(torch.nn.Module):
         router: routing.RouterBase,
         expert_mlps: expert_mlps.ExpertMLPsV2,
         shared_experts: Optional[SharedExperts] = None,
+        rmsnorm: Optional[torch.nn.Module] = None,
         sequence_parallel_enabled: bool = False,
         sequence_dimension: Optional[int] = None,
         return_router_logits: bool = False,
-        return_expert_index: bool = True,
+        return_expert_index: bool = False,
         token_shuffle_group_size: int = 1,  # disable token shuffle by default
         token_shuffle_seed=None,
         tensor_model_parallel_group: Optional[ProcessGroup] = None,
+        init_tkg_module: bool = False,
+        tkg_config: Optional[MoEFusedTKGConfig] = None,
     ):
         super().__init__()
 
@@ -110,6 +116,7 @@ class MoE(torch.nn.Module):
         self.router = router
         self.expert_mlps = expert_mlps
         self.shared_experts = shared_experts
+        self.rmsnorm = rmsnorm
         self.sequence_parallel_enabled = sequence_parallel_enabled
         if sequence_dimension is None:
             # Default to 0
@@ -128,7 +135,23 @@ class MoE(torch.nn.Module):
         self.tensor_parallel_group = tensor_model_parallel_group if \
             tensor_model_parallel_group is not None else parallel_state.get_tensor_model_parallel_group()
 
-    def forward(self, hidden_states):
+        self.moe_fused_tkg: Optional[MoEFusedTKG] = None
+        if init_tkg_module:
+            assert tkg_config is not None, "tkg_config must be passed if init_tkg_module is True"
+            self.moe_fused_tkg = MoEFusedTKG(
+                post_attention_layernorm=self.rmsnorm,
+                router=self.router,
+                expert_mlps=self.expert_mlps,
+                shared_experts=self.shared_experts,
+                config=tkg_config,
+                sequence_dimension=sequence_dimension,
+                tensor_model_parallel_group=self.tensor_parallel_group,
+                return_router_logits=self.return_router_logits,
+                return_expert_index=return_expert_index,
+            )
+            self.moe_fused_tkg.eval()
+
+    def _forward_compute_bound(self, hidden_states):
         """Forward pass of the MoE layer.
 
         Common nomenclature:
@@ -153,8 +176,11 @@ class MoE(torch.nn.Module):
             router_logits: (Optional) Tensor of shape (T, E) containing the router logits for each token.
                                       Returned if self.return_router_logits is True.
             expert_index: (Optional) Tensor of shape (T, E) containing the experts assigned to each token.
-                                     Returned if self.is_test is True.
+                                     Returned if self.return_expert_index is True.
         """
+
+        if self.rmsnorm is not None:
+            hidden_states = self.rmsnorm(hidden_states)
 
         if self.token_shuffle_group_size > 1:
             hidden_states, shuffle_permutation = token_shuffling.token_shuffle(
@@ -205,26 +231,27 @@ class MoE(torch.nn.Module):
         output = output.view(full_hidden_states_shape)
 
         if self.sequence_parallel_enabled:
+            # TODO: this is broken into four separate code paths currently due to MPMD test being dependent on this
+            # setup, but whether EP is enabled should be the same
             if self.ep_enabled:
-                # Reduction is done earlier in the case of EP
-                output = mappings.scatter_to_sequence_parallel_region(
-                output, self.sequence_dimension, process_group=self.tensor_parallel_group,
-            )
+                output = mappings.reduce_scatter_to_sequence_parallel_region(
+                    output, self.sequence_dimension, process_group=parallel_state.get_world_group()
+                )
             else:
                 # Delayed reduce-scatter back to sequence parallel (as the hidden_states were in SP)
                 output = mappings.reduce_scatter_to_sequence_parallel_region(
-                output, self.sequence_dimension, process_group=self.tensor_parallel_group,
-            )
+                    output, self.sequence_dimension, process_group=self.tensor_parallel_group,
+                )
         else:
             if self.ep_enabled:
                 output = mappings.reduce_from_tensor_model_parallel_region(
-                output, process_group=parallel_state.get_world_group()
-            )
+                    output, process_group=parallel_state.get_world_group()
+                )
             else:
                 # Delayed All-Reduce
                 output = mappings.reduce_from_tensor_model_parallel_region(
-                output, process_group=self.tensor_parallel_group
-            )
+                    output, process_group=self.tensor_parallel_group
+                )
 
         if self.token_shuffle_group_size > 1:
             output = token_shuffling.token_unshuffle(output, shuffle_permutation)
@@ -238,6 +265,12 @@ class MoE(torch.nn.Module):
         if self.return_expert_index:
             return_op += (expert_index,)
         return return_op
+
+    def forward(self, hidden_states):
+        seq_len = hidden_states.shape[self.sequence_dimension]
+        if seq_len <= MAX_MEMORY_BOUND_SEQLEN and self.moe_fused_tkg is not None:  # memory bound
+            return self.moe_fused_tkg(hidden_states)
+        return self._forward_compute_bound(hidden_states)
 
     def _apply_shared_experts(self, output, full_hidden_states, hidden_states, hidden_states_shape, seq_len):
         """

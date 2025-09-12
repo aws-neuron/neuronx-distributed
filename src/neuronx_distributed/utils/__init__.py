@@ -1,7 +1,7 @@
 import os
 import torch
 import torch_xla.core.xla_model as xm
-
+from .utils import hardware
 
 def cpu_mode():
     CPU_MODE = int(os.environ.get("NXD_CPU_MODE", "0")) > 0

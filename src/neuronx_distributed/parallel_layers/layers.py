@@ -24,10 +24,11 @@ from .mappings import (
     scatter_to_tensor_model_parallel_region,
 )
 from .parallel_state import (
+    model_parallel_is_initialized,
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_size,
-    get_aot_mode
+    get_aot_mode,
 )
 from .random import get_xla_rng_tracker
 from .utils import (
@@ -38,6 +39,7 @@ from .utils import (
     is_torch_version_greater_than_2,
     set_tensor_model_parallel_attributes,
     verify_casted_dtype,
+    initialize_fallback_parallel_state,
 )
 from .utils import param_is_not_tensor_parallel_duplicate  # noqa: F401 # pylint: disable=W0611
 from .layers_utils import (
@@ -150,7 +152,26 @@ def _initialize_parameter_cpu(
     return master_param_weight if return_master_param else None
 
 
-class ParallelEmbedding(torch.nn.Module):
+class BaseParallelLayer(torch.nn.Module):
+    """
+    Base class for all parallel layers.
+
+    This class provides common functionality for all the parallel layer implementations.
+    """
+    def __init__(self, device: Optional[torch.device] = None):
+        super().__init__()
+
+        if not model_parallel_is_initialized():
+            warnings.warn(
+                "Parallel state is not initialized. Falling back to non-parallel equivalent.",
+                category=UserWarning,
+                stacklevel=2
+            )
+
+            initialize_fallback_parallel_state(device)
+
+
+class ParallelEmbedding(BaseParallelLayer):
     """Embedding parallelized across vocabulary/embedding dimension.
 
     This is mainly adapted from torch.nn.Embedding and all the default
@@ -186,7 +207,8 @@ class ParallelEmbedding(torch.nn.Module):
         tile_cc: bool = False,
         rank_ordering: Optional[list] = None,
     ):
-        super().__init__()
+        super().__init__(device=device)
+
         # Keep the input dimensions.
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
@@ -486,11 +508,11 @@ def linear_with_async_allreduce(
         return autograd_func_class.apply(*args)
 
 
-class BaseParallelLinear(torch.nn.Module):
+class BaseParallelLinear(BaseParallelLayer):
     autograd_func_class: Type[torch.autograd.Function] = LinearWithAsyncCommunication
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, device: Optional[torch.device] = None):
+        super().__init__(device=device)
 
     def _init_weight(self, weight: torch.Tensor) -> None:
         if self.arg_init_method is None:
@@ -559,7 +581,7 @@ class ColumnParallelLinear(BaseParallelLinear):
         reduce_dtype: torch.dtype = torch.float32,
         rank_ordering: Optional[list] = None,
     ):
-        super().__init__()
+        super().__init__(device=device)
 
         # Keep input parameters
         self.input_size = input_size
@@ -620,6 +642,7 @@ class ColumnParallelLinear(BaseParallelLinear):
         if self.add_bias:
             bias_size = self.output_size if self.gather_output else self.output_size_per_partition
             self.bias_shape = (bias_size,)
+            self.bias_partition_dim = 0
         else:
             self.bias_shape = None
 
@@ -658,7 +681,7 @@ class ColumnParallelLinear(BaseParallelLinear):
 
             if not self.gather_output:
                 set_tensor_model_parallel_attributes(
-                    self.bias, True, 0, stride=self.stride, num_partitions=self.tensor_parallel_group.size(),
+                    self.bias, True, dim=self.bias_partition_dim, stride=self.stride, num_partitions=self.tensor_parallel_group.size(),
                     rank_ordering=self.rank_ordering,
                 )
         else:
@@ -726,7 +749,7 @@ class ColumnParallelLinear(BaseParallelLinear):
         if self.output_size != model_state_dict[prefix].shape[0] + self.pad_size:
             size = model_state_dict[prefix].shape[0]
             raise RuntimeError(f"State dict {prefix} is of an unexpected size {size} expected {size - self.pad_size}")
-        
+
         if prefix.endswith("weight"):
             model_state_dict[prefix] = torch.nn.functional.pad(model_state_dict[prefix], (0, 0, 0, self.pad_size))
         elif prefix.endswith("bias"):
@@ -817,7 +840,7 @@ class RowParallelLinear(BaseParallelLinear):
         tile_cc: bool = False,
         rank_ordering: Optional[list] = None,
     ):
-        super().__init__()
+        super().__init__(device=device)
 
         # Keep input parameters
         self.input_size = input_size
@@ -1527,18 +1550,27 @@ class SPMDRank(torch.nn.Module):
         return self.rank
 
     def initialize_expert_indices(self, num_local_experts) -> torch.Tensor:
-        """Initialize parameter tensor for tracking local expert indices.
+        """Initialize parameter tensor for tracking local expert indices and expert parallel rank.
 
         Args:
             num_local_experts (int): Number of experts on local device.
 
         Returns:
             torch.Tensor: Parameter tensor for local expert indices.
+            torch.Tensor: Parameter tensor for expert parallel rank.
         """
 
         self.local_expert_indices = torch.nn.Parameter(torch.zeros((1, num_local_experts), dtype=torch.int32), requires_grad=False)
+        self.ep_rank = torch.nn.Parameter(torch.zeros(1, dtype=torch.int32), requires_grad=False)
         set_tensor_model_parallel_attributes(
             self.local_expert_indices,
+            is_parallel=True,
+            dim=0,
+            stride=1,
+            num_partitions=self.world_size,
+        )
+        set_tensor_model_parallel_attributes(
+            self.ep_rank,
             is_parallel=True,
             dim=0,
             stride=1,
@@ -1553,3 +1585,7 @@ class SPMDRank(torch.nn.Module):
         """
 
         return self.local_expert_indices
+
+    def get_expert_parallel_rank(self) -> torch.Tensor:
+        return self.ep_rank
+

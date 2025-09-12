@@ -95,53 +95,44 @@ class Attention(nn.Module):
     def __init__(self, cfg: Config, batch_size: int, seq_len: int):
         super().__init__()
 
-        if parallel_state.model_parallel_is_initialized():
+        parallel_group = parallel_state.get_tensor_model_parallel_group()
+        tp_degree = parallel_group.size() if parallel_group else 1
 
-            tp_degree = parallel_state.get_tensor_model_parallel_group().size()
+        if cfg.n_heads % tp_degree != 0:
+            raise ValueError("n_heads not evenly divisible by tp degree")
 
-            if cfg.n_heads % tp_degree != 0:
-                raise ValueError("n_heads not evenly divisible by tp degree")
+        # we want atleast 1 kv head on a core
+        self.n_heads = cfg.n_heads // tp_degree
+        self.n_kv_heads = max(cfg.n_kv_heads // tp_degree, 1)
 
-            # we want atleast 1 kv head on a core
-            self.n_heads = cfg.n_heads // tp_degree
-            self.n_kv_heads = max(cfg.n_kv_heads // tp_degree, 1)
-
-            self.wq = ColumnParallelLinear(
-                cfg.hidden_size,
-                self.n_heads * tp_degree * cfg.head_dim,
-                bias=False,
-                gather_output=False,
-                dtype=cfg.dtype,
-            )
-            self.wk = ColumnParallelLinear(
-                cfg.hidden_size,
-                self.n_kv_heads * tp_degree * cfg.head_dim,
-                bias=False,
-                gather_output=False,
-                dtype=cfg.dtype,
-            )
-            self.wv = ColumnParallelLinear(
-                cfg.hidden_size,
-                self.n_kv_heads * tp_degree * cfg.head_dim,
-                bias=False,
-                gather_output=False,
-                dtype=cfg.dtype,
-            )
-            self.wo = RowParallelLinear(
-                self.n_heads * tp_degree * cfg.head_dim,
-                cfg.hidden_size,
-                bias=False,
-                input_is_parallel=True,
-                dtype=cfg.dtype,
-            )
-        else:
-            self.n_heads = cfg.n_heads
-            self.n_kv_heads = cfg.n_kv_heads
-
-            self.wq = nn.Linear(cfg.hidden_size, self.n_heads * cfg.head_dim, bias=False, dtype=cfg.dtype)
-            self.wk = nn.Linear(cfg.hidden_size, self.n_kv_heads * cfg.head_dim, bias=False, dtype=cfg.dtype)
-            self.wv = nn.Linear(cfg.hidden_size, self.n_kv_heads * cfg.head_dim, bias=False, dtype=cfg.dtype)
-            self.wo = nn.Linear(self.n_heads * cfg.head_dim, cfg.hidden_size, bias=False, dtype=cfg.dtype)
+        self.wq = ColumnParallelLinear(
+            cfg.hidden_size,
+            self.n_heads * tp_degree * cfg.head_dim,
+            bias=False,
+            gather_output=False,
+            dtype=cfg.dtype,
+        )
+        self.wk = ColumnParallelLinear(
+            cfg.hidden_size,
+            self.n_kv_heads * tp_degree * cfg.head_dim,
+            bias=False,
+            gather_output=False,
+            dtype=cfg.dtype,
+        )
+        self.wv = ColumnParallelLinear(
+            cfg.hidden_size,
+            self.n_kv_heads * tp_degree * cfg.head_dim,
+            bias=False,
+            gather_output=False,
+            dtype=cfg.dtype,
+        )
+        self.wo = RowParallelLinear(
+            self.n_heads * tp_degree * cfg.head_dim,
+            cfg.hidden_size,
+            bias=False,
+            input_is_parallel=True,
+            dtype=cfg.dtype,
+        )
 
         self.register_buffer('cache_k', torch.zeros(batch_size, seq_len, self.n_kv_heads, cfg.head_dim, requires_grad=False, dtype=cfg.dtype))
         self.register_buffer('cache_v', torch.zeros(batch_size, seq_len, self.n_kv_heads, cfg.head_dim, requires_grad=False, dtype=cfg.dtype))
@@ -219,20 +210,16 @@ class Attention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, cfg: Config):
         super().__init__()
-        if parallel_state.model_parallel_is_initialized():
-            self.gate_proj = ColumnParallelLinear(
-                cfg.hidden_size, cfg.intermediate_size, bias=False, gather_output=False, dtype=cfg.dtype
-            )
-            self.up_proj = ColumnParallelLinear(
-                cfg.hidden_size, cfg.intermediate_size, bias=False, gather_output=False, dtype=cfg.dtype
-            )
-            self.down_proj = RowParallelLinear(
-                cfg.intermediate_size, cfg.hidden_size, bias=False, input_is_parallel=True, dtype=cfg.dtype
-            )
-        else:
-            self.gate_proj = nn.Linear(cfg.hidden_size, cfg.intermediate_size, bias=False, dtype=cfg.dtype)
-            self.up_proj = nn.Linear(cfg.hidden_size, cfg.intermediate_size, bias=False, dtype=cfg.dtype)
-            self.down_proj = nn.Linear(cfg.intermediate_size, cfg.hidden_size, bias=False, dtype=cfg.dtype)
+
+        self.gate_proj = ColumnParallelLinear(
+            cfg.hidden_size, cfg.intermediate_size, bias=False, gather_output=False, dtype=cfg.dtype
+        )
+        self.up_proj = ColumnParallelLinear(
+            cfg.hidden_size, cfg.intermediate_size, bias=False, gather_output=False, dtype=cfg.dtype
+        )
+        self.down_proj = RowParallelLinear(
+            cfg.intermediate_size, cfg.hidden_size, bias=False, input_is_parallel=True, dtype=cfg.dtype
+        )
 
     def forward(self, x):
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
@@ -270,16 +257,12 @@ class Transformer(torch.nn.Module):
     def __init__(self, cfg: Config, batch_size: int, seq_len: int):
         super().__init__()
 
-        if parallel_state.model_parallel_is_initialized():
-            self.embedding = ParallelEmbedding(
-                cfg.vocab_size, cfg.hidden_size, shard_across_embedding=True, dtype=cfg.dtype
-            )
-            self.output = ColumnParallelLinear(
-                cfg.hidden_size, cfg.vocab_size, bias=False, gather_output=True, dtype=cfg.dtype
-            )
-        else:
-            self.embedding = torch.nn.Embedding(cfg.vocab_size, cfg.hidden_size, cfg.pad_token, dtype=cfg.dtype)
-            self.output = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False, dtype=cfg.dtype)
+        self.embedding = ParallelEmbedding(
+            cfg.vocab_size, cfg.hidden_size, shard_across_embedding=True, dtype=cfg.dtype
+        )
+        self.output = ColumnParallelLinear(
+            cfg.hidden_size, cfg.vocab_size, bias=False, gather_output=True, dtype=cfg.dtype
+        )
 
         self.layers = torch.nn.ModuleList()
         for _ in range(cfg.n_layers):

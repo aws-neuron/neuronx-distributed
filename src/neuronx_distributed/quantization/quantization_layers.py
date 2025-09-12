@@ -38,6 +38,7 @@ from neuronx_distributed.parallel_layers.mappings import (
     scatter_to_tensor_model_parallel_region,
 )
 from neuronx_distributed.parallel_layers.parallel_state import (
+    get_expert_model_parallel_group,
     get_expert_model_parallel_size,
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_size,
@@ -83,7 +84,7 @@ class BaseQuantizeParallelLinear(torch.nn.Module, metaclass=ABCMeta):
             dequantized_dtype (torch.dtype, optional): Detype to dequantize the weight to. Defaults to torch.bfloat16.
             quantized_dtype (torch.dtype, optional): Dtype to qunatize the weight to. Defaults to torch.int8.
             device (torch.device, optional): Device to which initialize the Parameters. Defaults to None.
-            rank_ordering (list, optional): indicates how sharded weights are mapped, the i'th element 
+            rank_ordering (list, optional): indicates how sharded weights are mapped, the i'th element
                 in the list corresponds to the original rank which is mapped to rank_ordering[i]
         """
         super().__init__()
@@ -224,7 +225,7 @@ class BaseQuantizeParallelLinear(torch.nn.Module, metaclass=ABCMeta):
 
             ## For expert wise quantization, we need to set the scale shape dim 0 to num_experts
             if quantization_type == QuantizationType.EXPERT_WISE_PER_CHANNEL_SYMMETRIC:
-                scale_shape[0] = self.num_experts
+                scale_shape[0] = self._n_local_experts
             self.scale = Parameter(torch.ones(scale_shape, device=self.weight.device), requires_grad=False)
 
             # Only when the weight partition dim is the per_channel_axis, we need to partition the scale
@@ -402,7 +403,7 @@ class QuantizedColumnParallel(BaseQuantizeParallelLinear):
         stride (int, optional): stride. Defaults to 1.
         sequence_parallel_enabled (bool, optional): Defaults to False.
         keep_master_weight (bool, optional): Defaults to False.
-        rank_ordering (list, optional): indicates how sharded weights are mapped, the i'th element 
+        rank_ordering (list, optional): indicates how sharded weights are mapped, the i'th element
             in the list corresponds to the original rank which is mapped to rank_ordering[i]
     """
 
@@ -507,6 +508,7 @@ class QuantizedColumnParallel(BaseQuantizeParallelLinear):
         if bias:
             self.bias_size = self.output_size if self.gather_output else self.output_size_per_partition
             self.bias_shape = (self.bias_size,)
+            self.bias_partition_dim = 0
         else:
             self.bias_shape = None
 
@@ -515,7 +517,7 @@ class QuantizedColumnParallel(BaseQuantizeParallelLinear):
         if bias:
             if not self.gather_output:
                 set_tensor_model_parallel_attributes(
-                    self.bias, True, 0, stride=self.stride, num_partitions=self.tensor_parallel_group.size(),
+                    self.bias, True, dim=self.bias_partition_dim, stride=self.stride, num_partitions=self.tensor_parallel_group.size(),
                 )
 
     def _setup_for_parallelism(self, world_size: int):
@@ -547,7 +549,7 @@ class QuantizedColumnParallel(BaseQuantizeParallelLinear):
             input_parallel = copy_to_tensor_model_parallel_region(
                 input, process_group=self.tensor_parallel_group,
             )
-        
+
         ## TODO: add a flow for static quantization once zhankuil@ is done
         if self.activation_quantization_type == ActivationQuantizationType.DYNAMIC:
             # Matrix multiply.
@@ -619,7 +621,7 @@ class QuantizedColumnParallel(BaseQuantizeParallelLinear):
             activation_quantization_type=q_config["activation_quantization_type"],
             clamp_bound=q_config["clamp_bound"],
         )
-        
+
         return cls._apply_post_quantization_hook(mod, new_mod)
 
     def preshard_hook(self, model_state_dict: Dict[str, Any], prefix: str) -> None:
@@ -652,7 +654,7 @@ class QuantizedRowParallel(BaseQuantizeParallelLinear):
         stride (int, optional): stride. Defaults to 1.
         sequence_parallel_enabled (bool, optional): Defaults to False.
         keep_master_weight (bool, optional):Defaults to False.
-        rank_ordering(list, optional): indicates how sharded weights are mapped, the i'th element 
+        rank_ordering(list, optional): indicates how sharded weights are mapped, the i'th element
         in the list corresponds to the original rank which is mapped to rank_ordering[i]
 
     Raises:
@@ -715,7 +717,7 @@ class QuantizedRowParallel(BaseQuantizeParallelLinear):
             sequence_dimension = 0
 
         self.sequence_dimension: int = sequence_dimension # type: ignore
-        
+
         self.stride = stride
         self.keep_master_weight = keep_master_weight
         self.reduce_output = reduce_output
@@ -791,8 +793,8 @@ class QuantizedRowParallel(BaseQuantizeParallelLinear):
             original_dtype = input_parallel.dtype
             #TODO: combine with zhankuil's implementation of static quantization for input
             quantized_input, input_scale = quantize_fp8_per_channel(input_parallel, dtype=torch.float8_e4m3fn, channel_axis=1)
-            
-            
+
+
             output_ = self._forward_impl(
                 input=quantized_input,
                 weight=self.weight,
@@ -824,7 +826,7 @@ class QuantizedRowParallel(BaseQuantizeParallelLinear):
                 tensor=output_, scale=self.scale.T, upcast_dtype=output_.dtype,
             )
 
-        
+
 
         if self.reduce_output:
             # All-reduce across all the partitions.
@@ -871,7 +873,7 @@ class QuantizedRowParallel(BaseQuantizeParallelLinear):
             activation_quantization_type=q_config["activation_quantization_type"],
             clamp_bound=q_config["clamp_bound"],
         )
-        
+
         return cls._apply_post_quantization_hook(mod, new_mod)
 
     def preshard_hook(self, model_state_dict: dict, prefix: str) -> None:
@@ -894,6 +896,7 @@ class QuantizedExpertFusedColumnParallel(QuantizedColumnParallel, ExpertFusedLin
         num_experts: int,
         input_size: int,
         output_size: int,
+        bias: bool = False,
         quantization_type: Union[QuantizationType, str] = "per_tensor_symmetric",
         dtype: torch.dtype = torch.float32,
         quantized_dtype: Union[QuantizedDtype, torch.dtype] = QuantizedDtype.INT8,
@@ -902,10 +905,13 @@ class QuantizedExpertFusedColumnParallel(QuantizedColumnParallel, ExpertFusedLin
         keep_master_weight: bool = False,
         quantization_per_channel_axis: Optional[int] = None,
         tensor_model_parallel_group: Optional[ProcessGroup] = None,
+        expert_model_parallel_group: Optional[ProcessGroup] = None,
+        is_prefill: bool = True,
         rank_ordering: Optional[list] = None,
     ):
-        self.num_experts = num_experts
-        self._n_local_experts = divide(num_experts, get_expert_model_parallel_size())
+        if expert_model_parallel_group is None:
+            expert_model_parallel_group = get_expert_model_parallel_group()
+        self._n_local_experts = divide(num_experts, expert_model_parallel_group.size())
 
         if quantization_type in [QuantizationType.PER_CHANNEL_SYMMETRIC, QuantizationType.EXPERT_WISE_PER_CHANNEL_SYMMETRIC]:
             if quantization_per_channel_axis is None:
@@ -918,7 +924,7 @@ class QuantizedExpertFusedColumnParallel(QuantizedColumnParallel, ExpertFusedLin
         super().__init__(
             input_size=input_size,
             output_size=output_size,
-            bias=False,
+            bias=bias,
             quantization_type=quantization_type,
             gather_output=False,
             dtype=dtype,
@@ -932,6 +938,8 @@ class QuantizedExpertFusedColumnParallel(QuantizedColumnParallel, ExpertFusedLin
             rank_ordering=rank_ordering,
         )
 
+        self._mark_expert_parallel_weights(expert_parallel_group_size=expert_model_parallel_group.size(), is_prefill=is_prefill)
+
     def _setup_for_weight_and_bias_config(self, bias: bool):
         """
         Same as the ExpertFusedColumnParallelLinear.set_weight_and_bias_config()
@@ -942,7 +950,12 @@ class QuantizedExpertFusedColumnParallel(QuantizedColumnParallel, ExpertFusedLin
         self.weight_shape = (self._n_local_experts, self.input_size, self.output_size_per_partition)
         # Column parallel partitioning for each expert
         self.weight_partition_dim = 2
-        self.bias_shape = None
+        if bias:
+            bias_size = self.output_size if self.gather_output else self.output_size_per_partition
+            self.bias_shape = (self._n_local_experts, bias_size)
+            self.bias_partition_dim = 1
+        else:
+            self.bias_shape = None
 
     def forward(self, input: torch.Tensor, expert_indices: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Same as the forward of ExpertFusedColumnParallelLinear, except with weight dequantization,
@@ -979,6 +992,20 @@ class QuantizedExpertFusedColumnParallel(QuantizedColumnParallel, ExpertFusedLin
             process_group=self.tensor_parallel_group,
         )
         output = scale_dequantize(tensor=output, scale=scale, upcast_dtype=output.dtype)
+
+        if self.bias is not None:
+            if expert_indices is not None:
+                bias = self.bias[expert_indices, :]
+            else:
+                bias = self.bias
+            # input dimensions are (e, 1, c, h) or (e/ep, ep, c, h)
+            # bias dimensions are always (e, h) or (e/ep, h)
+            # outer dimensions will always be equal, we unsqueeze inner dimensions to 1s
+            bias = bias.unsqueeze(1).unsqueeze(2)
+        else:
+            bias = None
+        # Always add bias
+        output = (output + bias) if bias is not None else output
         return output
 
     @classmethod
@@ -994,6 +1021,7 @@ class QuantizedExpertFusedColumnParallel(QuantizedColumnParallel, ExpertFusedLin
             num_experts=mod.num_experts,
             input_size=mod.input_size,
             output_size=mod.output_size,
+            bias=mod.bias is not None,
             quantization_type=q_config["quantization_type"],
             quantized_dtype=q_config["quantized_dtype"],
             dtype=mod.dtype,
@@ -1002,8 +1030,10 @@ class QuantizedExpertFusedColumnParallel(QuantizedColumnParallel, ExpertFusedLin
             keep_master_weight=mod.keep_master_weight,
             quantization_per_channel_axis=cast(int, q_config.get("quantization_per_channel_axis")),
             tensor_model_parallel_group=mod.tensor_parallel_group,
+            expert_model_parallel_group=mod.expert_model_parallel_group,
+            is_prefill = mod.is_prefill,
         )
-        return new_mod
+        return cls._apply_post_quantization_hook(mod, new_mod)
 
 
 class QuantizedExpertFusedRowParallel(QuantizedRowParallel, ExpertFusedLinear):
@@ -1019,6 +1049,7 @@ class QuantizedExpertFusedRowParallel(QuantizedRowParallel, ExpertFusedLinear):
         input_size: int,
         output_size: int,
         reduce_output: bool = False,
+        bias: bool = False,
         quantization_type: Union[QuantizationType, str] = "per_tensor_symmetric",
         quantized_dtype: Union[QuantizedDtype, torch.dtype] = QuantizedDtype.INT8,
         dtype: torch.dtype = torch.float32,
@@ -1027,10 +1058,13 @@ class QuantizedExpertFusedRowParallel(QuantizedRowParallel, ExpertFusedLinear):
         keep_master_weight: bool = False,
         quantization_per_channel_axis: Optional[int] = None,
         tensor_model_parallel_group: Optional[ProcessGroup] = None,
+        expert_model_parallel_group: Optional[ProcessGroup] = None,
+        is_prefill: bool = True,
         rank_ordering: Optional[list] = None,
     ):
-        self.num_experts = num_experts
-        self._n_local_experts = divide(num_experts, get_expert_model_parallel_size())
+        if expert_model_parallel_group is None:
+            expert_model_parallel_group = get_expert_model_parallel_group()
+        self._n_local_experts = divide(num_experts, expert_model_parallel_group.size())
 
         if quantization_type in [QuantizationType.PER_CHANNEL_SYMMETRIC, QuantizationType.EXPERT_WISE_PER_CHANNEL_SYMMETRIC]:
             if quantization_per_channel_axis is None:
@@ -1043,7 +1077,7 @@ class QuantizedExpertFusedRowParallel(QuantizedRowParallel, ExpertFusedLinear):
         super().__init__(
             input_size=input_size,
             output_size=output_size,
-            bias=False,
+            bias=bias,
             quantization_type=quantization_type,
             input_is_parallel=True,
             dtype=dtype,
@@ -1058,6 +1092,8 @@ class QuantizedExpertFusedRowParallel(QuantizedRowParallel, ExpertFusedLinear):
             rank_ordering=rank_ordering,
         )
 
+        self._mark_expert_parallel_weights(expert_parallel_group_size=expert_model_parallel_group.size(), is_prefill=is_prefill)
+
     def _setup_for_weight_and_bias_config(self, bias: bool):
         """
         Same as the ExpertFusedRowParallelLinear.set_weight_and_bias_config()
@@ -1068,19 +1104,22 @@ class QuantizedExpertFusedRowParallel(QuantizedRowParallel, ExpertFusedLinear):
         self.weight_shape = (self._n_local_experts, self.input_size_per_partition, self.output_size)
         # Row parallel partitioning for each expert
         self.weight_partition_dim = 1
-        self.bias_shape = None
+        if bias:
+            bias_size = self.output_size
+            self.bias_shape = (self._n_local_experts, bias_size)
+        else:
+            self.bias_shape = None
 
     def forward(self, input_: torch.Tensor, expert_indices: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Same as the forward of ExpertFusedRowParallelLinear, except with weight dequantization,
         and save_for_backward=False."""
-
 
         if expert_indices is not None:
             # Currently, CPU does not support indexing for FP8 tensor types, so we need to view it as int8 first and index it before converting it back to FP8.
             if cpu_mode() and self.weight.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
                 weight_dtype = self.weight.dtype
                 weight, scale = self.weight.view(torch.int8)[expert_indices, :, :].view(weight_dtype), self.scale[expert_indices, :, :]
-                
+
             else:
                 weight, scale = self.weight[expert_indices, :, :], self.scale[expert_indices, :, :]
         else:
@@ -1104,10 +1143,24 @@ class QuantizedExpertFusedRowParallel(QuantizedRowParallel, ExpertFusedLinear):
             output = reduce_from_tensor_model_parallel_region(
                 output_parallel, process_group=self.tensor_parallel_group,
             )
-            return output
         else:
             # Return without output all-reduce, in favor of an all-reduce or reduce-scatter after the MoE output combine.
-            return output_parallel
+            output =  output_parallel
+
+        if self.bias is not None:
+            if expert_indices is not None:
+                bias = self.bias[expert_indices, :]
+            else:
+                bias = self.bias
+            # input dimensions are (e, 1, c, h) or (e/ep, ep, c, h)
+            # bias dimensions are always (e, h) or (e/ep, h)
+            # outer dimensions will always be equal, we unsqueeze inner dimensions to 1s
+            bias = bias.unsqueeze(1).unsqueeze(2)
+        else:
+            bias = None
+        # Always add bias
+        output = (output + bias) if bias is not None else output
+        return output
 
     @classmethod
     def from_float(
@@ -1120,11 +1173,12 @@ class QuantizedExpertFusedRowParallel(QuantizedRowParallel, ExpertFusedLinear):
         """
         assert mod.__class__.__name__ == "ExpertFusedRowParallelLinear", "ExpertFusedRowParallelLinear expected"
 
-        return QuantizedExpertFusedRowParallel(
+        new_mod = QuantizedExpertFusedRowParallel(
             num_experts=mod.num_experts,
             input_size=mod.input_size,
             output_size=mod.output_size,
             reduce_output=mod.reduce_output,
+            bias=mod.bias is not None,
             quantization_type=q_config["quantization_type"],
             dtype=mod.dtype,
             quantized_dtype=q_config["quantized_dtype"],
@@ -1133,4 +1187,7 @@ class QuantizedExpertFusedRowParallel(QuantizedRowParallel, ExpertFusedLinear):
             keep_master_weight=mod.keep_master_weight,
             quantization_per_channel_axis=cast(int, q_config.get("quantization_per_channel_axis")),
             tensor_model_parallel_group=mod.tensor_parallel_group,
+            expert_model_parallel_group=mod.expert_model_parallel_group,
+            is_prefill = mod.is_prefill,
         )
+        return cls._apply_post_quantization_hook(mod, new_mod)

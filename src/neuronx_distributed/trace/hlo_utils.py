@@ -12,6 +12,7 @@ from typing import Dict, List, Optional, Set, Any
 from copy import deepcopy
 
 from neuronx_distributed.trace.model_builder_utils import (
+    TraceArtifacts,
     WLOArtifacts,
     generate_key
 )
@@ -76,21 +77,22 @@ def add_weight_idx_attr_to_hlo(hlo: hlo_pb2.HloModuleProto, weight_name_to_idx: 
 
 
 def mark_weights_for_wlo(
-    priority_model_trace_hlo: hlo_pb2.HloModuleProto,
-    priority_model_weight_name_to_idx: Dict[str, int],
+    trace_artifacts: TraceArtifacts,
     weights_to_skip_layout_optimization: Optional[Set] = None
 ) -> None:
     """
     Mark weights in the priority model for Weight Layout Optimization (WLO).
     
     Args:
-        priority_model_trace_hlo: Priority model trace HLO
-        priority_model_weight_name_to_idx: A dictionary mapping weight names to their indices for the priority model
+        trace_artifacts: Priority model trace artifacts
         weights_to_skip_layout_optimization: Set of weight names to exclude from optimization
         
     Returns:
         None
     """
+    priority_model_trace_hlo = trace_artifacts.hlo
+    priority_model_weight_name_to_idx = trace_artifacts.weight_name_to_idx
+
     if weights_to_skip_layout_optimization is None:
         weights_to_skip_layout_optimization = set()
 
@@ -106,11 +108,13 @@ def mark_weights_for_wlo(
 
         logger.info("Marking weights in the priority model for weight layout optimization.")
 
-        add_weight_idx_attr_to_hlo(
+        hlo_with_weight_idx_attr_added = add_weight_idx_attr_to_hlo(
             hlo=priority_model_trace_hlo,
             weight_name_to_idx=priority_model_weight_name_to_idx,
             weight_names_to_skip=weights_to_skip_layout_optimization
         )
+
+        trace_artifacts.hlo = hlo_with_weight_idx_attr_added
 
     except Exception as e:
         logger.error(f"Failed to mark weights for WLO: {str(e)}")
@@ -118,11 +122,8 @@ def mark_weights_for_wlo(
 
 
 def apply_layout_transformation(
-    hlo_module: hlo_pb2.HloModuleProto,
-    flattener: Any,
-    packer: Any,
-    metaneff: Any,
-    weight_name_to_idx: Dict[str, int],
+    trace_artifacts: TraceArtifacts,
+    priority_model_trace_artifacts: TraceArtifacts,
     wlo_artifacts: WLOArtifacts,
     key: Optional[str] = None
 ) -> None:
@@ -132,11 +133,8 @@ def apply_layout_transformation(
     This is a no-op if weights are already in optimal shape.
 
     Args:
-        hlo_module: The HLO module to apply the layout optimization to.
-        flattener: Function to flatten inputs.
-        packer: Function to pack outputs.
-        metaneff: The meta information for the Neuron Executable File Format (NEFF).
-        weight_name_to_idx: Dictionary mapping weight names to their indices.
+        trace_artifacts: Non-priority model trace artifacts to apply the layout optimization to.
+        priority_model_trace_artifacts: Priority model trace artifacts.
         wlo_artifacts: Artifacts containing the weight layout optimization information.
         key: Optional key used to tag the bucket with a meaningful name.
 
@@ -144,6 +142,12 @@ def apply_layout_transformation(
         None
     """
     try:
+        hlo_module = trace_artifacts.hlo
+        flattener = trace_artifacts.flattener
+        packer = trace_artifacts.packer
+        metaneff = trace_artifacts.metaneff
+        weight_name_to_idx = trace_artifacts.weight_name_to_idx
+
         # Input validation
         if not hlo_module:
             raise ValueError("HLO module is None")
@@ -170,7 +174,7 @@ def apply_layout_transformation(
         # Get the layout transformation map
         weight_name_to_transform_cpt = get_layout_transform_map(
             hlo_stub=wlo_stub, 
-            weight_name_to_idx=weight_name_to_idx
+            weight_name_to_idx=priority_model_trace_artifacts.weight_name_to_idx
         )
 
         # Create HLO artifacts
@@ -190,7 +194,7 @@ def apply_layout_transformation(
         # Use temporary files
         with tempfile.NamedTemporaryFile(mode='w+', suffix='.hlo') as original_hlo_file, \
              tempfile.NamedTemporaryFile(mode='w+', suffix='.hlo') as optimized_hlo_file:
-            
+
             # Write original HLO to temporary file
             write_hlo(original_hlo_file.name, hlo_artifacts.hlo_module)
 
@@ -204,7 +208,10 @@ def apply_layout_transformation(
                 hlo_artifacts.hlo_module.frontend_attributes.map
             )
 
-            logger.info(f"Successfully applied weight layout transformation for {key}")
+        logger.info(f"Successfully applied weight layout transformation for {key}")
+
+        # Save the optimized HLO
+        trace_artifacts.hlo = hlo_artifacts.hlo_module
 
     except Exception as e:
         raise RuntimeError(f"Weight layout transformation failed for {key}: {str(e)}") from e
@@ -479,19 +486,27 @@ def prepare_metaneff_for_wlt_hlo(
 # Experimental feature for weight layout transformation
 ################################################################################
 
-def update_weight(original_shape, second_shape, permute_order, x):
+def update_weight(original_shape, second_shape, permute_order, third_shape, x):
     """Get weight layout optimization function in torch"""
     assert x.shape == original_shape, f"actual shape is {x.shape}, but expected shape is {original_shape}"
     x = x.reshape(second_shape)
     x = x.permute(permute_order)
+    # TODO: third_shape is an optional attribute for backward compatibility with compiler.
+    # Once compiler is upgraded to latest, this change can be removed.
+    if third_shape:
+        x = x.reshape(third_shape)
     x = x.contiguous()
     return x
 
 
 def get_wlt(cpt):
     """Get weight layout optimization function in torch from HLO computation"""
-    assert len(cpt.instructions) == 3
-
+    # TODO: The latest compiler adds an extra reshape instruction at the end of every computation
+    # to ensure input and output shapes match. Allow computations with both 3 and 4 instructions
+    # to support multiple compiler versions and ensure backward compatibility.
+    # This can be removed once migration to new compiler is complete.
+    assert len(cpt.instructions) == 3 or len(cpt.instructions) == 4
+    third_shape = None
     read_instr = cpt.instructions[0]
     assert read_instr.opcode == "parameter"
     original_shape = tuple(read_instr.shape.dimensions[:])
@@ -503,7 +518,15 @@ def get_wlt(cpt):
     permute_instr = cpt.instructions[2]
     assert permute_instr.opcode == "transpose"
     permute_order = permute_instr.dimensions[:]
-    return partial(update_weight, original_shape, second_shape, permute_order)
+
+    # TODO: This check is present for backwards compatibility and should be
+    # removed once compiler has been upgraded.
+    if len(cpt.instructions) == 4:
+        final_reshape_instr = cpt.instructions[3]
+        assert final_reshape_instr.opcode == "reshape"
+        third_shape = tuple(final_reshape_instr.shape.dimensions[:])
+
+    return partial(update_weight, original_shape, second_shape, permute_order, third_shape)
 
 
 def get_wlt_map(hlo):
@@ -541,6 +564,8 @@ def get_input_order(metaneff):
     return ckpt_names, ckpt_shapes
 
 
+# TODO: WLO on CPU doesn't match WLO on device. This needs to be fixed
+# to ensure both flows produce same outputs.
 def transform_weight_layout_on_cpu(
         hlo_filename,
         metaneff_filename,
@@ -594,7 +619,7 @@ def transform_weight_layout_on_device_and_save_to_disk(
     but it avoids the overhead to transform it everytime during load.
     """
     with open(wlt_neff_path, "rb") as f:
-        wlt_neff =  f.read()
+        wlt_neff = f.read()
 
     with open(metaneff_filename, "rb") as f:
         metaneff = f.read()
@@ -608,12 +633,13 @@ def transform_weight_layout_on_device_and_save_to_disk(
 
     transposed_ckpt = wlt_model.forward(checkpoint, True)
     for rank, transposed_ckpt_per_rank in zip(range(start_rank_id, start_rank_id + local_ranks_size), transposed_ckpt):
+        ckpt_file = os.path.join(sharded_checkpoint_dir, f"tp{rank}_sharded_checkpoint.safetensors")
         for name, weight in transposed_ckpt_per_rank.items():
             logger.debug(f"tp_rank: {rank}, name: {name}, original shape: {checkpoint[0][name].shape}, new shape: {weight.shape}")
 
-        os.remove(checkpoint_file)
-        save_file(transposed_ckpt_per_rank, checkpoint_file)
-        logger.debug(f"Done, ckpt_file = {checkpoint_file}")
+        os.remove(ckpt_file)
+        save_file(transposed_ckpt_per_rank, ckpt_file)
+        logger.debug(f"Done, ckpt_file = {ckpt_file}")
 
     logger.info("Done layout transformation on device and serialization!")
 
@@ -654,6 +680,7 @@ def cleanup_after_layout_transformation(
         optimized_hlo_module: hlo_pb2.HloModuleProto, old_frontend_attrs_map: dict
     ) -> hlo_pb2.HloModuleProto:
     """ Cleanup the transformation functions from HLO module once it has been transformed into optimal layout. """
+
     lambda_func_names = old_frontend_attrs_map[REQUIRE_TRANSPOSE_CUSTOM_CALL].split(FRONTEND_ATTRIBUTES_DELIMITER)
 
     if optimized_hlo_module.frontend_attributes.map:

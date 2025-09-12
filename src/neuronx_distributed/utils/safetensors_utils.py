@@ -20,6 +20,8 @@ import torch
 from collections import defaultdict
 from typing import Set
 
+import logging
+
 _float8_e4m3fn = getattr(torch, "float8_e4m3fn", None)
 _float8_e5m2 = getattr(torch, "float8_e5m2", None)
 
@@ -109,6 +111,7 @@ def _remove_duplicate_names(
     *,
     preferred_names = None,
     discard_names = None,
+    remove_duplicate_tensors = False,
 ):
     if preferred_names is None:
         preferred_names = []
@@ -121,7 +124,10 @@ def _remove_duplicate_names(
     to_remove = defaultdict(list)
     for shared in shareds:
         complete_names = set([name for name in shared if _is_complete(state_dict[name])])
-        if not complete_names:
+        if not complete_names and not remove_duplicate_tensors:
+            logging.warning(f"Found shared tensors {shared}, this can cause checkpoint saving to fail. This warning can be safely ignored when using shard-on-load.")
+            continue
+        if not complete_names and remove_duplicate_tensors:
             raise RuntimeError(
                 "Error while trying to find names to remove to save state dict, but found no suitable name to keep"
                 f" for saving amongst: {shared}. None is covering the entire storage. Refusing to save/load the model"
@@ -143,7 +149,7 @@ def _remove_duplicate_names(
                 to_remove[keep_name].append(name)
     return to_remove
 
-def remove_duplicate_tensors(checkpoint):
+def  check_for_duplicate_tensors(checkpoint, remove_duplicate_tensors=False):
     """
     Removes duplicate tensor entries from a checkpoint dictionary to ensure compatibility with safetensors format.
     
@@ -152,11 +158,16 @@ def remove_duplicate_tensors(checkpoint):
 
     Args:
         checkpoint: Dictionary containing tensor names as keys and their corresponding tensor values
+        remove_duplicate_tensors: If set, this will allow removing duplicate tensors from the checkpoint, if they exist.
 
     Returns:
-        dict: Modified checkpoint dictionary with duplicate tensors removed
+        dict: Modified checkpoint dictionary with duplicate tensors removed if remove_duplicate_tensors is set,
+        otherwise returns an unmodified checkpoint.
     """
-    to_removes = _remove_duplicate_names(checkpoint)
+    to_removes = _remove_duplicate_names(checkpoint, remove_duplicate_tensors=remove_duplicate_tensors)
+
+    if not remove_duplicate_tensors:
+        return checkpoint
 
     for _, to_remove_group in to_removes.items():
         for to_remove in to_remove_group:

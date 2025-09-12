@@ -18,6 +18,7 @@ import json
 import os
 from typing import Dict, Any
 from neuronx_distributed.utils.utils import get_dict_from_json
+from neuronx_distributed.utils import hardware
 
 
 class TestGetDictFromJson:
@@ -101,3 +102,20 @@ class TestGetDictFromJson:
         result = get_dict_from_json(json_file)
 
         assert result == test_data
+
+
+HARDWARE_ENUM_TESTS = [
+    ('trn1', hardware.TRN1, False),
+    ('trn1n', hardware.TRN1, False),
+    ('inf2', hardware.TRN1, False),
+    ('trn2', hardware.TRN2, False),
+    ('inf1', None, True),
+]
+@pytest.mark.parametrize('test_str, expected_hardware, expect_failure', HARDWARE_ENUM_TESTS)
+def test_hardware_enum(test_str, expected_hardware, expect_failure):
+    try:  
+        neuron_hardware = hardware(test_str)
+        assert neuron_hardware == expected_hardware
+    except ValueError as e:
+        if not expect_failure:
+            raise e

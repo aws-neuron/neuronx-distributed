@@ -1,6 +1,6 @@
 import torch
 from torch import nn, Tensor
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Union, Tuple
 from torch.distributed import ProcessGroup
 
 from neuronx_distributed.modules.moe.model_utils import ACT2FN, create_spmd_ranks
@@ -11,41 +11,63 @@ from neuronx_distributed.parallel_layers.utils import indices_split_along_dim
 
 weight_cache: Dict[str, Any] = {}
 
-def _get_weight_from_state_dict(prefix: str, state_dict: Dict[str, Any]) -> torch.Tensor:
-    if prefix in weight_cache:
-        return weight_cache[prefix]
 
-    if (prefix + "weight") in state_dict:
-        transposed_weight = state_dict[prefix + "weight"].t()
-        weight_cache[prefix] = transposed_weight
-        return transposed_weight
+class ColumnParallelLinearTransposed(ColumnParallelLinear):
+    def forward(self, input: torch.Tensor, slice_indices: Optional[torch.Tensor] = None) -> Union[
+        torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        self._check_pad_false_for_training()
 
-    else:
-        raise RuntimeError(f"Cannot find {(prefix + 'weight')} in the state_dict")
+        input_parallel = self._cpl_maybe_input_copy_to_tp_region(input)
+        weight = self.weight[slice_indices, :] if slice_indices is not None else self.weight
+        # Matrix multiply.
+        output_parallel = self._forward_impl(
+            input=input_parallel,
+            weight=weight.t(),
+            bias=None,
+            async_grad_allreduce=self.async_tensor_model_parallel_allreduce,
+            sequence_parallel_enabled=self.sequence_parallel_enabled,
+            sequence_dimension=self.sequence_dimension,
+            autograd_func_class=self.autograd_func_class,
+            process_group=self.tensor_parallel_group,
+            reduce_dtype=self.reduce_dtype,
+        )
+
+        output = self._cpl_maybe_gather_output(output_parallel)
+
+        if self.skip_bias_add:
+            return output, self.bias
+        output = (output + self.bias) if self.bias is not None else output
+
+        return output
 
 
-def _set_weight_to_state_dict(
-    prefix: str, tensor: torch.Tensor, state_dict: Dict[str, Any]
-) -> None:
-    if (prefix + "weight") in state_dict:
-        state_dict[prefix + "weight"] = tensor.t()
-    else:
-        raise RuntimeError(f"Cannot find {(prefix + 'weight')} in the state_dict")
+class RowParallelLinearTransposed(RowParallelLinear):
+    def forward(self, input_: torch.Tensor, slice_indices: Optional[torch.Tensor] = None) -> Union[
+        torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        self._check_pad_false_for_training()
 
+        # Set up backprop all-reduce.
+        input_parallel = self._rpl_maybe_scatter_input(input_)
+        weight = self.weight[:, slice_indices] if slice_indices is not None else self.weight
+        # Matrix multiply.
+        output_ = self._forward_impl(
+            input=input_parallel,
+            weight=weight.t(),
+            bias=None,
+            async_grad_allreduce=False,
+            sequence_parallel_enabled=False,
+            sequence_dimension=self.sequence_dimension,
+            autograd_func_class=self.autograd_func_class,
+            process_group=self.tensor_parallel_group,
+            reduce_dtype = self.reduce_dtype,
+        )
 
-def transpose_parallel_linear_layer(parallel_layer):
-    """
-    This function clones and transposes a ColumnParallelLinear or RowParallelLinear
-    The attributes are also cloned and partition_dim is updated
-    """
-    orig_attrs = vars(parallel_layer)
-    new_layer = torch.nn.Parameter(parallel_layer.clone().T, requires_grad=False)
-    new_layer.__dict__.update(orig_attrs)
-    # flip the partition_dim from 0->1 or 1->0
-    setattr(new_layer, "partition_dim", 1 - getattr(new_layer, "partition_dim"))
-    setattr(new_layer, "get_tensor_from_state_dict", _get_weight_from_state_dict)
-    setattr(new_layer, "set_tensor_to_state_dict", _set_weight_to_state_dict)
-    return new_layer
+        output_ = self._rpl_maybe_reduce_output(output_)
+
+        if self.skip_bias_add:
+            return output_, self.bias
+        output = (output_ + self.bias) if self.bias is not None else output_
+        return output
 
 
 class SharedExperts(nn.Module):
@@ -107,6 +129,14 @@ class SharedExperts(nn.Module):
         self._initialize_parallel_layers()
 
     def preshard_hook(self, model_state_dict: Dict[str, Any], prefix: str) -> None:
+        if self.transpose_weights:
+            assert not self.fused_gate_up_projection
+            for suffix in ["weight", "scale"]:
+                if prefix.endswith(suffix):
+                    prefix = prefix.removesuffix("weight")
+                    model_state_dict[prefix + "gate_proj.weight"] = model_state_dict[prefix + "gate_proj.weight"].T
+                    model_state_dict[prefix + "up_proj.weight"] = model_state_dict[prefix + "up_proj.weight"].T
+                    model_state_dict[prefix + "down_proj.weight"] = model_state_dict[prefix + "down_proj.weight"].T
         if self.sequence_parallel_enabled :
             prefix = prefix.removesuffix("weight")
             create_spmd_ranks(
@@ -135,26 +165,37 @@ class SharedExperts(nn.Module):
                 stride=2,
                 **common_args
             )
+            self.down_proj = self._create_row_parallel_linear(
+                input_size=expert_dim,
+                **common_args
+            )
         else:
-            self.gate_proj = self._create_column_parallel_linear(
-                output_size=expert_dim,
-                **common_args
-            )
-            self.up_proj = self._create_column_parallel_linear(
-                output_size=expert_dim,
-                **common_args
-            )
-
-        self.down_proj = self._create_row_parallel_linear(
-            input_size=expert_dim,
-            **common_args
-        )
-
-        if self.transpose_weights:
-            assert not self.fused_gate_up_projection
-            self.gate_proj.weight = transpose_parallel_linear_layer(self.gate_proj.weight)
-            self.up_proj.weight = transpose_parallel_linear_layer(self.up_proj.weight)
-            self.down_proj.weight = transpose_parallel_linear_layer(self.down_proj.weight)
+            if self.transpose_weights:
+                self.gate_proj = self._create_row_parallel_linear(
+                    input_size=expert_dim,
+                    **common_args
+                )
+                self.up_proj = self._create_row_parallel_linear(
+                    input_size=expert_dim,
+                    **common_args
+                )
+                self.down_proj = self._create_column_parallel_linear(
+                    output_size=expert_dim,
+                    **common_args
+                )
+            else:
+                self.gate_proj = self._create_column_parallel_linear(
+                    output_size=expert_dim,
+                    **common_args
+                )
+                self.up_proj = self._create_column_parallel_linear(
+                    output_size=expert_dim,
+                    **common_args
+                )
+                self.down_proj = self._create_row_parallel_linear(
+                    input_size=expert_dim,
+                    **common_args
+                )
 
     def _create_column_parallel_linear(self, output_size: int, stride: int = 1, **kwargs):
         """
@@ -166,6 +207,15 @@ class SharedExperts(nn.Module):
         Returns:
             ColumnParallelLinear: The initialized parallel linear layer
         """
+        if self.transpose_weights:
+            return ColumnParallelLinearTransposed(
+                self.hidden_size,
+                output_size,
+                stride=stride,
+                bias=False,
+                gather_output=False,
+                **kwargs
+            )
         return ColumnParallelLinear(
             self.hidden_size,
             output_size,
@@ -184,6 +234,16 @@ class SharedExperts(nn.Module):
         Returns:
             RowParallelLinear: The initialized parallel linear layer
         """
+        if self.transpose_weights:
+            return RowParallelLinearTransposed(
+                input_size,
+                self.hidden_size,
+                bias=False,
+                input_is_parallel=True,
+                reduce_output=False,
+                reduce_dtype=self.reduce_dtype,
+                **kwargs
+            )
         return RowParallelLinear(
             input_size,
             self.hidden_size,

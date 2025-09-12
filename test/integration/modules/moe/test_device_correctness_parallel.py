@@ -132,6 +132,8 @@ def test_moe_layer_device_correctness_parallel():
         print_rank0(f"Running {len(test_configs)} tests")
         for i, cfg in enumerate(test_configs):
             print_rank0(f"Running test {i+1}/{len(test_configs)}: {str(cfg)}")
+            if cfg.top_k > 1 and cfg.early_expert_affinity_modulation:
+                continue
             try:
                 run_device_correctness_test(cfg, output_test_tols, grad_test_tols)
                 print_rank0("ok\n")

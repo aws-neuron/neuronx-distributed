@@ -11,6 +11,7 @@ from neuronx_distributed.parallel_layers import layers, mappings, parallel_state
 from neuronx_distributed.parallel_layers.parallel_state import (
     get_expert_model_parallel_size,
     get_tensor_model_parallel_group,
+    get_expert_model_parallel_group,
 )
 
 
@@ -136,15 +137,19 @@ class ExpertFusedLinearWithAsyncCommunication(torch.autograd.Function):
 
 
 class ExpertFusedLinear(nn.Module):
-    def _mark_expert_parallel_weights(self, iterable=None):
+    def _mark_expert_parallel_weights(self, iterable=None, expert_parallel_group_size=None, is_prefill=True):
         """Register expert parallel parameters"""
+        if expert_parallel_group_size is None:
+            expert_parallel_group_size = get_expert_model_parallel_size()
 
-        if get_expert_model_parallel_size() > 1:
+        if expert_parallel_group_size > 1:
             if iterable is None:
                 iterable = self.parameters()
 
             for p in iterable:
                 p.expert_model_parallel = True
+                if is_prefill:
+                    p.is_prefill = True
 
     def _apply(self, fn, *args, **kwargs):
         """Moving parameters from cpu to device creates new parameters. to() method
@@ -170,7 +175,6 @@ class ExpertFusedColumnParallelLinear(layers.ColumnParallelLinear, ExpertFusedLi
     column-parallel linear layer computation for 3D weights. The forward pass of the parent class is over-ridden
     to to support selective computations on a subset of experts.
 
-    Bias is not currently supported for MoE.
     Sequence parallelism is handled independently of MLP computations in MoE, and therefore defaults to False.
     """
 
@@ -181,20 +185,26 @@ class ExpertFusedColumnParallelLinear(layers.ColumnParallelLinear, ExpertFusedLi
         num_experts: int,
         input_size: int,
         output_size: int,
+        bias: bool = False,
         dtype: torch.dtype = torch.float32,
         device: Optional[torch.device] = None,
         stride: int = 1,
         init_method: Optional[Callable[..., Any]] = None,
         keep_master_weight: bool = False,
         tensor_model_parallel_group: Optional[ProcessGroup] = None,
+        expert_model_parallel_group: Optional[ProcessGroup] = None,
+        is_prefill: bool = True,
     ) -> None:
         self.num_experts = num_experts
-        self._n_local_experts = utils.divide(num_experts, parallel_state.get_expert_model_parallel_size())
-
+        if expert_model_parallel_group is None:
+            expert_model_parallel_group = get_expert_model_parallel_group()
+        self._n_local_experts = utils.divide(num_experts, expert_model_parallel_group.size())
+        self.expert_model_parallel_group = expert_model_parallel_group
+        self.is_prefill = is_prefill
         super().__init__(
             input_size=input_size,
             output_size=output_size,
-            bias=False,
+            bias=bias,
             gather_output=False,
             dtype=dtype,
             device=device,
@@ -205,7 +215,7 @@ class ExpertFusedColumnParallelLinear(layers.ColumnParallelLinear, ExpertFusedLi
             skip_bias_add=False,
             tensor_model_parallel_group=tensor_model_parallel_group,
         )
-        self._mark_expert_parallel_weights()
+        self._mark_expert_parallel_weights(expert_parallel_group_size=expert_model_parallel_group.size(), is_prefill=is_prefill)
 
     def set_weight_and_bias_config(self):
         # Define 3D weight tensor, one linear layer per expert
@@ -216,7 +226,13 @@ class ExpertFusedColumnParallelLinear(layers.ColumnParallelLinear, ExpertFusedLi
         )
         # Column parallel partitioning for each expert
         self.weight_partition_dim = 2
-        self.bias_shape = None
+
+        if self.add_bias:
+            bias_size = self.output_size if self.gather_output else self.output_size_per_partition
+            self.bias_shape = (self._n_local_experts, bias_size)
+            self.bias_partition_dim = 1
+        else:
+            self.bias_shape = None
 
     def _init_weight(self, weight):
         # Initialize the linear layer of each expert separately
@@ -226,6 +242,13 @@ class ExpertFusedColumnParallelLinear(layers.ColumnParallelLinear, ExpertFusedLi
                 torch.nn.init.kaiming_uniform_(weight[e], a=math.sqrt(5))
             else:
                 self.arg_init_method(weight[e])
+
+    def _init_bias(self) -> None:
+        assert len(self.bias.shape) == 2
+        for e in range(self.bias.shape[0]):
+            fan_in, _ = torch.nn.init._calculate_fan_in_and_fan_out(self.weight[e])
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+            torch.nn.init.uniform_(self.bias[e], -bound, bound)
 
     def forward(self, input_: torch.Tensor, expert_indices: Optional[torch.Tensor] = None, *_: Any) -> torch.Tensor:
         """If expert_indices is provided, then the computations are performed only on the specified experts.
@@ -250,6 +273,20 @@ class ExpertFusedColumnParallelLinear(layers.ColumnParallelLinear, ExpertFusedLi
             autograd_func_class=self.autograd_func_class,
             process_group=self.tensor_parallel_group,
         )
+
+        if self.bias is not None:
+            if expert_indices is not None:
+                bias = self.bias[expert_indices, :]
+            else:
+                bias = self.bias
+            # input dimensions are (e, 1, c, h) or (e/ep, ep, c, h)
+            # bias dimensions are always (e, h) or (e/ep, h)
+            # outer dimensions will always be equal, we unsqueeze inner dimensions to 1s
+            bias = bias.unsqueeze(1).unsqueeze(2)
+        else:
+            bias = None
+        # Always add bias
+        output = (output + bias) if bias is not None else output
         return output
 
 
@@ -261,8 +298,8 @@ class ExpertFusedRowParallelLinear(layers.RowParallelLinear, ExpertFusedLinear):
     to optionally avoid the output all-reduce depending on the sequence parallel mode, and to support selective
     computations on a subset of experts.
 
-    Bias is not currently supported for MoE.
     Sequence parallelism is handled independently of MLP computations in MoE, and therefore defaults to False.
+    Note that if reduce_output=False and bias=True, bias needs to be divided by TP degree.
     """
 
     autograd_func_class = ExpertFusedLinearWithAsyncCommunication
@@ -272,6 +309,7 @@ class ExpertFusedRowParallelLinear(layers.RowParallelLinear, ExpertFusedLinear):
         num_experts: int,
         input_size: int,
         output_size: int,
+        bias: bool = False,
         reduce_output: bool = True,
         dtype: torch.dtype = torch.float32,
         device: Optional[torch.device] = None,
@@ -279,14 +317,19 @@ class ExpertFusedRowParallelLinear(layers.RowParallelLinear, ExpertFusedLinear):
         init_method: Optional[Callable[..., Any]] = None,
         keep_master_weight: bool = False,
         tensor_model_parallel_group: Optional[ProcessGroup] = None,
+        expert_model_parallel_group: Optional[ProcessGroup] = None,
+        is_prefill: bool = True,
     ) -> None:
         self.num_experts = num_experts
-        self._n_local_experts = utils.divide(num_experts, parallel_state.get_expert_model_parallel_size())
-
+        if expert_model_parallel_group is None:
+            expert_model_parallel_group = get_expert_model_parallel_group()
+        self._n_local_experts = utils.divide(num_experts, expert_model_parallel_group.size())
+        self.expert_model_parallel_group = expert_model_parallel_group
+        self.is_prefill = is_prefill
         super().__init__(
             input_size=input_size,
             output_size=output_size,
-            bias=False,
+            bias=bias,
             input_is_parallel=True,
             dtype=dtype,
             device=device,
@@ -298,7 +341,8 @@ class ExpertFusedRowParallelLinear(layers.RowParallelLinear, ExpertFusedLinear):
             reduce_output=reduce_output,
             tensor_model_parallel_group=tensor_model_parallel_group,
         )
-        self._mark_expert_parallel_weights()
+
+        self._mark_expert_parallel_weights(expert_parallel_group_size=expert_model_parallel_group.size(), is_prefill=is_prefill)
 
     def set_weight_and_bias_config(self):
         # Define 3D weight tensor, one linear layer per expert
@@ -309,7 +353,12 @@ class ExpertFusedRowParallelLinear(layers.RowParallelLinear, ExpertFusedLinear):
         )
         # Row parallel partitioning for each expert
         self.weight_partition_dim = 1
-        self.bias_shape = None
+
+        if self.add_bias:
+            bias_size = self.output_size
+            self.bias_shape = (self._n_local_experts, bias_size)
+        else:
+            self.bias_shape = None
 
     def _init_weight(self, weight):
         # Initialize the linear layer of each expert separately
@@ -319,6 +368,12 @@ class ExpertFusedRowParallelLinear(layers.RowParallelLinear, ExpertFusedLinear):
                 torch.nn.init.kaiming_uniform_(weight[e], a=math.sqrt(5))
             else:
                 self.arg_init_method(weight[e])
+
+    def _init_bias(self) -> None:
+        assert len(self.bias.shape) == 2
+        for e in range(self.bias.shape[0]):
+            bound = 1 / math.sqrt(self.input_size_per_partition) if self.input_size_per_partition > 0 else 0
+            torch.nn.init.uniform_(self.bias[e], -bound, bound)
 
     def forward(self, input_: torch.Tensor, expert_indices: Optional[torch.Tensor] = None) -> torch.Tensor:
         """If expert_indices is provided, then the computations are performed only on the specified experts.
@@ -340,7 +395,21 @@ class ExpertFusedRowParallelLinear(layers.RowParallelLinear, ExpertFusedLinear):
             output = mappings.reduce_from_tensor_model_parallel_region(
                 output_parallel, process_group=self.tensor_parallel_group,
             )
-            return output
         else:
             # Return without output all-reduce, in favor of an all-reduce or reduce-scatter after the MoE output combine.
-            return output_parallel
+            output = output_parallel
+
+        if self.bias is not None:
+            if expert_indices is not None:
+                bias = self.bias[expert_indices, :]
+            else:
+                bias = self.bias
+            # input dimensions are (e, 1, c, h) or (e/ep, ep, c, h)
+            # bias dimensions are always (e, h) or (e/ep, h)
+            # outer dimensions will always be equal, we unsqueeze inner dimensions to 1s
+            bias = bias.unsqueeze(1).unsqueeze(2)
+        else:
+            bias = None
+        # Always add bias
+        output = (output + bias) if bias is not None else output
+        return output

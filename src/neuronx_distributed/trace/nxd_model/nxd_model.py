@@ -651,8 +651,9 @@ class NxDModel(torch.nn.Module, BaseNxDModel):
                     converted_dtypes,
                     torchscript_model.nxd_model.local_ranks_size,
                 ) if torchscript_model.nxd_model.state_initializer is not None else None,
-                torchscript_model.nxd_model.layout_transformer # these can remain opaque under torchscript, since it's opaque to python anyways
+                layout_transformer=None
             )
+            nxd_model.layout_transformer = torchscript_model.nxd_model.layout_transformer # these can remain opaque under torchscript, since it's opaque to python anyways
 
             # restore model_params
             nxd_model.model_params = [ModelParamInfo(param_info[0], param_info[1]) for param_info in torchscript_model.nxd_model.model_params]  # type: ignore[misc]

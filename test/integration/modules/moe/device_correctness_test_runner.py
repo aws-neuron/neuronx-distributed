@@ -222,8 +222,14 @@ def run_device_correctness_test(cfg: ExptCfg, output_tols, grad_tols):
             ut.nxd_init(
                 tp_degree=tp_degree, ep_degree=ep_degree, token_shuffle_group_size=token_shuffle_group_size, seed=it
             )
-            model_trn = ut.initialize_neuron_model(cfg_trn)
-            ut.match_expert_weights(model_trn, model_cpu, cfg.glu_mlp, cfg.moe_fused_tkg_enabled, cfg.shared_experts_sequence_parallel_enabled)
+            if cfg_trn.moe_fused_tkg_enabled:
+                transpose_shared_experts_weights = cfg_trn.moe_fused_tkg_kernel_enabled or (
+                    cfg_trn.moe_fused_tkg_kernel_enabled is None and cfg_trn.device == "xla"
+                ) or (cfg_trn.moe_fused_tkg_kernel_enabled is False and cfg_trn.shared_mlp_kernel_enabled is None and cfg_trn.device == "xla")
+            else:
+                transpose_shared_experts_weights = False
+            model_trn = ut.initialize_neuron_model(cfg_trn, transpose_shared_experts_weights=transpose_shared_experts_weights)
+            ut.match_expert_weights(model_trn, model_cpu, cfg.glu_mlp, transpose_shared_experts_weights, cfg.shared_experts_sequence_parallel_enabled)
             sequence_dimension = model_trn.sequence_dimension
             optimizer_cpu = None
             optimizer_trn = None
@@ -318,6 +324,11 @@ def run_device_correctness_test(cfg: ExptCfg, output_tols, grad_tols):
                         )
                         local_expert_index_trn = local_expert_index_trn.reshape(-1, cfg.top_k)
                         expert_index_trn = mappings.gather_from_sequence_parallel_region(local_expert_index_trn)
+
+                    if sequence_parallel_enabled and cfg.test_mode != "training":
+                        expert_index_trn = mappings.gather_from_sequence_parallel_region(expert_index_trn)
+                        router_logits_trn = mappings.gather_from_sequence_parallel_region(router_logits_trn)
+
                     ut.nxd_init(tp_degree=1, ep_degree=1, token_shuffle_group_size=1, seed=it)
                     local_expert_index_cpu = shard_batch(expert_index_cpu, cfg, dp_size, dp_rank, cfg.test_mode)
                     expert_mismatch_indices = set(
@@ -408,6 +419,9 @@ def run_device_correctness_test(cfg: ExptCfg, output_tols, grad_tols):
             if sequence_parallel_enabled:
                 # Compare with only output shard belonging to the TP rank
                 op_cpu = torch.tensor_split(op_cpu, tp_degree, dim=sequence_dimension)[tp_rank]
+                if cfg.test_mode != "training":
+                    # Gather Router logits across sequence parallel region
+                    router_logits_trn = mappings.gather_from_sequence_parallel_region(router_logits_trn)
 
             if cfg.test_mode == "training":
                 batch_dim = 1

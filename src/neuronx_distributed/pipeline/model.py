@@ -11,13 +11,7 @@ import torch_xla.core.xla_model as xm
 from torch import nn
 from torch.autograd.variable import Variable
 from torch_xla.distributed.parallel_loader import MpDeviceLoader
-from neuronx_distributed.utils import cpu_mode
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import _CHECKPOINT_PREFIX
-
-if not cpu_mode():
-    from torch_neuronx.xla_impl.ops import neuron_layer
-else:
-    def neuron_layer(x): return x
 
 from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.parallel_layers.grads import bucket_allreduce_gradients
@@ -241,9 +235,6 @@ class NxDPPModel(nn.Module):
         if transformer_layer_cls is None and manual_pp_partition is False:
             raise ValueError("NxDPPModel requires transformer_layer_cls as input")
         self.original_torch_module = module
-
-        # Add layer boundary markers in HLO
-        neuron_layer(transformer_layer_cls)
 
         # Public configs
         self.output_loss_value_spec = output_loss_value_spec

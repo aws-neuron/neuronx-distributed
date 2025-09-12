@@ -248,7 +248,7 @@ class MoEFusedTKGNkiAvailabilityTest(unittest.TestCase):
     def test_can_use_moe_fused_tkg_nki(self):
         for cfg in _generate_test_configs():
             hidden_states = torch.rand(cfg.batch_size, cfg.seq_len, cfg.hidden_size, dtype=cfg.dtype, device=cfg.device)
-            model = ut.initialize_neuron_model(cfg, move_to_device=False)
+            model = ut.initialize_neuron_model(cfg, move_to_device=False).moe_fused_tkg
             res = model._can_use_nki_kernel(cfg.test_kernel, hidden_states)
             assert res == cfg.result, f"Test failed for {cfg}"
 

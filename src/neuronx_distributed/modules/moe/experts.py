@@ -15,14 +15,35 @@ from neuronx_distributed.parallel_layers.mappings import (
 )
 from neuronx_distributed.parallel_layers.parallel_state import (
     get_expert_model_parallel_size,
+    get_expert_model_parallel_group,
     get_tensor_model_parallel_group,
 )
-
+from neuronx_distributed.utils.logger import get_logger
+from neuronx_distributed.modules.moe.model_utils import GLUType
+logger = get_logger()
 
 class Experts(Module):
     """Module which performs the expert MLP computations for the given hidden states.
     Expert Parallelism (EP), if enabled, is applied through scatter-gather optimization
     across TP ranks.
+
+    Arguments:
+        num_experts: Total number of experts in the model
+        hidden_size: Size of the hidden dimension
+        intermediate_size: Size of the intermediate dimension in the MLP
+        glu: Whether to use Gated Linear Units
+        activation_fn: Activation function to use
+        dtype: Data type for the module parameters
+        device: Device to place the module parameters on
+        bias: Whether to include bias terms in linear layers
+        glu_type: Type of GLU to use (GLU or SWIGLU)
+        hidden_act_scaling_factor: Scaling factor for hidden activations
+        hidden_act_bias: Bias term added to the linear layer in hidden activation
+        input_layer_init_method: Initialization method for input layers
+        output_layer_init_method: Initialization method for output layers
+        is_prefill: Whether this is used in prefill phase
+        tensor_model_parallel_group: Process group for tensor parallelism
+        expert_model_parallel_group: Process group for expert parallelism
     """
 
     def __init__(
@@ -34,18 +55,31 @@ class Experts(Module):
         activation_fn: Callable[[Tensor], Tensor],
         dtype: torch.dtype,
         device: torch.device,
+        bias: bool = False,
+        glu_type: Optional[GLUType] = GLUType.GLU,
+        hidden_act_scaling_factor: float = 1.,
+        hidden_act_bias: float = 0.,
         input_layer_init_method=None,
         output_layer_init_method=None,
+        is_prefill = True,
         tensor_model_parallel_group: Optional[ProcessGroup] = None,
+        expert_model_parallel_group: Optional[ProcessGroup] = None,
     ) -> None:
         super().__init__()
 
         self._glu = glu
+        if self._glu:
+            glu_type = GLUType.validate(glu_type)
+        self._glu_type = glu_type
         self._activation_fn = activation_fn
         self.num_experts = num_experts
+        self.hidden_act_scaling_factor = hidden_act_scaling_factor
+        self.hidden_act_bias = hidden_act_bias
         # todo: we can also generalize expert-parallel group
         self.tensor_parallel_group = tensor_model_parallel_group if \
             tensor_model_parallel_group is not None else get_tensor_model_parallel_group()
+        self.expert_model_parallel_group = expert_model_parallel_group if \
+            expert_model_parallel_group is not None else get_expert_model_parallel_group()
 
         if self._glu:
             self.gate_up_proj = ExpertFusedColumnParallelLinear(
@@ -56,11 +90,14 @@ class Experts(Module):
                 # we fuse up and gate projections to a single matmul. Later on in code
                 # we'll split the resulting output to yield up and gate matrices.
                 output_size=intermediate_size * 2,
+                bias=bias,
                 dtype=dtype,
                 device=device,
                 stride=2,
                 init_method=input_layer_init_method,
                 tensor_model_parallel_group=self.tensor_parallel_group,
+                expert_model_parallel_group=self.expert_model_parallel_group,
+                is_prefill=is_prefill,
             )
         else:
             self.up_proj = ExpertFusedColumnParallelLinear(
@@ -69,10 +106,13 @@ class Experts(Module):
                 num_experts=num_experts,
                 input_size=hidden_size,
                 output_size=intermediate_size,
+                bias=bias,
                 dtype=dtype,
                 device=device,
                 init_method=input_layer_init_method,
                 tensor_model_parallel_group=self.tensor_parallel_group,
+                expert_model_parallel_group=self.expert_model_parallel_group,
+                is_prefill=is_prefill,
             )
 
         self.down_proj = ExpertFusedRowParallelLinear(
@@ -81,11 +121,14 @@ class Experts(Module):
             num_experts=num_experts,
             input_size=intermediate_size,
             output_size=hidden_size,
-            reduce_output=get_expert_model_parallel_size() > 1,
+            bias=bias,
+            reduce_output=False,
             dtype=dtype,
             device=device,
             init_method=output_layer_init_method,
             tensor_model_parallel_group=self.tensor_parallel_group,
+            expert_model_parallel_group=self.expert_model_parallel_group,
+            is_prefill=is_prefill,
         )
 
     def forward(self, hidden_states: Tensor, expert_indices: Optional[Tensor] = None) -> Tensor:
@@ -123,7 +166,7 @@ class Experts(Module):
         # capacity is not divisible by TP degree.
         # num_tokens_divisible_by_tp = c % get_tensor_model_parallel_size() == 0
 
-        if get_expert_model_parallel_size() > 1:
+        if self.expert_model_parallel_group.size() > 1 and self.training:
             # (e, c, h) -> (e/ep, ep, c, h)
             dispatched_hidden_states = enter_expert_parallel_region(
                 hidden_states,
@@ -147,7 +190,7 @@ class Experts(Module):
         # (e/ep, ep, c, h)
         projected_states = self.down_proj.forward(intermediate_states, expert_indices=expert_indices)
 
-        if get_expert_model_parallel_size() > 1:
+        if self.expert_model_parallel_group.size() > 1 and self.training:
             # (e/ep, ep, c, h) -> (e, c, h)
             output = exit_expert_parallel_region(
                 projected_states,
@@ -162,7 +205,15 @@ class Experts(Module):
 
     def _activation(self, x: Tensor) -> Tensor:
         if self._glu:
-            gate, up = torch.chunk(x, chunks=2, dim=-1)
-            return self._activation_fn(gate) * up
+            if self._glu_type == GLUType.GLU:
+                gate, up = torch.chunk(x, chunks=2, dim=-1)
+                return self._activation_fn(self.hidden_act_scaling_factor * gate) * (up + self.hidden_act_bias)
+            elif self._glu_type == GLUType.SWIGLU:
+                gate, up = torch.chunk(x, chunks=2, dim=-1)
+                gate = gate * self._activation_fn(self.hidden_act_scaling_factor * gate)
+                out = gate * (up + self.hidden_act_bias)
+                return out
+            else:
+                raise NotImplementedError(f"Only supports glu_type='glu', 'swiglu', got {self._glu_type}")
         else:
             return self._activation_fn(x)

@@ -387,7 +387,8 @@ def initialize_model_parallel(
     expert_model_parallel_size: int = 1,
     skip_collective_init: bool = False,
     lnc_size: int = 1,
-) -> None:
+    mesh_only: bool = False,
+):
     """
     Initialize model data parallel groups.
 
@@ -396,6 +397,7 @@ def initialize_model_parallel(
         tensor_model_parallel_size: number of Neuron devices used to parallelize model tensor.
         context_parallel_size: number of Neuron devices used to parallelize model sequence.
         expert_model_parallel_size: number of Neuron devices used to parallelize MoE experts.
+        mesh_only: if True, only group mesh will be returned instead of creating ProcessGroup.
 
     mental model:
     WITHOUT EXPERT PARALLELISM (EP)
@@ -634,7 +636,7 @@ def initialize_model_parallel(
         logger.info("> initializing expert model parallel with size %d", expert_model_parallel_size)
         logger.info("> initializing data parallel (exp) with size %d", expert_data_parallel_size)
 
-    if not skip_collective_init and not cpu_mode():
+    if not skip_collective_init and not cpu_mode() and not mesh_only:
         # cut graph because compiler birsim cannot verify graph with rand()
         xm.mark_step()
         # We create a dummy neff and execute it across all workers in the world.
@@ -645,6 +647,23 @@ def initialize_model_parallel(
         temp = torch.rand([1], device="xla")
         torch.distributed.all_reduce(temp, group=torch.distributed.group.WORLD)
         xm.mark_step()
+    
+    allocate_ranks_fn = get_logic_chosen(lnc_size, _HARDWARE_TYPE, tp=tensor_model_parallel_size)
+
+    replica_groups = allocate_ranks_fn(lnc_size, cluster_ranks_nonexp, cluster_ranks_exp,
+                                        tensor_model_parallel_size, data_parallel_size, 
+                                        pipeline_model_parallel_size, expert_model_parallel_size,
+                                        expert_data_parallel_size, context_parallel_size)
+    
+    logger.info(rmsg(f"tp_groups: {replica_groups.tp_groups=}"))
+    logger.info(rmsg(f"dp_groups: {replica_groups.dp_groups=}"))
+    logger.info(rmsg(f"pp_groups: {replica_groups.pp_groups=}"))
+    logger.info(rmsg(f"cp_groups: {replica_groups.cp_groups=}"))
+    logger.info(rmsg(f"ep_model_groups: {replica_groups.ep_model_groups=}"))
+    logger.info(rmsg(f"ep_data_groups: {replica_groups.ep_data_groups=}"))
+
+    if mesh_only:
+        return replica_groups
 
     rank = torch.distributed.get_rank()
     compress_rg = not skip_collective_init and os.environ.get("NEURON_EXPERIMENTAL_COMPRESS_RG", "0") == "1"
@@ -656,21 +675,6 @@ def initialize_model_parallel(
         mesh=world_ranks,
         compress_rg=False,
     )
-    
-    allocate_ranks_fn = get_logic_chosen(lnc_size, _HARDWARE_TYPE, tp=tensor_model_parallel_size)
-
-    replica_groups = allocate_ranks_fn(lnc_size, cluster_ranks_nonexp, cluster_ranks_exp,
-                                        tensor_model_parallel_size, data_parallel_size, 
-                                        pipeline_model_parallel_size, expert_model_parallel_size,
-                                        expert_data_parallel_size, context_parallel_size)
-    
-
-    logger.info(rmsg(f"tp_groups: {replica_groups.tp_groups=}"))
-    logger.info(rmsg(f"dp_groups: {replica_groups.dp_groups=}"))
-    logger.info(rmsg(f"pp_groups: {replica_groups.pp_groups=}"))
-    logger.info(rmsg(f"cp_groups: {replica_groups.cp_groups=}"))
-    logger.info(rmsg(f"ep_model_groups: {replica_groups.ep_model_groups=}"))
-    logger.info(rmsg(f"ep_data_groups: {replica_groups.ep_data_groups=}"))
 
     _build_and_assign_groups(
         group_name="_TENSOR_MODEL_PARALLEL_GROUP",

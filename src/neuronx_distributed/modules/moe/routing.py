@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import Optional, Dict, Any
 
 import torch
 from torch.distributed import ProcessGroup
@@ -20,6 +20,7 @@ class RouterBase(torch.nn.Module, ABC):
         dtype: Datatype for the layer weights.
         device: Device for the layer weights.
         jitter_eps: Random noise factor for input perturbation.
+        store_transposed_weights: Whether to register transposed router weights in the buffer.
     """
 
     def __init__(
@@ -32,8 +33,11 @@ class RouterBase(torch.nn.Module, ABC):
         sequence_dimension: Optional[int],
         dtype: torch.dtype,
         device: torch.device,
+        bias: bool = False,
         tensor_model_parallel_group: Optional[ProcessGroup] = None,
         jitter_eps: float = 0.0,
+        store_transposed_weights: bool = False,
+        apply_act_fn_over_topk: bool = False,
     ):
         super().__init__()
         self.num_experts = num_experts
@@ -53,7 +57,10 @@ class RouterBase(torch.nn.Module, ABC):
 
         self.dtype = dtype
         self.device = device
+        self.bias = bias
         self.jitter_eps = jitter_eps
+        self.store_transposed_weights = store_transposed_weights
+        self.apply_act_fn_over_topk = apply_act_fn_over_topk
 
         # TODO: Refactor with expert MLPv2 design to include parallel groups as mandatory arg
         if get_expert_model_parallel_size() > 1:
@@ -63,26 +70,36 @@ class RouterBase(torch.nn.Module, ABC):
                 tensor_model_parallel_group is not None else get_tensor_model_parallel_group()
 
         # Create router
-        self.linear_router = torch.nn.Linear(hidden_size, num_experts, dtype=dtype, device=device, bias=False)
+        self.linear_router = torch.nn.Linear(hidden_size, num_experts, dtype=dtype, device=device, bias=bias)
+        if self.store_transposed_weights:
+            self.weight_T = torch.nn.Parameter(self.linear_router.weight.detach().T.clone())
         setattr(self.linear_router.weight, "sequence_parallel_enabled", sequence_parallel_enabled)
 
-    def get_router_logits_and_expert_affinities(self, hidden_states):
+    def _if_training_gather_for_sp(self):
+        """Determines when to gather from sequence parallel region based on mode.
+            - training: gather router logits before activation
+            - inference: delayed gather expert affinities mask and expert index
         """
-        Returns the router logits and expert affinities.
-        Note that this function always returns the logits and affinities corresponding to the full hidden states, by handling 
+        return self.sequence_parallel_enabled and self.training
+
+    def get_router_logits(self, hidden_states):
+        """
+        Returns the router logits.
+        Note that this function always returns the logits corresponding to the full hidden states, by handling
         sequence parallelism internally.
         """
-
+        original_hidden_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(dtype=self.linear_router.weight.dtype)
         # Add noise to the input tensor by applying jitter.
         if self.jitter_eps != 0.0 and self.training:
             hidden_states *= torch.empty_like(hidden_states).uniform_(
                 1.0 - self.jitter_eps, 1.0 + self.jitter_eps
             )
 
-        # router_logits: (*, H) @ (H, E) -> (*, E)            
+        # router_logits: (*, H) @ (H, E) -> (*, E)
         router_logits = self.linear_router(hidden_states)
 
-        if self.sequence_parallel_enabled:
+        if self._if_training_gather_for_sp():
             # Gather the router_logits across ranks
             router_logits = mappings.gather_from_sequence_parallel_region(
                 router_logits,
@@ -93,19 +110,20 @@ class RouterBase(torch.nn.Module, ABC):
 
         # Flatten S and B to T dimension
         router_logits = router_logits.view(-1, self.num_experts)
+        hidden_states = hidden_states.to(dtype=original_hidden_dtype)
+        return router_logits
 
+    def apply_activation_fn(self, weights):
         # Perform activation in fp64 to prevent auto-downcasting of operation to bf16, for numerical accuracy
         # expert_affinities: (T, E)
         if self.act_fn == "sigmoid":
-            expert_affinities = torch.sigmoid(router_logits.to(dtype=torch.float64))
+            expert_affinities = torch.sigmoid(weights.to(dtype=torch.float64))
         elif self.act_fn == "softmax":
-            expert_affinities = F.softmax(router_logits, dim=1, dtype=torch.float64)
+            expert_affinities = F.softmax(weights, dim=1, dtype=torch.float64)
         else:
             raise ValueError("act_fn must be either 'sigmoid' or 'softmax'")
 
-        # Cast to required dtype
-        expert_affinities = expert_affinities.to(dtype=hidden_states.dtype)
-        return router_logits, expert_affinities
+        return expert_affinities
 
     @abstractmethod
     def forward(self, hidden_states):
@@ -117,7 +135,7 @@ class RouterBase(torch.nn.Module, ABC):
 
         Arguments:
             hidden_states: Input tensor of shape (S, B, H) or (B, S, H)
-                           If self.sequence_parallel_enabled is True, then hidden_states is assumed to be sharded in SP. 
+                           If self.sequence_parallel_enabled is True, then hidden_states is assumed to be sharded in SP.
 
         Returns:
             router_logits: Tensor of shape (T, E) containing the router logits for each token for each expert.
@@ -126,6 +144,12 @@ class RouterBase(torch.nn.Module, ABC):
                           During training, the expert_index may be different from the expert with the maximum affinity for a token
                           (if the router performs any token balancing, e.g. Sinkhorn).
         """
+
+    def preshard_hook(self, model_state_dict: Dict[str, Any], prefix: str) -> None:
+        if self.store_transposed_weights:
+            original_key = prefix.removesuffix("router.weight") + "router.linear_router.weight"
+            transposed_key = prefix.removesuffix("router.weight") + "router.weight_T"
+            model_state_dict[transposed_key] = model_state_dict[original_key].detach().transpose(0, 1).clone()
 
 
 class RouterTopK(RouterBase):
@@ -142,9 +166,12 @@ class RouterTopK(RouterBase):
         sequence_dimension: Optional[int] = None,
         dtype: torch.dtype = torch.float32,
         device: torch.device = torch.device("cpu"),
+        bias: bool = False,
         tensor_model_parallel_group: Optional[ProcessGroup] = None,
         act_fn="softmax",
+        apply_act_fn_over_topk: bool = False,
         jitter_eps: float = 0.0,
+        store_transposed_weights: bool = False,
     ):
         super().__init__(
             num_experts=num_experts,
@@ -155,17 +182,29 @@ class RouterTopK(RouterBase):
             sequence_dimension=sequence_dimension,
             dtype=dtype,
             device=device,
+            bias=bias,
             tensor_model_parallel_group=tensor_model_parallel_group,
             jitter_eps=jitter_eps,
+            store_transposed_weights=store_transposed_weights,
+            apply_act_fn_over_topk=apply_act_fn_over_topk,
         )
 
     def forward(self, hidden_states):
         # Get router_logits and expert_affinities
-        router_logits, expert_affinities = self.get_router_logits_and_expert_affinities(hidden_states)
+        router_logits = self.get_router_logits(hidden_states)
+        if self.apply_act_fn_over_topk:
+            expert_affinities = torch.zeros_like(router_logits, dtype=torch.float64)
+            topk_weights, expert_index = torch.topk(router_logits.to(torch.float64), self.top_k, dim=1)
+            topk_affinities = self.apply_activation_fn(topk_weights)
+            expert_affinities = expert_affinities.scatter_(1, expert_index, topk_affinities)
+        else:
+            expert_affinities = self.apply_activation_fn(router_logits)
+            # For each token, get the top_k experts
+            # expert_index: (T, top_k)
+            _, expert_index = torch.topk(router_logits, self.top_k)
 
-        # For each token, get the top_k experts
-        # expert_index: (T, top_k)
-        _, expert_index = torch.topk(router_logits, self.top_k)
+        # Cast to required dtype
+        expert_affinities = expert_affinities.to(dtype=hidden_states.dtype)
         expert_index = expert_index.detach().to(dtype=torch.long)
 
         return router_logits, expert_affinities, expert_index
@@ -218,7 +257,10 @@ class RouterSinkhorn(RouterBase):
 
     def forward(self, hidden_states):
         # Get router_logits and expert_affinities
-        router_logits, expert_affinities = self.get_router_logits_and_expert_affinities(hidden_states)
+        router_logits = self.get_router_logits(hidden_states)
+        expert_affinities = self.apply_activation_fn(router_logits)
+        # Cast to required dtype
+        expert_affinities = expert_affinities.to(dtype=hidden_states.dtype)
 
         with torch.no_grad():
             if self.training:
@@ -336,7 +378,11 @@ class GroupLimitedRouter(RouterBase):
                 - expert_weights: Weights for each selected expert
                 - topk_idx: Indices of selected experts
         """
-        router_logits, expert_affinities = self.get_router_logits_and_expert_affinities(hidden_states)
+        router_logits = self.get_router_logits(hidden_states)
+        expert_affinities = self.apply_activation_fn(router_logits)
+        # Cast to required dtype
+        expert_affinities = expert_affinities.to(dtype=hidden_states.dtype)
+
         topk_idx, expert_weights = self.noaux_tc_top_k(expert_affinities)
         topk_idx = topk_idx.detach().to(dtype=torch.long)
 
@@ -411,5 +457,3 @@ class GroupLimitedRouter(RouterBase):
         return group_mask.unsqueeze(-1).expand(
             batch_size, self.n_group, self.num_experts // self.n_group
         ).reshape(batch_size, -1)
-
-

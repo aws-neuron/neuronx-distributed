@@ -15,7 +15,15 @@ class Logger:
             exist = os.path.exists(tb_dir)
             if exist:
                 shutil.rmtree(tb_dir)
-            self.writer = SummaryWriter(log_dir=tb_dir)
+            self.writer = SummaryWriter(os.path.join(
+                tb_dir,
+                f"neuron_tblogs_{time.strftime('%m%d%y_%H%M')}"
+                f"_lr{args.lr}"
+                f"_bs{args.num_microbatches}"
+                f"_acc{args.train_batch_size}"
+                f"_warmup{args.warmup_steps}"
+                f"_max{args.max_steps}"
+            ))
         else:
             self.writer = None
         self.throughputs = []
@@ -25,10 +33,10 @@ class Logger:
         iteration_time = end - start
         tps = throughput.get_throughput()
         print(
-            f"step {total_steps} step_time {iteration_time}s throughput {tps} seq/s loss {loss.detach().cpu().item()} grad norm {global_norm.item() if global_norm is not None else None}"
+            f"step {total_steps} step_time {iteration_time}s throughput {tps} seq/s step loss {loss.detach().cpu().item()} grad norm {global_norm.item() if global_norm is not None else None}"
         )
         if self.writer is not None:
-            self.writer.add_scalar("loss", loss.item(), total_steps)
+            self.writer.add_scalar("step loss", loss.item(), total_steps)
             if global_norm is not None:
                 self.writer.add_scalar("global_norm", global_norm.item(), total_steps)
             self.writer.add_scalar("lr", current_lr, total_steps)

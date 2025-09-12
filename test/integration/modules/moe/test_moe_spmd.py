@@ -17,7 +17,6 @@ from neuronx_distributed import parallel_layers
 from neuronx_distributed.modules.moe.shared_experts import SharedExperts
 from neuronx_distributed.modules.moe import MoE, ExpertMLPs, RouterTopK
 from neuronx_distributed.modules.moe.moe_configs import MoEFusedTKGConfig
-from neuronx_distributed.modules.moe.moe_fused_tkg import MoEFusedTKG
 from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.parallel_layers.mappings import (
     _reduce_scatter_along_dim,
@@ -116,30 +115,31 @@ def init_moe(cfg: ExptCfg):
         )
     else:
         shared_experts = None
-    router = RouterTopK(**router_args)
-    neuron_model = MoE(
-        router=router,
-        expert_mlps=expert_mlps,
-        return_router_logits=False,
-        sequence_parallel_enabled=cfg.input_is_sequence_parallel,
-        sequence_dimension=1,
-        shared_experts=shared_experts,
-    )
-    neuron_model.training = False
+    router = RouterTopK(**router_args, store_transposed_weights=cfg.moe_fused_tkg_enabled)
+
     if cfg.moe_fused_tkg_enabled is True:
         assert not cfg.router_sequence_parallel_enabled and not cfg.input_is_sequence_parallel
-        moe = neuron_model
-        post_attention_layernorm = ut.LlamaRMSNormV2(hidden_size=cfg.hidden_size, eps=cfg.rms_norm_eps)
         moe_fused_tkg_config = MoEFusedTKGConfig(
             quantized=False,
             moe_fused_kernel_enabled=cfg.moe_fused_tkg_kernel_enabled,
         )
-        neuron_model = MoEFusedTKG(
-            config=moe_fused_tkg_config,
-            post_attention_layernorm=post_attention_layernorm,
-            moe=moe,
-            return_router_logits=False,
-        )
+        rmsnorm = ut.LlamaRMSNormV2(hidden_size=cfg.hidden_size, eps=cfg.rms_norm_eps)
+    else:
+        moe_fused_tkg_config = None
+        rmsnorm = None
+    neuron_model = MoE(
+        router=router,
+        expert_mlps=expert_mlps,
+        return_router_logits=False,
+        return_expert_index=False,
+        sequence_parallel_enabled=cfg.input_is_sequence_parallel,
+        sequence_dimension=1,
+        shared_experts=shared_experts,
+        rmsnorm=rmsnorm,
+        init_tkg_module=cfg.moe_fused_tkg_enabled,
+        tkg_config=moe_fused_tkg_config,
+    )
+    neuron_model.training = False
 
     return neuron_model.eval()
 
@@ -259,14 +259,14 @@ def _generate_test_configs():
     if get_platform_lnc() == LogicalNCConfig.LNC_2:
         test_configs.extend(
             [
-                # ExptCfg(
-                #     batch_size=1,
-                #     seq_len=1,
-                #     dtype=torch.bfloat16,
-                #     early_expert_affinity_modulation=True,
-                #     moe_fused_tkg_enabled=True,
-                #     **get_model_config("llama4-100b"),
-                # ),
+                ExptCfg(
+                    batch_size=1,
+                    seq_len=1,
+                    dtype=torch.bfloat16,
+                    early_expert_affinity_modulation=True,
+                    moe_fused_tkg_enabled=True,
+                    **get_model_config("llama4-100b"),
+                ),
                 # This is currently broken, might be due to compiler regression
                 # ExptCfg(
                 #     batch_size=1,
@@ -278,7 +278,7 @@ def _generate_test_configs():
                 #     **get_model_config("llama4-100b"),
                 # ),
                 ExptCfg(
-                    batch_size=4, # Note batch_size=4 is not working with the alpha compiler wheel yet
+                    batch_size=4,
                     seq_len=1,
                     dtype=torch.bfloat16,
                     early_expert_affinity_modulation=True,
@@ -286,7 +286,15 @@ def _generate_test_configs():
                     **get_model_config("llama4-100b"),
                 ),
                 ExptCfg(
-                    batch_size=1,
+                    batch_size=8,
+                    seq_len=1,
+                    dtype=torch.bfloat16,
+                    early_expert_affinity_modulation=True,
+                    moe_fused_tkg_enabled=True,
+                    **get_model_config("llama4-100b"),
+                ),
+                ExptCfg(
+                    batch_size=16,
                     seq_len=1,
                     dtype=torch.bfloat16,
                     early_expert_affinity_modulation=True,
@@ -323,14 +331,16 @@ class TestMoERoutedAndSharedExperts(unittest.TestCase):
                     continue
                 neuron_checkpoint = copy.deepcopy(hf_checkpoint)
                 if moe_fused_tkg_enabled:
-                    neuron_checkpoint["moe.shared_experts.spmd_rank.rank"] = torch.arange(
-                        0, set_tp_degree(), dtype=torch.int32
-                    )
                     test_config.transpose_weights = True
-                else:
-                    neuron_checkpoint["shared_experts.spmd_rank.rank"] = torch.arange(
-                        0, set_tp_degree(), dtype=torch.int32
-                    )
+                    for name in list(neuron_checkpoint.keys()):
+                        if "moe_fused_tkg" in name:
+                            del neuron_checkpoint[name]
+                    # router weights are processed in preshard hook
+                    neuron_checkpoint["router.linear_router.weight"] = neuron_checkpoint["router.weight_T"].T.clone().contiguous()
+                    del neuron_checkpoint["router.weight_T"]
+                neuron_checkpoint["shared_experts.spmd_rank.rank"] = torch.arange(
+                    0, set_tp_degree(), dtype=torch.int32
+                )
                 test_config.input_is_sequence_parallel = input_is_sequence_parallel
                 if input_is_sequence_parallel:
                     load_module = _load_module_moe_sp

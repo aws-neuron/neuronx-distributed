@@ -7,7 +7,13 @@ import torch_xla.core.xla_model as xm
 from torch.distributed import ProcessGroup
 
 from neuronx_distributed.modules.moe.experts import Experts
-from neuronx_distributed.modules.moe.model_utils import ACT2FN, DEFAULT_SELECTIVE_LOADING_THRESHOLD, create_spmd_ranks
+from neuronx_distributed.modules.moe.model_utils import (
+    ACT2FN,
+    GLUType,
+    ACTFunc,
+    DEFAULT_SELECTIVE_LOADING_THRESHOLD,
+    get_kernel_activation_func_id,
+)
 from neuronx_distributed.modules.moe.blockwise import (
     BlockwiseMatmulNKIFunc,
     can_use_blockwise_matmul_nki,
@@ -17,19 +23,23 @@ from neuronx_distributed.modules.moe.blockwise import (
 )
 from neuronx_distributed.modules.moe.moe_configs import RoutedExpertsMLPOpsConfig, BlockwiseMatmulConfig
 from neuronx_distributed.parallel_layers import mappings
-from neuronx_distributed.parallel_layers import parallel_state
+from neuronx_distributed.parallel_layers import parallel_state, comm
 from neuronx_distributed.parallel_layers.layers import SPMDRank
 from neuronx_distributed.utils.tensor_utils import cumsum
 from neuronx_distributed.parallel_layers.parallel_state import (
     get_expert_model_parallel_group,
-    get_expert_model_parallel_size,
     get_tensor_model_parallel_group,
-    get_tensor_model_parallel_size,
     rmsg,
 )
 from neuronx_distributed.utils.logger import get_logger
 from neuronx_distributed.quantization.quantization_config import QuantizationType
 from neuronx_distributed.modules.moe.blockwise import augment_inputs_for_padded_blockwise_matmul
+from neuronx_distributed.modules.moe.moe_process_group import (
+    get_moe_tp_ep_group,
+    get_moe_ep_group,
+)
+import neuronxcc.nki.language as nl
+from neuronx_distributed.kernels.find_index import find_index_shard_rows
 
 logger = get_logger()
 
@@ -42,7 +52,13 @@ class ExpertMLPsV2(torch.nn.Module):
         return_bias: Whether to return the bias in the forward pass. Currently not supported.
         init_method: Function used for initializing the gate and up projection linear layer weights.
         dtype: Datatype for the layer weights.
+        sequence_parallel_enabled: Whether sequence parallel is enabled.
         device: Device for the layer weights.
+        tkg_tensor_model_parallel_group: when hybrid sharding is enabled, this will be the tensor_model_parallel_group for decode
+        tkg_expert_model_parallel_group: when hybrid sharding is enabled, this will be the expert_model_parallel_group for decode
+        cte_tensor_model_parallel_group: when hybrid sharding is enabled, this will be the tensor_model_parallel_group for prefill
+        cte_expert_model_parallel_group: when hybrid sharding is enabled, this will be the expert_model_parallel_group for prefill
+        enabled_hybrid_sharding: flag to enable hybrid sharding feature. In hybrid sharding expert_mlps will have different sharding strategy used for prefill and decode
     """
     def __init__(
         self,
@@ -50,61 +66,167 @@ class ExpertMLPsV2(torch.nn.Module):
         blockwise_matmul_config: BlockwiseMatmulConfig = BlockwiseMatmulConfig.default(),
         return_bias: bool = False,
         dtype: torch.dtype = torch.float32,
+        sequence_parallel_enabled: bool = False,
         device: torch.device = torch.device("cpu"),
         tensor_model_parallel_group: Optional[ProcessGroup] = None,
         expert_model_parallel_group: Optional[ProcessGroup] = None,
+        # The below 4 model_parallel_group will be needed for hybrid sharding
+        # For TKG we need 1 set of process group (tensor_model_parallel_group and expert_model_parallel_group)
+        # when sharding and doing collectives
+        # For CTE, we will need another set of process group for the same purpose
+        tkg_tensor_model_parallel_group: Optional[ProcessGroup] = None,
+        tkg_expert_model_parallel_group: Optional[ProcessGroup] = None,
+        cte_tensor_model_parallel_group: Optional[ProcessGroup] = None,
+        cte_expert_model_parallel_group: Optional[ProcessGroup] = None,
+        is_prefill = True,
+        enabled_hybrid_sharding=False,
         # spmd_rank will be removed once we support ReplicaID (P87857655)
     ):
         super().__init__()
         self.routed_experts_mlp_config = routed_experts_mlp_config
         self.blockwise_matmul_config = blockwise_matmul_config
+        self.sequence_parallel_enabled = sequence_parallel_enabled
         skip_dma = SkipMode(blockwise_matmul_config.skip_dma_token,blockwise_matmul_config.skip_dma_weight)
         setattr(self.blockwise_matmul_config,"skip_dma",skip_dma)
         self.validate_routed_experts_configs(routed_experts_mlp_config)
+        self.enabled_hybrid_sharding = enabled_hybrid_sharding
+
         if return_bias:
-            raise NotImplementedError("bias is currently unsupported for MoE")
+            raise NotImplementedError("Returning bias is currently unsupported for MoE")
         self.return_bias = return_bias
+
         self.tensor_parallel_group = tensor_model_parallel_group if \
             tensor_model_parallel_group is not None else get_tensor_model_parallel_group()
         self.expert_model_parallel_group = expert_model_parallel_group if \
             expert_model_parallel_group is not None else get_expert_model_parallel_group()
 
+        if enabled_hybrid_sharding:
+            assert tkg_tensor_model_parallel_group is not None
+            assert tkg_expert_model_parallel_group is not None
+            assert cte_tensor_model_parallel_group is not None
+            assert cte_expert_model_parallel_group is not None
+        else:
+            # This is added for old modeling code that does not pass in
+            # cte_tensor_model_parallel_group and cte_expert_model_parallel_group
+            cte_tensor_model_parallel_group = self.tensor_parallel_group if cte_tensor_model_parallel_group is None else cte_tensor_model_parallel_group
+            cte_expert_model_parallel_group = self.expert_model_parallel_group if cte_expert_model_parallel_group is None else cte_expert_model_parallel_group
+            tkg_tensor_model_parallel_group = self.tensor_parallel_group if tkg_tensor_model_parallel_group is None else tkg_tensor_model_parallel_group
+            tkg_expert_model_parallel_group = self.expert_model_parallel_group if tkg_expert_model_parallel_group is None else tkg_expert_model_parallel_group
+
+        self.dtype = dtype
+        self.device = device
+        self.is_prefill = is_prefill
+        self.enabled_hybrid_sharding = enabled_hybrid_sharding
+        # In current state, selective loading is not in EP.
         if routed_experts_mlp_config.enable_spmd_rank:
             # spmd_rank will be removed once we support ReplicaID (P87857655)
             self.spmd_rank = SPMDRank(
                 world_size=parallel_state.get_world_group().size(),
-                tensor_model_parallel_size=parallel_state.get_tensor_model_parallel_group().size(),
+                tensor_model_parallel_size=cte_tensor_model_parallel_group.size(),
             )
-        
-        if self.expert_model_parallel_group.size() > 1:
+            if enabled_hybrid_sharding:
+                self.spmd_rank_tkg = SPMDRank(
+                world_size=parallel_state.get_world_group().size(),
+                tensor_model_parallel_size=tkg_tensor_model_parallel_group.size(),
+                )
+
+        if cte_expert_model_parallel_group.size() > 1:
             logger.warning(f"enable_spmd_rank set to {self.routed_experts_mlp_config.enable_spmd_rank}, enable_spmd_rank must be set to True when using expert parallelism under SPMD flow")
 
-        self.mlp_op = Experts(
-            num_experts=routed_experts_mlp_config.num_experts,
-            hidden_size=routed_experts_mlp_config.hidden_size,
-            intermediate_size=routed_experts_mlp_config.intermediate_size,
-            glu=routed_experts_mlp_config.glu_mlp,
-            activation_fn=ACT2FN[routed_experts_mlp_config.hidden_act],
-            dtype=dtype,
-            device=device,
-            input_layer_init_method=routed_experts_mlp_config.input_layer_init_method,
-            output_layer_init_method=routed_experts_mlp_config.output_layer_init_method,
-            tensor_model_parallel_group=self.tensor_parallel_group,
-        )
-        self.dtype = dtype
-        self.device = device
-
-        if self.expert_model_parallel_group.size() > 1:
+        self.mlp_op = self.initialize_mlp_op(cte_tensor_model_parallel_group, cte_expert_model_parallel_group, True)
+        if cte_expert_model_parallel_group.size() > 1:
             self.spmd_rank.initialize_expert_indices(num_local_experts=self.mlp_op.gate_up_proj._n_local_experts)
 
+        if enabled_hybrid_sharding:
+            self.mlp_op_tkg = self.initialize_mlp_op(tkg_tensor_model_parallel_group, tkg_expert_model_parallel_group, False)
+            if tkg_expert_model_parallel_group.size() > 1:
+                self.spmd_rank_tkg.initialize_expert_indices(num_local_experts=self.mlp_op_tkg.gate_up_proj._n_local_experts)
+
+        self.moe_tensor_model_parallel_group = cte_tensor_model_parallel_group if is_prefill else tkg_tensor_model_parallel_group
+        self.moe_expert_model_parallel_group = cte_expert_model_parallel_group if is_prefill else tkg_expert_model_parallel_group
+
+    def initialize_mlp_op(self, tensor_model_parallel_group: ProcessGroup, expert_model_parallel_group: ProcessGroup, is_prefill: bool):
+        mlp_op = Experts(
+            num_experts=self.routed_experts_mlp_config.num_experts,
+            hidden_size=self.routed_experts_mlp_config.hidden_size,
+            intermediate_size=self.routed_experts_mlp_config.intermediate_size,
+            glu=self.routed_experts_mlp_config.glu_mlp,
+            activation_fn=ACT2FN[self.routed_experts_mlp_config.hidden_act],
+            dtype=self.dtype,
+            device=self.device,
+            bias=self.routed_experts_mlp_config.bias,
+            glu_type=self.routed_experts_mlp_config.glu_type,
+            hidden_act_scaling_factor=self.routed_experts_mlp_config.hidden_act_scaling_factor,
+            hidden_act_bias=self.routed_experts_mlp_config.hidden_act_bias,
+            input_layer_init_method=self.routed_experts_mlp_config.input_layer_init_method,
+            output_layer_init_method=self.routed_experts_mlp_config.output_layer_init_method,
+            tensor_model_parallel_group=tensor_model_parallel_group,
+            expert_model_parallel_group=expert_model_parallel_group,
+            is_prefill=is_prefill,
+        )
+        return mlp_op
+
+    def get_mlp_op(self):
+        """
+        This function selects the correct weight for mlp_op when hybrid_sharding is enabled
+        """
+        if self.is_prefill or not self.enabled_hybrid_sharding:
+            return self.mlp_op
+        else:
+            return self.mlp_op_tkg
+
+    def get_spmd_rank(self):
+        """
+        This function selects the correct weight for spmd_rank when hybrid_sharding is enabled
+        """
+        if self.is_prefill or not self.enabled_hybrid_sharding:
+            return self.spmd_rank
+        else:
+            return self.spmd_rank_tkg
+
     def preshard_hook(self, model_state_dict: Dict[str, Any], prefix: str) -> None:
-        if self.routed_experts_mlp_config.enable_spmd_rank :
-            prefix = prefix.removesuffix("weight")
+        prefix = prefix.removesuffix("weight")
+        create_spmd_ranks(
+            model_state_dict=model_state_dict,
+            prefix=prefix,
+            world_size=parallel_state.get_world_group().size(),
+            n_routed_experts=self.routed_experts_mlp_config.num_experts,
+            expert_model_parallel_group=self.moe_expert_model_parallel_group,
+            spmd_rank_name="spmd_rank"
+        )
+
+        # In hybrid sharding new keys will be created for gate_up_proj and down_proj for different sharding strategy
+        if self.enabled_hybrid_sharding:
+            old_prefix_down_proj_weight = f"{prefix}mlp_op.down_proj.weight"
+            new_prefix_down_proj_weight = f"{prefix}mlp_op_tkg.down_proj.weight"
+            old_prefix_gate_up_proj_weight = f"{prefix}mlp_op.gate_up_proj.weight"
+            new_prefix_gate_up_proj_weight = f"{prefix}mlp_op_tkg.gate_up_proj.weight"
+            old_prefix_down_proj_bias = f"{prefix}mlp_op.down_proj.bias"
+            new_prefix_down_proj_bias = f"{prefix}mlp_op_tkg.down_proj.bias"
+            old_prefix_gate_up_proj_bias = f"{prefix}mlp_op.gate_up_proj.bias"
+            new_prefix_gate_up_proj_bias = f"{prefix}mlp_op_tkg.gate_up_proj.bias"
+            duplicate_and_replace_prefixes(old_prefix_down_proj_weight, new_prefix_down_proj_weight, model_state_dict)
+            duplicate_and_replace_prefixes(old_prefix_gate_up_proj_weight, new_prefix_gate_up_proj_weight, model_state_dict)
+            duplicate_and_replace_prefixes(old_prefix_down_proj_bias, new_prefix_down_proj_bias, model_state_dict)
+            duplicate_and_replace_prefixes(old_prefix_gate_up_proj_bias, new_prefix_gate_up_proj_bias, model_state_dict)
+
+            # create another spmd_rank for decode
             create_spmd_ranks(
                 model_state_dict=model_state_dict,
                 prefix=prefix,
                 world_size=parallel_state.get_world_group().size(),
+                n_routed_experts=self.routed_experts_mlp_config.num_experts,
+                expert_model_parallel_group=get_moe_ep_group(prefill=False),
+                spmd_rank_name="spmd_rank_tkg",
             )
+            if self.routed_experts_mlp_config.bias:
+                model_state_dict[f"{prefix}mlp_op_tkg.down_proj.bias"] = model_state_dict[f"{prefix}mlp_op_tkg.down_proj.bias"] / get_moe_tp_ep_group(prefill=False).size()
+
+        if self.routed_experts_mlp_config.bias:
+                model_state_dict[f"{prefix}mlp_op.down_proj.bias"] = model_state_dict[f"{prefix}mlp_op.down_proj.bias"] / get_moe_tp_ep_group(prefill=True).size()
+
+        if self.routed_experts_mlp_config.bias:
+            model_state_dict[f"{prefix}mlp_op.down_proj.bias"] = model_state_dict[f"{prefix}mlp_op.down_proj.bias"] / self.moe_tensor_model_parallel_group.size()
 
     @staticmethod
     def validate_routed_experts_configs(routed_experts_mlp_config: RoutedExpertsMLPOpsConfig):
@@ -167,43 +289,41 @@ class ExpertMLPsV2(torch.nn.Module):
 
         return expert_affinities_masked
 
+    def get_sp_expert_masks_index(self, expert_affinities_masked: torch.tensor, expert_index: torch.tensor):
+            """Gather for Inference when sequence parallel enabled
+            Gathers expert affinities mask and indices from sequence parallel region and computes expert mask.
+
+            Args:
+                expert_affinities_masked: Tensor of shape (T, E) with masked expert affinities.
+                expert_index: Tensor of shape (T, top_k) with chosen expert indices.
+
+            Returns:
+                Tuple of (expert_affinities_masked, expert_mask, expert_index) after gathering from sequence parallel region.
+            """
+
+            expert_affinities_masked, expert_index = [
+                    mappings.gather_from_sequence_parallel_region(
+                        tensor,
+                        sequence_dimension=0,
+                        to_model_parallel=False,
+                        process_group=self.tensor_parallel_group,
+                    ) for tensor in (expert_affinities_masked, expert_index)
+                ]
+            expert_mask = (expert_affinities_masked > 0).to(torch.float64)
+            return expert_affinities_masked, expert_mask, expert_index
+
     def forward_all_experts(self, hidden_states, expert_affinities, expert_index, chosen_expert_indices=None):
         """Forward pass where all tokens are computed by all experts.
         This is equivalent to running forward_capacity_factor with full capacity (i.e. no token dropping), but
         by avoiding the permute/unpermute overhead.
         """
-
-        if get_expert_model_parallel_size() > 1:
-            raise NotImplementedError("Expert parallelism is not supported without capacity factor.")
-
-        num_experts = expert_affinities.shape[1]
-        if chosen_expert_indices is None:
-            assert num_experts == self.routed_experts_mlp_config.num_experts
-        else:
-            assert num_experts == chosen_expert_indices.shape[0]
-
-        # expert_mask: (T, E)
-        expert_mask = self.get_expert_mask(expert_index, num_experts)
-        # expert_affinities_masked: (T, E)
-        expert_affinities_masked = self.get_expert_affinities_masked(
-            expert_affinities, 
-            expert_mask, 
-            self.routed_experts_mlp_config.normalize_top_k_affinities,
-        )
-
-        # multiply expert affinity with hidden states
-        if self.routed_experts_mlp_config.early_expert_affinity_modulation:
-            mlp_input = torch.zeros_like(hidden_states)
-            for e in range(num_experts):
-                # TH * T1 -> TH
-                mlp_input += hidden_states * expert_affinities_masked[:, e].unsqueeze(1)
-        else:
-            mlp_input = hidden_states
+        mlp_op = self.get_mlp_op()
+        num_experts, expert_mask, expert_affinities_masked, mlp_input = self.setup_all_experts(hidden_states, expert_affinities, expert_index, chosen_expert_indices=chosen_expert_indices)
 
         # Pass all tokens through all experts
         # gate_up_proj: (1, T, H) @ (E, H, I) -> (E, T, I)
         # down_proj: (E, T, I) @ (E, I, H) -> (E, T, H)
-        mlp_output = self.mlp_op(mlp_input.unsqueeze(0), expert_indices=chosen_expert_indices)
+        mlp_output = mlp_op(mlp_input.unsqueeze(0), expert_indices=chosen_expert_indices)
 
         output = torch.zeros(
             hidden_states.shape[0], hidden_states.shape[1], device=hidden_states.device, dtype=hidden_states.dtype
@@ -220,6 +340,96 @@ class ExpertMLPsV2(torch.nn.Module):
 
         return output
 
+    def forward_all_experts_EP(
+        self,
+        hidden_states: torch.Tensor,
+        expert_affinities: torch.Tensor,
+        expert_index: torch.Tensor,
+        chosen_expert_indices: Optional[torch.Tensor] = None
+        ) -> torch.Tensor:
+        """Forward pass where all tokens are computed by all experts.
+        This is equivalent to running forward_capacity_factor with full capacity (i.e. no token dropping), but
+        by avoiding the permute/unpermute overhead.
+
+        Args:
+        hidden_states: Input tensor of shape (T, H) where T is batch_size * sequence_length and H is hidden dimension
+        expert_affinities: Expert routing weights of shape (T, E) where E is number of experts
+        expert_index: Selected expert indices of shape (T, TopK)
+        chosen_expert_indices: Optional tensor for chosen expert specific compute
+
+        """
+        assert not (self.routed_experts_mlp_config.early_expert_affinity_modulation and self.routed_experts_mlp_config.top_k > 1), \
+            "Early expert affinity modulation is not compatible with top_k > 1."
+        mlp_op = self.get_mlp_op()
+        spmd_rank = self.get_spmd_rank()
+        _, expert_mask, expert_affinities_masked, mlp_input = self.setup_all_experts(hidden_states, expert_affinities, expert_index, chosen_expert_indices=chosen_expert_indices)
+        T = hidden_states.shape[0]
+        num_local_experts = mlp_op.gate_up_proj._n_local_experts
+        # [T, E/ep_size]
+        local_expert_indices = spmd_rank.get_local_expert_indices()
+        broadcasted_local_expert_indices = torch.broadcast_to(local_expert_indices, (T, num_local_experts))
+        local_expert_affinities_masked = torch.gather(expert_affinities_masked, 1, broadcasted_local_expert_indices)
+        local_expert_mask = torch.gather(expert_mask, 1, broadcasted_local_expert_indices)
+
+        # Pass all tokens through all experts
+        # gate_up_proj: (1, T, H) @ (E/Ep, H, I) -> (E/Ep, T, I)
+        # down_proj: (E/Ep, T, I) @ (E/Ep, I, H) -> (E/Ep, T, H)
+        mlp_output = mlp_op(mlp_input.unsqueeze(0), expert_indices=chosen_expert_indices)
+
+        output = torch.zeros(
+            hidden_states.shape[0], hidden_states.shape[1], device=hidden_states.device, dtype=hidden_states.dtype
+        )
+        # Scale by expert affinity and combine output
+        if self.routed_experts_mlp_config.early_expert_affinity_modulation:
+            for e in range(num_local_experts):
+                # TH * T1 -> TH
+                output += mlp_output[e] * local_expert_mask[:, e].unsqueeze(1)
+        else:
+            for e in range(num_local_experts):
+                # TH * T1 -> TH
+                output += mlp_output[e] * local_expert_affinities_masked[:, e].unsqueeze(1)
+
+        return output
+
+    def setup_all_experts(
+        self,
+        hidden_states: torch.Tensor,
+        expert_affinities: torch.Tensor,
+        expert_index: torch.Tensor,
+        chosen_expert_indices: Optional[torch.Tensor] = None
+        ) -> torch.Tensor:
+        """
+        This is the common setup for forward_all_expert and forward_all_expert_EP, this function returns the global expert_mask,
+        expert_affinity_mask and mlp_input
+        """
+        num_experts = expert_affinities.shape[1]
+        if chosen_expert_indices is None:
+            assert num_experts == self.routed_experts_mlp_config.num_experts
+        else:
+            assert num_experts == chosen_expert_indices.shape[0]
+
+        # expert_mask: (T, E)
+        expert_mask = self.get_expert_mask(expert_index, num_experts)
+        # expert_affinities_masked: (T, E)
+        expert_affinities_masked = self.get_expert_affinities_masked(
+            expert_affinities,
+            expert_mask,
+            self.routed_experts_mlp_config.normalize_top_k_affinities,
+        )
+
+        if self.sequence_parallel_enabled and not self.training:
+            expert_affinities_masked, expert_mask, expert_index = self.get_sp_expert_masks_index(expert_affinities_masked, expert_index)
+
+        if self.routed_experts_mlp_config.early_expert_affinity_modulation:
+            mlp_input = torch.zeros_like(hidden_states)
+            # dense_expert_affinities_masked: (T, 1)
+            # This will only work for TopK = 1
+            dense_expert_affinities_masked = torch.gather(expert_affinities_masked, 1, expert_index)
+            mlp_input = hidden_states * dense_expert_affinities_masked
+        else:
+            mlp_input = hidden_states
+        return num_experts, expert_mask, expert_affinities_masked, mlp_input
+
     def forward_capacity_factor(self, hidden_states, expert_affinities, expert_index):
         """Forward pass for performing Expert MLP computations, where each expert has a fixed 'expert capacity',
         i.e. maximum number of tokens that it can process. This is necessary for maintaining static shapes in the
@@ -230,13 +440,23 @@ class ExpertMLPsV2(torch.nn.Module):
         Note that when capacity_factor >= num_experts / top_k, C = total_tokens (i.e. each expert can hold all
         input tokens, and therefore no tokens are dropped).
         """
-
+        mlp_op = self.get_mlp_op()
         total_tokens = hidden_states.shape[0]
 
         # compute expert capacity C = (total_tokens * top_k * Cf) / E
         expert_capacity = math.ceil(total_tokens * self.routed_experts_mlp_config.top_k * self.routed_experts_mlp_config.capacity_factor / self.routed_experts_mlp_config.num_experts)
         # expert_capacity can be upper bounded by total number of tokens, for the case when every token is routed to an expert
         expert_capacity = min(expert_capacity, total_tokens)
+
+        if self.sequence_parallel_enabled and not self.training:
+            expert_affinities, expert_index = [
+                    mappings.gather_from_sequence_parallel_region(
+                        tensor,
+                        sequence_dimension=0,
+                        to_model_parallel=False,
+                        process_group=self.tensor_parallel_group,
+                    ) for tensor in (expert_affinities, expert_index)
+            ]
 
         # expert_mask: (T, E)
         expert_mask = self.get_expert_mask(expert_index, self.routed_experts_mlp_config.num_experts)
@@ -250,8 +470,8 @@ class ExpertMLPsV2(torch.nn.Module):
 
         # expert_affinities_masked: (T, E)
         expert_affinities_masked = self.get_expert_affinities_masked(
-            expert_affinities, 
-            expert_mask, 
+            expert_affinities,
+            expert_mask,
             self.routed_experts_mlp_config.normalize_top_k_affinities
         )
 
@@ -302,7 +522,7 @@ class ExpertMLPsV2(torch.nn.Module):
 
         # Perform MLP operations
         # expert_aligned_output: (E, C, H)
-        expert_aligned_output = self.mlp_op(expert_aligned_hidden_states)
+        expert_aligned_output = mlp_op(expert_aligned_hidden_states)
 
         # convert back (E, C, H) into (C*E, H)
         permuted_output = expert_aligned_output.view(expert_capacity * self.routed_experts_mlp_config.num_experts, -1)
@@ -323,7 +543,7 @@ class ExpertMLPsV2(torch.nn.Module):
 
     def forward_selective_loading(self, hidden_states, expert_affinities, expert_index):
         """Forward pass which selectively loads only the experts chosen for each input token, during token generation."""
-
+        mlp_op = self.get_mlp_op()
         T = hidden_states.shape[0]
 
         # chosen_expert_affinities: (T, top_k)
@@ -338,12 +558,12 @@ class ExpertMLPsV2(torch.nn.Module):
         for t in range(T):
             if self.routed_experts_mlp_config.early_expert_affinity_modulation:
                 weighted_hidden = hidden_states[t].unsqueeze(0) * chosen_expert_affinities[t].unsqueeze(1)
-                mlp_output_t = self.mlp_op(weighted_hidden.unsqueeze(1), expert_indices=expert_index[t])
+                mlp_output_t = mlp_op(weighted_hidden.unsqueeze(1), expert_indices=expert_index[t])
                 output_t = torch.sum(mlp_output_t.squeeze(1), dim=0)
             else:
                 # gate_up_proj: (1, 1, H) @ (top_k, H, I) -> (top_k, 1, I)
                 # down_proj: (top_k, 1, I) @ (top_k, I, H) -> (top_k, 1, H)
-                mlp_output_t = self.mlp_op(hidden_states[t].unsqueeze(0).unsqueeze(1), expert_indices=expert_index[t])
+                mlp_output_t = mlp_op(hidden_states[t].unsqueeze(0).unsqueeze(1), expert_indices=expert_index[t])
                 # output_t: sum((top_k, H) * (top_k, 1), dim=0) -> H
                 output_t = torch.sum(mlp_output_t.squeeze(1) * chosen_expert_affinities[t].unsqueeze(1), dim=0)
             output_list.append(output_t)
@@ -366,21 +586,31 @@ class ExpertMLPsV2(torch.nn.Module):
         carefully. Larger block sizes result in better hardware utilization, but may also lead to large
         padding overheads (especially at smaller sequence lengths).
         """
+        mlp_op = self.get_mlp_op()
+        spmd_rank = self.get_spmd_rank() if self.routed_experts_mlp_config.enable_spmd_rank else None
         total_tokens, hidden_size = hidden_states.shape
 
         # num_blocks N = CEIL(((T*top_k)-(E-1))/ B) + (E-1)
         # N is the number of blocks needed in the worst case distribution of tokens to experts. Intuition below.
         # With top_k = 1, let E-1 experts be assigned 1 token each. They require 1 block each, and (E-1) total. The remaining
         # tokens are all assigned the same experts, and require CEIL((T-(E-1))/B) blocks. The formula holds for top_k > 1 also.
-        if self.expert_model_parallel_group.size() > 1 and not self.training:
-            assert self.mlp_op.gate_up_proj._n_local_experts == self.mlp_op.down_proj._n_local_experts
-            local_experts = self.mlp_op.gate_up_proj._n_local_experts
+        if self.moe_expert_model_parallel_group.size() > 1 and not self.training:
+            assert mlp_op.gate_up_proj._n_local_experts == mlp_op.down_proj._n_local_experts
+            local_experts = mlp_op.gate_up_proj._n_local_experts
         else:
             local_experts = self.routed_experts_mlp_config.num_experts
-        
+
         num_blocks = math.ceil((total_tokens * self.routed_experts_mlp_config.top_k - (local_experts - 1)) / self.blockwise_matmul_config.block_size) + local_experts - 1
         # Handle case where T*top_k is smaller than E. We will need atmost T*top_k blocks.
         num_blocks = min(num_blocks, total_tokens * self.routed_experts_mlp_config.top_k)
+        
+        # Get num_static_block from blockwise_matmul_config, if not set, the default num_static_blocks will be computed as
+        # NUM_STATIC_BLOCK = T * TopK / (EP_degree * B) 
+        # this estimation represent a perfect balance workload between workers.
+        if self.blockwise_matmul_config.num_static_blocks is not None:
+            num_static_blocks = self.blockwise_matmul_config.num_static_blocks
+        else:
+            num_static_blocks = int(math.ceil((total_tokens * self.routed_experts_mlp_config.top_k) / self.moe_expert_model_parallel_group.size() ) / self.blockwise_matmul_config.block_size)
 
         # expert_mask: (T, E). Still happens on all the experts, not just the local experts
         expert_mask = self.get_expert_mask(expert_index, self.routed_experts_mlp_config.num_experts)
@@ -391,14 +621,17 @@ class ExpertMLPsV2(torch.nn.Module):
             self.routed_experts_mlp_config.normalize_top_k_affinities,
         )
 
-        if self.expert_model_parallel_group.size() > 1 and not self.training:
+        if self.sequence_parallel_enabled and not self.training:
+            expert_affinities_masked, expert_mask, expert_index = self.get_sp_expert_masks_index(expert_affinities_masked, expert_index)
+
+        if self.moe_expert_model_parallel_group.size() > 1 and not self.training:
             # [T, E/ep_size]
-            local_expert_indices = self.spmd_rank.get_local_expert_indices()
+            local_expert_indices = spmd_rank.get_local_expert_indices()
             broadcasted_local_expert_indices = torch.broadcast_to(local_expert_indices, (total_tokens, local_experts))
 
             local_expert_mask = torch.gather(expert_mask, 1, broadcasted_local_expert_indices)
             local_expert_affinities_masked = torch.gather(expert_affinities_masked, 1, broadcasted_local_expert_indices)
-            # TODO: make EP work with optimized_block_to_token_mapping in the future, currently not supported. 
+            # TODO: make EP work with optimized_block_to_token_mapping in the future, currently not supported.
             ues_optimized_block_to_token_mapping = False
             logger.info("Expert Parallel Enabled for forward_blockwise\n" +
                         f"broadcasted_local_expert_indices: {broadcasted_local_expert_indices.shape}\n" +
@@ -412,29 +645,61 @@ class ExpertMLPsV2(torch.nn.Module):
             local_expert_affinities_masked = expert_affinities_masked
             ues_optimized_block_to_token_mapping = self.blockwise_matmul_config.optimized_block_to_token_mapping,
 
-        block_to_expert, token_position_to_id = self.get_blockwise_expert_and_token_mapping(
-            total_tokens=total_tokens,
-            num_blocks=num_blocks,
-            expert_mask=local_expert_mask,
-            expert_index=expert_index,
+        use_index_calc_kernel = self.can_use_index_calc_kernel(
+            T=total_tokens,
             block_size=self.blockwise_matmul_config.block_size,
-            device=hidden_states.device,
-            enable_spmd_rank=self.routed_experts_mlp_config.enable_spmd_rank,
-            spmd_rank=self.spmd_rank if self.routed_experts_mlp_config.enable_spmd_rank else None,
-            tensor_parallel_group=self.tensor_parallel_group,
-            optimized_block_to_token_mapping=ues_optimized_block_to_token_mapping,
-            parallelize_token_to_block_mapping=self.blockwise_matmul_config.parallelize_token_to_block_mapping,
-        )
+            E_local=local_experts,
+            logical_nc_config=self.blockwise_matmul_config.logical_nc_config,
+            tp_size=self.moe_tensor_model_parallel_group.size())
+        if self.moe_expert_model_parallel_group.size() > 1 and use_index_calc_kernel and not self.training:
+            # Enable kernel flow only for EP + inference (cte) cases.
+            block_to_expert, token_position_to_id = self.get_blockwise_expert_and_token_mapping_kernel(
+                num_blocks=num_blocks,
+                expert_mask=local_expert_mask,
+                block_size=self.blockwise_matmul_config.block_size,
+                device=hidden_states.device,
+                spmd_rank = spmd_rank,
+                tensor_parallel_group=self.moe_tensor_model_parallel_group,
+                logical_nc_config=self.blockwise_matmul_config.logical_nc_config,
+            )
+        else:
+            block_to_expert, token_position_to_id = self.get_blockwise_expert_and_token_mapping(
+                total_tokens=total_tokens,
+                num_blocks=num_blocks,
+                expert_mask=local_expert_mask,
+                expert_index=expert_index,
+                block_size=self.blockwise_matmul_config.block_size,
+                device=hidden_states.device,
+                enable_spmd_rank=self.routed_experts_mlp_config.enable_spmd_rank,
+                spmd_rank=spmd_rank if self.routed_experts_mlp_config.enable_spmd_rank else None,
+                tensor_parallel_group=self.moe_tensor_model_parallel_group,
+                optimized_block_to_token_mapping=ues_optimized_block_to_token_mapping,
+                parallelize_token_to_block_mapping=self.blockwise_matmul_config.parallelize_token_to_block_mapping,
+            )
+
+        if self.blockwise_matmul_config.use_shard_on_block_dynamic_while:
+            # shard-on-block dynamic while kernel will only use even-numbered idx element in conditions.
+            # Each loop iteration will process 2 blocks in shard-on-block dynamic while kernel.
+            conditions = self.get_block_conditions(self.blockwise_matmul_config.block_size, num_blocks, token_position_to_id)[::2]
+        elif self.blockwise_matmul_config.use_shard_on_intermediate_dynamic_while:
+            conditions = self.get_block_conditions(self.blockwise_matmul_config.block_size, num_blocks, token_position_to_id)
+        else:
+            conditions = None
 
         use_blockwise_matmul_nki = can_use_blockwise_matmul_nki(
             hidden_size=hidden_size,
-            intermediate_size_tp=self.mlp_op.down_proj.weight.shape[1],
+            intermediate_size_tp=mlp_op.down_proj.weight.shape[1],
             block_size=self.blockwise_matmul_config.block_size,
             glu_mlp=self.routed_experts_mlp_config.glu_mlp,
+            glu_type=self.routed_experts_mlp_config.glu_type,
+            act_fn=self.routed_experts_mlp_config.hidden_act,
             device=hidden_states.device,
             logical_nc_config=self.blockwise_matmul_config.logical_nc_config,
             use_block_parallel=self.blockwise_matmul_config.use_block_parallel,
+            use_shard_on_intermediate=self.blockwise_matmul_config.use_shard_on_intermediate_dynamic_while,
             use_torch_block_wise=self.blockwise_matmul_config.use_torch_block_wise,
+            use_bias=self.routed_experts_mlp_config.bias,
+            scaling_factor=self.routed_experts_mlp_config.hidden_act_scaling_factor,
         )
         if use_blockwise_matmul_nki:
             expert_affinities_scaling_mode = ExpertAffinityScaleMode.POST_SCALE
@@ -445,16 +710,20 @@ class ExpertMLPsV2(torch.nn.Module):
                 if self.blockwise_matmul_config.blockwise_nki_autograd_cls \
                 else BlockwiseMatmulNKIFunc
 
-            gate_up_proj_scale, down_proj_scale = getattr(self.mlp_op.gate_up_proj, "scale", None), getattr(self.mlp_op.down_proj, "scale", None)
+            gate_up_proj_scale, down_proj_scale = getattr(mlp_op.gate_up_proj, "scale", None), getattr(mlp_op.down_proj, "scale", None)
             if (gate_up_proj_scale is not None or down_proj_scale is not None) and \
-            QuantizationType.EXPERT_WISE_PER_CHANNEL_SYMMETRIC == self.mlp_op.gate_up_proj.quantization_type:
+            QuantizationType.EXPERT_WISE_PER_CHANNEL_SYMMETRIC == mlp_op.gate_up_proj.quantization_type:
                 assert self.blockwise_matmul_config.logical_nc_config == 2, "EXPERT_WISE_PER_CHANNEL_SYMMETRIC only supported for LNC=2"
 
+            # This will retrieve the activation function id based on glu_type and act_func
+            # Currently, SiLU should be used when glu_type == GLU_TYPE.GLU in NKI kernel
+            # Sigmoid should be used when glu_type == GLU_TYPE.SWIGLU
+            kernel_act_fn_id = get_kernel_activation_func_id(ACTFunc.validate(self.routed_experts_mlp_config.hidden_act), self.routed_experts_mlp_config.glu_type)
             return blockwise_nki_autograd_cls.apply(
                 hidden_states,
                 local_expert_affinities_masked,
-                self.mlp_op.gate_up_proj.weight,
-                self.mlp_op.down_proj.weight,
+                mlp_op.gate_up_proj.weight,
+                mlp_op.down_proj.weight,
                 token_position_to_id,
                 block_to_expert,
                 gate_up_proj_scale,
@@ -463,6 +732,11 @@ class ExpertMLPsV2(torch.nn.Module):
                 self.blockwise_matmul_config,
                 self.routed_experts_mlp_config.top_k > 1,
                 expert_affinities_scaling_mode,
+                conditions,
+                num_static_blocks,
+                mlp_op.gate_up_proj.bias if self.routed_experts_mlp_config.bias else None,
+                mlp_op.down_proj.bias if self.routed_experts_mlp_config.bias else None,
+                kernel_act_fn_id,
             )
         elif self.training:
             return self.forward_all_experts(hidden_states, expert_affinities, expert_index)
@@ -476,6 +750,117 @@ class ExpertMLPsV2(torch.nn.Module):
                 block_to_expert=block_to_expert,
                 pad_inputs_for_matmul=not self.blockwise_matmul_config.skip_dma_token,
             )
+
+    @staticmethod
+    def can_use_index_calc_kernel(
+        T: int,
+        block_size: int,
+        E_local: int,
+        logical_nc_config: int,
+        tp_size: int,
+    ) -> bool:
+        # The kernel outputs (E/EP, T) and we massage the data to (N*B,) for BWMM kernel input.
+        # If T is not divisible by the block_size, the kernel path is not supported.
+        if T % block_size != 0:
+            logger.warning(f"T {T} not divisible by block_size {block_size}, cannot use index calc kernel.")
+            return False
+        # The kernel currently runs on LNC2, sharidng along the expert dimension.
+        # This means each rank needs to have at least 2 experts --> min 128 experts needed on a node.
+        if not (E_local % (logical_nc_config * tp_size) == 0):
+            logger.warning(f"E_local {E_local} not divisible by {logical_nc_config * tp_size}, cannot use index calc kernel, will use non-kernel index calc path")
+            return False
+        return True
+
+    @staticmethod
+    def get_block_conditions(
+        block_size,
+        num_blocks,
+        token_position_to_id
+    ):
+        # Reshape the token positions into blocks
+        blocks = token_position_to_id.view(num_blocks, block_size)
+        # Check each block for non padded tokens (any position != -1)
+        conditions = torch.any(blocks != -1, dim=1).to(torch.int32)
+        return conditions
+
+    @staticmethod
+    def get_blockwise_expert_and_token_mapping_kernel(
+        num_blocks: int,
+        expert_mask: torch.tensor,
+        block_size: int,
+        device: torch.device,
+        spmd_rank: SPMDRank,
+        tensor_parallel_group: ProcessGroup,
+        logical_nc_config: int,
+    ):
+        '''
+        Equivalent function of get_blockwise_expert_and_token_mapping, but nstead of torch code,
+        this function uses a kernel to perform the index mapping.
+
+        The assumption is that the input is already EP sharded if we're in EP.
+
+        Args:
+            num_blocks: int, total number of blocks on this rank.
+            expert_mask: Tensor of shape (T,E), containing top_k-hot encoded experts for each token
+            block_size: int, block size of the blockwise matmul kernel.
+            device: device
+            spmd_rank: SPMDRank object for the local rank.
+            tensor_parallel_group: TP process group
+        Returns:
+            block_to_expert: Tensor of shape (num_blocks,), indicating which expert each block belongs to.
+            token_position_to_id: Tensor of shape (num_blocks*block_size,), mapping positions of tokens in
+                the flattened blocks to their indices in T.
+        '''
+        T, E_local = expert_mask.shape
+
+        # Run kernel in EP around the world.
+        tp_rank = torch.remainder(spmd_rank.get_rank(), tensor_parallel_group.size())
+        expert_mask = mappings.scatter_to_process_group_spmd(
+            expert_mask,
+            partition_dim=1,
+            rank=tp_rank,
+            process_group=tensor_parallel_group,
+        )
+
+        # Index calculation kernel --- ids_per_expert: (E_local/TP,T); tokens_per_expert: (E_local/TP,)
+        ids_per_expert, tokens_per_expert = find_index_shard_rows[nl.nc(logical_nc_config)](expert_mask.T.to(torch.int32), T, T)
+
+        # Gather kernel output --- ids_per_expert: (E_local,T); tokens_per_expert: (E_local,)
+        ids_per_expert, tokens_per_expert = xm.all_gather_bucketized(
+            [ids_per_expert, tokens_per_expert],
+            0,
+            comm._get_group_mesh(tensor_parallel_group)
+        )
+
+        # From this point onward, each rank within a TP group is doing duplicate work.
+        # TODO: make the code below more optimal.
+
+        # Turn kernel output into blocks.
+        T_B = T // block_size
+        ids_per_expert = ids_per_expert.reshape(E_local, T_B, block_size)
+
+        # Get mask of valid blocks
+        block_indices = torch.arange(T_B, device=device).unsqueeze(0)  # [1, T_B]
+        blocks_per_expert = ((tokens_per_expert + block_size - 1) // block_size).to(dtype=torch.long)  # (E_local,)
+        blocks_per_expert_expanded = blocks_per_expert.unsqueeze(1)  # (E_local, 1)
+        mask = block_indices < blocks_per_expert_expanded  # (E_local, T_B)
+
+        # Get index of valid blocks in the full num_blocks N.
+        position_in_N = torch.cumsum(mask, dim=1).to(dtype=torch.long)  # (E_local, T_B)
+        cumulative_blocks_per_expert = cumsum(blocks_per_expert_expanded)  # (E_local, 1)
+        position_in_N[1:] += cumulative_blocks_per_expert[:-1]  # (E_local, T_B)
+        position_in_N = position_in_N.masked_fill(torch.eq(mask, 0), 0).to(dtype=torch.long)  # (E_local, T_B)
+
+        # Shuffle blocks to turn (E_local, T_B, block_size) into (num_blocks * block_size) representation.
+        token_position_to_id = -1 * torch.ones((num_blocks+1, block_size), device=device, dtype=torch.long)
+        token_position_to_id[position_in_N] = ids_per_expert.to(torch.long)
+        token_position_to_id = token_position_to_id[1:].reshape(-1)  # (N*B,)
+
+        # Get the block to expert mapping.
+        block_ids = torch.arange(num_blocks, device=device, dtype=torch.long)  # (N, )
+        block_to_expert = torch.sum(block_ids.unsqueeze(1) >= cumulative_blocks_per_expert[:-1].squeeze(1), dim=1).to(torch.long)
+
+        return block_to_expert, token_position_to_id
 
     @staticmethod
     def get_blockwise_expert_and_token_mapping(
@@ -555,9 +940,9 @@ class ExpertMLPsV2(torch.nn.Module):
         # Initialize with -1 indices (which will remain as the indices of padding tokens)
         token_position_to_id = -1 * torch.ones(num_blocks * block_size + 1, device=device, dtype=torch.long)
 
-        if total_tokens % get_tensor_model_parallel_size() != 0:
+        if total_tokens % tensor_parallel_group.size() != 0:
             # Pad token_position_by_id_and_expert
-            num_pad = (-total_tokens) % get_tensor_model_parallel_size()
+            num_pad = (-total_tokens) % tensor_parallel_group.size()
             token_position_by_id_and_expert = F.pad(token_position_by_id_and_expert, (0, 0, 0, num_pad))
             tokens_idx = torch.arange(total_tokens + num_pad, device=device, dtype=torch.long)
         else:
@@ -576,15 +961,15 @@ class ExpertMLPsV2(torch.nn.Module):
         else:
             if enable_spmd_rank:
                 # use rank information is available at runtime in inference
-                # get world_rank from global rank
+                # get tp_rank from global rank
                 # note: we use `get_tensor_model_parallel_group()` here to parallelize within a single node
                 #       but may get replicated in multi-node case
-                world_rank = torch.remainder(spmd_rank.get_rank(), parallel_state.get_world_group().size())
+                tp_rank = torch.remainder(spmd_rank.get_rank(), tensor_parallel_group.size())
                 token_position_by_id_and_expert = mappings.scatter_to_process_group_spmd(
-                    token_position_by_id_and_expert, partition_dim=0, rank=world_rank, process_group=parallel_state.get_world_group(),
+                    token_position_by_id_and_expert, partition_dim=0, rank=tp_rank, process_group=tensor_parallel_group,
                 )
                 tokens_idx = mappings.scatter_to_process_group_spmd(
-                    tokens_idx, partition_dim=0, rank=world_rank, process_group=parallel_state.get_world_group(),
+                    tokens_idx, partition_dim=0, rank=tp_rank, process_group=tensor_parallel_group,
                 )
                 # Assemble token_position_to_id using chunk of token_position_by_id_and_expert and tokens_idx at each TP rank
                 # This generates small DMA transfers because of discontinuous writes, and benefits from distributing across TP ranks
@@ -592,7 +977,7 @@ class ExpertMLPsV2(torch.nn.Module):
                 token_position_to_id = token_position_to_id[1:]
                 # Accumulate results across TP ranks (use MAX to correctly account for the -1 index initialization)
                 token_position_to_id = mappings._reduce(
-                    token_position_to_id, computation=xm.REDUCE_MAX, process_group=parallel_state.get_world_group(),
+                    token_position_to_id, computation=xm.REDUCE_MAX, process_group=tensor_parallel_group,
                 )
             else:
                 # To avoid rank-specific computations, we do a reduce-scatter instead of a simple split
@@ -628,6 +1013,7 @@ class ExpertMLPsV2(torch.nn.Module):
         This is used when running on GPU, or when the blockwise NKI kernel is not compatible with the model
         configuration.
         """
+        mlp_op = self.get_mlp_op()
         total_tokens, hidden_size = hidden_states.shape
         output = torch.zeros(total_tokens, hidden_size, device=hidden_states.device, dtype=hidden_states.dtype)
         # this simulates the case (when using blockwise nki kernel) when skip_tokens in skip_dma is false,
@@ -649,12 +1035,12 @@ class ExpertMLPsV2(torch.nn.Module):
                 block_hidden_states = (
                     hidden_states[block_token_indices]
                     * expert_affinities_masked[block_token_indices, block_expert_idx.unsqueeze(0)].unsqueeze(1)).unsqueeze(0)
-                block_output = self.mlp_op(block_hidden_states, expert_indices=block_expert_idx.unsqueeze(0)).squeeze(0)
+                block_output = mlp_op(block_hidden_states, expert_indices=block_expert_idx.unsqueeze(0)).squeeze(0)
             else:
                 # block_hidden_states: (1, B, H)
                 block_hidden_states = hidden_states[block_token_indices].unsqueeze(0)
                 # block_mlp_output: (B, H)
-                block_mlp_output = self.mlp_op(block_hidden_states, expert_indices=block_expert_idx.unsqueeze(0)).squeeze(0)
+                block_mlp_output = mlp_op(block_hidden_states, expert_indices=block_expert_idx.unsqueeze(0)).squeeze(0)
                 # block_output: (B, H)
                 # FIXME: remove unsqueeze(0) from block_expert_idx.unsqueeze(0) would OOM
                 block_output = block_mlp_output * expert_affinities_masked[block_token_indices, block_expert_idx.unsqueeze(0)].unsqueeze(
@@ -703,6 +1089,11 @@ class ExpertMLPsV2(torch.nn.Module):
             expert_index: Tensor of shape (T, top_k), containing the 'chosen' experts for each token.
             seq_len: Sequence length S. Used to infer context encoding vs token generation in inference.
 
+            If sequence_parallel_enabled:
+                hidden_states: Tensor of shape (T, H).
+                expert_affinities: Tensor of shape (T//tp_degree, E)
+                expert_index: Tensor of shape (T//tp_degree, top_k)
+
         Returns:
             output: Output tensor of the same shape as hidden_states, obtained by passing each token through its assigned experts,
                     combined with the corresponding expert affinities.
@@ -728,14 +1119,17 @@ class ExpertMLPsV2(torch.nn.Module):
             total_tokens = hidden_states.shape[0]
             if seq_len == 1:
                 # Token generation
-                if get_expert_model_parallel_size() > 1:
-                    raise NotImplementedError("Expert parallelism is not supported in token generation.")
-
                 perc_experts_loaded = total_tokens * self.routed_experts_mlp_config.top_k / self.routed_experts_mlp_config.num_experts
                 if perc_experts_loaded >= DEFAULT_SELECTIVE_LOADING_THRESHOLD:
-                    return self.forward_all_experts(hidden_states, expert_affinities, expert_index)
+                    if self.moe_expert_model_parallel_group.size() > 1:
+                        return self.forward_all_experts_EP(hidden_states, expert_affinities, expert_index)
+                    else:
+                        return self.forward_all_experts(hidden_states, expert_affinities, expert_index)
                 else:
-                    return self.forward_selective_loading(hidden_states, expert_affinities, expert_index)
+                    if self.moe_expert_model_parallel_group.size() > 1:
+                        raise NotImplementedError("Selective Loading with Expert parallelism is not supported in token generation.")
+                    else:
+                        return self.forward_selective_loading(hidden_states, expert_affinities, expert_index)
             else:
                 # Context Encoding / Speculative Decoding
                 if self.routed_experts_mlp_config.capacity_factor is None:
@@ -752,3 +1146,53 @@ class ExpertMLPsV2(torch.nn.Module):
                         return self.forward_blockwise(hidden_states, expert_affinities, expert_index)
                 else:
                     return self.forward_capacity_factor(hidden_states, expert_affinities, expert_index)
+
+def create_spmd_ranks(
+    model_state_dict: Dict[str, Any],
+    prefix: str,
+    world_size,
+    n_routed_experts: int,
+    expert_model_parallel_group: ProcessGroup,
+    spmd_rank_name: str,
+):
+    # add weight for spmd rank
+    model_state_dict[f"{prefix}{spmd_rank_name}.rank"] = torch.arange(
+        0, world_size, dtype=torch.int32
+    )
+    if expert_model_parallel_group.size() > 1:
+        expert_indices = []
+        expert_ranks = []
+        for rank in range(world_size):
+            curr_expert_rank = parallel_state.get_expert_parallel_rank_from_global_rank(
+                rank=rank, expert_parallel_group=expert_model_parallel_group
+            )
+            curr_expert_indices = parallel_state.get_experts_for_expert_parallel_rank(
+                curr_expert_rank,
+                total_number_of_experts=n_routed_experts,
+                expert_model_parallel_size=expert_model_parallel_group.size(),
+            )
+            expert_indices.append(curr_expert_indices)
+            expert_ranks.append(curr_expert_rank)
+
+        model_state_dict[f"{prefix}{spmd_rank_name}.local_expert_indices"] = torch.tensor(
+            expert_indices, dtype=torch.int32
+        )
+        model_state_dict[f"{prefix}{spmd_rank_name}.ep_rank"] = torch.tensor(
+            expert_ranks, dtype=torch.int32
+        )
+
+def duplicate_and_replace_prefixes(old_prefix: str, new_prefix: str, model_state_dict: Dict[str, Any]):
+    """
+    This function is used by hybrid sharding to duplicate weight with key "old_prefix" with new_key "new_prefix"
+    in model_state_dict. The duplicated weight will be sharded with different sharding strategy.
+    """
+    old_keys = []
+    new_keys = []
+    for key in model_state_dict.keys():
+        if old_prefix in key:
+            new_key = key.replace(old_prefix, new_prefix)
+            new_keys.append(new_key)
+            old_keys.append(key)
+
+    for key_index in range(len(old_keys)):
+        model_state_dict[new_keys[key_index]] = model_state_dict[old_keys[key_index]]

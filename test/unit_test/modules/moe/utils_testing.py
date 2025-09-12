@@ -25,7 +25,6 @@ from neuronx_distributed.modules.moe.moe_configs import (
     MoEFusedTKGConfig,
     RoutedExpertsMLPOpsConfig,
 )
-from neuronx_distributed.modules.moe.moe_fused_tkg import MoEFusedTKG
 from neuronx_distributed.modules.moe.shared_experts import SharedExperts
 from neuronx_distributed.optimizer import NeuronEPZero1Optimizer, NeuronZero1Optimizer
 from neuronx_distributed.parallel_layers import parallel_state
@@ -297,26 +296,24 @@ def get_intermediate_size(cfg):
     return intermediate_size
 
 
-def match_expert_weights(model_trn, model_cpu, glu_mlp, moe_fused_tkg_enabled, run_shared_expert_in_sp=False):
+def match_expert_weights(model_trn, model_cpu, glu_mlp, transpose_shared_experts_weights=False, run_shared_expert_in_sp=False):
     """
     Copy expert weights from the CPU model to the TRN model. This is necessary
     under expert parallelism because NxD weight initialization currently does not
     take expert parallelism into account.
     """
 
-    if moe_fused_tkg_enabled:
-        module = model_cpu.moe.expert_mlps.mlp_op.gate_up_proj if glu_mlp else model_cpu.moe.expert_mlps.mlp_op.up_proj
-    else:
-        module = model_cpu.expert_mlps.mlp_op.gate_up_proj if glu_mlp else model_cpu.expert_mlps.mlp_op.up_proj
+    module = model_cpu.expert_mlps.mlp_op.gate_up_proj if glu_mlp else model_cpu.expert_mlps.mlp_op.up_proj
     num_experts = module.weight.shape[0]
     ep_degree = parallel_state.get_expert_model_parallel_size()
     ep_rank = parallel_state.get_expert_model_parallel_rank()
     tp_degree = parallel_state.get_tensor_model_parallel_size()
     tp_rank = parallel_state.get_tensor_model_parallel_rank()
+    # Shared expert should always be sharded on world size on TRN (because the reduction happens on world size).
+    # This needs to be hardcoded until hybrid parallelism is supported.
+    shared_expert_trn_tp_degree = parallel_state.get_world_group().size()
+    shared_expert_trn_tp_rank = torch.distributed.get_rank()
     num_local_experts = num_experts // ep_degree
-    expert_dim = 0
-    input_dim = 1
-    output_dim = 2
 
     # Record trn params that does not exist in cpu params
     missing_keys = []
@@ -328,10 +325,61 @@ def match_expert_weights(model_trn, model_cpu, glu_mlp, moe_fused_tkg_enabled, r
                 continue
             # Find corresponding parameter in CPU model
             cpu_param = cpu_params_dict[trn_name]
-            if "shared_experts" in trn_name and run_shared_expert_in_sp:
-                 trn_param.copy_(cpu_param.contiguous())
+            if "shared_experts" in trn_name:
+                if run_shared_expert_in_sp:
+                    trn_param.copy_(cpu_param.contiguous())
+                elif transpose_shared_experts_weights:
+                    input_dim = 0
+                    output_dim = 1
+                    if "up_proj" in trn_name:
+                        input_size, output_size = cpu_param.shape
+                        local_input_size = input_size // tp_degree
+                        weight_slice = cpu_param.narrow(input_dim, local_input_size * tp_rank, local_input_size)
+                        trn_param.copy_(weight_slice.T.clone())
 
+                    elif "gate_proj" in trn_name:
+                        input_size, output_size = cpu_param.shape
+                        local_input_size = input_size // tp_degree
+                        weight_slice = cpu_param.narrow(input_dim, local_input_size * tp_rank, local_input_size)
+                        trn_param.copy_(weight_slice.T.clone())
+
+                    elif "down_proj" in trn_name:
+                        input_size, output_size = cpu_param.shape
+                        stride = 1
+                        local_output_size = output_size // tp_degree // stride
+                        down_weight_slice = cpu_param.narrow(output_dim, local_output_size * tp_rank, local_output_size)
+                        trn_param.copy_(down_weight_slice.T.clone())
+                else:
+                    if "gate_up_proj" in trn_name:
+                        stride = 2
+                        slice_dim = 0
+                        slice_size = (cpu_param.size(slice_dim) // stride) // shared_expert_trn_tp_degree
+                        start_idx = shared_expert_trn_tp_rank * slice_size
+                        end_idx = start_idx + slice_size
+
+                        # Split the CPU tensor into gate and up projections
+                        gate_proj_tensor, up_proj_tensor = torch.tensor_split(cpu_param, stride, dim=slice_dim)
+                        
+                        # Get slices for both gate and up projections
+                        gate_slice = gate_proj_tensor[start_idx:end_idx]
+                        up_slice = up_proj_tensor[start_idx:end_idx]
+                        
+                        # Concatenate the slices back together
+                        trn_param.copy_(torch.cat([gate_slice, up_slice], dim=slice_dim))                    
+                    elif "up_proj" in trn_name or "gate_proj" in trn_name:
+                        slice_size = cpu_param.size(0) // shared_expert_trn_tp_degree
+                        start_idx = shared_expert_trn_tp_rank * slice_size
+                        end_idx = start_idx + slice_size
+                        trn_param.copy_(cpu_param[start_idx:end_idx])                    
+                    elif "down_proj" in trn_name:
+                        slice_size = cpu_param.size(1) // shared_expert_trn_tp_degree
+                        start_idx = shared_expert_trn_tp_rank * slice_size
+                        end_idx = start_idx + slice_size
+                        trn_param.copy_(cpu_param[:, start_idx:end_idx])                        
             elif "expert_mlp" in trn_name:
+                expert_dim = 0
+                input_dim = 1
+                output_dim = 2
                 if "gate_up_proj" in trn_name:
                     _, input_size, output_size = cpu_param.shape
                     stride = 2 if glu_mlp else 1
@@ -511,7 +559,7 @@ def get_router_act_fn(cfg: ExptCfg):
         return "sigmoid"
     raise AssertionError(f"Unknown supported implementation for get router activation function: {cfg.implementation}")
 
-def initialize_neuron_model(cfg, seed=0, move_to_device=True):
+def initialize_neuron_model(cfg, seed=0, move_to_device=True, transpose_shared_experts_weights=False):
     """
     Create a Neuron model, as specified in the config.
     """
@@ -546,13 +594,28 @@ def initialize_neuron_model(cfg, seed=0, move_to_device=True):
     )
     if cfg.implementation == "sbase":
         router = RouterSinkhorn(**router_args)
-    elif cfg.implementation == "topk" or cfg.implementation == "llama4":
+    elif cfg.implementation == "topk":
         router = RouterTopK(**router_args)
+    elif cfg.implementation == "llama4":
+        router = RouterTopK(**router_args, store_transposed_weights=cfg.moe_fused_tkg_enabled)
     else:
         raise AssertionError(f"Unknown implementation: {cfg.implementation}")
 
     expert_mlps = init_expert_mlps(cfg)
-    shared_experts = init_shared_experts(cfg)
+    shared_experts = init_shared_experts(cfg, transpose_weights=transpose_shared_experts_weights)
+
+    if cfg.moe_fused_tkg_enabled is True:
+        moe_fused_tkg_config = MoEFusedTKGConfig(
+            quantized=cfg.quantized,
+            moe_fused_kernel_enabled=cfg.moe_fused_tkg_kernel_enabled,
+            router_topk_kernel_enabled=cfg.router_topk_kernel_enabled,
+            expert_mlp_kernel_enabled=cfg.expert_mlp_kernel_enabled,
+            shared_mlp_kernel_enabled=cfg.shared_mlp_kernel_enabled,
+        )
+        rmsnorm = LlamaRMSNormV2(hidden_size=cfg.hidden_size, eps=cfg.rms_norm_eps)
+    else:
+        moe_fused_tkg_config = None
+        rmsnorm = None
     # Initialize model
     neuron_model = MoE(
         router=router,
@@ -562,27 +625,12 @@ def initialize_neuron_model(cfg, seed=0, move_to_device=True):
         sequence_parallel_enabled=cfg.sequence_parallel_enabled,
         sequence_dimension=sequence_dimension,
         shared_experts=shared_experts,
+        rmsnorm=rmsnorm,
         token_shuffle_group_size=parallel_state.get_token_shuffle_group_size(),
         token_shuffle_seed=42,
+        init_tkg_module=cfg.moe_fused_tkg_enabled,
+        tkg_config=moe_fused_tkg_config,
     )
-
-    if cfg.moe_fused_tkg_enabled is True:
-        moe = neuron_model
-        post_attention_layernorm = LlamaRMSNormV2(hidden_size=cfg.hidden_size, eps=cfg.rms_norm_eps)
-        moe_fused_tkg_config = MoEFusedTKGConfig(
-            quantized=cfg.quantized,
-            moe_fused_kernel_enabled=cfg.moe_fused_tkg_kernel_enabled,
-            router_topk_kernel_enabled=cfg.router_topk_kernel_enabled,
-            expert_mlp_kernel_enabled=cfg.expert_mlp_kernel_enabled,
-            shared_mlp_kernel_enabled=cfg.shared_mlp_kernel_enabled,
-        )
-        neuron_model = MoEFusedTKG(
-            config=moe_fused_tkg_config,
-            post_attention_layernorm=post_attention_layernorm,
-            moe=moe,
-            return_expert_index=return_expert_index,
-            return_router_logits=return_router_logits,
-        )
 
     stack_size = getattr(cfg, "stack_size", 1)
     if stack_size > 1:
@@ -610,6 +658,7 @@ def init_expert_mlps(cfg:ExptCfg):
             init_method=torch.nn.init.kaiming_uniform_,
             output_layer_init_method=torch.nn.init.kaiming_uniform_,
             glu_mlp=cfg.glu_mlp,
+            sequence_parallel_enabled=cfg.sequence_parallel_enabled,
             dtype=cfg.dtype,
             use_torch_block_wise=cfg.use_torch_block_wise,
             device=torch.device("cpu"),
@@ -661,6 +710,7 @@ def init_expert_mlps(cfg:ExptCfg):
         expert_mlps = ExpertMLPsV2(
             routed_experts_mlp_config=routed_experts_mlp_config,
             blockwise_matmul_config=blockwise_matmul_config,
+            sequence_parallel_enabled = cfg.sequence_parallel_enabled,
             dtype=cfg.dtype,
             return_bias=False,
         )
@@ -675,21 +725,21 @@ def init_expert_mlps(cfg:ExptCfg):
 
     return expert_mlps
 
-def init_shared_experts(cfg:ExptCfg):
+def init_shared_experts(cfg:ExptCfg, transpose_weights):
     if cfg.num_shared_experts == 0:
         return None
-    if cfg.moe_fused_tkg_enabled:
-        transpose_weights = cfg.moe_fused_tkg_kernel_enabled or (
-            cfg.moe_fused_tkg_kernel_enabled is None and cfg.device == "xla"
-        ) or (cfg.moe_fused_tkg_kernel_enabled is False and cfg.shared_mlp_kernel_enabled is None and cfg.device == "xla")
-    else:
-        transpose_weights = False
+    # Shared expert should always be sharded on world size on TRN (because the reduction happens on world size)
+    # This needs to be hardcoded until hybrid parallelism is supported.
+    tensor_model_parallel_group=parallel_state.get_world_group()
+    if cfg.device == "cpu":
+            tensor_model_parallel_group = parallel_state.get_tensor_model_parallel_group()
     return SharedExperts(
         hidden_size=cfg.hidden_size,
         intermediate_size=cfg.intermediate_size,
         num_shared_experts=cfg.num_shared_experts,
         fused_gate_up_projection=cfg.fused_gate_up_shared_expert,
         hidden_act=cfg.hidden_act,
+        tensor_model_parallel_group=tensor_model_parallel_group, 
         dtype=cfg.dtype,
         sequence_parallel_enabled=cfg.shared_experts_sequence_parallel_enabled,
         transpose_weights=transpose_weights,

@@ -432,7 +432,7 @@ class GQAQKVColumnParallelLinear(BaseParallelLinear):
         fuse_qkv: bool = True,
         reduce_dtype: torch.dtype = torch.float32,
     ):
-        super().__init__()
+        super().__init__(device=device)
 
         # Keep input parameters
         self.input_size = input_size

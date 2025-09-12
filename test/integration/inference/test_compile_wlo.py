@@ -65,8 +65,7 @@ class TestCompileWLO(unittest.TestCase):
 
         # Let 'key1' be the priority model
         mark_weights_for_wlo(
-            priority_model_trace_hlo=trace_artifacts['key1'].hlo,
-            priority_model_weight_name_to_idx=trace_artifacts['key1'].weight_name_to_idx,
+            trace_artifacts=trace_artifacts['key1']
         )
 
         wlo_artifacts = compile_wlo(
@@ -82,11 +81,8 @@ class TestCompileWLO(unittest.TestCase):
         # Subsequent model compilation
         for key in ['key2', 'key3']:
             apply_layout_transformation(
-                hlo_module=trace_artifacts[key].hlo,
-                flattener=trace_artifacts[key].flattener,
-                packer=trace_artifacts[key].packer,
-                metaneff=trace_artifacts[key].metaneff,
-                weight_name_to_idx=trace_artifacts[key].weight_name_to_idx,
+                trace_artifacts=trace_artifacts[key],
+                priority_model_trace_artifacts=trace_artifacts['key1'],
                 wlo_artifacts=wlo_artifacts,
                 key=key
             )
@@ -157,8 +153,7 @@ class TestCompileWLODistributed(unittest.TestCase):
 
         # Let 'key1' be the priority model
         mark_weights_for_wlo(
-            priority_model_trace_hlo=trace_artifacts['key1'].hlo,
-            priority_model_weight_name_to_idx=trace_artifacts['key1'].weight_name_to_idx,
+            trace_artifacts=trace_artifacts['key1']
         )
 
         wlo_artifacts = compile_wlo(
@@ -174,11 +169,8 @@ class TestCompileWLODistributed(unittest.TestCase):
         # Subsequent model compilation
         for key in ['key2', 'key3']:
             apply_layout_transformation(
-                hlo_module=trace_artifacts[key].hlo,
-                flattener=trace_artifacts[key].flattener,
-                packer=trace_artifacts[key].packer,
-                metaneff=trace_artifacts[key].metaneff,
-                weight_name_to_idx=trace_artifacts[key].weight_name_to_idx,
+                trace_artifacts=trace_artifacts[key],
+                priority_model_trace_artifacts=trace_artifacts['key1'],
                 wlo_artifacts=wlo_artifacts,
                 key=key
             )

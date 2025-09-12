@@ -2,6 +2,7 @@ from dataclasses import dataclass
 import importlib
 from typing import Any, Optional, Tuple
 
+from torch_neuronx.utils import get_platform_target
 from torch_neuronx.xla_impl.ops import nki_jit
 from neuronxcc.nki import jit
 
@@ -40,7 +41,7 @@ def import_nki(import_config: NKIImport) -> Tuple[Optional[Any], Optional[str]]:
             module = importlib.import_module(path)
             attr = getattr(module, import_config.name)
             if import_config.nki_jit_type == "use_jit_decorator":
-                return jit()(attr), None
+                return jit(platform_target = get_platform_target())(attr), None
             elif import_config.nki_jit_type == "use_nki_jit_decorator":
                 return nki_jit()(attr), None
             return attr, None

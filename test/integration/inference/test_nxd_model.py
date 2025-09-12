@@ -138,8 +138,7 @@ def trace_and_compile_model(
         if use_wlo:
             # Let 'key1' always be the priority model for test simplicity
             mark_weights_for_wlo(
-                priority_model_trace_hlo=trace_artifacts['key1'].hlo,
-                priority_model_weight_name_to_idx=trace_artifacts['key1'].weight_name_to_idx,
+                trace_artifacts=trace_artifacts['key1']
             )
             wlo_artifacts = compile_wlo(
                 hlo_module=trace_artifacts['key1'].hlo,
@@ -151,11 +150,7 @@ def trace_and_compile_model(
                 if key == 'key1':
                     continue
                 apply_layout_transformation(
-                    hlo_module=trace_artifacts[key].hlo,
-                    flattener=trace_artifacts[key].flattener,
-                    packer=trace_artifacts[key].packer,
-                    metaneff=trace_artifacts[key].metaneff,
-                    weight_name_to_idx=trace_artifacts[key].weight_name_to_idx,
+                    trace_artifacts=trace_artifacts[key],
                     wlo_artifacts=wlo_artifacts,
                     key=key
                 )
@@ -860,3 +855,24 @@ def test_nxd_model_load_dtype_conversion():
         for name, dtype in expected_dtypes.items():
             assert name in loaded_model.state_initializer.dtypes
             assert loaded_model.state_initializer.dtypes[name] == dtype
+
+
+def test_nxd_model_load_with_wlo():
+    inputs = {
+        'key1': (torch.rand(1,10), None),
+    }
+    world_size = 2
+    original_model = build_nxd_model(
+        partial(DenseMLP, True),
+        inputs,
+        world_size,
+        use_wlo=True
+    )
+
+    # Save and load the model
+    with tempfile.NamedTemporaryFile(suffix='.pt') as tmp:
+        original_model.save(tmp.name)
+        loaded_model = NxDModel.load(tmp.name)
+
+        assert isinstance(loaded_model, NxDModel)
+        assert loaded_model.layout_transformer is not None

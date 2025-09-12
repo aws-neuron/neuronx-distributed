@@ -285,11 +285,8 @@ class TestModelBuilderV2(unittest.TestCase):
 
         for key in ["bucket2", "bucket3"]:
             apply_layout_transformation(
-                hlo_module=trace_artifacts[key].hlo,
-                flattener=trace_artifacts[key].flattener,
-                packer=trace_artifacts[key].packer,
-                metaneff=trace_artifacts[key].metaneff,
-                weight_name_to_idx=trace_artifacts[key].weight_name_to_idx,
+                trace_artifacts=trace_artifacts[key],
+                priority_model_trace_artifacts=trace_artifacts["bucket1"],
                 wlo_artifacts=wlo_artifacts,
                 key=key
             )
@@ -705,7 +702,7 @@ class TestModelBuilderV2Distributed(unittest.TestCase):
                 attention_mask = torch.zeros(batch_size, 1, 1, seq_len)
                 attention_mask[:, :, :, :seq_len//2] = -10000.0  # Simulate padding
                 kwargs['attention_mask'] = attention_mask
-                
+
             if has_pos:
                 kwargs['position_embeddings'] = torch.rand(batch_size, seq_len, 1024)
                 
@@ -717,8 +714,7 @@ class TestModelBuilderV2Distributed(unittest.TestCase):
                 kwargs=kwargs,
                 tag=f"bucket{idx}"
             )
-        
-        # Compile with first bucket as priority
+
         nxd_model = builder.compile(priority_model_key="bucket1")
 
         self.assertIsInstance(nxd_model, neuronx_distributed.trace.nxd_model.NxDModel)
@@ -793,7 +789,7 @@ class TestModelBuilderV2Distributed(unittest.TestCase):
             )
         
         # Compile with first bucket as priority
-        nxd_model = builder.compile(priority_model_key="bucket1")
+        nxd_model = builder.compile()
         
         self.assertIsInstance(nxd_model, neuronx_distributed.trace.nxd_model.NxDModel)
         
@@ -884,11 +880,8 @@ class TestModelBuilderV2Distributed(unittest.TestCase):
 
         for key in ["bucket2", "bucket3"]:
             apply_layout_transformation(
-                hlo_module=trace_artifacts[key].hlo,
-                flattener=trace_artifacts[key].flattener,
-                packer=trace_artifacts[key].packer,
-                metaneff=trace_artifacts[key].metaneff,
-                weight_name_to_idx=trace_artifacts[key].weight_name_to_idx,
+                trace_artifacts=trace_artifacts[key],
+                priority_model_trace_artifacts=trace_artifacts["bucket1"],
                 wlo_artifacts=wlo_artifacts,
                 key=key
             )
