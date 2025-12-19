@@ -3,6 +3,7 @@ import torch
 from functools import partial
 
 from neuronx_distributed.trace.model_builder import ModelBuilder, BaseModelInstance
+from neuronx_distributed.utils.safetensors_utils import check_for_duplicate_tensors
 
 torch.manual_seed(0)
 
@@ -28,7 +29,10 @@ def test_shared_tensors_model():
     tp_degree = 2
 
     model = SharedTensorsModel(hidden_dim=hidden_dim)
-    torch.save(model.state_dict(), ckpt_path)
+
+    # check for duplicate tensors and delete them
+    checkpoint = check_for_duplicate_tensors(checkpoint=model.state_dict(), remove_duplicate_tensors=True)
+    torch.save(checkpoint, ckpt_path)
 
     builder = ModelBuilder(
         router=None,

@@ -244,7 +244,7 @@ class TopKConstants:
 
 
 def get_permutation_matrix(
-    block_size: int = 32, num_blocks: int = 1, dtype: Type[np.dtype] = np.float32
+    block_size: int = 32, num_blocks: int = 1, dtype: np.dtype = np.dtype(np.float32)
 ):
     shift = 1  # number of positions to roll
     # permutation base vector for circulant block

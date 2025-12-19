@@ -1,9 +1,10 @@
-from typing import Union, Optional, Callable, Any
+from typing import Union, Optional, Callable, Any, List
 
 import torch
 from neuronxcc.nki._private_kernels.blockwise_mm import BlockShardStrategy
 from torch.distributed import ProcessGroup
 
+from neuronx_distributed.modules.moe.experts import GLUType
 from neuronx_distributed.modules.moe.expert_mlps_v2 import ExpertMLPsV2
 from neuronx_distributed.modules.moe.model_utils import DEFAULT_BLOCK_SIZE, DEFAULT_LNC_SIZE
 from neuronx_distributed.modules.moe.moe_configs import RoutedExpertsMLPOpsConfig, BlockwiseMatmulConfig
@@ -45,6 +46,9 @@ class ExpertMLPs(ExpertMLPsV2):
         block_sharding_strategy: corresponds to different block parallel blockwise matmul kernel
         skip_dma: kernel optimizations for skip tokens and skip weights. When skip token is true, inputs to blockwise kernel do not need to be padded.
                   always_augment_inputs_for_blockwise_matmul: always pad the inputs to blockwise kernel regardless of the value of skip dma.
+        use_index_calc_kernel: if enabled, the index calculation kernel will be used if its conditions are satisfied, otherwise will fall back to
+                  default non-kernel path.
+        expert_distribution: The distribution of experts across different expert parallel groups.
     """
     def __init__(
         self,
@@ -55,8 +59,17 @@ class ExpertMLPs(ExpertMLPsV2):
         hidden_act: str,
         glu_mlp: bool,
         capacity_factor: Union[None, float],
+        sequence_parallel_enabled: bool = False,
         block_size: Union[None, int] = None,
         normalize_top_k_affinities: bool = False,
+        bias: bool = False,
+        glu_type: Optional[GLUType] = GLUType.GLU,
+        hidden_act_scaling_factor: float = 1.,
+        hidden_act_bias: float = 0.,
+        gate_clamp_upper_limit: Optional[float] = None,
+        gate_clamp_lower_limit: Optional[float] = None,
+        up_clamp_upper_limit: Optional[float] = None,
+        up_clamp_lower_limit: Optional[float] = None,
         return_bias: bool = False,
         init_method: Optional[Callable[..., Any]] = torch.nn.init.kaiming_uniform_,
         output_layer_init_method: Optional[Callable[..., Any]] = torch.nn.init.kaiming_uniform_,
@@ -75,13 +88,31 @@ class ExpertMLPs(ExpertMLPsV2):
         always_augment_inputs_for_blockwise_matmul: bool = False,
         block_sharding_strategy:BlockShardStrategy = BlockShardStrategy.HI_LO,
         skip_dma_token: bool = False,
-        skip_dma_weight: bool = False
+        skip_dma_weight: bool = False,
+        tkg_tensor_model_parallel_group: Optional[ProcessGroup] = None,
+        tkg_expert_model_parallel_group: Optional[ProcessGroup] = None,
+        cte_tensor_model_parallel_group: Optional[ProcessGroup] = None,
+        cte_expert_model_parallel_group: Optional[ProcessGroup] = None,
+        is_prefill = True,
+        enabled_hybrid_sharding = False,
+        use_shard_on_intermediate_dynamic_while = False,
+        use_shard_on_block_dynamic_while = False,
+        use_index_calc_kernel = False,
+        expert_distribution: Optional[List[List[int]]] = None
     ):
         routed_experts_mlp_config = RoutedExpertsMLPOpsConfig(
             num_experts=num_experts,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             glu_mlp=glu_mlp,
+            bias=bias,
+            glu_type=glu_type,
+            hidden_act_scaling_factor=hidden_act_scaling_factor,
+            hidden_act_bias=hidden_act_bias,
+            gate_clamp_upper_limit=gate_clamp_upper_limit,
+            gate_clamp_lower_limit=gate_clamp_lower_limit,
+            up_clamp_upper_limit=up_clamp_upper_limit,
+            up_clamp_lower_limit=up_clamp_lower_limit,
             normalize_top_k_affinities=normalize_top_k_affinities,
             early_expert_affinity_modulation=early_expert_affinity_modulation,
             input_layer_init_method=init_method,
@@ -90,8 +121,10 @@ class ExpertMLPs(ExpertMLPsV2):
             top_k=top_k,
             hidden_act=hidden_act,
             enable_spmd_rank=enable_spmd_rank,
+            use_index_calc_kernel=use_index_calc_kernel,
+            expert_distribution=expert_distribution,
         )
-  
+
         blockwise_matmul_config = BlockwiseMatmulConfig.from_kwargs(
             block_size=block_size if block_size else DEFAULT_BLOCK_SIZE,
             logical_nc_config=logical_nc_config,
@@ -104,16 +137,24 @@ class ExpertMLPs(ExpertMLPsV2):
             always_augment_inputs_for_blockwise_matmul=always_augment_inputs_for_blockwise_matmul,
             block_sharding_strategy=block_sharding_strategy,
             skip_dma_token=skip_dma_token,
-            skip_dma_weight=skip_dma_weight
+            skip_dma_weight=skip_dma_weight,
+            use_shard_on_intermediate_dynamic_while=use_shard_on_intermediate_dynamic_while,
+            use_shard_on_block_dynamic_while=use_shard_on_block_dynamic_while,
         )
 
         super().__init__(
              routed_experts_mlp_config =routed_experts_mlp_config,
              blockwise_matmul_config=blockwise_matmul_config,
+             sequence_parallel_enabled=sequence_parallel_enabled,
              dtype=dtype,
              device=device,
              return_bias=return_bias,
              tensor_model_parallel_group=tensor_model_parallel_group,
              expert_model_parallel_group=expert_model_parallel_group,
+             tkg_tensor_model_parallel_group=tkg_tensor_model_parallel_group,
+             tkg_expert_model_parallel_group=tkg_expert_model_parallel_group,
+             cte_tensor_model_parallel_group=cte_tensor_model_parallel_group,
+             cte_expert_model_parallel_group=cte_expert_model_parallel_group,
+             is_prefill = is_prefill,
+             enabled_hybrid_sharding = enabled_hybrid_sharding,
             )
-

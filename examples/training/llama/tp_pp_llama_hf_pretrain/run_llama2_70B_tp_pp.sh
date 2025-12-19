@@ -72,7 +72,7 @@ elif [ -v OMPI_COMM_WORLD_RANK ]; then
     export FI_EFA_FORK_SAFE=1
 
     # Dataset is in shared location
-    DATA_PATH="$SHARED_PATH_PREFIX/mars_data_set/examples_datasets/wikicorpus_llama${LLAMA_VERSION}_tokenized_4k"
+    DATA_PATH="$SHARED_PATH_PREFIX/wikicorpus_llama${LLAMA_VERSION}_tokenized_4k"
     
     # Store metrics in shared location
     METRICS_FILE=$ARTIFACT_PATH/results.json

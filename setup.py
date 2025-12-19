@@ -70,6 +70,7 @@ setup(
         "torch-xla",
         "safetensors",
         "tenacity",
+        "setuptools>=70.1"
     ],
     extras_require={
         "test": ["pytest", "pytest-forked", "pytest-cov", "pytest-xdist", "transformers==4.51.*"],

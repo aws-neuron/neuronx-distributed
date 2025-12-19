@@ -23,6 +23,7 @@ def _generate_test_configs():
                     "intermediate_size_tp": 2048,
                     "block_size": 512,
                     "glu_mlp": True,
+                    "glu_type": "glu",
                     "use_torch_block_wise": False,
                     "device": "xla",
                     "result": True
@@ -31,6 +32,7 @@ def _generate_test_configs():
                     "intermediate_size_tp": 2048,
                     "block_size": 512,
                     "glu_mlp": True,
+                    "glu_type": "glu",
                     "use_torch_block_wise": False,
                     "device": "cpu",
                     "result": False # should return false because of device type
@@ -39,6 +41,7 @@ def _generate_test_configs():
                     "intermediate_size_tp": 2048,
                     "block_size": 512,
                     "glu_mlp": True,
+                    "glu_type": "glu",
                     "use_torch_block_wise": True, # should return false because of using torch blockwise
                     "device": "xla",
                     "result": False
@@ -47,6 +50,7 @@ def _generate_test_configs():
                     "intermediate_size_tp": 2048,
                     "block_size": 512,
                     "glu_mlp": False, # should return false because of glu_mlp is false
+                    "glu_type": "glu",
                     "use_torch_block_wise": False,
                     "device": "xla",
                     "result": False
@@ -55,6 +59,7 @@ def _generate_test_configs():
                     "intermediate_size_tp": 2048,
                     "block_size": 16, # should return false because of unsupported block size
                     "glu_mlp": True,
+                    "glu_type": "glu",
                     "use_torch_block_wise": False,
                     "device": "xla",
                     "result": False
@@ -63,6 +68,7 @@ def _generate_test_configs():
                     "intermediate_size_tp": 2048,
                     "block_size": 512,
                     "glu_mlp": True,
+                    "glu_type": "glu",
                     "use_torch_block_wise": False,
                     "device": "xla",
                     "result": False
@@ -72,10 +78,50 @@ def _generate_test_configs():
                     "intermediate_size_tp": 2048,
                     "block_size": 512,
                     "glu_mlp": True,
+                    "glu_type": "glu",
                     "use_torch_block_wise": False,
                     "device": "xla",
                     "result": False
                     }
+    test_config8 = {"hidden_size": 4096,
+                    "intermediate_size_tp": 2048,
+                    "block_size": 512,
+                    "glu_mlp": True,
+                    "glu_type": None,
+                    "use_torch_block_wise": False,
+                    "device": "xla",
+                    "result": True
+                    }
+    test_config9 = {"hidden_size": 4096,
+                    "intermediate_size_tp": 2048,
+                    "block_size": 512,
+                    "glu_mlp": True,
+                    "glu_type": "swiglu",
+                    "use_torch_block_wise": False,
+                    "device": "xla",
+                    "result": False
+                    }
+    test_config10 = {"hidden_size": 4096,
+                     "intermediate_size_tp": 2048,
+                     "block_size": 512,
+                     "glu_mlp": True,
+                     "glu_type": "glu",
+                     "use_torch_block_wise": False,
+                     "device": "xla",
+                     "use_shard_on_block_dynamic_while": True,
+                     "result": True
+                     }
+    
+    test_config11 = {"hidden_size": 4096,
+                     "intermediate_size_tp": 2048,
+                     "block_size": 512,
+                     "glu_mlp": True,
+                     "glu_type": "glu",
+                     "use_torch_block_wise": False,
+                     "device": "xla",
+                     "use_shard_on_block_dynamic_while": False,
+                     "result": True
+                     }
 
     test_configs = []
     test_configs.append(test_config1)
@@ -85,6 +131,10 @@ def _generate_test_configs():
     test_configs.append(test_config5)
     test_configs.append(test_config6)
     test_configs.append(test_config7)
+    test_configs.append(test_config8)
+    test_configs.append(test_config9)
+    test_configs.append(test_config10)
+    test_configs.append(test_config11)
     return test_configs
 
 class BlockWiseNkiAvailabilityTest(unittest.TestCase):
@@ -94,11 +144,26 @@ class BlockWiseNkiAvailabilityTest(unittest.TestCase):
             intermediate_size_tp = test_config["intermediate_size_tp"]
             block_size = test_config["block_size"]
             glu_mlp = test_config["glu_mlp"]
+            glu_type = test_config["glu_type"]
             use_torch_block_wise = test_config["use_torch_block_wise"]
             device = torch.device(test_config["device"])
             lnc = test_config.get("logical_nc_config", get_platform_lnc())
             use_block_parallel = test_config.get("use_block_parallel", False)
-            res = can_use_blockwise_matmul_nki(hidden_size, intermediate_size_tp, block_size, glu_mlp, use_torch_block_wise, device, lnc, use_block_parallel)
+            use_shard_on_block_dynamic_while = test_config.get("use_shard_on_block_dynamic_while", False)
+            
+            res = can_use_blockwise_matmul_nki(
+                hidden_size, 
+                intermediate_size_tp, 
+                block_size, 
+                glu_mlp, 
+                glu_type, 
+                use_torch_block_wise, 
+                device, 
+                lnc, 
+                use_block_parallel,
+                use_shard_on_block_dynamic_while=use_shard_on_block_dynamic_while
+            )
+            print(test_config)
             assert res == test_config["result"]
 
 if __name__ == "__main__":

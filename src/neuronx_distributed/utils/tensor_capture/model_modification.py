@@ -4,6 +4,7 @@ import types
 from typing import List, Dict, Any, Optional, Union, Callable
 from .registry import TensorRegistry
 from neuronx_distributed.utils.logger import get_logger
+import os
 
 # Get the logger
 logger = get_logger()
@@ -45,7 +46,7 @@ def modify_model_for_tensor_capture(model: nn.Module,
     model_info = registry.model_info
 
     def make_hook(module_name: str) -> Callable:
-        def hook(module: nn.Module, input: Any, output: Any) -> None:
+        def hook(module: nn.Module, args: tuple, kwargs: dict, output: Any) -> None:
             # Get registry
             registry = TensorRegistry.get_instance()
 
@@ -56,6 +57,9 @@ def modify_model_for_tensor_capture(model: nn.Module,
                 elif isinstance(obj, tuple):
                     for i, item in enumerate(obj):
                         register_tensor_object(f"{prefix}.{i}", item)
+                elif isinstance(obj, dict):
+                    for key, value in obj.items():
+                        register_tensor_object(f"{prefix}.{key}", value)
                 elif hasattr(obj, '__dataclass_fields__') or (hasattr(obj, '__dict__') and not isinstance(obj, type)):
                     # For dataclass objects or any object with attributes
                     for attr_name in dir(obj):
@@ -66,21 +70,130 @@ def modify_model_for_tensor_capture(model: nn.Module,
                                 registry.register_tensor(f"{prefix}.{attr_name}", attr_value)
 
             # Register input tensors if enabled
-            if capture_inputs and input:
-                register_tensor_object(f"{module_name}.inputs", input)
-            
+            if capture_inputs:
+                # Register args as "inputs" (same as old API)
+                if args:
+                    register_tensor_object(f"{module_name}.inputs", args)
+
+                # Register keyword arguments
+                if kwargs:
+                    register_tensor_object(f"{module_name}.inputs.kwargs", kwargs)
+
             # Register output tensors
             register_tensor_object(f"{module_name}.outputs", output)
         return hook
-    
+
     # Register forward hooks for targeted modules
     for name, module in dict(model.named_modules()).items():
         if name in modules_to_capture:
-            hook_handle = module.register_forward_hook(make_hook(name))
+            hook_handle = module.register_forward_hook(make_hook(name), with_kwargs=True)
             model_info.hooks.append(hook_handle)
-            logger.info(f"Registered forward hook for module {name} for tensor capture")
-    
+            logger.info(f"Registered forward hook for module {name} : {module} for tensor capture")
+
     return model
+
+
+def modify_hf_eager_model_for_tensor_capture(model: nn.Module, 
+                            modules_to_capture: Optional[List[str]] = None,
+                            tensor_capture_save_dir='', 
+                            capture_inputs: bool = False) -> nn.Module:
+    """
+    Set up tensor capture for a hf model running in eager mode
+    
+    Args:
+        model: The model to set up tensor capture for
+        modules_to_capture: List of module names whose outputs should be captured
+        capture_inputs: Whether to capture module input tensors
+        
+    Returns:
+        The HF model with tensor capture enabled
+        
+    Raises:
+        ValueError: If any module in modules_to_capture is not found in the model
+    """
+    if modules_to_capture is None:
+        logger.info("No modules to capture.")
+        modules_to_capture = []
+    
+    # Validate that all modules_to_capture exist in the model
+    available_modules = set(find_available_modules(model))
+    available_modules = {
+        name.removeprefix("model.") if name.startswith("model.") else name
+        for name in available_modules
+    }
+    invalid_modules = [module for module in modules_to_capture if module not in available_modules]
+    if invalid_modules:
+        raise ValueError(f"The following modules were not found in the model: {invalid_modules}")
+    
+    os.makedirs(tensor_capture_save_dir, exist_ok=True)
+
+    original_forward = model.forward
+    step_counter = {"step": 1}
+    def patched_forward(*args, **kwargs):
+        result = original_forward(*args, **kwargs)
+        step_counter["step"] += 1  # Bump after each forward call
+        return result
+    model.forward = patched_forward
+
+    hooks = []
+    
+    def make_hook(module_name: str, step_counter: dict) -> Callable:
+        def hook(module: nn.Module, args: tuple, kwargs: dict, output: Any) -> None:
+
+            def save_tensor(name, obj):
+                if step_counter['step'] == 1:
+                    model_phase = "cte"
+                else:
+                    model_phase = "tkg"
+                module_output_tensor_file_name = f"captured_tensors_{model_phase}_step_{step_counter['step']}_module_{name}.pt"
+                module_output_tensor_save_path = os.path.join(tensor_capture_save_dir, module_output_tensor_file_name)
+                module_output_cpu_tensor = obj.detach().cpu()
+                torch.save(module_output_cpu_tensor, module_output_tensor_save_path)
+                logger.info(f"Saved {name} output tensor to {os.path.abspath(module_output_tensor_save_path)}")
+                
+            def register_tensor_object(prefix: str, obj: Any) -> None:
+                """Helper function to register tensors from various object types"""
+                if isinstance(obj, torch.Tensor):
+                    save_tensor(prefix, obj)
+                elif isinstance(obj, tuple):
+                    for i, item in enumerate(obj):
+                        register_tensor_object(f"{prefix}_{i}", item)
+                elif isinstance(obj, dict):
+                    for key, value in obj.items():
+                        register_tensor_object(f"{prefix}_{key}", value)
+                elif hasattr(obj, '__dataclass_fields__') or (hasattr(obj, '__dict__') and not isinstance(obj, type)):
+                    # For dataclass objects or any object with attributes
+                    for attr_name in dir(obj):
+                        # Skip private attributes, methods, and callables
+                        if not attr_name.startswith('_') and not callable(getattr(obj, attr_name)):
+                            attr_value = getattr(obj, attr_name)
+                            if isinstance(attr_value, torch.Tensor):
+                                save_tensor(f"{prefix}_{attr_name}", attr_value)
+
+            # Register input tensors if enabled
+            if capture_inputs:
+                # Register args as "inputs" (same as old API)
+                if args:
+                    register_tensor_object(f"{module_name}_inputs", args)
+
+                # Register keyword arguments
+                if kwargs:
+                    register_tensor_object(f"{module_name}_inputs_kwargs", kwargs)
+
+            # Register output tensors
+            register_tensor_object(f"{module_name}_output", output)
+        return hook
+
+    # Register forward hooks for targeted modules
+    for name, module in dict(model.named_modules()).items():
+        name = name.removeprefix("model.") if name.startswith('model.') else name
+        if name in modules_to_capture:
+            hook_handle = module.register_forward_hook(make_hook(name, step_counter), with_kwargs=True)
+            hooks.append(hook_handle)
+            logger.info(f"Registered forward hook for module {name} for tensor capture")
+
+    return model, hooks, original_forward
+
 
 
 def restore_model(model: nn.Module) -> nn.Module:

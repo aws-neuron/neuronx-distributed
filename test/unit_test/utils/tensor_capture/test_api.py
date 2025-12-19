@@ -1,11 +1,10 @@
 """
-Unit tests for the tensor_capture API functions.
+Unit tests for the API functions in the tensor_capture module.
 """
 
 import unittest
 import torch
 import torch.nn as nn
-from dataclasses import dataclass
 from unittest.mock import patch, MagicMock
 
 from neuronx_distributed.utils.tensor_capture import (
@@ -13,161 +12,121 @@ from neuronx_distributed.utils.tensor_capture import (
     disable_tensor_capture,
     get_available_modules,
     register_tensor,
-    get_captured_tensors_dict,
+    get_captured_tensors_dict
+)
+from neuronx_distributed.utils.tensor_capture.registry import TensorRegistry
+
+# Import test utilities for deduplication
+from .test_utils import (
+    SimpleModel,
+    AttentionModel,
+    DataclassModel,
+    TupleOutputModel,
+    TestFixtures,
+    TestHelpers,
+    TestConstants
 )
 
 
-class SimpleModel(nn.Module):
-    """Simple model for testing tensor capture"""
-    def __init__(self):
-        super().__init__()
-        self.layers = nn.ModuleList([
-            nn.Linear(10, 20),
-            nn.Linear(20, 30),
-            nn.Linear(30, 10)
-        ])
-        self.activation = nn.ReLU()
-    
-    def forward(self, x):
-        for i, layer in enumerate(self.layers):
-            x = layer(x)
-            x = self.activation(x)
-        return x
-
-
-@dataclass
-class ModelOutput:
-    """Dataclass for testing tensor capture with dataclasses"""
-    logits: torch.Tensor
-    hidden_states: torch.Tensor
-
-
-class DataclassModel(nn.Module):
-    """Model that returns a dataclass for testing tensor capture with dataclasses"""
-    def __init__(self):
-        super().__init__()
-        self.linear1 = nn.Linear(10, 20)
-        self.linear2 = nn.Linear(20, 10)
-    
-    def forward(self, x):
-        hidden = self.linear1(x)
-        logits = self.linear2(hidden)
-        return ModelOutput(logits=logits, hidden_states=hidden)
-
-
-class TupleOutputModel(nn.Module):
-    """Model that returns a tuple for testing tensor capture with tuples"""
-    def __init__(self):
-        super().__init__()
-        self.linear1 = nn.Linear(10, 20)
-        self.linear2 = nn.Linear(20, 10)
-    
-    def forward(self, x):
-        hidden = self.linear1(x)
-        logits = self.linear2(hidden)
-        return logits, hidden
-
-
-class TestEnableDisableTensorCapture(unittest.TestCase):
-    """Test cases for enable_tensor_capture and disable_tensor_capture functions"""
+class TestEnableTensorCapture(unittest.TestCase):
+    """Test cases for the enable_tensor_capture function"""
     
     def setUp(self):
         """Set up test fixtures"""
+        self.registry = TestHelpers.setup_registry()
+        self.input_tensor = TestFixtures.get_input_tensor()
+        self.attention_mask = TestFixtures.get_attention_mask()
+        self.position_ids = TestFixtures.get_position_ids()
         self.model = SimpleModel()
-        self.input_tensor = torch.randn(2, 10)
         
-    def test_enable_disable_tensor_capture(self):
-        """Test enabling and disabling tensor capture on a model"""
-        modules_to_capture = ["layers.0", "layers.1"]
+    def tearDown(self):
+        """Clean up after tests"""
+        TestHelpers.teardown_registry()
         
-        # Enable tensor capture
+    def test_enable_tensor_capture_basic(self):
+        """Test basic tensor capture enabling"""
+        modules_to_capture = TestConstants.SIMPLE_MODULES[:2]  # ["layers.0", "layers.1"]
+        
         model_with_capture = enable_tensor_capture(self.model, modules_to_capture)
         
-        # Check that the model is the same instance (no modifications)
+        # Should return the same model instance
         self.assertIs(model_with_capture, self.model)
         
-        # Run the model to capture tensors
-        _ = model_with_capture(self.input_tensor)
+        # Registry should be enabled and configured
+        self.assertTrue(self.registry.enabled)
+        self.assertEqual(self.registry.model_info.modules_to_capture, modules_to_capture)
         
-        # Check that we can get tensors using the API functions
-        tensors_dict = get_captured_tensors_dict()
-        self.assertEqual(len(tensors_dict), len(modules_to_capture))
-        
-        # Disable tensor capture
-        model_without_capture = disable_tensor_capture(model_with_capture)
-        
-        # Check that the model is the same instance
-        self.assertIs(model_without_capture, self.model)
-        
-    def test_enable_with_max_tensors(self):
+    def test_enable_tensor_capture_with_max_tensors(self):
         """Test enabling tensor capture with max_tensors parameter"""
         modules_to_capture = ["layers.0"]
-        max_tensors = 5
+        max_tensors = 10
         
-        # Enable tensor capture with max_tensors
-        model_with_capture = enable_tensor_capture(self.model, modules_to_capture, max_tensors)
+        model_with_capture = enable_tensor_capture(
+            self.model, modules_to_capture, max_tensors=max_tensors
+        )
         
-        # Check that the model is the same instance (no modifications)
         self.assertIs(model_with_capture, self.model)
+        self.assertEqual(self.registry.model_info.max_tensors, max_tensors)
         
-        # Register some manual tensors
-        for i in range(max_tensors + 2):  # Try to register more than max_tensors
-            register_tensor(f"manual_tensor_{i}", torch.tensor([float(i)]))
-        
-        # Run the model
-        _ = model_with_capture(self.input_tensor)
-        
-        # Get captured tensors
-        tensors_dict = get_captured_tensors_dict()
-        
-        # Count manual tensors (should be limited to max_tensors)
-        manual_tensors = [name for name in tensors_dict.keys() if "manual" in name]
-        self.assertEqual(len(manual_tensors), max_tensors)
-        
-    def test_enable_with_capture_inputs(self):
+    def test_enable_tensor_capture_with_capture_inputs(self):
         """Test enabling tensor capture with capture_inputs parameter"""
         modules_to_capture = ["layers.0"]
         
-        # Enable tensor capture with capture_inputs=True
-        model_with_capture = enable_tensor_capture(self.model, modules_to_capture, capture_inputs=True)
+        model_with_capture = enable_tensor_capture(
+            self.model, modules_to_capture, capture_inputs=True
+        )
         
-        # Run the model to capture tensors
-        _ = model_with_capture(self.input_tensor)
+        self.assertIs(model_with_capture, self.model)
+        self.assertTrue(self.registry.model_info.capture_inputs)
         
-        # Get captured tensors as dictionary
-        captured_tensors_dict = get_captured_tensors_dict()
-        
-        # Should have both input and output tensors for layers.0
-        self.assertEqual(len(captured_tensors_dict), 2)
-        
-        # Check that we have both input and output tensors
-        input_tensors = [name for name in captured_tensors_dict.keys() if "inputs" in name]
-        output_tensors = [name for name in captured_tensors_dict.keys() if "outputs" in name]
-        self.assertEqual(len(input_tensors), 1)
-        self.assertEqual(len(output_tensors), 1)
-        
-    def test_enable_with_no_modules(self):
-        """Test enabling tensor capture with no modules to capture"""
-        # Enable tensor capture with no modules
+    def test_enable_tensor_capture_none_modules(self):
+        """Test enabling tensor capture with None modules"""
         model_with_capture = enable_tensor_capture(self.model, None)
         
-        # Check that the model is the same instance (no modifications)
         self.assertIs(model_with_capture, self.model)
+        self.assertEqual(self.registry.model_info.modules_to_capture, [])
         
-        # Run the model
-        _ = model_with_capture(self.input_tensor)
-        
-        # Get captured tensors as dictionary - should be empty since no modules were specified
-        tensors_dict = get_captured_tensors_dict()
-        self.assertEqual(len(tensors_dict), 0)
-        
-    def test_invalid_module_name(self):
+    def test_enable_tensor_capture_invalid_modules(self):
         """Test enabling tensor capture with invalid module names"""
-        modules_to_capture = ["invalid_module", "layers.999"]
+        invalid_modules = ["invalid_module", "layers.999"]
         
-        # This should raise a ValueError
         with self.assertRaises(ValueError):
-            enable_tensor_capture(self.model, modules_to_capture)
+            enable_tensor_capture(self.model, invalid_modules)
+
+
+class TestDisableTensorCapture(unittest.TestCase):
+    """Test cases for the disable_tensor_capture function"""
+    
+    def setUp(self):
+        """Set up test fixtures"""
+        self.registry = TestHelpers.setup_registry()
+        self.input_tensor = TestFixtures.get_input_tensor()
+        self.attention_mask = TestFixtures.get_attention_mask()
+        self.position_ids = TestFixtures.get_position_ids()
+        self.model = SimpleModel()
+        
+    def tearDown(self):
+        """Clean up after tests"""
+        TestHelpers.teardown_registry()
+        
+    def test_disable_tensor_capture(self):
+        """Test disabling tensor capture"""
+        modules_to_capture = TestConstants.SIMPLE_MODULES[:1]  # ["layers.0"]
+        
+        # First enable tensor capture
+        model_with_capture = enable_tensor_capture(self.model, modules_to_capture)
+        self.assertTrue(self.registry.enabled)
+        
+        # Then disable it
+        restored_model = disable_tensor_capture(model_with_capture)
+        
+        # Should return the same model instance
+        self.assertIs(restored_model, self.model)
+        
+        # Registry should be disabled and cleared
+        self.assertFalse(self.registry.enabled)
+        self.assertEqual(len(self.registry.model_info.module_tensors), 0)
+        self.assertEqual(len(self.registry.model_info.manual_tensors), 0)
 
 
 class TestGetAvailableModules(unittest.TestCase):
@@ -179,35 +138,20 @@ class TestGetAvailableModules(unittest.TestCase):
         
     def test_get_available_modules(self):
         """Test getting available modules from a model"""
-        available_modules = get_available_modules(self.model)
+        modules = get_available_modules(self.model)
         
-        # Check that we got the expected modules
-        self.assertIn("layers", available_modules)
-        self.assertIn("layers.0", available_modules)
-        self.assertIn("layers.1", available_modules)
-        self.assertIn("layers.2", available_modules)
-        self.assertIn("activation", available_modules)
+        # Should include expected modules
+        expected_modules = ["layers", "layers.0", "layers.1", "layers.2", "activation"]
+        TestHelpers.assert_tensor_keys_present(self, {m: None for m in modules}, expected_modules)
         
-    def test_get_available_modules_nested(self):
-        """Test getting available modules from a nested model"""
-        class NestedModel(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.feature_extractor = SimpleModel()
-                self.classifier = nn.Linear(10, 2)
-                
-            def forward(self, x):
-                x = self.feature_extractor(x)
-                return self.classifier(x)
+    def test_get_available_modules_attention_model(self):
+        """Test getting available modules from attention model"""
+        model = AttentionModel()
+        modules = get_available_modules(model)
         
-        nested_model = NestedModel()
-        available_modules = get_available_modules(nested_model)
-        
-        # Check that we got the expected modules
-        self.assertIn("feature_extractor", available_modules)
-        self.assertIn("feature_extractor.layers", available_modules)
-        self.assertIn("feature_extractor.layers.0", available_modules)
-        self.assertIn("classifier", available_modules)
+        # Should include attention-specific modules
+        expected_modules = ["linear", "norm"]
+        TestHelpers.assert_tensor_keys_present(self, {m: None for m in modules}, expected_modules)
 
 
 class TestRegisterTensor(unittest.TestCase):
@@ -215,165 +159,177 @@ class TestRegisterTensor(unittest.TestCase):
     
     def setUp(self):
         """Set up test fixtures"""
-        # Import the registry directly for testing
-        from neuronx_distributed.utils.tensor_capture.registry import TensorRegistry
-        self.registry = TensorRegistry.get_instance()
-        self.registry.clear()
-        self.registry.configure(enabled=True, max_tensors=5)
-        
-        self.test_tensor = torch.tensor([1.0, 2.0, 3.0])
+        self.registry = TestHelpers.setup_registry()
+        self.input_tensor = TestFixtures.get_input_tensor()
+        self.attention_mask = TestFixtures.get_attention_mask()
+        self.position_ids = TestFixtures.get_position_ids()
         
     def tearDown(self):
         """Clean up after tests"""
-        self.registry.clear()
+        TestHelpers.teardown_registry()
         
-    def test_register_tensor(self):
-        """Test registering a tensor"""
-        register_tensor("test_tensor", self.test_tensor)
+    def test_register_tensor_enabled(self):
+        """Test registering a tensor when capture is enabled"""
+        self.registry.configure(enabled=True, modules=[], max_tensors=5)
         
+        tensor = TestFixtures.get_input_tensor()
+        register_tensor("test_tensor", tensor)
+        
+        # Should be registered
         manual_tensors = self.registry.get_manual_tensors()
         self.assertEqual(len(manual_tensors), 1)
         
-        # Check that the tensor was registered correctly
-        key = list(manual_tensors.keys())[0]
-        self.assertTrue(torch.equal(manual_tensors[key], self.test_tensor))
+    def test_register_tensor_disabled(self):
+        """Test registering a tensor when capture is disabled"""
+        self.registry.configure(enabled=False)
+        
+        tensor = TestFixtures.get_input_tensor()
+        register_tensor("test_tensor", tensor)
+        
+        # Should not be registered
+        manual_tensors = self.registry.get_manual_tensors()
+        self.assertEqual(len(manual_tensors), 0)
+        
+    def test_register_tensor_module_match(self):
+        """Test registering a tensor that matches a monitored module"""
+        modules = ["linear"]
+        self.registry.configure(enabled=True, modules=modules)
+        
+        tensor = TestFixtures.get_input_tensor()
+        register_tensor("linear", tensor)
+        
+        # Should be registered as module tensor
+        module_tensors = self.registry.get_module_tensors()
+        manual_tensors = self.registry.get_manual_tensors()
+        
+        self.assertEqual(len(module_tensors), 1)
+        self.assertEqual(len(manual_tensors), 0)
 
 
-class TestDataclassCapture(unittest.TestCase):
-    """Test cases for tensor capture with dataclasses"""
+class TestGetCapturedTensorsDict(unittest.TestCase):
+    """Test cases for the get_captured_tensors_dict function"""
     
     def setUp(self):
         """Set up test fixtures"""
-        self.model = DataclassModel()
-        self.input_tensor = torch.randn(2, 10)
+        self.registry = TestHelpers.setup_registry()
+        self.input_tensor = TestFixtures.get_input_tensor()
+        self.attention_mask = TestFixtures.get_attention_mask()
+        self.position_ids = TestFixtures.get_position_ids()
         
-    def test_dataclass_capture(self):
-        """Test capturing tensors from a model that returns a dataclass"""
-        modules_to_capture = ["linear1", "linear2"]
+    def tearDown(self):
+        """Clean up after tests"""
+        TestHelpers.teardown_registry()
         
-        # Enable tensor capture
-        model_with_capture = enable_tensor_capture(self.model, modules_to_capture)
+    def test_get_captured_tensors_dict_empty(self):
+        """Test getting captured tensors when none are registered"""
+        tensors_dict = get_captured_tensors_dict()
         
-        # Run the model
-        _ = model_with_capture(self.input_tensor)
+        self.assertEqual(len(tensors_dict), 0)
         
-        # Get captured tensors as dictionary
-        captured_tensors_dict = get_captured_tensors_dict()
+    def test_get_captured_tensors_dict_with_tensors(self):
+        """Test getting captured tensors with registered tensors"""
+        modules = ["linear"]
+        self.registry.configure(enabled=True, modules=modules, max_tensors=2)
         
-        # Check that we got the expected number of tensors
-        self.assertEqual(len(captured_tensors_dict), len(modules_to_capture))
+        # Register module tensor
+        module_tensor = TestFixtures.get_input_tensor()
+        register_tensor("linear", module_tensor)
         
-        # Get the values as a list to check shapes
-        tensors = list(captured_tensors_dict.values())
+        # Register manual tensor
+        manual_tensor = TestFixtures.get_input_tensor()
+        register_tensor("manual_tensor", manual_tensor)
         
-        # Check that the tensors have the expected shapes
-        self.assertEqual(tensors[0].shape, (2, 20))  # Output of linear1
-        self.assertEqual(tensors[1].shape, (2, 10))  # Output of linear2
+        tensors_dict = get_captured_tensors_dict()
+        
+        # Should have both tensors
+        self.assertEqual(len(tensors_dict), 2)
+        
+        # Module tensor should come first
+        tensor_keys = list(tensors_dict.keys())
+        self.assertEqual(tensor_keys[0], "linear")
 
 
-class TestTupleOutputCapture(unittest.TestCase):
-    """Test cases for tensor capture with tuple outputs"""
+class TestIntegrationWithAttentionModel(unittest.TestCase):
+    """Integration tests using the AttentionModel with professional naming"""
     
     def setUp(self):
         """Set up test fixtures"""
-        self.model = TupleOutputModel()
-        self.input_tensor = torch.randn(2, 10)
+        self.registry = TestHelpers.setup_registry()
+        self.input_tensor = TestFixtures.get_input_tensor()
+        self.attention_mask = TestFixtures.get_attention_mask()
+        self.position_ids = TestFixtures.get_position_ids()
+        self.model = AttentionModel()
         
-    def test_tuple_output_capture(self):
-        """Test capturing tensors from a model that returns a tuple"""
-        modules_to_capture = ["linear1", "linear2"]
+    def tearDown(self):
+        """Clean up after tests"""
+        TestHelpers.teardown_registry()
         
-        # Enable tensor capture
-        model_with_capture = enable_tensor_capture(self.model, modules_to_capture)
+    def test_attention_model_integration(self):
+        """Test complete workflow with attention model"""
+        modules_to_capture = TestConstants.ATTENTION_MODULES[:1]  # ["linear"]
         
-        # Run the model
-        _ = model_with_capture(self.input_tensor)
+        # Enable tensor capture with input capture
+        model_with_capture = enable_tensor_capture(
+            self.model, modules_to_capture, max_tensors=3, capture_inputs=True
+        )
         
-        # Get captured tensors as dictionary
-        captured_tensors_dict = get_captured_tensors_dict()
+        # Run model with attention parameters
+        _ = model_with_capture(
+            self.input_tensor,
+            attention_mask=self.attention_mask,
+            position_ids=self.position_ids
+        )
         
-        # Check that we got the expected number of tensors
-        self.assertEqual(len(captured_tensors_dict), len(modules_to_capture))
+        # Get captured tensors
+        tensors_dict = get_captured_tensors_dict()
         
-        # Get the values as a list to check shapes
-        tensors = list(captured_tensors_dict.values())
+        # Should capture attention parameters as kwargs
+        expected_keys = [
+            "linear.inputs.0",  # Positional input
+            "linear.inputs.kwargs.attention_mask",
+            "linear.inputs.kwargs.position_ids",
+            "linear.outputs"
+        ]
+        TestHelpers.assert_tensor_keys_present(self, tensors_dict, expected_keys)
         
-        # Check that the tensors have the expected shapes
-        self.assertEqual(tensors[0].shape, (2, 20))  # Output of linear1
-        self.assertEqual(tensors[1].shape, (2, 10))  # Output of linear2
-
-
-class TestCaptureInputs(unittest.TestCase):
-    """Test cases for capturing module inputs"""
-    
-    def setUp(self):
-        """Set up test fixtures"""
-        self.model = SimpleModel()
-        self.input_tensor = torch.randn(2, 10)
-        
-    def test_capture_inputs(self):
-        """Test capturing module inputs"""
-        modules_to_capture = ["layers.1"]  # Capture the middle layer
-        
-        # Enable tensor capture with capture_inputs=True
-        model_with_capture = enable_tensor_capture(self.model, modules_to_capture, capture_inputs=True)
-        
-        # Run the model
-        _ = model_with_capture(self.input_tensor)
-        
-        # Get captured tensors as dictionary
-        captured_tensors_dict = get_captured_tensors_dict()
-        
-        # Should have both input and output tensors for layers.1
-        self.assertEqual(len(captured_tensors_dict), 2)
-        
-        # Get the values as a list to check shapes
-        tensors = list(captured_tensors_dict.values())
-        
-        # First tensor should be the input to layers.1, which is the output of layers.0 after activation
-        # Second tensor should be the output of layers.1
-        self.assertEqual(tensors[0].shape, (2, 20))  # Input to layers.1
-        self.assertEqual(tensors[1].shape, (2, 30))  # Output of layers.1
-
-
-class TestEndToEndAPI(unittest.TestCase):
-    """End-to-end tests for the tensor_capture API"""
-    
-    def setUp(self):
-        """Set up test fixtures"""
-        self.model = SimpleModel()
-        self.input_tensor = torch.randn(2, 10)
-        
-    def test_end_to_end_tensor_capture(self):
-        """Test end-to-end tensor capture workflow using the API"""
-        # Define modules to capture
-        modules_to_capture = ["layers.0", "layers.1"]
-        
-        # Enable tensor capture
-        model_with_capture = enable_tensor_capture(self.model, modules_to_capture)
-        
-        # Run the model
-        _ = model_with_capture(self.input_tensor)
-        
-        # Get captured tensors as dictionary
-        captured_tensors_dict = get_captured_tensors_dict()
-        
-        # Check that we got the expected number of tensors
-        self.assertEqual(len(captured_tensors_dict), len(modules_to_capture))
-        
-        # Get the values as a list to check shapes
-        tensors = list(captured_tensors_dict.values())
-        
-        # Check that the tensors have the expected shapes
-        self.assertEqual(tensors[0].shape, (2, 20))  # Output of layers.0
-        self.assertEqual(tensors[1].shape, (2, 30))  # Output of layers.1
+        # Verify tensor shapes
+        expected_shapes = {
+            "linear.inputs.0": TestConstants.INPUT_SHAPE,
+            "linear.inputs.kwargs.attention_mask": TestConstants.ATTENTION_MASK_SHAPE,
+            "linear.inputs.kwargs.position_ids": TestConstants.POSITION_IDS_SHAPE,
+            "linear.outputs": TestConstants.HIDDEN_SHAPE_20  # AttentionLinear outputs (2, 20)
+        }
+        TestHelpers.assert_tensor_shapes(self, tensors_dict, expected_shapes)
         
         # Disable tensor capture
-        disable_tensor_capture(model_with_capture)
+        restored_model = disable_tensor_capture(model_with_capture)
+        self.assertIs(restored_model, self.model)
         
-        # After disabling, we should get an empty dictionary
-        empty_dict = get_captured_tensors_dict()
-        self.assertEqual(len(empty_dict), 0)
+    def test_attention_model_manual_registration(self):
+        """Test manual tensor registration with attention model"""
+        modules_to_capture = ["linear"]
+        
+        # Enable tensor capture
+        model_with_capture = enable_tensor_capture(
+            self.model, modules_to_capture, max_tensors=2
+        )
+        
+        # Register manual tensors
+        register_tensor("intermediate_activation", self.input_tensor)
+        register_tensor("attention_weights", self.attention_mask)
+        
+        # Run model
+        _ = model_with_capture(self.input_tensor)
+        
+        # Get captured tensors
+        tensors_dict = get_captured_tensors_dict()
+        
+        # Should have module output + manual tensors
+        self.assertGreaterEqual(len(tensors_dict), 3)
+        
+        # Check for manual tensors (they get prefixed)
+        manual_keys = TestHelpers.get_keys_with_pattern(tensors_dict, "manual_")
+        self.assertEqual(len(manual_keys), 2)
 
 
 if __name__ == '__main__':

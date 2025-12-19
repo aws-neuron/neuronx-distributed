@@ -43,6 +43,29 @@ if [ -v SLURM_NTASKS ]; then
     MASTER_ADDR=${HOSTS[0]}
     MASTER_PORT=44000
     DISTRIBUTED_ARGS="--nproc_per_node $PROCESSES_PER_NODE --nnodes $NTASKS --node_rank $NODEID --master_addr $MASTER_ADDR --master_port $MASTER_PORT"
+elif [ -v OMPI_COMM_WORLD_RANK ]; then
+    # Increase the fd limit for container
+    ulimit -n 65535
+    WORLD_SIZE=$OMPI_COMM_WORLD_SIZE
+    NODEID=$OMPI_COMM_WORLD_RANK
+    NODELIST=$(/root/nodelist_helper.py)
+    HOSTS=(${NODELIST//\ / })
+    MASTER_ADDR=${HOSTS[0]}
+    NTASKS=$WORLD_SIZE
+    JOB_ID=$POD_UID
+    export NEMO_EXPM_VERSION=$POD_UID
+    export EXPLICIT_LOGDIR=null
+    LOG_PATH="$ARTIFACT_PATH/logs/$JOB_ID/$NODEID"
+    mkdir -p $LOG_PATH
+
+    export CCOM_SOCKET_IFNAME=eth0
+    export FI_EFA_FORK_SAFE=1
+
+    # Dataset is in shared location
+    DATA_PATH="$SHARED_PATH_PREFIX/wikicorpus_llama2_tokenized_4k"
+
+    MASTER_PORT=44000
+    DISTRIBUTED_ARGS="--nproc_per_node $PROCESSES_PER_NODE --nnodes $NTASKS --node_rank $NODEID --master_addr $MASTER_ADDR --master_port $MASTER_PORT"
 else
     DISTRIBUTED_ARGS="--nproc_per_node $PROCESSES_PER_NODE"
     LOG_PATH=logs
@@ -68,7 +91,7 @@ BS=$(($GBS / $DP))
 NUM_MICROBATCHES=$BS
 DATA_PATH="$HOME/examples_datasets/wikicorpus_llama2_tokenized_4k"
 
-
+# Set default values if not set by SLURM or MPI sections
 if [ "$NEURON_EXTRACT_GRAPHS_ONLY" = "1" ]; then
     max_steps=10
     tb_dir="/shared/tensorboard/llama70B_compile"

@@ -43,6 +43,8 @@ export NUM_NEURONCORES=32
 NODE_ID=0
 WORLD_SIZE=1
 DISTRIBUTED_ARGS="--nproc_per_node $NUM_NEURONCORES"
+METRICS_FILE="results.json"
+
 if [ ! -z "$SLURM_NTASKS" ]; then
     WORLD_SIZE=$SLURM_NTASKS
     NODE_ID=$SLURM_NODEID
@@ -56,13 +58,60 @@ if [ ! -z "$SLURM_NTASKS" ]; then
     fi
     export FI_EFA_USE_DEVICE_RDMA=1
     export FI_PROVIDER=efa
+    sudo sysctl -w net.ipv4.ip_local_reserved_ports=44000,48620
+
+    if [ $NEURON_EXTRACT_GRAPHS_ONLY -gt 0 ]; then
+        STEPS_THIS_RUN=2
+        OUTPUT_LOG=log_compile-$NODE_ID.log
+    elif [ -v PERF_TEST ] && [ $PERF_TEST -gt 0 ]; then
+        STEPS_THIS_RUN=100
+        OUTPUT_LOG=log_exe-$NODE_ID.log
+    else
+        STEPS_THIS_RUN=-1
+        OUTPUT_LOG=log_exe-$NODE_ID.log
+    fi
+elif [ -v OMPI_COMM_WORLD_RANK ]; then
+    # Increase the fd limit for container
+    ulimit -n 65535
+    WORLD_SIZE=$OMPI_COMM_WORLD_SIZE
+    NODE_ID=$OMPI_COMM_WORLD_RANK
+    NODELIST=$(/root/nodelist_helper.py)
+    HOSTS=(${NODELIST//\ / })
+    MASTER_ADDRESS=${HOSTS[0]}
+    DISTRIBUTED_ARGS="--nproc_per_node $NUM_NEURONCORES --nnodes $WORLD_SIZE --node_rank $NODE_ID --master_addr $MASTER_ADDRESS --master_port 44000"
+    
+    export FI_EFA_USE_DEVICE_RDMA=1
+    export FI_PROVIDER=efa
+    export CCOM_SOCKET_IFNAME=eth0
+    export FI_EFA_FORK_SAFE=1
+
+    # Dataset is in shared location
+    DATA_PATH="$SHARED_PATH_PREFIX/wikicorpus_llama2_tokenized_4k"
+
+    # Store metrics in shared location
+    METRICS_FILE=$ARTIFACT_PATH/results.json
+    mkdir -p $ARTIFACT_PATH
+
+    JOB_ID=$POD_UID
+    export EXPLICIT_LOGDIR=null
+    LOG_PATH="$ARTIFACT_PATH/logs/$JOB_ID/$NODE_ID"
+    mkdir -p $LOG_PATH
+
+    if [ $NEURON_EXTRACT_GRAPHS_ONLY -gt 0 ]; then
+        STEPS_THIS_RUN=2
+        OUTPUT_LOG="$LOG_PATH/log_compile-$NODE_ID.log"
+    elif [ -v PERF_TEST ] && [ $PERF_TEST -gt 0 ]; then
+        STEPS_THIS_RUN=100
+        OUTPUT_LOG="$LOG_PATH/log_exe-$NODE_ID.log"
+    else
+        STEPS_THIS_RUN=-1
+        OUTPUT_LOG="$LOG_PATH/log_exe-$NODE_ID.log"
+    fi
 fi
 
 echo "WORLD_SIZE=$WORLD_SIZE"
 echo "NODE_ID=$NODE_ID"
 echo "MASTER_ADDRESS=$MASTER_ADDRESS"
-
-sudo sysctl -w net.ipv4.ip_local_reserved_ports=44000,48620
 
 export NEURON_RT_NUM_CORES=32
 export NUM_NEURONCORES=$NEURON_RT_NUM_CORES
@@ -75,15 +124,15 @@ export TPU_CHIPS_PER_HOST_BOUNDS=$NEURON_RT_NUM_CORES
 DP=$(($NEURON_RT_NUM_CORES * $WORLD_SIZE / $TP_DEGREE))
 ACC_STEPS=$(($GBS / $MBS / $DP))
 
-
-if [ $NEURON_EXTRACT_GRAPHS_ONLY -gt 0 ]; then
-    STEPS_THIS_RUN=2
-    OUTPUT_LOG=log_compile-$NODE_ID.log
-else
-    STEPS_THIS_RUN=-1
-    OUTPUT_LOG=log_exe-$NODE_ID.log
-fi
-
+# Set default values if not set by SLURM or MPI sections
+if [ -z "$STEPS_THIS_RUN" ]; then
+    if [ $NEURON_EXTRACT_GRAPHS_ONLY -gt 0 ]; then
+        STEPS_THIS_RUN=2
+        OUTPUT_LOG=log_compile-$NODE_ID.log
+    else
+        STEPS_THIS_RUN=-1
+        OUTPUT_LOG=log_exe-$NODE_ID.log
+    fi
 echo TP_DEGREE=$TP_DEGREE
 echo GBS=$GBS
 echo MBS=$MBS

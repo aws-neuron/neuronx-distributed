@@ -10,11 +10,14 @@ import torch_xla.core.xla_env_vars as xenv
 import torch_xla.core.xla_model as xm
 import torch_xla.runtime as xr
 
+
 from neuronx_distributed.parallel_layers.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_size,
+    initialize_model_parallel,
 )
 from neuronx_distributed.utils.logger import get_logger
+from neuronx_distributed.utils.random import set_random_seed
 
 _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {
     "tensor_model_parallel": False,
@@ -311,3 +314,22 @@ def indices_split_along_dim(tensor: torch.Tensor, dim: int, rank: int, num_parti
     indices = torch.arange(partition_size, device=tensor.device) + start_idx
 
     return indices
+
+def initialize_fallback_parallel_state(device: Optional[torch.device] = None):
+    """
+    Initialize single-process distributed state for fallback scenarios.
+    """
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = os.environ.get("MASTER_PORT", "29500")
+
+    backend = "xla" if device is not None and device.type == "xla" else "gloo"
+    torch.distributed.init_process_group(
+        backend=backend,
+        world_size=1,
+        rank=0,
+    )
+
+    initialize_model_parallel(skip_collective_init=True)
+
+    if backend == "xla":
+        set_random_seed(0)

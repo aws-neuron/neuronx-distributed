@@ -387,7 +387,8 @@ def initialize_model_parallel(
     expert_model_parallel_size: int = 1,
     skip_collective_init: bool = False,
     lnc_size: int = 1,
-) -> None:
+    mesh_only: bool = False,
+):
     """
     Initialize model data parallel groups.
 
@@ -396,6 +397,7 @@ def initialize_model_parallel(
         tensor_model_parallel_size: number of Neuron devices used to parallelize model tensor.
         context_parallel_size: number of Neuron devices used to parallelize model sequence.
         expert_model_parallel_size: number of Neuron devices used to parallelize MoE experts.
+        mesh_only: if True, only group mesh will be returned instead of creating ProcessGroup.
 
     mental model:
     WITHOUT EXPERT PARALLELISM (EP)
@@ -634,7 +636,7 @@ def initialize_model_parallel(
         logger.info("> initializing expert model parallel with size %d", expert_model_parallel_size)
         logger.info("> initializing data parallel (exp) with size %d", expert_data_parallel_size)
 
-    if not skip_collective_init and not cpu_mode():
+    if not skip_collective_init and not cpu_mode() and not mesh_only:
         # cut graph because compiler birsim cannot verify graph with rand()
         xm.mark_step()
         # We create a dummy neff and execute it across all workers in the world.
@@ -645,6 +647,23 @@ def initialize_model_parallel(
         temp = torch.rand([1], device="xla")
         torch.distributed.all_reduce(temp, group=torch.distributed.group.WORLD)
         xm.mark_step()
+    
+    allocate_ranks_fn = get_logic_chosen(lnc_size, _HARDWARE_TYPE, tp=tensor_model_parallel_size)
+
+    replica_groups = allocate_ranks_fn(lnc_size, cluster_ranks_nonexp, cluster_ranks_exp,
+                                        tensor_model_parallel_size, data_parallel_size, 
+                                        pipeline_model_parallel_size, expert_model_parallel_size,
+                                        expert_data_parallel_size, context_parallel_size)
+    
+    logger.info(rmsg(f"tp_groups: {replica_groups.tp_groups=}"))
+    logger.info(rmsg(f"dp_groups: {replica_groups.dp_groups=}"))
+    logger.info(rmsg(f"pp_groups: {replica_groups.pp_groups=}"))
+    logger.info(rmsg(f"cp_groups: {replica_groups.cp_groups=}"))
+    logger.info(rmsg(f"ep_model_groups: {replica_groups.ep_model_groups=}"))
+    logger.info(rmsg(f"ep_data_groups: {replica_groups.ep_data_groups=}"))
+
+    if mesh_only:
+        return replica_groups
 
     rank = torch.distributed.get_rank()
     compress_rg = not skip_collective_init and os.environ.get("NEURON_EXPERIMENTAL_COMPRESS_RG", "0") == "1"
@@ -656,21 +675,6 @@ def initialize_model_parallel(
         mesh=world_ranks,
         compress_rg=False,
     )
-    
-    allocate_ranks_fn = get_logic_chosen(lnc_size, _HARDWARE_TYPE, tp=tensor_model_parallel_size)
-
-    replica_groups = allocate_ranks_fn(lnc_size, cluster_ranks_nonexp, cluster_ranks_exp,
-                                        tensor_model_parallel_size, data_parallel_size, 
-                                        pipeline_model_parallel_size, expert_model_parallel_size,
-                                        expert_data_parallel_size, context_parallel_size)
-    
-
-    logger.info(rmsg(f"tp_groups: {replica_groups.tp_groups=}"))
-    logger.info(rmsg(f"dp_groups: {replica_groups.dp_groups=}"))
-    logger.info(rmsg(f"pp_groups: {replica_groups.pp_groups=}"))
-    logger.info(rmsg(f"cp_groups: {replica_groups.cp_groups=}"))
-    logger.info(rmsg(f"ep_model_groups: {replica_groups.ep_model_groups=}"))
-    logger.info(rmsg(f"ep_data_groups: {replica_groups.ep_data_groups=}"))
 
     _build_and_assign_groups(
         group_name="_TENSOR_MODEL_PARALLEL_GROUP",
@@ -984,14 +988,16 @@ def get_expert_parallel_rank_from_global_rank(rank: int, expert_parallel_group: 
     raise ValueError(f"rank: {rank} not found in the mesh: {mesh}")
 
 
-def get_experts_for_expert_parallel_rank(expert_parallel_rank: int, total_number_of_experts: int, expert_model_parallel_size: int) -> List[int]:
+def get_experts_for_expert_parallel_rank(expert_parallel_rank: int, total_number_of_experts: int, expert_model_parallel_size: int, expert_distribution: Optional[List[List[int]]] = None) -> List[int]:
     """
     Get list of expert indices that belong to a specific ep_rank.
     
     Args:
-        ep_rank: The parallel rank to get experts for
-        n_expert: Total number of experts
-        EP_DEGREE: Number of parallel ranks (EP)
+        expert_parallel_rank: The parallel rank to get experts for
+        total_number_of_experts: Total number of experts
+        expert_model_parallel_size: Number of parallel ranks (EP)
+        expert_distribution: expert distribution configuration for each rank.
+
     
     Returns:
         list[int]: List of expert indices belonging to this ep_rank
@@ -1001,7 +1007,13 @@ def get_experts_for_expert_parallel_rank(expert_parallel_rank: int, total_number
     assert expert_parallel_rank < expert_model_parallel_size, \
         f"expert_parallel_rank: {expert_parallel_rank} is not less than expert_model_parallel_size: {expert_model_parallel_size}"
     experts_per_rank = total_number_of_experts // expert_model_parallel_size
-
+    if expert_distribution:
+        assert len(expert_distribution) == expert_model_parallel_size, \
+            f"len of expert_distribution: {expert_distribution} is not matching the expert_model_parallel_size: {expert_model_parallel_size}"
+        flattened_expert_distribution = [item for sublist in expert_distribution for item in sublist]
+        assert set(range(total_number_of_experts)) == set(flattened_expert_distribution), \
+            f"Expert indexing not covering all expert id in the range [0,{total_number_of_experts})"
+        return expert_distribution[expert_parallel_rank]
     start_expert = expert_parallel_rank * experts_per_rank
     end_expert = start_expert + experts_per_rank
     

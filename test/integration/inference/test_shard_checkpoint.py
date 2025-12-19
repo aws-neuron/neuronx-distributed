@@ -3,7 +3,7 @@ import tempfile
 import pytest
 import torch
 import torch_neuronx
-from neuronx_distributed.trace.model_builder import shard_checkpoint
+from neuronx_distributed.trace.functions import shard_checkpoint
 from neuronx_distributed.trace.mock_torchdist import mock_distributed
 from neuronx_distributed.parallel_layers import ColumnParallelLinear, parallel_state
 from safetensors.torch import load_file

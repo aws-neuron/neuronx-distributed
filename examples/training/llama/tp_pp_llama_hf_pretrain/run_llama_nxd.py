@@ -191,7 +191,7 @@ def train_llama(args):
         args.training_dir, args.train_batch_size, dp_size, dp_rank, args.seed
     )
 
-    print("Creating sample dataloader finised")
+    print("Creating sample dataloader finished")
 
     # Only print/logging on the last PP rank of the first PP group
     # Since loss is only in the last PP rank
@@ -404,7 +404,7 @@ if __name__ == "__main__":
     parser.add_argument("--training_dir", type=str, default=None)
     parser.add_argument("--training_config", type=str, default=None)
     parser.add_argument("--trace_file_path", type=str, default=None)
-    parser.add_argument("--tb_dir", type=str, default="")
+    parser.add_argument("--tb_dir", type=str, default="output")
     parser.add_argument("--max_steps", type=int, default=100, help="max steps")
     parser.add_argument("--checkpoint_freq", type=int, default=100000, help="save checkpoint freq")
     parser.add_argument("--checkpoint_dir", type=str, default=None)

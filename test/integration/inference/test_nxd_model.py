@@ -13,7 +13,7 @@ from torch_neuronx.xla_impl.trace import get_torch_dtype
 from neuronx_distributed.parallel_layers import ColumnParallelLinear, RowParallelLinear, parallel_state
 from neuronx_distributed.trace.nxd_model import NxDModel
 from neuronx_distributed.trace.mock_torchdist import mock_distributed
-from neuronx_distributed.trace.model_builder import trace, compile, compile_wlo, compile_layout_transformer
+from neuronx_distributed.trace.functions import trace, compile, compile_wlo, compile_layout_transformer
 from neuronx_distributed.trace.hlo_utils import mark_weights_for_wlo, apply_layout_transformation
 from neuronx_distributed.trace.model_builder_utils import TraceArtifacts, CompilationArtifacts, WLOArtifacts, ModelParamInfo
 
@@ -138,8 +138,7 @@ def trace_and_compile_model(
         if use_wlo:
             # Let 'key1' always be the priority model for test simplicity
             mark_weights_for_wlo(
-                priority_model_trace_hlo=trace_artifacts['key1'].hlo,
-                priority_model_weight_name_to_idx=trace_artifacts['key1'].weight_name_to_idx,
+                trace_artifacts=trace_artifacts['key1']
             )
             wlo_artifacts = compile_wlo(
                 hlo_module=trace_artifacts['key1'].hlo,
@@ -151,11 +150,7 @@ def trace_and_compile_model(
                 if key == 'key1':
                     continue
                 apply_layout_transformation(
-                    hlo_module=trace_artifacts[key].hlo,
-                    flattener=trace_artifacts[key].flattener,
-                    packer=trace_artifacts[key].packer,
-                    metaneff=trace_artifacts[key].metaneff,
-                    weight_name_to_idx=trace_artifacts[key].weight_name_to_idx,
+                    trace_artifacts=trace_artifacts[key],
                     wlo_artifacts=wlo_artifacts,
                     key=key
                 )
@@ -457,6 +452,17 @@ def test_get_nonexistent_hlo():
     torch.classes.neuron.Runtime().unsafe_close()
     nxd_model.get_hlo("key10")
 
+def test_func_multi_copy():
+    def func(a,b):
+        return a+b
+    
+    trace_artifacts = trace(func,(torch.rand(2),torch.rand(2)))
+    compile_artifacts = compile(trace_artifacts.hlo, trace_artifacts.metaneff)
+
+    nxd_model = NxDModel(2)
+    nxd_model.add("adder", trace_artifacts, compile_artifacts)
+    nxd_model.to_neuron() # shouldn't fail
+
 @pytest.mark.parametrize('buffer_type', [('weights',),('states',)])
 def test_read_from_neuron_buffer(buffer_type: str):
     nxd_model = generate_nxdmodel_with_mock_spmdmodels(1, 1)
@@ -725,7 +731,7 @@ def test_forward_basic(mode):
     else:
         output = nxd_model([a],[b],forward_mode=mode)
         assert torch.equal(output[0][0], a)
-        assert torch.equal(output[0][1], b)
+        assert torch.equal(output[1][0], b)
 
 @pytest.mark.parametrize('mode',['default','ranked','async',])
 def test_forward_kwargs(mode):
@@ -751,7 +757,7 @@ def test_forward_kwargs(mode):
     else:
         output = nxd_model(b=[b],a=[a], forward_mode=mode)
         assert torch.equal(output[0][0], a)
-        assert torch.equal(output[0][1], b)
+        assert torch.equal(output[1][0], b)
 
 @pytest.mark.parametrize('mode',['default','ranked','async',])
 def test_forward_pos_and_kwargs(mode):
@@ -777,7 +783,7 @@ def test_forward_pos_and_kwargs(mode):
     else:
         output = nxd_model([a],b=[b], forward_mode=mode)
         assert torch.equal(output[0][0], a)
-        assert torch.equal(output[0][1], b)
+        assert torch.equal(output[1][0], b)
 
 @pytest.mark.parametrize('mode',['default','ranked','async',])
 def test_forward_specific_model_name(mode):
@@ -790,10 +796,10 @@ def test_forward_specific_model_name(mode):
     nxd_model.input_shape_map = {
         '(a: [1, 2], b: [1, 2])': ['key0', 'key1'],
     }
-    nxd_model.flattener_map['key0'] = IdentityModule()
-    nxd_model.flattener_map['key1'] = IdentityModule()
-    nxd_model.packer_map['key0'] = IdentityModule()
-    nxd_model.packer_map['key1'] = IdentityModule()
+    for key in ['key0', 'key1']:
+        nxd_model.flattener_map[key] = IdentityModule()
+        nxd_model.packer_map[key] = IdentityModule()
+
     def mock_model(tensors):
         if isinstance(tensors[0], list):
             return [
@@ -816,7 +822,79 @@ def test_forward_specific_model_name(mode):
     else:
         output = nxd_model([a],b=[b], model_name='key1', forward_mode=mode)
         assert torch.equal(output[0][0], a + 1)
-        assert torch.equal(output[0][1], b + 1)
+        assert torch.equal(output[1][0], b + 1)
+
+@pytest.mark.parametrize('mode',['default','ranked','async',])
+def test_forward_pos_and_kwargs_distributed(mode):
+    nxd_model = generate_nxdmodel_with_mock_spmdmodels(2,1)
+
+    # mock nxdmodel settings
+    nxd_model.loaded_on_neuron = True
+    model_params = [('a', True), ('b', False)]
+    nxd_model.model_params = [ModelParamInfo(*model_param) for model_param in model_params]
+    nxd_model.input_shape_map = {
+        '(a: [1, 2], b: [1, 2])': ['key0'],
+        '(a: [4, 2], b: [4, 2])': ['key1'],
+    }
+    for key in ['key0', 'key1']:
+        nxd_model.flattener_map[key] = IdentityModule()
+        nxd_model.packer_map[key] = IdentityModule()
+
+    a = torch.rand(1,2)
+    b = torch.rand(1,2)
+
+    if mode == 'default':
+        output = nxd_model(a, b=b, forward_mode=mode)
+        assert torch.equal(output[0], a)
+        assert torch.equal(output[1], b)
+    else:
+        output = nxd_model([a]*2,b=[b]*2, forward_mode=mode)
+        assert torch.equal(output[0][0], a)
+        assert torch.equal(output[1][0], b)
+        assert torch.equal(output[0][1], a)
+        assert torch.equal(output[1][1], b)
+        
+
+@pytest.mark.parametrize('mode',['default','ranked','async',])
+def test_forward_specific_model_name_distributed(mode):
+    nxd_model = generate_nxdmodel_with_mock_spmdmodels(2,2)
+
+    # mock nxdmodel settings
+    nxd_model.loaded_on_neuron = True
+    model_params = [('a', True), ('b', False)]
+    nxd_model.model_params = [ModelParamInfo(*model_param) for model_param in model_params]
+    nxd_model.input_shape_map = {
+        '(a: [1, 2], b: [1, 2])': ['key0', 'key1'],
+    }
+    for key in ['key0', 'key1']:
+        nxd_model.flattener_map[key] = IdentityModule()
+        nxd_model.packer_map[key] = IdentityModule()
+
+    def mock_model(tensors):
+        if isinstance(tensors[0], list):
+            return [
+                [tensor+1 for tensor in tensor_collection]
+                for tensor_collection in tensors
+            ]
+        return [tensor+1 for tensor in tensors]
+    setattr(mock_model, 'forward', mock_model)
+    setattr(mock_model, 'forward_ranked', mock_model)
+    setattr(mock_model, 'forward_async', mock_model)
+    nxd_model.spmd_models['key1'] = mock_model
+
+    a = torch.rand(1,2)
+    b = torch.rand(1,2)
+
+    if mode == 'default':
+        output = nxd_model(a, b=b, model_name='key1', forward_mode=mode)
+        assert torch.equal(output[0], a + 1)
+        assert torch.equal(output[1], b + 1)
+    else:
+        output = nxd_model([a]*2,b=[b]*2, model_name='key1', forward_mode=mode)
+        assert torch.equal(output[0][0], a + 1)
+        assert torch.equal(output[1][0], b + 1)
+        assert torch.equal(output[0][1], a + 1)
+        assert torch.equal(output[1][1], b + 1)
 
 
 def test_nxd_model_load_dtype_conversion():
@@ -860,3 +938,24 @@ def test_nxd_model_load_dtype_conversion():
         for name, dtype in expected_dtypes.items():
             assert name in loaded_model.state_initializer.dtypes
             assert loaded_model.state_initializer.dtypes[name] == dtype
+
+
+def test_nxd_model_load_with_wlo():
+    inputs = {
+        'key1': (torch.rand(1,10), None),
+    }
+    world_size = 2
+    original_model = build_nxd_model(
+        partial(DenseMLP, True),
+        inputs,
+        world_size,
+        use_wlo=True
+    )
+
+    # Save and load the model
+    with tempfile.NamedTemporaryFile(suffix='.pt') as tmp:
+        original_model.save(tmp.name)
+        loaded_model = NxDModel.load(tmp.name)
+
+        assert isinstance(loaded_model, NxDModel)
+        assert loaded_model.layout_transformer is not None

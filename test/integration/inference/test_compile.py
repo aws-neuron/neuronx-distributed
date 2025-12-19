@@ -4,7 +4,7 @@ import os
 import shutil
 import tempfile
 
-from neuronx_distributed.trace.model_builder import trace, compile
+from neuronx_distributed.trace.functions import trace, compile
 from neuronx_distributed.trace.model_builder_utils import (
     ModelBuilderConstants,
     CompilationArtifacts,

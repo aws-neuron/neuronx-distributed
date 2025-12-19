@@ -595,8 +595,8 @@ class TestImplCorrectness(unittest.TestCase):
 
                 elif cfg.implementation == "llama4":
                     # Run fwd on both the Neuron and llama4 HF model
-                    op_neuron, _, _ = model_neuron(ip)
-                    op_llama4, _ = model_golden(ip)
+                    op_neuron = model_neuron(ip)[0]
+                    op_llama4 = model_golden(ip)[0]
                     # Check that router logits and outputs match
                     ut.check_tensors(op_neuron.view(-1, cfg.hidden_size), op_llama4, **TEST_TOLS, additional_msg=f"Iteration {it}")
 

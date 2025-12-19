@@ -13,6 +13,7 @@ from .trainer.trainer import (
 )
 # ModelBuilder and NxDModel
 # TODO: Expose fundamental units at this level
-from .trace.model_builder import ModelBuilderV2 as ModelBuilder, shard_checkpoint
+from .trace.model_builder_v2 import ModelBuilder
+from .trace.functions import shard_checkpoint
 from .trace.nxd_model import BaseNxDModel, NxDModel, TorchScriptNxDModel, convert_nxd_model_to_torchscript_model
 from .trace.parallel_context import NxDParallelState

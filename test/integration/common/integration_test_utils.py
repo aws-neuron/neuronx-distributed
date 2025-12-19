@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import subprocess
 
@@ -8,6 +9,7 @@ import torch_xla.core.xla_model as xm
 import random
 import numpy
 
+from torch_neuronx.utils import get_platform_target
 from neuronx_distributed.parallel_layers import layers, parallel_state
 from neuronx_distributed.parallel_layers.random import model_parallel_xla_manual_seed
 
@@ -304,3 +306,34 @@ def download_from_s3(s3_file, local_file):
     print(f"Download duration: {round(total_time, 2)}s")
     print(f"Download size: {round(downloaded_bytes / 1000000000, 2)}GB")
     print(f"Download speed: {round(downloaded_bytes * 8 / 1000000000 / total_time, 2)}Gbps")
+
+def get_profile_latency(neff_path):
+    """ Run neuron profiling and return latency in milliseconds
+
+        Arguments:
+            neff_path: direct path to the neff file
+        Returns:
+            latency in ms (milliseconds)
+    """
+    worker = 64 if get_platform_target() == "trn2" else 32
+    neff_dir = os.path.dirname(neff_path)
+    profile_path = f"{neff_dir}/profile.ntff"
+    
+    cmd = [
+        "neuron-profile", "capture", "-n", neff_path, "-s", profile_path,
+        "--collectives-worker-start-id", "0", "--collectives-workers-per-node", f"{worker}",
+        "--collectives-worker-count", f"{worker}", "--collectives-profile-id", "0",
+        "--num-exec=2", "--profile-nth-exec=2"
+    ]
+    
+    subprocess.run(cmd, check=True)
+    profile_path = f"{neff_dir}/*.ntff"
+
+    view_cmd = f"neuron-profile view --output-format summary-text -n {neff_path} -s {profile_path} | grep -e 'total_time'"
+    result = subprocess.run(view_cmd, shell=True, capture_output=True, text=True)
+    
+    if result.stdout:
+        match = re.search(r'total_time.*?([0-9.]+)', result.stdout)
+        if match:
+            return float(match.group(1)) * 1000
+    return None

@@ -5,7 +5,7 @@ from torch_neuronx.proto import metaneff_pb2
 
 from neuronx_distributed.parallel_layers.layers import ColumnParallelLinear, RowParallelLinear
 from neuronx_distributed.parallel_layers import parallel_state
-from neuronx_distributed.trace.model_builder import trace
+from neuronx_distributed.trace.functions import trace
 from neuronx_distributed.trace.model_builder_utils import TraceArtifacts
 from neuronx_distributed.trace.mock_torchdist import mock_distributed
 

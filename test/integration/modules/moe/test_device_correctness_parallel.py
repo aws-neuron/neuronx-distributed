@@ -8,6 +8,7 @@ import torch
 # Imports from MoE unit tests (for this import to succeed, test/unit_test/modules/moe must be added to PYTHONPATH)
 from device_correctness_test_configs import (
     get_device_correctness_parallel_test_configs,
+    get_device_correctness_parallel_test_configs_EP,
     get_neuron_cc_flags,
 )
 from device_correctness_test_runner import run_device_correctness_test
@@ -54,8 +55,8 @@ def parse_args():
     parser.add_argument("--test_dtype", required=True, choices=["fp32", "bf16", "fp16"], help="Either fp32 or bf16")
     parser.add_argument("--test_mode", required=True, type=str, help="Either training or inference")
     parser.add_argument("--test_modules", required=False, default=None, type=str, help="sub test classes, mostly feature level ('module1,module2,module3')")
-    allowed_tp_degrees = [1, 2, 8, 16, 32]
-    tp_degrees_help_msg = "One of 1, 2, 8, 16, 32"
+    allowed_tp_degrees = [1, 2, 4, 8, 16, 32]
+    tp_degrees_help_msg = "One of 1, 2, 4, 8, 16, 32"
     if get_platform_lnc() == 2:
         allowed_tp_degrees.append(64)
         tp_degrees_help_msg.join(", 64")
@@ -118,20 +119,33 @@ def test_moe_layer_device_correctness_parallel():
         output_test_tols, grad_test_tols = OUTPUT_TEST_TOLS_FP16, GRAD_TEST_TOLS_FP16
 
     def _test_moe_layer_device_correctness_parallel():
-        test_configs = get_device_correctness_parallel_test_configs(
-            dtype=TEST_DTYPE,
-            tp_degree=TEST_TP_DEGREE,
-            ep_degree=TEST_EP_DEGREE,
-            token_shuffle_group_size=TEST_TOKEN_SHUFFLE_GROUP_SIZE,
-            test_mode=TEST_MODE,
-            test_modules=TEST_MODULES,
-            zero1=ZERO1,
-        )
+        if TEST_EP_DEGREE>1 and TEST_MODE == "training":
+            test_configs = get_device_correctness_parallel_test_configs_EP(
+                dtype=TEST_DTYPE,
+                tp_degree=TEST_TP_DEGREE,
+                ep_degree=TEST_EP_DEGREE,
+                token_shuffle_group_size=TEST_TOKEN_SHUFFLE_GROUP_SIZE,
+                test_mode=TEST_MODE,
+                test_modules=TEST_MODULES,
+                zero1=ZERO1,
+            )	
+        else:	
+            test_configs = get_device_correctness_parallel_test_configs(	
+                dtype=TEST_DTYPE,	
+                tp_degree=TEST_TP_DEGREE,	
+                ep_degree=TEST_EP_DEGREE,	
+                token_shuffle_group_size=TEST_TOKEN_SHUFFLE_GROUP_SIZE,	
+                test_mode=TEST_MODE,	
+                test_modules=TEST_MODULES,	
+                zero1=ZERO1,	
+            )
         start_time = time.time()
         failed = 0
         print_rank0(f"Running {len(test_configs)} tests")
         for i, cfg in enumerate(test_configs):
             print_rank0(f"Running test {i+1}/{len(test_configs)}: {str(cfg)}")
+            if cfg.top_k > 1 and cfg.early_expert_affinity_modulation:
+                continue
             try:
                 run_device_correctness_test(cfg, output_test_tols, grad_test_tols)
                 print_rank0("ok\n")

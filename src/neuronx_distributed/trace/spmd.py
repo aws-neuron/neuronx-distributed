@@ -1,8 +1,12 @@
+import logging
+import math
 from typing import List, Dict, Tuple
 
 from neuronx_distributed.parallel_layers.utils import is_torch_version_greater_than_2
 import torch
 from torch_neuronx.xla_impl import structure
+
+logger = logging.getLogger("Neuron")
 
 def default_bucket_kernel(inputs: List[torch.Tensor]):
     return inputs, torch.tensor(0).to(torch.int)
@@ -62,23 +66,75 @@ class SPMDBucketModelScript(torch.nn.Module):
 
 
 class StateInitializer(torch.nn.Module):
+    kv_cache_keys_map: Dict[str, Tuple[str, str]]
+    state_keys: List[str]
+
     # torchscript cannot script dict of with values of different types
     # so we store shapes and dtypes in separate dicts
-    def __init__(self, shapes, dtypes, local_ranks_size):
+    def __init__(self, shapes, dtypes, local_ranks_size, combine_kv_on_device=False):
         super().__init__()
         self.shapes = shapes
         self.dtypes = dtypes
         self.local_ranks_size = local_ranks_size
+        self.kv_cache_keys_map = {}
+        self.state_keys = []
+
+        kv_cache_keys = []
+        for key in self.shapes.keys():
+            if combine_kv_on_device and ".past_key_values." in key:
+                kv_cache_keys.append(key)
+            else:
+                self.state_keys.append(key)
+
+        # Iterate through kv_cache_keys in pairs.
+        it = iter(kv_cache_keys)
+        for idx, (k_key, v_key) in enumerate(zip(it, it)):
+            k_shape = self.shapes[k_key]
+            v_shape = self.shapes[v_key]
+            k_dtype = self.dtypes[k_key]
+            v_dtype = self.dtypes[v_key]
+            if k_dtype != v_dtype or math.prod(k_shape) != math.prod(v_shape):
+                raise ValueError("Could not combine KV allocations due to incompatible dtype or shape")
+
+            kv_key = k_key.rsplit(".", 1)[0] + f".combined.{idx}"
+            kv_shape = [2, *k_shape]
+            logger.debug(f"Will combine {k_key} and {v_key} into {kv_key}, shape: {kv_shape}")
+            # Insert combined kv_key and kv_shape into state_keys and shapes so they are created on device.
+            self.state_keys.append(kv_key)
+            self.dtypes[kv_key] = k_dtype
+            self.shapes[kv_key] = kv_shape
+            # Map the combined kv_key back to (k_key, v_key) so they can be split once on device.
+            self.kv_cache_keys_map[kv_key] = (k_key, v_key)
 
     def forward(self):
+        cpu_states : Dict[str, torch.Tensor] = {}
+
+        # Create states on CPU
+        for key in self.state_keys:
+            dtype = self.dtypes[key]
+            shape = self.shapes[key]
+            if is_torch_version_greater_than_2() and dtype == torch.float8_e4m3fn:
+                val = torch.zeros(shape, dtype=torch.bfloat16).to(dtype=dtype)
+            else:
+                val = torch.zeros(shape, dtype=dtype)
+            cpu_states[key] = val
+
         results : List[Dict[str, torch.Tensor]]= []
+
+        # Copy CPU states to all ranks.
         for rank in range(0, self.local_ranks_size):
             states = {}
-            for key in self.shapes.keys():
-                if is_torch_version_greater_than_2() and self.dtypes[key] == torch.float8_e4m3fn:
-                    states[key] = torch.zeros(self.shapes[key], dtype=torch.bfloat16).to(dtype=self.dtypes[key]).to(device=f"privateuseone:{rank}")
-                else:
-                    states[key] = torch.zeros(self.shapes[key], dtype=self.dtypes[key], device=f"privateuseone:{rank}")
+
+            for key, val in cpu_states.items():
+                val = val.to(device=f"privateuseone:{rank}")
+                states[key] = val
+
+                # Split K and V on device.
+                if key in self.kv_cache_keys_map:
+                    k_key, v_key = self.kv_cache_keys_map[key]
+                    states[k_key] = val[0].view(self.shapes[k_key])
+                    states[v_key] = val[1].view(self.shapes[v_key])
+
             results.append(states)
 
         return results
@@ -158,6 +214,8 @@ class NxDModel(torch.nn.Module):
 
     def router(self, inputs: List[torch.Tensor]) -> Tuple[str, int]:
         actual_shape = str([tensor.shape for tensor in inputs])
+        if actual_shape not in self.input_shape_map:
+            raise ValueError(f"Input shape {actual_shape} not found in input_shape_map: {self.input_shape_map.keys()}")
         return self.input_shape_map[actual_shape]
 
     def forward(self, inputs: List[torch.Tensor]):
@@ -170,7 +228,7 @@ class NxDModel(torch.nn.Module):
         # torch.jit.script does not allow indexing of ModuleDict
         # so we work around by looping and conditionally executing it
         for name, flattener in self.flattener_map.items():
-            if name == model_name:
+            if name == f"{model_name}_{bucket_idx}":
                 flattened_inputs = flattener(inputs)
 
         result: List[torch.Tensor] = [torch.zeros(0)]
@@ -188,7 +246,7 @@ class NxDModel(torch.nn.Module):
 
         flattened_input_collection: List[List[torch.Tensor]] = []
         for name, flattener in self.flattener_map.items():
-            if name == model_name:
+            if name == f"{model_name}_{bucket_idx}":
                 for inputs in input_collection:
                     flattened_inputs = flattener(inputs)
                     flattened_input_collection.append(flattened_inputs)
@@ -207,7 +265,7 @@ class NxDModel(torch.nn.Module):
 
         flattened_input_collection: List[List[torch.Tensor]] = []
         for name, flattener in self.flattener_map.items():
-            if name == model_name:
+            if name == f"{model_name}_{bucket_idx}":
                 for inputs in input_collection:
                     flattened_inputs = flattener(inputs)
                     flattened_input_collection.append(flattened_inputs)

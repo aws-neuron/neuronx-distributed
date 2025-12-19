@@ -373,6 +373,7 @@ def initialize_mixtral_moe_layer(config):
         router=router,
         expert_mlps=expert_mlps,
         return_router_logits=True,
+        return_expert_index=False,
         sequence_parallel_enabled=config.sequence_parallel_enabled,
         sequence_dimension=0,
     )

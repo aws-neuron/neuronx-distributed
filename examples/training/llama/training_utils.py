@@ -135,7 +135,12 @@ def create_llama_pretraining_dataset(data_dir, mini_batch_size, dp_size, dp_rank
 def create_instruction_based_dataset(data_dir, mini_batch_size, dp_size, dp_rank, seed, tokenizer=None, task=None):
     if data_dir.startswith("s3://") or (os.path.isdir(data_dir) and os.path.exists(data_dir)):
         # Pass FULL absolute path
+        import tempfile
+        cache_dir = os.path.join(tempfile.gettempdir(), "hf_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        os.environ['HF_DATASETS_CACHE'] = cache_dir
         raw_datasets = datasets.load_from_disk(data_dir)
+        raw_datasets = raw_datasets['train']
     else:
         raw_datasets = datasets.load_dataset(data_dir, split="train")
     if task:
