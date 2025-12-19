@@ -15,7 +15,11 @@ from neuronx_distributed.parallel_layers.layers import (
     RowParallelLinear,
 )
 from neuronx_distributed.quantization.quantization_config import (
+    QuantizedDtype,
+    QuantizationType,
+    ScaleDtype,
     get_default_custom_qconfig_dict,
+    get_default_blockwise_custom_qconfig_dict,
     get_default_per_channel_custom_qconfig_dict,
 )
 from neuronx_distributed.quantization.quantization_layers import (
@@ -103,9 +107,8 @@ class TestBaseQuantizeParallelLinear(unittest.TestCase):
     def test_init(self):
         with self.assertRaises(AssertionError) as context:
             BaseQuantizeParallelLinear(quantization_type="something")
-
         self.assertTrue(
-            "something quantization is not supported currently. Specify from [['per_tensor_symmetric', 'per_channel_symmetric', 'expert_wise_per_channel_symmetric']]"
+            "something quantization is not supported currently. Specify from [['per_tensor_symmetric', 'per_channel_symmetric', 'blockwise_symmetric', 'expert_wise_per_channel_symmetric']]"
             in str(context.exception)
         )
 
@@ -173,6 +176,115 @@ class TestBaseQuantizeParallelLinear(unittest.TestCase):
         assert test_class.scale.tensor_model_parallel is False
 
 
+    @patch.multiple(BaseQuantizeParallelLinear, __abstractmethods__=set())
+    def test_setup_for_scale_blockwise(self):
+        test_class = BaseQuantizeParallelLinear(quantization_type="blockwise_symmetric", quantized_dtype=torch.int8)
+        test_class.weight = MagicMock(device=torch.device("cpu"))
+
+        # Test case 1: Regular 2D case where dimensions are larger than DEFAULT_BLOCK_SIZE (128)
+        weight_shape = (512, 256)  # dimensions larger than 128
+        test_class._setup_for_scale(
+            weight_shape=weight_shape,
+            quantization_type=test_class.quantization_type,
+            weight_partition_dim=1,
+            block_axis=[0, 1],
+            block_size=[128, 128]
+        )
+        expected_scale_shape = (4, 2)
+        assert hasattr(test_class.scale, "get_tensor_from_state_dict")
+        assert test_class.scale.shape == expected_scale_shape
+        assert test_class.scale.tensor_model_parallel is True
+        assert test_class.scale.partition_dim == 1
+
+        # Test case 2: 2D case where one dimension is smaller than DEFAULT_BLOCK_SIZE
+        weight_shape = (256, 64)  # first dimension smaller than 128
+        test_class._setup_for_scale(
+            weight_shape=weight_shape,
+            quantization_type=test_class.quantization_type,
+            weight_partition_dim=1,  # partitioning along the smaller dimension
+            block_axis=[0, 1],
+            block_size=[128, 128]
+        )
+        expected_scale_shape = (2, 1)  # Should be (1, 2)
+        assert hasattr(test_class.scale, "get_tensor_from_state_dict")
+        assert test_class.scale.shape == expected_scale_shape
+        assert test_class.scale.tensor_model_parallel is True
+        assert test_class.scale.partition_dim == 1
+
+        # Test case 3: 3D case where all dimensions are larger than DEFAULT_BLOCK_SIZE
+        weight_shape = (5, 256, 512)
+        test_class._setup_for_scale(
+            weight_shape=weight_shape,
+            quantization_type=test_class.quantization_type,
+            weight_partition_dim=2,
+            block_axis=[1, 2],
+            block_size=[128, 128]
+        )
+        expected_scale_shape = (5, 2, 4)  # Should be (5, 4, 2)
+        assert hasattr(test_class.scale, "get_tensor_from_state_dict")
+        assert test_class.scale.shape == expected_scale_shape
+        assert test_class.scale.tensor_model_parallel is True
+        assert test_class.scale.partition_dim == 2
+
+        # Test case 4: 3D case with one dimension smaller than DEFAULT_BLOCK_SIZE at partition dim
+        weight_shape = (5, 256, 256)
+        test_class._setup_for_scale(
+            weight_shape=weight_shape,
+            quantization_type=test_class.quantization_type,
+            weight_partition_dim=2,
+            block_axis=[1, 2],
+            block_size=[128, 128]
+        )
+        expected_scale_shape = (5, 2, 2)  # Should be (1, 2, 2)
+        assert hasattr(test_class.scale, "get_tensor_from_state_dict")
+        assert test_class.scale.shape == expected_scale_shape
+        assert test_class.scale.tensor_model_parallel is True
+        assert test_class.scale.partition_dim == 2
+
+        # Case 6a: dimension smaller than DEFAULT_BLOCK_SIZE not at partition dim
+        with pytest.raises(AssertionError):
+            test_class._setup_for_scale(
+                weight_shape=(5, 64, 256),  # middle dimension smaller than 128
+                quantization_type=test_class.quantization_type,
+                weight_partition_dim=2,
+                block_axis=[1, 2],
+                block_size=[128, 128]
+            )
+
+        # Block is 1D, block axis is at the last dimension
+        weight_shape = (5, 256, 256)
+        test_class._setup_for_scale(
+            weight_shape=weight_shape,
+            quantization_type=test_class.quantization_type,
+            weight_partition_dim=2,
+            block_axis=[2],
+            block_size=[128]
+        )
+        expected_scale_shape = (5, 256, 2)
+        
+        # Block is 1D, block axis is in middle dimension
+        weight_shape = (5, 256, 256)
+        test_class._setup_for_scale(
+            weight_shape=weight_shape,
+            quantization_type=test_class.quantization_type,
+            weight_partition_dim=2,
+            block_axis=[1],
+            block_size=[128]
+        )
+        expected_scale_shape = (5, 2, 256)
+        
+        # Block is 1D, block axis is at the first dimension
+        weight_shape = (256, 256)
+        test_class._setup_for_scale(
+            weight_shape=weight_shape,
+            quantization_type=test_class.quantization_type,
+            weight_partition_dim=2,
+            block_axis=[0],
+            block_size=[128]
+        )
+        expected_scale_shape = (2, 256)
+
+
 class TestQuantizedColumnParallel(unittest.TestCase):
     def setUp(self) -> None:
         self.initial_tensor_model_parallel_group = parallel_state._TENSOR_MODEL_PARALLEL_GROUP
@@ -232,9 +344,9 @@ class TestQuantizedColumnParallel(unittest.TestCase):
             partition_dim=0,
             num_partitions=2,
             init_method=layer._init_weight,
-            param_dtype=torch.int8,
+            param_dtype=QuantizedDtype.INT8,
             stride=layer.stride,
-            return_master_param=layer.keep_master_weight,
+            return_master_param=layer.keep_master_weight
         )
 
         # Assert weight properties
@@ -360,7 +472,7 @@ class TestQuantizedRowParallel(unittest.TestCase):
             partition_dim=1,
             num_partitions=2,
             init_method=layer._init_weight,
-            param_dtype=torch.int8,
+            param_dtype=QuantizedDtype.INT8,
             stride=layer.stride,
             return_master_param=layer.keep_master_weight,
         )
@@ -466,7 +578,7 @@ class TestQuantizedExpertFusedColumnParallel(unittest.TestCase):
             input_size=3,
             output_size=4,
             quantization_type="per_tensor_symmetric",
-            quantized_dtype=torch.int8,
+            quantized_dtype=QuantizedDtype.INT8,
             dtype=torch.bfloat16,
         )
         mock_setup_for_weight.assert_called_once()
@@ -495,7 +607,7 @@ class TestQuantizedExpertFusedColumnParallel(unittest.TestCase):
             partition_dim=2,
             num_partitions=2,
             init_method=layer._init_weight,
-            param_dtype=torch.int8,
+            param_dtype=QuantizedDtype.INT8,
             stride=layer.stride,
             return_master_param=layer.keep_master_weight,
         )
@@ -534,6 +646,68 @@ class TestQuantizedExpertFusedColumnParallel(unittest.TestCase):
         qcpl = QuantizedExpertFusedColumnParallel.from_float(cpl, q_config=q_config)
         qcpl.scale.shape == (1, 1, 6)
         assert qcpl.scale.tensor_model_parallel is True and qcpl.scale.partition_dim == 2
+    
+    def test_from_float_fp4x4(self):
+        cpl = ExpertFusedColumnParallelLinear(
+            num_experts=2,
+            input_size=4,
+            output_size=8,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+        q_config = get_default_blockwise_custom_qconfig_dict()
+        q_config["quantized_dtype"] = QuantizedDtype.F4E2M1FN_X4
+        q_config["quantization_type"] = QuantizationType.BLOCKWISE_SYMMETRIC
+        q_config["block_axis"] = [2]
+        q_config["block_size"] = [2]
+        q_config["scale_dtype"] = ScaleDtype.F32
+
+        qcpl = QuantizedExpertFusedColumnParallel.from_float(cpl, q_config=q_config)
+        assert qcpl.weight.dtype == QuantizedDtype.F4E2M1FN_X4.value
+        assert qcpl.bias is None
+        assert qcpl.scale.shape == (2,4,4)
+
+        q_config = get_default_blockwise_custom_qconfig_dict()
+        q_config["quantized_dtype"] = QuantizedDtype.F4E2M1FN_X4
+        q_config["quantization_type"] = QuantizationType.BLOCKWISE_SYMMETRIC
+        q_config["block_axis"] = [1, 2]
+        q_config["block_size"] = [2, 2]
+        q_config["scale_dtype"] = ScaleDtype.F32
+        qcpl = QuantizedExpertFusedColumnParallel.from_float(cpl, q_config=q_config)
+        assert qcpl.scale.shape == (2,2,4)
+        
+    def test_from_float_fp4x4_mx_swizzle(self):
+        cpl = ExpertFusedColumnParallelLinear(
+            num_experts=2,
+            input_size=32,
+            output_size=64,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+        q_config = get_default_blockwise_custom_qconfig_dict()
+        q_config["quantized_dtype"] = QuantizedDtype.F4E2M1FN_X4
+        q_config["quantization_type"] = QuantizationType.BLOCKWISE_SYMMETRIC
+        q_config["block_axis"] = [-1]
+        q_config["block_size"] = [2]
+        q_config["scale_dtype"] = ScaleDtype.F8E8M0
+
+        qcpl = QuantizedExpertFusedColumnParallel.from_float(cpl, q_config=q_config)
+        assert qcpl.weight.dtype == QuantizedDtype.F4E2M1FN_X4.value
+        assert qcpl.bias is None
+        assert qcpl.mx_swizzle
+        assert qcpl.scale.shape == (2,8,1,128), f"expected (2,8,1,128) got {qcpl.scale.shape}"
+
+        cpl.is_fused_gate_up = True
+        q_config = get_default_blockwise_custom_qconfig_dict()
+        q_config["quantized_dtype"] = QuantizedDtype.F4E2M1FN_X4
+        q_config["quantization_type"] = QuantizationType.BLOCKWISE_SYMMETRIC
+        q_config["block_axis"] = [1, -1]
+        q_config["block_size"] = [8, 4]
+        q_config["scale_dtype"] = ScaleDtype.F8E8M0
+        qcpl = QuantizedExpertFusedColumnParallel.from_float(cpl, q_config=q_config)
+        assert qcpl.scale.shape == (2,1,2,1,32), f"expected (2,1,2,1,32) got {qcpl.scale.shape}"
+        assert qcpl.mx_swizzle
+
 
 
 class TestQuantizedExpertFusedRowParallel(unittest.TestCase):
@@ -586,7 +760,7 @@ class TestQuantizedExpertFusedRowParallel(unittest.TestCase):
             partition_dim=1,
             num_partitions=2,
             init_method=layer._init_weight,
-            param_dtype=torch.int8,
+            param_dtype=QuantizedDtype.INT8,
             stride=layer.stride,
             return_master_param=layer.keep_master_weight,
         )
@@ -611,6 +785,39 @@ class TestQuantizedExpertFusedRowParallel(unittest.TestCase):
         self.assertEqual(layer.weight.dtype, torch.int8)
         self.assertFalse(layer.weight.requires_grad)
 
+    @patch("neuronx_distributed.quantization.quantization_layers._initialize_parameter_cpu")
+    def test_setup_for_weight_fp4x4(self, mock_initialize_parameter_cpu):
+        num_experts = 2
+        input_size = 6
+        output_size = 4
+        parallel_state._TENSOR_MODEL_PARALLEL_GROUP = MagicMock(spec=torch.distributed.ProcessGroup)
+        parallel_state._TENSOR_MODEL_PARALLEL_GROUP.size.return_value = 2
+        layer = QuantizedExpertFusedRowParallel(
+            num_experts, 
+            input_size, 
+            output_size, 
+            quantized_dtype=QuantizedDtype.F4E2M1FN_X4, 
+            quantization_type=QuantizationType.BLOCKWISE_SYMMETRIC,
+            block_axis=[-1],
+            block_size=[2],
+            device=torch.device("cpu")
+        )
+        
+        mock_initialize_parameter_cpu.assert_called_once_with(
+            param=layer.weight,
+            partition_dim=1,
+            num_partitions=2,
+            init_method=layer._init_weight,
+            param_dtype=QuantizedDtype.F4E2M1FN_X4,
+            stride=layer.stride,
+            return_master_param=layer.keep_master_weight
+        )
+
+        self.assertEqual(layer.weight.dtype, QuantizedDtype.F4E2M1FN_X4.value)
+        self.assertFalse(layer.weight.requires_grad)
+        self.assertEqual(layer.weight.shape, (2, 3, 1))
+        assert hasattr(layer.weight, "get_tensor_from_state_dict")
+    
     def test_from_float(self):
         rpl = ExpertFusedRowParallelLinear(
             num_experts=2,
@@ -630,6 +837,67 @@ class TestQuantizedExpertFusedRowParallel(unittest.TestCase):
         qrpl = QuantizedExpertFusedRowParallel.from_float(rpl, q_config=q_config)
         qrpl.scale.shape == (1, 1, 4)
         assert qrpl.scale.tensor_model_parallel is False
+
+    def test_from_float_fp4x4(self):
+        rpl = ExpertFusedRowParallelLinear(
+            num_experts=2,
+            input_size=6,
+            output_size=4,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+        q_config = get_default_blockwise_custom_qconfig_dict()
+        q_config["quantized_dtype"] = QuantizedDtype.F4E2M1FN_X4
+        q_config["quantization_type"] = QuantizationType.BLOCKWISE_SYMMETRIC
+        q_config["block_axis"] = [2]
+        q_config["block_size"] = [2]
+        q_config["scale_dtype"] = ScaleDtype.F32
+
+        qrpl = QuantizedExpertFusedRowParallel.from_float(rpl, q_config=q_config)
+        assert qrpl.weight.dtype == QuantizedDtype.F4E2M1FN_X4.value
+        assert qrpl.bias is None
+        assert qrpl.scale.shape == (2,6,2)
+
+        q_config = get_default_blockwise_custom_qconfig_dict()
+        q_config["quantized_dtype"] = QuantizedDtype.F4E2M1FN_X4
+        q_config["quantization_type"] = QuantizationType.BLOCKWISE_SYMMETRIC
+        q_config["block_axis"] = [1, 2]
+        q_config["block_size"] = [2, 2]
+        q_config["scale_dtype"] = ScaleDtype.F32
+        qrpl = QuantizedExpertFusedRowParallel.from_float(rpl, q_config=q_config)
+        assert qrpl.scale.shape == (2,3,2)
+        
+    def test_from_float_fp4x4_mx_swizzle(self):
+        rpl = ExpertFusedRowParallelLinear(
+            num_experts=2,
+            input_size=64,
+            output_size=32,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+        q_config = get_default_blockwise_custom_qconfig_dict()
+        q_config["quantized_dtype"] = QuantizedDtype.F4E2M1FN_X4
+        q_config["quantization_type"] = QuantizationType.BLOCKWISE_SYMMETRIC
+        q_config["block_axis"] = [1]
+        q_config["block_size"] = [2]
+        q_config["scale_dtype"] = ScaleDtype.F8E8M0
+
+        qrpl = QuantizedExpertFusedRowParallel.from_float(rpl, q_config=q_config)
+        assert qrpl.weight.dtype == QuantizedDtype.F4E2M1FN_X4.value
+        assert qrpl.bias is None
+        assert qrpl.scale.shape == (2,8,1,128), f"expected (2,8,1,128) got {qrpl.scale.shape}"
+        assert qrpl.mx_swizzle
+
+        rpl.is_fused_gate_up = True
+        q_config = get_default_blockwise_custom_qconfig_dict()
+        q_config["quantized_dtype"] = QuantizedDtype.F4E2M1FN_X4
+        q_config["quantization_type"] = QuantizationType.BLOCKWISE_SYMMETRIC
+        q_config["block_axis"] = [1, -1]
+        q_config["block_size"] = [8, 4]
+        q_config["scale_dtype"] = ScaleDtype.F8E8M0
+        qrpl = QuantizedExpertFusedRowParallel.from_float(rpl, q_config=q_config)
+        assert qrpl.scale.shape == (2,2,2,1,16), f"expected (2,2,2,1,16) got {qrpl.scale.shape}"
+        assert qrpl.mx_swizzle
 
 
 if __name__ == "__main__":

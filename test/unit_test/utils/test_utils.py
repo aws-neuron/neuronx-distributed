@@ -18,7 +18,7 @@ import json
 import os
 from typing import Dict, Any
 from neuronx_distributed.utils.utils import get_dict_from_json
-from neuronx_distributed.utils import hardware
+from neuronx_distributed.utils import hardware, HloMetadataLevel
 
 
 class TestGetDictFromJson:
@@ -116,6 +116,24 @@ def test_hardware_enum(test_str, expected_hardware, expect_failure):
     try:  
         neuron_hardware = hardware(test_str)
         assert neuron_hardware == expected_hardware
+    except ValueError as e:
+        if not expect_failure:
+            raise e
+
+
+HLO_METADATA_LEVEL_TESTS = [
+    ('debug', HloMetadataLevel.DEBUG, False),
+    ('info', HloMetadataLevel.INFO, False),
+    ('none', HloMetadataLevel.NONE, False),
+    (True, HloMetadataLevel.DEBUG, False),
+    (False, HloMetadataLevel.INFO, False),
+    ('invalid', None, True),
+]
+@pytest.mark.parametrize('test_value, expected_level, expect_failure', HLO_METADATA_LEVEL_TESTS)
+def test_metadata_level_enum(test_value, expected_level, expect_failure):
+    try:
+        metadata_level = HloMetadataLevel(test_value)
+        assert metadata_level == expected_level
     except ValueError as e:
         if not expect_failure:
             raise e

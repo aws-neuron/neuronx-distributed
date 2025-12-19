@@ -77,8 +77,8 @@ class NxDModel(torch.nn.Module, BaseNxDModel):
         self.flattener_map: torch.nn.ModuleDict = torch.nn.ModuleDict()  # type: ignore
         self.packer_map: torch.nn.ModuleDict = torch.nn.ModuleDict() # type: ignore
 
-        self.weights: List[Dict[str, torch.Tensor]] = [{}]
-        self.states: List[Dict[str, torch.Tensor]] = [{}]
+        self.weights: List[Dict[str, torch.Tensor]] = [{}] * self.world_size
+        self.states: List[Dict[str, torch.Tensor]] = [{}] * self.world_size
         self.state_initializer = state_initializer
 
         self.loaded_on_neuron = False
@@ -303,9 +303,6 @@ class NxDModel(torch.nn.Module, BaseNxDModel):
         else:
             self.weights = torch.ops.neuron._parallel_load(sharded_checkpoint)
 
-        if (self.state_initializer is not None):
-            self.states = self.state_initializer()
-
     @torch.jit.export
     def to_neuron(self):
         """
@@ -322,6 +319,10 @@ class NxDModel(torch.nn.Module, BaseNxDModel):
         # MUST BE TORCHSCRIPT COMPATIBLE
         if self.loaded_on_neuron:
             return
+
+        if (self.state_initializer is not None):
+            self.states = self.state_initializer()
+
         for model in self.spmd_models.values():
             model.initialize(self.states, self.weights, self.start_rank)
         self.loaded_on_neuron = True
@@ -551,10 +552,11 @@ class NxDModel(torch.nn.Module, BaseNxDModel):
             outputs: List[List[torch.Tensor]] = self.spmd_models[model_name].forward_async(flattened_inputs)  # type: ignore[no-redef]
 
         # only runs for 'ranked' and 'async' modes
-        transposed_outputs: List[List[torch.Tensor]] = [[] for _ in range(len(outputs[0]))]
+        # change output from [rank][output] to [output][rank]
+        transposed_outputs: List[List[torch.Tensor]] = [[None for _ in range(len(outputs))] for _ in range(len(outputs[0]))]
         for rank,output in enumerate(outputs):
-            for output_tensor in output:
-                transposed_outputs[rank].append(output_tensor)
+            for output_num,output_tensor in enumerate(output):
+                transposed_outputs[output_num][rank] = output_tensor
 
         return transposed_outputs
 
@@ -822,9 +824,16 @@ class TorchScriptNxDModel(torch.nn.Module):
                 flattened_inputs = [flattener(inp) for inp in inputs]
 
         if async_mode:
-            return self.nxd_model.spmd_models[model_name].forward_async(flattened_inputs)
+            outputs = self.nxd_model.spmd_models[model_name].forward_async(flattened_inputs)
         else:
-            return self.nxd_model.spmd_models[model_name].forward_ranked(flattened_inputs)
+            outputs = self.nxd_model.spmd_models[model_name].forward_ranked(flattened_inputs)
+        
+        transposed_outputs: List[List[torch.Tensor]] = [[torch.tensor(0) for _ in range(len(outputs))] for _ in range(len(outputs[0]))]
+        for rank,output in enumerate(outputs):
+            for output_num,output_tensor in enumerate(output):
+                transposed_outputs[output_num][rank] = output_tensor
+        
+        return transposed_outputs
 
     def forward(  # type: ignore
         self,
@@ -917,9 +926,9 @@ def convert_nxd_model_to_torchscript_model(nxd_model: "NxDModel", save_weights: 
     """
     # unable to save empty containers in torchscript
     if not save_weights or (len(nxd_model.weights) == 1 and len(nxd_model.weights[0]) == 0):
-        nxd_model.weights = [{'__neuronprivatetensor__':torch.tensor(0)}]
+        nxd_model.weights = [{'__neuronprivatetensor__':torch.tensor(0)}] * nxd_model.world_size
     if not save_weights or (len(nxd_model.states) == 1 and len(nxd_model.states[0]) == 0):
-        nxd_model.states = [{'__neuronprivatetensor__':torch.tensor(0)}]
+        nxd_model.states = [{'__neuronprivatetensor__':torch.tensor(0)}] * nxd_model.world_size
 
     new_flattener_map: List[Tuple[str, torch.jit.ScriptModule]] = []
     for key,flattener in nxd_model.flattener_map.items():

@@ -5,7 +5,7 @@ import math
 import neuronxcc.nki as nki
 import neuronxcc.nki.language as nl
 
-from neuronx_distributed.kernels.find_index import find_index_shard_rows
+from neuronx_distributed.kernels.find_index import find_index_shard_rows, count_nonzeros_shard_rows
 from torch_neuronx.utils import get_platform_target
 
 def routing_setup_random_topk(T, top_k, E):
@@ -67,27 +67,111 @@ def get_golden(mask, n_values_max):
     return true_indices, true_counts
 
 
-@pytest.mark.parametrize("T,E,SP,EP,top_k,cf,expected_p99_lat_us", [
-    # Dropping
-    (2048, 256, 1, 64, 8, 1, 27),
-    (8192, 256, 1, 64, 8, 1, 42),
-    (16384, 256, 1, 64, 8, 1, 76),
-    pytest.param(2048, 128, 1, 64, 1, 1, 0, marks=pytest.mark.xfail(reason="Kernel not generalized to case where values are too few")),
-    (8192, 128, 1, 64, 1, 1, 34),
-    (16384, 128, 1, 64, 1, 1, 46),
-    # Dropless
-    (2048, 256, 1, 64, 8, -1, 35),
-    (8192, 256, 1, 64, 8, -1, 185),
-    (16384, 256, 1, 64, 8, -1, 624),
-    (2048, 128, 1, 64, 1, -1, 28),
-    (8192, 128, 1, 64, 1, -1, 104),
-    (16384, 128, 1, 64, 1, -1, 325),
+@pytest.mark.parametrize("T,E,E_local,sliced_mask,bool_mask,expected_p99_lat_us", [
+    (2048, 256, 4, True, True, 20),
+    (8192, 256, 4, True, True, 30),
+    (16384, 256, 4, True, True, 40),
+    (2048, 128, 8, True, True, 20),
+    (8192, 128, 8, True, True, 30),
+    (16384, 128, 8, True, True, 45),
+    (2048, 256, 4, False, False, 23),
+    (8192, 256, 4, False, False, 35),
+    (16384, 256, 4, False, False, 50),
+    (2048, 128, 8, False, False, 25),
+    (8192, 128, 8, False, False, 35),
+    (16384, 128, 8, False, False, 55),
 ])
-def test_find_index(T,E,SP,EP,top_k,cf,expected_p99_lat_us):
+def test_count_nonzeros_shard_rows(
+    T: int,
+    E: int,
+    E_local: int,
+    sliced_mask: bool,
+    bool_mask: bool,
+    expected_p99_lat_us: int,
+):
+    np.random.seed(42)
+    expert_mask, _ = routing_setup_random_topk(T, 5, E)
+    expert_mask = expert_mask.astype(np.float32)
+
+    expert_mask_sliced = expert_mask[:, :E_local]
+    expert_mask_sliced = expert_mask_sliced.T
+    expert_mask = expert_mask.T
+
+    # Get golden
+    expected_counts = np.sum(expert_mask_sliced, axis=1)
+
+    # Prepare kernel inputs
+    kernel_args = {}
+    if sliced_mask:
+        kernel_args["mask"] = expert_mask_sliced
+    else:
+        kernel_args["mask"] = expert_mask
+        kernel_args["row_start_id"] = np.array([0]).astype(np.int32)
+        kernel_args["n_rows"] = E_local
+    if not bool_mask:
+        # simulate passing expert affinities directly to kernel and have the kernel handle boolean conversion
+        kernel_args["mask"][kernel_args["mask"] > 0] = 0.1
+        kernel_args["boolean_mask"] = False
+
+    # Get kernel outputs
+    actual_counts = count_nonzeros_shard_rows[nl.nc(2)](**kernel_args)
+
+    bench_func = nki.benchmark(warmup=20, iters=100)(count_nonzeros_shard_rows[nl.nc(2)])
+    bench_func(**kernel_args)
+    p99_lat = bench_func.benchmark_result.nc_latency.get_latency_percentile(99)
+
+    assert np.allclose(actual_counts, expected_counts), f"Failed indices match for config T={T}, E={E}, E_local={E_local}, sliced_mask={sliced_mask}, bool_mask={bool_mask}"
+    lat_regression_threshold = 1.05
+    assert p99_lat < lat_regression_threshold * expected_p99_lat_us, f"Failed indices match for config T={T}, E={E}, E_local={E_local}, sliced_mask={sliced_mask}, bool_mask={bool_mask}"
+
+
+@pytest.mark.parametrize("T,E,SP,EP,top_k,cf,sliced_mask,bool_mask,expected_p99_lat_us", [
+    # Dropping, sliced boolean expert mask
+    (2048, 256, 1, 64, 8, 1, True, True, 27),
+    (8192, 256, 1, 64, 8, 1, True, True, 42),
+    (16384, 256, 1, 64, 8, 1, True, True, 76),
+    pytest.param(2048, 128, 1, 64, 1, 1, True, True, 0, marks=pytest.mark.xfail(reason="Kernel not generalized to case where values are too few")),
+    (8192, 128, 1, 64, 1, 1, True, True, 34),
+    (16384, 128, 1, 64, 1, 1, True, True, 46),
+    # Dropping, full expert affinities, mask conversion in kernel
+    (2048, 256, 1, 64, 8, 1, False, False, 36),
+    (8192, 256, 1, 64, 8, 1, False, False, 49),
+    (16384, 256, 1, 64, 8, 1, False, False, 81),
+    pytest.param(2048, 128, 1, 64, 1, 1, False, False, 0, marks=pytest.mark.xfail(reason="Kernel not generalized to case where values are too few")),
+    (8192, 128, 1, 64, 1, 1, False, False, 39),
+    (16384, 128, 1, 64, 1, 1, False, False, 52),
+    # Dropless, sliced boolean expert mask
+    (2048, 256, 1, 64, 8, -1, True, True, 35),
+    (8192, 256, 1, 64, 8, -1, True, True, 185),
+    (16384, 256, 1, 64, 8, -1, True, True, 624),
+    (2048, 128, 1, 64, 1, -1, True, True, 28),
+    (8192, 128, 1, 64, 1, -1, True, True, 104),
+    (16384, 128, 1, 64, 1, -1, True, True, 325),
+    # Dropless, full expert affinities, mask conversion in kernel
+    (2048, 256, 1, 64, 8, -1, False, False, 44),
+    (8192, 256, 1, 64, 8, -1, False, False, 192),
+    (16384, 256, 1, 64, 8, -1, False, False, 628),
+    (2048, 128, 1, 64, 1, -1, False, False, 33),
+    (8192, 128, 1, 64, 1, -1, False, False, 109),
+    (16384, 128, 1, 64, 1, -1, False, False, 333),
+])
+def test_find_index_shard_rows(
+    T: int,
+    E: int,
+    SP: int,
+    EP: int,
+    top_k: int,
+    cf: float,
+    sliced_mask: bool,
+    bool_mask: bool,
+    expected_p99_lat_us: int,
+):
+    assert SP == 1, "Kernel is expected to run in pure EP as of now"
     def nc(x): return x if get_platform_target() == "trn1" else nl.nc(x)
 
     np.random.seed(42)
     expert_mask, _ = routing_setup_random_topk(T, top_k, E)
+    expert_mask = expert_mask.astype(np.float32)
     if cf > 0:
         num_tokens_per_expert = get_capacity_dropping(T, top_k, E, cf)
     else:
@@ -95,26 +179,42 @@ def test_find_index(T,E,SP,EP,top_k,cf,expected_p99_lat_us):
     assert E % EP == 0, f"Number of experts {E} not divisble by EP degree {EP}"
     E_local = E // EP
     T_local = T // SP
-    expert_mask = expert_mask[:T_local, :E_local]
     n_programs = 1 if E_local == 1 else 2
 
-    # (E, T)
+    expert_mask_sliced = expert_mask[:T_local, :E_local]
+    expert_mask_sliced = expert_mask_sliced.T
     expert_mask = expert_mask.T
 
     # Get golden
-    expected_true_indices, expected_true_counts = get_golden(expert_mask, num_tokens_per_expert)
+    expected_true_indices, expected_true_counts = get_golden(expert_mask_sliced, num_tokens_per_expert)
+
+    # Prepare kernel inputs
+    kernel_args = {
+        "n_values_max": num_tokens_per_expert,
+        "n_values_min": num_tokens_per_expert,
+    }
+    if sliced_mask:
+        kernel_args["mask"] = expert_mask_sliced
+    else:
+        kernel_args["mask"] = expert_mask
+        kernel_args["row_start_id"] = np.array([0]).astype(np.int32)
+        kernel_args["n_rows"] = E_local
+    if not bool_mask:
+        # simulate passing expert affinities directly to kernel and have the kernel handle boolean conversion
+        kernel_args["mask"][kernel_args["mask"] > 0] = 0.1
+        kernel_args["boolean_mask"] = False
 
     # Get kernel outputs
-    actual_true_indices, actual_true_counts = find_index_shard_rows[(nc(n_programs),)](expert_mask, num_tokens_per_expert, num_tokens_per_expert)
+    actual_true_indices, actual_true_counts = find_index_shard_rows[(nc(n_programs),)](**kernel_args)
 
     bench_func = nki.benchmark(warmup=20, iters=100)(find_index_shard_rows[(nc(n_programs),)])
-    bench_func(expert_mask, num_tokens_per_expert, num_tokens_per_expert)
+    bench_func(**kernel_args)
     p99_lat = bench_func.benchmark_result.nc_latency.get_latency_percentile(99)
 
-    assert np.allclose(actual_true_indices, expected_true_indices), f"Failed indices match for config T={T}, E={E}, SP={SP}, EP={EP}, top_k={top_k}, cf={cf}"
-    assert np.allclose(actual_true_counts, expected_true_counts), f"Failed counts match for config T={T}, E={E}, SP={SP}, EP={EP}, top_k={top_k}, cf={cf}"
+    assert np.allclose(actual_true_indices, expected_true_indices), f"Failed indices match for config T={T}, E={E}, SP={SP}, EP={EP}, top_k={top_k}, cf={cf}, sliced_mask={sliced_mask}, bool_mask={bool_mask}"
+    assert np.allclose(actual_true_counts, expected_true_counts), f"Failed counts match for config T={T}, E={E}, SP={SP}, EP={EP}, top_k={top_k}, cf={cf}, sliced_mask={sliced_mask}, bool_mask={bool_mask}"
     lat_regression_threshold = 1.05
-    assert p99_lat < lat_regression_threshold * expected_p99_lat_us, f"Failed p99 latency check for config T={T}, E={E}, SP={SP}, EP={EP}, top_k={top_k}, cf={cf}"
+    assert p99_lat < lat_regression_threshold * expected_p99_lat_us, f"Failed p99 latency check for config T={T}, E={E}, SP={SP}, EP={EP}, top_k={top_k}, cf={cf}, sliced_mask={sliced_mask}, bool_mask={bool_mask}"
 
 
 if __name__ == "__main__":

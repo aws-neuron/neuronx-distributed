@@ -86,6 +86,16 @@ TEST_MODEL_CONFIGS = {
         "enable_spmd_rank": True,
         "optimized_block_to_token_mapping": False,
         "parallelize_token_to_block_mapping": False,
+    },
+    "qwen3-experts-ep": {
+        "hidden_size": 4096,
+        "intermediate_size": 1536,
+        "num_experts": 128,
+        "num_shared_experts": 0,
+        "top_k": 4,
+        "enable_spmd_rank": True,
+        "optimized_block_to_token_mapping": False,
+        "parallelize_token_to_block_mapping": False,
     }
 }
 
@@ -150,6 +160,7 @@ def get_device_correctness_test_configs_EP(dtype) -> List[ExptCfg]:
                 top_k=8,
                 num_shared_experts=0,
                 enable_spmd_rank=True,
+                use_index_calc_kernel=True,
                 **test_cfg
             ),
             ExptCfgParallel(
@@ -162,6 +173,7 @@ def get_device_correctness_test_configs_EP(dtype) -> List[ExptCfg]:
                 top_k=8,
                 num_shared_experts=0,
                 enable_spmd_rank=True,
+                use_index_calc_kernel=True,
                 **test_cfg
             ),
         ])
@@ -753,7 +765,7 @@ def get_device_correctness_parallel_test_configs(dtype, test_mode, tp_degree, ep
         ]
     )
 
-    test_cfg["test_module"] = "skip_dma"
+    test_cfg["test_module"] = "skip_dma1"
     test_configs.extend(
         [   
             ExptCfgParallel(
@@ -762,15 +774,6 @@ def get_device_correctness_parallel_test_configs(dtype, test_mode, tp_degree, ep
                 capacity_factor=None,
                 use_expert_mlps_v2=True,
                 skip_dma=SkipMode(True,True),
-                **get_model_config("mixtral", scale_down_factor=1),
-                **test_cfg
-            ),
-            ExptCfgParallel(
-                seq_len=512,
-                batch_size=1,
-                capacity_factor=None,
-                use_expert_mlps_v2=True,
-                skip_dma=SkipMode(True,False),
                 **get_model_config("mixtral", scale_down_factor=1),
                 **test_cfg
             ),
@@ -803,6 +806,11 @@ def get_device_correctness_parallel_test_configs(dtype, test_mode, tp_degree, ep
                 **get_model_config("mixtral", scale_down_factor=1),
                 **test_cfg
             ),
+        ]
+    )
+    test_cfg["test_module"] = "skip_dma2"
+    test_configs.extend(
+        [   
             ExptCfgParallel(
                 seq_len=256,
                 batch_size=1,
@@ -851,7 +859,6 @@ def get_device_correctness_parallel_test_configs(dtype, test_mode, tp_degree, ep
             ),
         ]
     )
-
     if get_platform_lnc() == LogicalNCConfig.LNC_2:
         test_cfg["test_module"] = "block_parallel"
         test_configs.extend(
@@ -1207,4 +1214,54 @@ def get_device_correctness_parallel_test_configs(dtype, test_mode, tp_degree, ep
                 test_configs_parallel.append(cfg_parallel)
 
 
+    return test_configs_parallel
+
+def get_device_correctness_parallel_test_configs_EP(dtype, test_mode, tp_degree, ep_degree, token_shuffle_group_size, zero1, test_modules=None):	
+    assert test_mode in {"training", "inference"}	
+    test_configs = []	
+    if get_platform_lnc() == LogicalNCConfig.LNC_2:	
+        test_cfg = {	
+            "dtype": dtype,	
+            "glu_mlp": True,	
+            "hidden_act": "silu",	
+            "implementation": "llama4",	
+            "num_iters": 1,	
+        }	
+        	
+        test_cfg["test_mode"] = "training"	
+        	
+        test_configs.extend(	
+            [	
+                ExptCfgParallel(	
+                    seq_len=1024,	
+                    batch_size=1,	
+                    capacity_factor=0.0,	
+                    fused_gate_up_shared_expert=False,	
+                    **get_model_config("qwen3-experts-ep", scale_down_factor=1),	
+                    **test_cfg	
+                ),	
+                	
+            ]	
+        )	
+        	
+    # Add tp_degree, sequence_parallel_enabled to config	
+    test_configs_parallel = []	
+    if test_mode == "training":
+        for cfg in test_configs:			
+            sp_modes = [True]	
+            for sp_mode in sp_modes:	
+                if cfg.seq_len == 1 and sp_mode:	
+                    # Token gen cannot be run in SP	
+                    continue	
+                if cfg.shared_experts_sequence_parallel_enabled and not sp_mode and cfg.seq_len > 1:	
+                    # Running shared expert in SP for context encoding is not available when input is not in SP	
+                    continue	
+                cfg_parallel = dataclasses.replace(	
+                    cfg,	
+                    tp_degree=tp_degree,	
+                    ep_degree=ep_degree,	
+                    token_shuffle_group_size=token_shuffle_group_size,	
+                    sequence_parallel_enabled=sp_mode,	
+                )	
+                test_configs_parallel.append(cfg_parallel)	
     return test_configs_parallel

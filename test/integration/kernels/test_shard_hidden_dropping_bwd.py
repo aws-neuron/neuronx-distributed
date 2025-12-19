@@ -87,11 +87,17 @@ if __name__ == "__main__":
           payload['cfg']["TestDef"]["Custom"] = {**payload['cfg']["TestDef"]["Custom"], **kpi_data}
           payload['kpi']["TestFailMessage"] = "Pass"
           logger.info(f"{test_line}, {log_header}, {str(payload['cfg']['TestDef']['Custom'])}\n")
+        except AssertionError as ae:
+          payload["kpi"]["TestPassFail"] = "xFail"
+          payload['kpi']["TestFailMessage"] = str(ae)
+          logger.error(f"{test_line}, {log_header}, {str(ae)}\n")
+          logger.error("Test Failed!!!")
         except Exception as err:
           payload["kpi"]["TestPassFail"] = "Fail"
           payload['kpi']["TestFailMessage"] = str(err)
           logger.error(f"{test_line}, {log_header}, {str(err)}\n")
-      
+          logger.error("Test Failed!!!")
+          
       saved_results.append(payload)
 
     logging.info("All Test Cases Passed")

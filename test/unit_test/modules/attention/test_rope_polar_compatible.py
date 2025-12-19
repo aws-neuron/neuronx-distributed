@@ -2,6 +2,7 @@ import logging
 
 import pytest
 import torch
+from torch_neuronx.testing import neuron_allclose
 from transformers.models.llama4.modeling_llama4 import apply_rotary_emb
 from neuronx_distributed.utils.random import set_random_seed
 from neuronx_distributed.modules.attention.utils import precompute_freqs_cis, apply_rotary_polar_compatible
@@ -25,17 +26,14 @@ set_random_seed(0)
     ],
 )
 def test_rotary_polar_compatible(dtype, num_chunks, seq_len, n_local_heads, head_dim):
+    generator = torch.Generator()
+    generator.manual_seed(42)
+
     # inputs
-    xq = torch.randn(
-        [
-            num_chunks,
-            seq_len,
-            n_local_heads,
-            head_dim,
-        ],
-        dtype=dtype,
-    )  # (bsz, seqlen, self.n_local_heads, self.head_dim)
-    xk = torch.randn_like(xq)  # (bsz, seqlen, self.n_local_heads, self.head_dim)
+    xq = torch.randn([num_chunks, seq_len, n_local_heads, head_dim], 
+                     dtype=dtype, generator=generator)
+    xk = torch.randn([num_chunks, seq_len, n_local_heads, head_dim], 
+                     dtype=dtype, generator=generator)
 
     neuron_freqs = precompute_freqs_cis(head_dim, seq_len, theta=10000.0).unsqueeze(0)
     original_freq_cis = torch.view_as_complex(
@@ -50,6 +48,6 @@ def test_rotary_polar_compatible(dtype, num_chunks, seq_len, n_local_heads, head
 
     neuron_xq, _ = apply_rotary_polar_compatible(xq, xk, neuron_freqs)
 
-    torch.testing.assert_close(neuron_xq, expected_xq)
+    all_close_summary = neuron_allclose(neuron_xq, expected_xq)
+    assert all_close_summary.allclose
     logger.info("Golden and Neuron outputs match!")
-    

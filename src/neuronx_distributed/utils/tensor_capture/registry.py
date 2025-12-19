@@ -169,7 +169,34 @@ class TensorRegistry:
             result[key] = tensor
         
         return result
-    
+
+    def _add_moe_tensors_to_manual_registry(self, manual_captured_tensors_dict: Dict[str, torch.Tensor]):
+        """
+           Retrieves and processes automatically captured MoE (Mixture of Experts) tensors.
+
+           This function:
+           1. Gets manually captured tensors from a dictionary
+           2. Identifies tensors with 'moe_auto' in their keys
+           3. Stacks multiple MoE tensors if more than one exists
+           4. Combines stacked MoE tensors with other manual tensors
+
+           Returns:
+               list[Any]: A list containing processed tensors including:
+                   - Stacked MoE tensors for expert index
+                   - All individual tensors from the manual capture dictionary
+        """
+        moe_auto_tensors_list = []
+        moe_tensor_keys = [k for k in manual_captured_tensors_dict if "moe_auto" in k]  # example condition
+        for k in moe_tensor_keys:
+            moe_auto_tensors_list.append(manual_captured_tensors_dict[k])
+            del manual_captured_tensors_dict[k]
+
+        if len(moe_auto_tensors_list) >= 1:
+            moe_tensors_stacked = torch.stack(moe_auto_tensors_list)
+            # currently only expert index will be captured to be efficient as it is the source expert stats of others,
+            # such as expert_affinities, block_token_assignment since they are all computed using expert_index.
+            manual_captured_tensors_dict["auto_moe_stats.expert_index"] = moe_tensors_stacked
+
     def get_module_tensors(self):
         """
         Get all tensors from monitored modules.
@@ -186,6 +213,7 @@ class TensorRegistry:
         Returns:
             Dictionary mapping tensor names to their values
         """
+        self._add_moe_tensors_to_manual_registry(self.model_info.manual_tensors)
         return self.model_info.manual_tensors
         
     def get_manual_tensor_count(self):

@@ -422,6 +422,8 @@ def moe_blockwise_fwd(H, T, E, TOPK, I_TP, BS, dtype, dma_skip_forward, rtype, c
       ktype: Kernel Type. 0 for the dropping kernel, 1 for non dropping 
     """
     logger.info("Generating Inputs and Goldens for Training")
+    BS = 1
+    logger.info("Overriding BS to 1")
     kpi_payload = dict()
     B = get_block_size_dropping(T, TOPK, cf, E, EP)
     np_dtype = dtype_mapping[dtype]
@@ -437,17 +439,24 @@ def moe_blockwise_fwd(H, T, E, TOPK, I_TP, BS, dtype, dma_skip_forward, rtype, c
     data['dtype'] = dtype
 
 
-    forward_tensor_mappings = {('hidden_states_output', 'HiddenStatesOutput'): data['hidden_states_output']}
     try:
       nki_function = BlockwiseMoeShardHiddenDropping.apply
       output_autograd = nki_function(data['hidden_states'], data['expert_affinities'], data['gate_and_up_proj_weights'], data['down_proj_weights'], data['token_position_to_id'], data['block_to_expert'], data['block_size'], dtype, map_skip_mode(dma_skip_forward), ktype)
-      
-      for kernel_output_name, golden in forward_tensor_mappings.items():
-        largest_abs_diff, max_abs_diff_element_rel_diff = verify_accuracy(output_autograd, golden, np_dtype, kernel_output_name[0], "forward")
-        kpi_payload["Forward" + kernel_output_name[1] + "LargestAbsDiff"] = largest_abs_diff
-        kpi_payload["Forward" + kernel_output_name[1] + "MaxElementRelDiff"] = max_abs_diff_element_rel_diff
+      xm.mark_step()
+    except AssertionError as ae:
+      raise ae
     except Exception as e:
-       raise e
+      raise e
+    
+    forward_tensor_mappings = {'HiddenStatesOutput':(output_autograd, data['hidden_states_output'].cpu())}
+
+    try:
+      for kernel_output_name, value in forward_tensor_mappings.items():
+        largest_abs_diff, max_abs_diff_element_rel_diff = verify_accuracy(value[0], value[1], np_dtype, kernel_output_name, "forward")
+        kpi_payload["Forward" +kernel_output_name+ "LargestAbsDiff"] = largest_abs_diff
+        kpi_payload["Forward" +kernel_output_name+ "MaxElementRelDiff"] = max_abs_diff_element_rel_diff 
+    except Exception as e:
+      raise e
 
     return kpi_payload
 
@@ -474,6 +483,8 @@ def moe_blockwise_bwd(H, T, E, TOPK, I_TP, BS, dtype, dma_skip, rtype, cf, EP, k
       ktype: Kernel Type. 0 for the dropping kernel, 1 for non dropping 
     """
     logger.info("Generating Inputs and Goldens for Training")
+    BS = 1
+    logger.info("Overriding BS to 1")
     kpi_payload = dict()
     B = get_block_size_dropping(T, TOPK, cf, E, EP)
     np_dtype = dtype_mapping[dtype]
@@ -497,17 +508,21 @@ def moe_blockwise_bwd(H, T, E, TOPK, I_TP, BS, dtype, dma_skip, rtype, cf, EP, k
     grad_output = data["grad_output"].to(device)
     hidden_states_grad_np, affinities_grad_np, gate_up_weight_grad_np, down_weight_grad_np = golden_output["hidden_states_grad"], golden_output["expert_affinities_masked_grad"], golden_output["gate_up_proj_weight_grad"], golden_output["down_proj_weight_grad"] 
     
-    backward_tensor_mappings = {('hidden_states', 'HiddenStatesGrad'):hidden_states_grad_np, ('expert_affinities', 'ExpertAffinitiesGrad'): affinities_grad_np, ('gate_and_up_proj_weights', 'GateAndUpProjWeightsGrad'): gate_up_weight_grad_np, ('down_proj_weights', 'DownProjWeightsGrad'): down_weight_grad_np}
     try:
       output_autograd.backward(gradient=grad_output)
+      xm.mark_step()
+    except AssertionError as ae:
+      raise ae
     except Exception as e:
       raise e
+    
+    backward_tensor_mappings = { 'HiddenStatesGrad':(data['hidden_states'].grad.cpu(), hidden_states_grad_np), 'ExpertAffinitiesGrad': (data['expert_affinities'].grad.cpu(), affinities_grad_np), 'GateAndUpProjWeightsGrad': (data['gate_and_up_proj_weights'].grad.cpu(), gate_up_weight_grad_np), 'DownProjWeightsGrad': (data['down_proj_weights'].grad.cpu(), down_weight_grad_np)}
 
-    for kernel_output_name, golden in backward_tensor_mappings.items():
+    for kernel_output_name, values in backward_tensor_mappings.items():
         try:
-          largest_abs_diff, max_abs_diff_element_rel_diff = verify_accuracy(data[kernel_output_name[0]].grad, golden, np_dtype, kernel_output_name[0], "backward")
-          kpi_payload["Backward"+kernel_output_name[1]+"LargestAbsDiff"] = largest_abs_diff
-          kpi_payload["Backward"+kernel_output_name[1]+"MaxAbsDiffElementRelDiff"] = max_abs_diff_element_rel_diff
+          largest_abs_diff, max_abs_diff_element_rel_diff = verify_accuracy(values[0], values[1], np_dtype, kernel_output_name, "backward")
+          kpi_payload["Backward"+kernel_output_name+"LargestAbsDiff"] = largest_abs_diff
+          kpi_payload["Backward"+kernel_output_name+"MaxAbsDiffElementRelDiff"] = max_abs_diff_element_rel_diff
         except Exception as e:
           if len(e.args) > 1: # All close passes true if accuracy mismatch
             raise e
@@ -516,6 +531,5 @@ def moe_blockwise_bwd(H, T, E, TOPK, I_TP, BS, dtype, dma_skip, rtype, cf, EP, k
           kpi_payload["Backward"+kernel_output_name[1]+"LargestAbsDiff"] = -1
           kpi_payload["Backward"+kernel_output_name[1]+"MaxAbsDiffElementRelDiff"] = -1
     
-  
     return kpi_payload
       

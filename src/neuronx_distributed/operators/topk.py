@@ -11,18 +11,16 @@ from neuronx_distributed.parallel_layers.parallel_state import get_tensor_model_
 from neuronx_distributed.parallel_layers.mappings import  _gather_along_dim
 from neuronx_distributed.kernels.topk import topk_rotated
 from neuronx_distributed.utils.utils import hardware
-import logging
 
 try:
-    from neuronxcc.nki._pre_prod_kernels.topk.topk import topk as nki_topk
+    from neuronxcc.nki._private_kernels.topk.topk import topk as nki_topk
 except ImportError:
-    logging.warning("Use a more recent neuron compiler version to enable nki_topk")
-    nki_topk = None
+    from neuronxcc.nki._pre_prod_kernels.topk.topk import topk as nki_topk
 
 
 def _is_nki_topk_available():
     hardware_type = hardware(get_platform_target())
-    return (nki_topk is not None) and (hardware_type == hardware.TRN2)
+    return hardware_type == hardware.TRN2 or hardware_type == hardware.TRN3
 
 def _nki_topk_wrapper(tensor, k, dim):
     """
@@ -78,7 +76,7 @@ def topk(tensor, k, dim, gather_dim, process_group=None, stages=1, rank_id=None,
     tp_degree = torch.distributed.get_world_size(group=process_group)
     hardware_type = hardware(get_platform_target())
     is_trn1 = hardware_type == hardware.TRN1
-    is_trn2 = hardware_type == hardware.TRN2
+    is_trn2_or_trn3 = (hardware_type == hardware.TRN2 or hardware_type == hardware.TRN3)
 
     if use_topk_rotated_kernel:
         lnc = lnc if is_trn1 else nl.nc(lnc)
@@ -111,7 +109,7 @@ def topk(tensor, k, dim, gather_dim, process_group=None, stages=1, rank_id=None,
             return topk_implementation(tensor, k, dim=dim)
 
     if stages > 1:
-        if is_trn2:
+        if is_trn2_or_trn3:
             assert tp_degree == 64, f"tp degree other than 64 is not supported got {tp_degree} on {hardware_type}"
             assert stages == 3, f"stages other than 3 is not supported got {stages} on {hardware_type}"
         else:
@@ -119,7 +117,7 @@ def topk(tensor, k, dim, gather_dim, process_group=None, stages=1, rank_id=None,
             assert stages == 2, f"stages other than 2 is not supported got {stages} on {hardware_type}"
 
         mesh = []
-        if is_trn2: # 4x4x4 topology
+        if is_trn2_or_trn3: # 4x4x4 topology
             group_size = int(math.ceil(math.pow(tp_degree,1/stages)))
             n_groups = tp_degree//group_size
 

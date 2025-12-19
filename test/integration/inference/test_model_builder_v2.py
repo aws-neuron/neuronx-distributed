@@ -11,7 +11,8 @@ from torch_neuronx.proto import metaneff_pb2
 from neuronx_distributed import NxDParallelState
 import neuronx_distributed.trace.nxd_model
 from neuronx_distributed.trace.hlo_utils import apply_layout_transformation
-from neuronx_distributed.trace.model_builder import ModelBuilderV2, trace, compile, compile_wlo
+from neuronx_distributed.trace.model_builder_v2 import ModelBuilder
+from neuronx_distributed.trace.functions import trace, compile, compile_wlo
 from neuronx_distributed.trace.model_builder_utils import TraceArtifacts, ModelBuilderConstants
 from neuronx_distributed.parallel_layers.layers import ColumnParallelLinear, RowParallelLinear
 from neuronx_distributed.parallel_layers import parallel_state
@@ -58,7 +59,7 @@ class TestModelBuilderV2(unittest.TestCase):
         model = SimpleModel()
         example_inputs = torch.rand(3, 10)
         
-        traced_model = ModelBuilderV2(model) \
+        traced_model = ModelBuilder(model) \
                         .trace(args=example_inputs, tag="key1")
 
         self.assertIsInstance(traced_model.trace_artifacts_collection["key1"], TraceArtifacts)
@@ -78,7 +79,7 @@ class TestModelBuilderV2(unittest.TestCase):
         example_inputs2 = torch.rand(2, 10)
         example_inputs3 = torch.rand(4, 10)
         
-        traced_model = ModelBuilderV2(model) \
+        traced_model = ModelBuilder(model) \
                         .trace(args=example_inputs1, tag="key1") \
                         .trace(args=example_inputs2, tag="key2") \
                         .trace(args=example_inputs3, tag="key3")
@@ -102,7 +103,7 @@ class TestModelBuilderV2(unittest.TestCase):
         example_inputs1 = (torch.rand(3, 5), torch.rand(3, 11))
         example_inputs2 = (torch.rand(12, 5), torch.rand(12, 11))
 
-        traced_model = ModelBuilderV2(model) \
+        traced_model = ModelBuilder(model) \
                         .trace(args=example_inputs1, tag="bkt1") \
                         .trace(args=example_inputs2, tag="bkt2")
 
@@ -124,7 +125,7 @@ class TestModelBuilderV2(unittest.TestCase):
                 return out1 + out2
 
         model = KwargsModel()
-        traced_model = ModelBuilderV2(model) \
+        traced_model = ModelBuilder(model) \
             .trace(kwargs={"input1": torch.rand(3, 10), "input2": torch.rand(3, 8)}, tag="both_inputs") \
             .trace(kwargs={"input1": torch.rand(2, 10)}, tag="input1_only")
 
@@ -156,7 +157,7 @@ class TestModelBuilderV2(unittest.TestCase):
                 return out
 
         model = MixedModel()
-        traced_model = ModelBuilderV2(model) \
+        traced_model = ModelBuilder(model) \
             .trace(
                 args=(torch.rand(3, 10),),
                 kwargs={"scale": torch.rand(3, 5), "bias": torch.rand(3, 5)},
@@ -193,7 +194,7 @@ class TestModelBuilderV2(unittest.TestCase):
         model = SimpleModel()
         example_inputs = torch.rand(3, 10)
         
-        nxd_model = ModelBuilderV2(model) \
+        nxd_model = ModelBuilder(model) \
             .trace(args=example_inputs, tag="key1") \
             .compile()
         
@@ -216,7 +217,7 @@ class TestModelBuilderV2(unittest.TestCase):
         example_inputs1 = torch.rand(3, 10)
         example_inputs2 = torch.rand(2, 10)
         
-        nxd_model = ModelBuilderV2(model) \
+        nxd_model = ModelBuilder(model) \
             .trace(args=example_inputs1, tag="priority") \
             .trace(args=example_inputs2, tag="secondary") \
             .compile(priority_model_key="priority")
@@ -244,7 +245,7 @@ class TestModelBuilderV2(unittest.TestCase):
         example_inputs3 = torch.rand(4, 10)
 
         # Trace multiple buckets
-        builder = ModelBuilderV2(model) \
+        builder = ModelBuilder(model) \
             .trace(args=example_inputs1, tag="bucket1") \
             .trace(args=example_inputs2, tag="bucket2") \
             .trace(args=example_inputs3, tag="bucket3")
@@ -340,7 +341,7 @@ class TestModelBuilderV2Distributed(unittest.TestCase):
         model = ColumnParallelModel()
         example_inputs = torch.rand(32, 1024)
         
-        traced_model = ModelBuilderV2(model) \
+        traced_model = ModelBuilder(model) \
                         .trace(args=example_inputs, tag="key1")
 
         self.assertIsInstance(traced_model.trace_artifacts_collection["key1"], TraceArtifacts)
@@ -359,7 +360,7 @@ class TestModelBuilderV2Distributed(unittest.TestCase):
         model = RowParallelModel()
         example_inputs = torch.rand(32, 1024)
         
-        traced_model = ModelBuilderV2(model) \
+        traced_model = ModelBuilder(model) \
                         .trace(args=example_inputs, tag="key1")
 
         self.assertIsInstance(traced_model.trace_artifacts_collection["key1"], TraceArtifacts)
@@ -380,7 +381,7 @@ class TestModelBuilderV2Distributed(unittest.TestCase):
         model = CPLRPLModel()
         example_inputs = torch.rand(32, 1024)
         
-        traced_model = ModelBuilderV2(model) \
+        traced_model = ModelBuilder(model) \
                         .trace(args=example_inputs, tag="key1")
 
         self.assertIsInstance(traced_model.trace_artifacts_collection["key1"], TraceArtifacts)
@@ -401,7 +402,7 @@ class TestModelBuilderV2Distributed(unittest.TestCase):
         example_inputs2 = torch.rand(2, 1024)
         example_inputs3 = torch.rand(4, 1024)
         
-        traced_model = ModelBuilderV2(model) \
+        traced_model = ModelBuilder(model) \
                         .trace(args=example_inputs1, tag="key1") \
                         .trace(args=example_inputs2, tag="key2") \
                         .trace(args=example_inputs3, tag="key3")
@@ -425,7 +426,7 @@ class TestModelBuilderV2Distributed(unittest.TestCase):
         example_inputs2 = torch.rand(2, 1024)
         example_inputs3 = torch.rand(4, 1024)
         
-        traced_model = ModelBuilderV2(model) \
+        traced_model = ModelBuilder(model) \
                         .trace(args=example_inputs1, tag="key1") \
                         .trace(args=example_inputs2, tag="key2") \
                         .trace(args=example_inputs3, tag="key3")
@@ -451,7 +452,7 @@ class TestModelBuilderV2Distributed(unittest.TestCase):
         example_inputs2 = torch.rand(2, 1024)
         example_inputs3 = torch.rand(4, 1024)
         
-        traced_model = ModelBuilderV2(model) \
+        traced_model = ModelBuilder(model) \
                         .trace(args=example_inputs1, tag="key1") \
                         .trace(args=example_inputs2, tag="key2") \
                         .trace(args=example_inputs3, tag="key3")
@@ -474,7 +475,7 @@ class TestModelBuilderV2Distributed(unittest.TestCase):
                 return out
 
         model = ColumnParallelKwargsModel()
-        traced_model = ModelBuilderV2(model) \
+        traced_model = ModelBuilder(model) \
             .trace(
                 kwargs={
                     "input_ids": torch.rand(32, 1024),
@@ -514,7 +515,7 @@ class TestModelBuilderV2Distributed(unittest.TestCase):
                 return self.layer2(x)
 
         model = MixedCPLRPLModel()
-        traced_model = ModelBuilderV2(model) \
+        traced_model = ModelBuilder(model) \
             .trace(
                 args=(torch.rand(32, 1024),),
                 kwargs={"scale_factor": torch.rand(32, 1)},
@@ -552,7 +553,7 @@ class TestModelBuilderV2Distributed(unittest.TestCase):
         model = DistributedModel()
         example_inputs = torch.rand(32, 1024)
         
-        nxd_model = ModelBuilderV2(model) \
+        nxd_model = ModelBuilder(model) \
             .trace(args=example_inputs, tag="key1") \
             .compile()
         
@@ -577,7 +578,7 @@ class TestModelBuilderV2Distributed(unittest.TestCase):
         example_inputs1 = torch.rand(32, 1024)
         example_inputs2 = torch.rand(16, 1024)
         
-        nxd_model = ModelBuilderV2(model) \
+        nxd_model = ModelBuilder(model) \
             .trace(args=example_inputs1, tag="priority") \
             .trace(args=example_inputs2, tag="secondary") \
             .compile(priority_model_key="priority")
@@ -689,7 +690,7 @@ class TestModelBuilderV2Distributed(unittest.TestCase):
             (4, 1024, False, False, False),  # No optional inputs
         ]
         
-        builder = ModelBuilderV2(model)
+        builder = ModelBuilder(model)
         
         # Trace with different input configurations
         for idx, (batch_size, seq_len, has_attn, has_pos, has_token) in enumerate(input_configs, 1):
@@ -767,7 +768,7 @@ class TestModelBuilderV2Distributed(unittest.TestCase):
             (8, True),    # Different batch size with mask
         ]
         
-        builder = ModelBuilderV2(
+        builder = ModelBuilder(
             model, 
             weights_to_skip_layout_optimization=weights_to_skip
         )
@@ -839,7 +840,7 @@ class TestModelBuilderV2Distributed(unittest.TestCase):
         )
         
         # Trace multiple buckets
-        builder = ModelBuilderV2(model) \
+        builder = ModelBuilder(model) \
             .trace(args=inputs1[0], tag="bucket1") \
             .trace(args=inputs2[0], tag="bucket2") \
             .trace(args=inputs3[0], kwargs=inputs3[1], tag="bucket3")
@@ -931,7 +932,7 @@ class TestModelBuilderV2WithNxDParallelState(unittest.TestCase):
             example_inputs1 = torch.rand(32, 1024)
             example_inputs2 = torch.rand(16, 1024)
             
-            nxd_model = ModelBuilderV2(model) \
+            nxd_model = ModelBuilder(model) \
                 .trace(args=example_inputs1, tag="priority") \
                 .trace(args=example_inputs2, tag="secondary") \
                 .compile(priority_model_key="priority")

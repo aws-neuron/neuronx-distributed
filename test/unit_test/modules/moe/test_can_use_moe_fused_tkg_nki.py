@@ -99,7 +99,7 @@ def _generate_test_configs():
                 glu_mlp=True,
                 top_k=2,
                 normalize_top_k_affinities=True,
-                result=False,
+                result=True,
             ),
             TestCfg(
                 **cfg,
@@ -117,7 +117,7 @@ def _generate_test_configs():
                 device="xla",
                 glu_mlp=True,
                 normalize_top_k_affinities=False,
-                result=False,
+                result=True,
             ),
         ]
     )
@@ -130,7 +130,7 @@ def _generate_test_configs():
             TestCfg(
                 **cfg,
                 device="xla",
-                result=True,
+                result=False,
             ),
             TestCfg(
                 **cfg,
@@ -141,7 +141,7 @@ def _generate_test_configs():
                 **cfg,
                 device="xla",
                 router_topk_kernel_enabled=True,
-                result=True,
+                result=False,
             ),
             TestCfg(
                 **cfg,
@@ -159,7 +159,7 @@ def _generate_test_configs():
                 **cfg,
                 num_shared_experts=1,
                 device="xla",
-                result=True,
+                result=False,
             ),
             TestCfg(
                 **cfg,
@@ -172,7 +172,7 @@ def _generate_test_configs():
                 num_shared_experts=1,
                 device="xla",
                 shared_mlp_kernel_enabled=True,
-                result=True,
+                result=False,
             ),
             TestCfg(
                 **cfg,
@@ -200,7 +200,7 @@ def _generate_test_configs():
                 device="xla",
                 glu_mlp=False,
                 normalize_top_k_affinities=False,
-                result=True,
+                result=False,
             ),
             TestCfg(
                 **cfg,
@@ -215,7 +215,7 @@ def _generate_test_configs():
                 device="xla",
                 glu_mlp=True,
                 normalize_top_k_affinities=False,
-                result=True,
+                result=False,
             ),
             TestCfg(
                 **cfg,

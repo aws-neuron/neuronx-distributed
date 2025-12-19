@@ -156,6 +156,7 @@ class SharedExperts(nn.Module):
         common_args = {
             "dtype": self.dtype,
             "pad": not self.training,
+            "reduce_dtype": self.reduce_dtype,
             "tensor_model_parallel_group": self.tensor_parallel_group,
         }
 
@@ -241,7 +242,6 @@ class SharedExperts(nn.Module):
                 bias=False,
                 input_is_parallel=True,
                 reduce_output=False,
-                reduce_dtype=self.reduce_dtype,
                 **kwargs
             )
         return RowParallelLinear(
@@ -250,7 +250,6 @@ class SharedExperts(nn.Module):
             bias=False,
             input_is_parallel=True,
             reduce_output=False,
-            reduce_dtype=self.reduce_dtype,
             **kwargs
         )
 

@@ -685,6 +685,13 @@ def create_local_weight(rank, world_size, full_weight, partition_dim, per_partit
     else:
         return my_weight_list[0]
 
+def create_local_weight_with_expert_parallel(rank, world_size, full_weight, partition_dim, per_partition_size, stride, local_expert_indices, tensor_dtype, out_weight=None):
+    if local_expert_indices is not None:
+        if tensor_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
+            return create_local_weight(rank, world_size, full_weight, partition_dim, per_partition_size, stride,out_weight=out_weight).view(torch.int8)[local_expert_indices,...].view(tensor_dtype)
+        return create_local_weight(rank, world_size, full_weight, partition_dim, per_partition_size, stride,out_weight=out_weight)[local_expert_indices,...]
+    else:
+        return create_local_weight(rank, world_size, full_weight, partition_dim, per_partition_size, stride,out_weight=out_weight)
 
 def _mock_parallel_state(tp_degree: int, rank: int):
     """
@@ -723,9 +730,12 @@ def invoke_preshard_hook(module, checkpoint, prefix):
             invoke_preshard_hook(child, checkpoint, prefix + name + ".")
 
 
-def shard_children(module, checkpoint, prefix, dtype, rank, tp_degree):
+def shard_children(module, checkpoint, prefix, dtype, rank, tp_degree, is_lora_cpu_shard=False):
     """
     Checkpoint weights are sharded based on rank and tp_degree
+    is_lora_cpu_shard is used to bypass some operations for LoRA weights sharding on CPU in dynamic multi-LoRA serving:
+        1. bypass weights sharding of the quantized base model because only LoRA weights need to be sharded
+        2. bypass weight shape check because multiple LoRAs are enabled and LoRA linear layers are sharded on CPU
     """
 
     if module is None:
@@ -733,31 +743,32 @@ def shard_children(module, checkpoint, prefix, dtype, rank, tp_degree):
 
     for name, child in module._modules.items():
         if child is not None:
-            shard_children(child, checkpoint, prefix + name + ".", dtype, rank, tp_degree)
+            shard_children(child, checkpoint, prefix + name + ".", dtype, rank, tp_degree, is_lora_cpu_shard)
 
     if not isinstance(module, __SUPPORTED_SHARDED_MODULES):
         return
 
+    unordered_rank = rank
     for module_parameter_name, module_parameter in module.named_parameters():
         # only split parameters that are leaf nodes of the parent module to prevent double splitting of nested parallel modules
         if len(module_parameter_name.split(".")) != 1:
             continue
         parameter_name = prefix + module_parameter_name
 
+        if hasattr(module_parameter, "rank_ordering") and module_parameter.rank_ordering is not None:
+            rank = module_parameter.rank_ordering[unordered_rank]
+
         # If a few cases, the module parameter name might not appear exactly in the state dict
         # This is true especially for pytorch quantized models. In that case add the attribute,
         # get_tensor_from_state_dict, for that parameter
         #TODO: Get tensor from state dict should be now part of each class to make shard_children not have single-point-responsibilty
         #TODO: See how torch handles _load_from_state_dict
-        if hasattr(module_parameter, "get_tensor_from_state_dict"):
+        if hasattr(module_parameter, "get_tensor_from_state_dict") and not is_lora_cpu_shard:
             tensor = module_parameter.get_tensor_from_state_dict(prefix, checkpoint)
         else:
             if parameter_name not in checkpoint:
                 continue
             tensor = checkpoint[parameter_name]
-
-        if hasattr(module_parameter, "rank_ordering") and module_parameter.rank_ordering is not None:
-            rank = module_parameter.rank_ordering[rank]
 
         if hasattr(module_parameter, "expert_model_parallel"):
             #TODO: Refactor custom logic in sharding function
@@ -766,19 +777,17 @@ def shard_children(module, checkpoint, prefix, dtype, rank, tp_degree):
             else:
                 expert_parallel_group=get_moe_ep_group(prefill=False)
             ep_rank = parallel_state.get_expert_parallel_rank_from_global_rank(rank=rank, expert_parallel_group=expert_parallel_group)
+
+            # Now the sharding is delayed to be done with TP sharding to avoid the need of additional intermediate tensor,
+            # thus reduce peak memory usage
             local_expert_indices = parallel_state.get_experts_for_expert_parallel_rank(
                 expert_parallel_rank=ep_rank,
                 total_number_of_experts=checkpoint[parameter_name].shape[0],
-                expert_model_parallel_size=expert_parallel_group.size()
+                expert_model_parallel_size=expert_parallel_group.size(),
+                expert_distribution=module_parameter.expert_distribution
                 )
-
-            # Assume Expert Dim is always dim 0
-            # Need check tensor_dtype for expert indexing due to float8_e4m3fn and float8_e5m2 are not supported indexing on CPU
-            tensor_dtype = checkpoint[parameter_name].dtype
-            if tensor_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
-                tensor = checkpoint[parameter_name].view(torch.int8)[local_expert_indices, ...].view(tensor_dtype)
-            else:
-                tensor = checkpoint[parameter_name][local_expert_indices, ...]
+        else:
+            local_expert_indices = None
 
         if hasattr(module_parameter, "tensor_model_parallel") and module_parameter.tensor_model_parallel:
             partition_dim = module_parameter.partition_dim
@@ -795,11 +804,18 @@ def shard_children(module, checkpoint, prefix, dtype, rank, tp_degree):
                     partition_rank, num_partitions, tensor, partition_dim, query_len, kv_len
                 )
             else:
-                checkpoint[parameter_name] = create_local_weight(
-                    partition_rank, num_partitions, tensor, partition_dim, per_partition_size, stride
+                checkpoint[parameter_name] = create_local_weight_with_expert_parallel(
+                    partition_rank, num_partitions, tensor, partition_dim, per_partition_size, stride, local_expert_indices, tensor.dtype
                 )
         else:
-            checkpoint[parameter_name] = tensor
+            tensor_dtype = tensor.dtype
+            if local_expert_indices is not None:
+                if tensor_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
+                    checkpoint[parameter_name] = tensor.view(torch.int8)[local_expert_indices,...].view(tensor_dtype)
+                else:
+                    checkpoint[parameter_name] = tensor[local_expert_indices,...]
+            else:
+                checkpoint[parameter_name] = tensor
 
-        if checkpoint[parameter_name].shape != module_parameter.shape:
+        if checkpoint[parameter_name].shape != module_parameter.shape and not is_lora_cpu_shard:
             raise RuntimeError(f"expected shape {module_parameter.shape} for {parameter_name} but found {checkpoint[parameter_name].shape}")

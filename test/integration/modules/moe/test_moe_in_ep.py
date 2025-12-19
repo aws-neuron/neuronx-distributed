@@ -1,7 +1,7 @@
 import copy
 from dataclasses import dataclass
 import pytest
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 import torch
 from torch import nn
 from functools import partial
@@ -36,11 +36,15 @@ class TestConfig:
     norm_topk_prob: bool = False
     glu_type: str = "glu"
     hidden_act_scaling_factor: float = 1.
-    hidden_act_bias: float = 0.
+    hidden_act_bias: float = 1.
     apply_act_fn_over_topk: bool = False
     router_bias: bool = False
     experts_bias: bool = False
     init_tkg_module: bool = False
+    gate_clamp_lower_limit: Optional[float] = None
+    gate_clamp_upper_limit: Optional[float] = None
+    up_clamp_lower_limit: Optional[float] = None
+    up_clamp_upper_limit: Optional[float] = None
 
 class CPUMoE(nn.Module):
     def __init__(
@@ -53,12 +57,16 @@ class CPUMoE(nn.Module):
             hidden_act: str,
             rms_norm_eps: float,
             hidden_act_scaling_factor: float = 1.,
-            hidden_act_bias: float = 0.,
+            hidden_act_bias: float = 1.,
             experts_bias: bool = False,
             router_bias: bool = False,
             apply_act_fn_over_topk: bool = False,
             normalize_top_k_affinities: bool = False,
             dtype = torch.bfloat16,
+            gate_clamp_lower_limit: Optional[float] = None,
+            gate_clamp_upper_limit: Optional[float] = None,
+            up_clamp_lower_limit: Optional[float] = None,
+            up_clamp_upper_limit: Optional[float] = None
         ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -78,6 +86,10 @@ class CPUMoE(nn.Module):
                 hidden_act_bias=hidden_act_bias,
                 bias=experts_bias,
                 dtype=dtype,
+                gate_clamp_lower_limit=gate_clamp_lower_limit,
+                gate_clamp_upper_limit=gate_clamp_upper_limit,
+                up_clamp_lower_limit=up_clamp_lower_limit,
+                up_clamp_upper_limit=up_clamp_upper_limit
             ) for i in range(self.n_routed_experts)
         ])
 
@@ -156,6 +168,7 @@ class MoEWrapper(torch.nn.Module):
             n_routed_experts=self.config.n_routed_experts,
             tp_degree=self.moe.expert_mlps.moe_tensor_model_parallel_group.size(),
             experts_bias=self.experts_bias,
+            hidden_act_bias=self.config.neuron_config.hidden_act_bias,
             prefix=f"{prefix}moe.",
         )
         create_spmd_ranks(
@@ -179,6 +192,7 @@ def create_spmd_ranks(
     )
     if expert_model_parallel_group.size() > 1:
         expert_indices = []
+        expert_ranks = []
         for rank in range(world_size):
             curr_expert_rank = parallel_state.get_expert_parallel_rank_from_global_rank(
                 rank=rank, expert_parallel_group=expert_model_parallel_group
@@ -189,12 +203,32 @@ def create_spmd_ranks(
                 expert_model_parallel_size=expert_model_parallel_group.size(),
             )
             expert_indices.append(curr_expert_indices)
+            expert_ranks.append(curr_expert_rank)
 
         model_state_dict["moe.expert_mlps.spmd_rank.local_expert_indices"] = torch.tensor(
             expert_indices, dtype=torch.int32
         )
+        model_state_dict["moe.expert_mlps.spmd_rank.ep_rank"] = torch.tensor(
+            expert_ranks, dtype=torch.int32
+        )
 
-def generate_test_config(model_configs, tp_degree, ep_degree, router_bias, experts_bias, glu_type, hidden_act, init_tkg_module, rms_norm_eps=1e-5):
+def generate_test_config(
+        model_configs,
+        tp_degree,
+        ep_degree,
+        router_bias,
+        experts_bias,
+        glu_type,
+        hidden_act,
+        hidden_act_scaling_factor,
+        init_tkg_module,
+        apply_act_fn_over_topk,
+        gate_clamp_lower_limit,
+        gate_clamp_upper_limit,
+        up_clamp_lower_limit,
+        up_clamp_upper_limit,
+        rms_norm_eps=1e-5
+    ):
     test_config = TestConfig(
         tp_degree=tp_degree,
         ep_degree=ep_degree,
@@ -203,8 +237,14 @@ def generate_test_config(model_configs, tp_degree, ep_degree, router_bias, exper
         experts_bias=experts_bias,
         glu_type=glu_type,
         hidden_act=hidden_act,
+        hidden_act_scaling_factor=hidden_act_scaling_factor,
         init_tkg_module=init_tkg_module,
         rms_norm_eps=rms_norm_eps,
+        apply_act_fn_over_topk=apply_act_fn_over_topk,
+        gate_clamp_upper_limit=gate_clamp_upper_limit,
+        gate_clamp_lower_limit=gate_clamp_lower_limit,
+        up_clamp_upper_limit=up_clamp_upper_limit,
+        up_clamp_lower_limit=up_clamp_lower_limit,
         **model_configs,
     )
 
@@ -241,6 +281,13 @@ def generate_inference_config(config, seq_len):
             "skip_dma_weight": True,
             "parallelize_token_to_block_mapping": True,
         },
+        glu_type=config.glu_type,
+        hidden_act_scaling_factor=config.hidden_act_scaling_factor,
+        hidden_act_bias=config.hidden_act_bias,
+        gate_clamp_lower_limit=config.gate_clamp_lower_limit,
+        gate_clamp_upper_limit=config.gate_clamp_upper_limit,
+        up_clamp_lower_limit=config.up_clamp_lower_limit,
+        up_clamp_upper_limit=config.up_clamp_upper_limit,
     )
 
     inference_config = InferenceConfig(
@@ -256,8 +303,8 @@ def compile_neuron_moe_model(sample_inputs, checkpoint, load_module, test_config
 
     builder = ModelBuilder(
         router=None,
-        tp_degree=test_config.tp_degree,
-        ep_degree=test_config.ep_degree,
+        tp_degree=64 if get_platform_target() == "trn2" else 32,
+        ep_degree=1,
         checkpoint_loader=lambda: checkpoint,
         logical_nc_config=get_platform_lnc(),
     )
@@ -316,6 +363,10 @@ class TestMoEEPAgainstHFCPUGolden:
             router_bias=test_config.router_bias,
             normalize_top_k_affinities=test_config.norm_topk_prob,
             dtype=test_config.torch_dtype,
+            gate_clamp_lower_limit=test_config.gate_clamp_lower_limit,
+            gate_clamp_upper_limit=test_config.gate_clamp_upper_limit,
+            up_clamp_lower_limit=test_config.up_clamp_lower_limit,
+            up_clamp_upper_limit=test_config.up_clamp_upper_limit,
         ).eval()
 
         hf_checkpoint = cpu_model.state_dict()
@@ -336,13 +387,47 @@ class TestMoEEPAgainstHFCPUGolden:
         {"hidden_size": 3072, "intermediate_size": 3072, "n_routed_experts": 128, "seq_len": 1, "num_experts_per_tok": 4, "batch_size": 32},
     ])
     @pytest.mark.parametrize("tp_degree,ep_degree", [(4, 16)])
-    @pytest.mark.parametrize("router_bias", [False])
-    @pytest.mark.parametrize("experts_bias", [False])
-    @pytest.mark.parametrize("glu_type,hidden_act", [("glu", "silu")])
-    @pytest.mark.parametrize("init_tkg_module", [False])
+    @pytest.mark.parametrize("router_bias", [True])
+    @pytest.mark.parametrize("experts_bias", [True])
+    @pytest.mark.parametrize("glu_type,hidden_act,hidden_act_scaling_factor", [("swiglu", "sigmoid", 1.702)])
+    @pytest.mark.parametrize("init_tkg_module", [True])
+    @pytest.mark.parametrize("apply_act_fn_over_topk", [True])
+    @pytest.mark.parametrize("gate_clamp_lower_limit,gate_clamp_upper_limit", [(None, 7)])
+    @pytest.mark.parametrize("up_clamp_lower_limit,up_clamp_upper_limit", [(-7, 7)])
     @pytest.mark.skipif(get_platform_target() != 'trn2', reason="Test only runs on trn2 platform")
-    def test_moe_spmd(self, model_configs, tp_degree, ep_degree, router_bias, experts_bias, glu_type, hidden_act, init_tkg_module):
-        test_config = generate_test_config(model_configs, tp_degree, ep_degree, router_bias, experts_bias, glu_type, hidden_act, init_tkg_module)
+    def test_moe_spmd(
+        self,
+        model_configs,
+        tp_degree,
+        ep_degree,
+        router_bias,
+        experts_bias,
+        glu_type,
+        hidden_act,
+        hidden_act_scaling_factor,
+        init_tkg_module,
+        apply_act_fn_over_topk,
+        gate_clamp_lower_limit,
+        gate_clamp_upper_limit,
+        up_clamp_lower_limit,
+        up_clamp_upper_limit,
+    ):
+        test_config = generate_test_config(
+            model_configs,
+            tp_degree,
+            ep_degree,
+            router_bias,
+            experts_bias,
+            glu_type,
+            hidden_act,
+            hidden_act_scaling_factor,
+            init_tkg_module,
+            apply_act_fn_over_topk,
+            gate_clamp_lower_limit,
+            gate_clamp_upper_limit,
+            up_clamp_lower_limit,
+            up_clamp_upper_limit,
+        )
 
         print(f"Running test config:  {test_config}")
         sample_inputs = _load_sample_inputs(

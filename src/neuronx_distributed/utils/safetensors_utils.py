@@ -28,9 +28,11 @@ _float8_e5m2 = getattr(torch, "float8_e5m2", None)
 _SIZE = {
     torch.int64: 8,
     torch.float32: 4,
+    torch.uint32: 4,
     torch.int32: 4,
     torch.bfloat16: 2,
     torch.float16: 2,
+    torch.uint16: 2,
     torch.int16: 2,
     torch.uint8: 1,
     torch.int8: 1,

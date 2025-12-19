@@ -93,7 +93,7 @@ def verify_accuracy(kernel_output, golden_output, np_dtype, tensor_name, kernel_
         else:
             status, LargestAbsDiff, MaxAbsDiffElementRelDiff = allclose(kernel_output.to(torch.float32).cpu().numpy().astype(np_dtype), golden_output.clone().to(torch.float32).detach().cpu().numpy().astype(np_dtype), rtol=2e-2, atol=1e-5)
         if not status:
-            raise Exception(f"[{kernel_name}] Accuracy Mismatch for {tensor_name} Tensor with largest_abs_diff={LargestAbsDiff, MaxAbsDiffElementRelDiff} and ")
+            raise Exception(f"[{kernel_name}] Accuracy Mismatch for {tensor_name} Tensor with LargestAbsDiff={LargestAbsDiff}, MaxAbsDiffElementRelDiff={MaxAbsDiffElementRelDiff}")
     
     except Exception as e:
        raise Exception(f"[{kernel_name}] Call Failed for {tensor_name} {str(e)}", True)

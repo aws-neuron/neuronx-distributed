@@ -1,10 +1,11 @@
 import copy
 from dataclasses import dataclass
 import pytest
+import json
 
 import torch
 from torch import nn
-from typing import Any, Dict
+from typing import Any, Dict, Optional, List
 from functools import partial
 import torch_neuronx
 from neuronx_distributed.trace.model_builder import BaseModelInstance, ModelBuilder
@@ -19,6 +20,7 @@ from neuronx_distributed.modules.moe.moe_process_group import (
     init_tensor_expert_parallel_moe_process_groups,
     get_moe_tp_ep_group,
     get_moe_ep_group,
+    destroy_moe_model_parallel,
 )
 
 from .utils import init_parallel_cpu_golden, CPUExpert, fuse_experts_weights
@@ -45,6 +47,11 @@ class TestConfig:
     apply_act_fn_over_topk: bool = False
     router_bias: bool = False
     experts_bias: bool = False
+    gate_clamp_upper_limit: Optional[float] = None
+    gate_clamp_lower_limit: Optional[float] = None
+    up_clamp_upper_limit: Optional[float] = None
+    up_clamp_lower_limit: Optional[float] = None
+    expert_distribution: Optional[List[List[int]]] = None
 
 class CPUMoE(nn.Module):
     def __init__(
@@ -57,6 +64,10 @@ class CPUMoE(nn.Module):
             hidden_act: str,
             hidden_act_scaling_factor: float = 1.,
             hidden_act_bias: float = 0.,
+            gate_clamp_upper_limit: Optional[float] = None,
+            gate_clamp_lower_limit: Optional[float] = None,
+            up_clamp_upper_limit: Optional[float] = None,
+            up_clamp_lower_limit: Optional[float] = None,
             experts_bias: bool = False,
             router_bias: bool = False,
             apply_act_fn_over_topk: bool = False,
@@ -78,6 +89,10 @@ class CPUMoE(nn.Module):
                 hidden_act=hidden_act,
                 hidden_act_scaling_factor=hidden_act_scaling_factor,
                 hidden_act_bias=hidden_act_bias,
+                gate_clamp_upper_limit=gate_clamp_upper_limit,
+                gate_clamp_lower_limit=gate_clamp_lower_limit,
+                up_clamp_upper_limit=up_clamp_upper_limit,
+                up_clamp_lower_limit=up_clamp_lower_limit,
                 bias=experts_bias,
                 dtype=dtype
             ) for i in range(self.n_routed_experts)
@@ -157,6 +172,11 @@ class MoEWrapper(torch.nn.Module):
             glu_type=config.glu_type,
             hidden_act_scaling_factor=config.hidden_act_scaling_factor,
             hidden_act_bias=config.hidden_act_bias,
+            gate_clamp_upper_limit=config.gate_clamp_upper_limit,
+            gate_clamp_lower_limit=config.gate_clamp_lower_limit,
+            up_clamp_upper_limit=config.up_clamp_upper_limit,
+            up_clamp_lower_limit=config.up_clamp_lower_limit,
+            expert_distribution=config.expert_distribution,
             capacity_factor=None,
             dtype=config.torch_dtype,
             logical_nc_config=get_platform_lnc(),
@@ -210,6 +230,7 @@ class MoEWrapper(torch.nn.Module):
             self.config.n_routed_experts,
             self.expert_mlps.moe_tensor_model_parallel_group.size(),
             self.config.experts_bias,
+            self.config.hidden_act_bias,
         )
         create_spmd_ranks(
             model_state_dict=model_state_dict,
@@ -217,6 +238,7 @@ class MoEWrapper(torch.nn.Module):
             world_size=self.config.world_size,
             n_routed_experts=self.config.n_routed_experts,
             expert_model_parallel_group=self.expert_mlps.moe_expert_model_parallel_group,
+            expert_distribution=self.config.expert_distribution
         )
 
 def create_spmd_ranks(
@@ -225,6 +247,7 @@ def create_spmd_ranks(
     world_size,
     n_routed_experts: int,
     expert_model_parallel_group,
+    expert_distribution=None,
 ):
     # add weight for spmd rank
     model_state_dict["expert_mlps.spmd_rank.rank"] = torch.arange(
@@ -240,6 +263,7 @@ def create_spmd_ranks(
                 curr_expert_rank,
                 total_number_of_experts=n_routed_experts,
                 expert_model_parallel_size=expert_model_parallel_group.size(),
+                expert_distribution=expert_distribution,
             )
             expert_indices.append(curr_expert_indices)
 
@@ -292,7 +316,21 @@ def _load_sample_inputs(batch_size, seq_len, hidden_size, dtype):
     hidden_states = torch.randn(batch_size, seq_len, hidden_size, dtype=dtype)
     return (hidden_states, )
 
-def generate_test_config(model_configs, tp_degree, ep_degree, router_bias, experts_bias, glu_type, hidden_act, norm_topk_prob):
+def generate_test_config(
+        model_configs,
+        tp_degree,
+        ep_degree,
+        router_bias,
+        experts_bias,
+        glu_type,
+        hidden_act,
+        hidden_act_bias,
+        norm_topk_prob,
+        gate_clamp_upper_limit,
+        gate_clamp_lower_limit,
+        up_clamp_upper_limit,
+        up_clamp_lower_limit,
+    ):
     test_config = TestConfig(
         tp_degree=tp_degree,
         ep_degree=ep_degree,
@@ -302,9 +340,32 @@ def generate_test_config(model_configs, tp_degree, ep_degree, router_bias, exper
         glu_type=glu_type,
         hidden_act=hidden_act,
         norm_topk_prob=norm_topk_prob,
+        hidden_act_bias=hidden_act_bias,
+        gate_clamp_upper_limit=gate_clamp_upper_limit,
+        gate_clamp_lower_limit=gate_clamp_lower_limit,
+        up_clamp_upper_limit=up_clamp_upper_limit,
+        up_clamp_lower_limit=up_clamp_lower_limit,
         **model_configs,
     )
 
+    return test_config
+
+def generate_test_config_with_shuffling(
+    model_configs,
+    tp_degree,
+    ep_degree,
+    expert_distribution_file,
+):
+    with open(expert_distribution_file, 'r') as f:
+        expert_distribution = json.load(f)
+    test_config = TestConfig(
+        tp_degree=tp_degree,
+        ep_degree=ep_degree,
+        world_size=tp_degree * ep_degree,
+        norm_topk_prob=False,
+        expert_distribution=expert_distribution,
+        **model_configs,
+    )
     return test_config
 
 class TestMoESPMDAgainstHFCPUGolden:
@@ -322,6 +383,10 @@ class TestMoESPMDAgainstHFCPUGolden:
             hidden_act=test_config.hidden_act,
             hidden_act_scaling_factor=test_config.hidden_act_scaling_factor,
             hidden_act_bias=test_config.hidden_act_bias,
+            gate_clamp_upper_limit=test_config.gate_clamp_upper_limit,
+            gate_clamp_lower_limit=test_config.gate_clamp_lower_limit,
+            up_clamp_upper_limit=test_config.up_clamp_upper_limit,
+            up_clamp_lower_limit=test_config.up_clamp_lower_limit,
             experts_bias=test_config.experts_bias,
             router_bias=test_config.router_bias,
             normalize_top_k_affinities=test_config.norm_topk_prob,
@@ -352,16 +417,48 @@ class TestMoESPMDAgainstHFCPUGolden:
     @pytest.mark.parametrize("experts_bias", [False, True])
     @pytest.mark.parametrize("glu_type,hidden_act", [("glu", "silu"), ("swiglu", "sigmoid")])
     @pytest.mark.parametrize("norm_topk_prob", [False, True])
+    @pytest.mark.parametrize("hidden_act_bias", [0., 1.])
+    @pytest.mark.parametrize("gate_clamp_lower_limit,gate_clamp_upper_limit", [(None, None), (-1, 1)])
+    @pytest.mark.parametrize("up_clamp_lower_limit,up_clamp_upper_limit", [(None, None), (-1, 1)])
     @pytest.mark.skipif(get_platform_target() != 'trn2', reason="Test only runs on trn2 platform")
-    def test_moe_spmd(self, model_configs, tp_degree, ep_degree, router_bias, experts_bias, glu_type, hidden_act, norm_topk_prob):
-        test_config = generate_test_config(model_configs, tp_degree, ep_degree, router_bias, experts_bias, glu_type, hidden_act, norm_topk_prob)
+    def test_moe_spmd(
+        self,
+        model_configs,
+        tp_degree,
+        ep_degree,
+        router_bias,
+        experts_bias,
+        glu_type,
+        hidden_act,
+        hidden_act_bias,
+        norm_topk_prob,
+        gate_clamp_upper_limit,
+        gate_clamp_lower_limit,
+        up_clamp_upper_limit,
+        up_clamp_lower_limit,
+    ):
+        test_config = generate_test_config(
+            model_configs,
+            tp_degree,
+            ep_degree,
+            router_bias,
+            experts_bias,
+            glu_type,
+            hidden_act,
+            hidden_act_bias,
+            norm_topk_prob,
+            gate_clamp_upper_limit,
+            gate_clamp_lower_limit,
+            up_clamp_upper_limit,
+            up_clamp_lower_limit,
+        )
 
         print(f"Running test config:  {test_config}")
         sample_inputs = _load_sample_inputs(
             test_config.batch_size,
             test_config.seq_len,
             test_config.hidden_size,
-            dtype=torch.bfloat16,
+            dtype=torch.float32,
         )
 
         cpu_model, neuron_model = self._create_models(
@@ -372,6 +469,90 @@ class TestMoESPMDAgainstHFCPUGolden:
         init_parallel_cpu_golden()
         cpu_output = cpu_model(*sample_inputs)
         neuron_output = neuron_model(*sample_inputs)
+        torch_neuronx.testing.assert_close(neuron_output, cpu_output)
+        del cpu_model, neuron_model
+        parallel_state.destroy_model_parallel()
+        destroy_moe_model_parallel()
+
+
+    @pytest.mark.parametrize("model_configs", [
+        {"hidden_size": 3072, "intermediate_size": 3072, "n_routed_experts": 128, "seq_len": 2048, "num_experts_per_tok": 4, "batch_size": 1},
+        {"hidden_size": 4096, "intermediate_size": 1536, "n_routed_experts": 128, "seq_len": 2048, "num_experts_per_tok": 8, "batch_size": 1},
+    ])
+    @pytest.mark.parametrize("tp_degree,ep_degree", [(1, 64), (2, 32), (4, 16), (16, 4)])
+    @pytest.mark.skipif(get_platform_target() != 'trn2', reason="Test only runs on trn2 platform")
+    def test_moe_spmd_static_weight_shuffled(
+        self,
+        model_configs,
+        tp_degree,
+        ep_degree,
+    ):
+        expert_distribution_file = f"expert_distribution/{model_configs['n_routed_experts']}_experts_{ep_degree}_ep_no_redundancy.json"
+        test_config = generate_test_config_with_shuffling(
+            model_configs,
+            tp_degree,
+            ep_degree,
+            expert_distribution_file,
+        )
+        print(f"Running test config:  {test_config}")
+        sample_inputs = _load_sample_inputs(
+            test_config.batch_size,
+            test_config.seq_len,
+            test_config.hidden_size,
+            dtype=torch.float32,
+        )
+
+        cpu_model, neuron_model = self._create_models(
+            sample_inputs=sample_inputs,
+            test_config=test_config,
+        )
+        init_parallel_cpu_golden()
+        cpu_output = cpu_model(*sample_inputs)
+        neuron_output = neuron_model(*sample_inputs)
 
         torch_neuronx.testing.assert_close(neuron_output, cpu_output)
         del cpu_model, neuron_model
+        parallel_state.destroy_model_parallel()
+        destroy_moe_model_parallel()
+
+
+    @pytest.mark.parametrize("model_configs", [
+        {"hidden_size": 3072, "intermediate_size": 3072, "n_routed_experts": 128, "seq_len": 2048, "num_experts_per_tok": 4, "batch_size": 1},
+        {"hidden_size": 4096, "intermediate_size": 1536, "n_routed_experts": 128, "seq_len": 2048, "num_experts_per_tok": 8, "batch_size": 1},
+    ])
+    @pytest.mark.parametrize("tp_degree,ep_degree,redundancy", [(1, 64, 128), (2, 32, 128), (4, 16, 128), (16, 4, 16)])
+    @pytest.mark.skipif(get_platform_target() != 'trn2', reason="Test only runs on trn2 platform")
+    def test_moe_spmd_static_redundancy(
+        self,
+        model_configs,
+        tp_degree,
+        ep_degree,
+        redundancy,
+    ):
+        expert_distribution_file = f"expert_distribution/{model_configs['n_routed_experts']}_experts_{ep_degree}_ep_{redundancy}_redundancy.json"
+        test_config = generate_test_config_with_shuffling(
+            model_configs,
+            tp_degree,
+            ep_degree,
+            expert_distribution_file,
+        )
+        print(f"Running test config:  {test_config}")
+        sample_inputs = _load_sample_inputs(
+            test_config.batch_size,
+            test_config.seq_len,
+            test_config.hidden_size,
+            dtype=torch.float32,
+        )
+
+        cpu_model, neuron_model = self._create_models(
+            sample_inputs=sample_inputs,
+            test_config=test_config,
+        )
+        init_parallel_cpu_golden()
+        cpu_output = cpu_model(*sample_inputs)
+        neuron_output = neuron_model(*sample_inputs)
+
+        torch_neuronx.testing.assert_close(neuron_output, cpu_output)
+        del cpu_model, neuron_model
+        parallel_state.destroy_model_parallel()
+        destroy_moe_model_parallel()

@@ -86,7 +86,7 @@ def init_moe(cfg: ExptCfg):
         use_block_parallel=False,
         early_expert_affinity_modulation=False,
         block_sharding_strategy=None,
-        enable_spmd_rank=False,
+        enable_spmd_rank=True,
     )
 
     expert_mlps = ExpertMLPs(**expert_mlps_args)

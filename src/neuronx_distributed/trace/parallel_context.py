@@ -3,11 +3,12 @@ import torch
 
 from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.trace.mock_torchdist import mock_distributed
+from neuronx_distributed.utils.model_utils import get_platform_lnc, LogicalNCConfig
 
 class NxDParallelState:
     """
     A consolidated context manager for NeuronX Distributed (NxD) that handles parallel state initialization
-    and cleanup for distributed training scenarios.
+    and cleanup.
     
     This context manager provides a unified interface to set up and tear down the distributed environment
     required for model parallelism in NeuronX Distributed.
@@ -20,13 +21,13 @@ class NxDParallelState:
     - Proper cleanup of all initialized components on exit
     
     Args:
-        world_size (int, optional): Total number of processes in the distributed setup. Defaults to 1.
-        rank (int, optional): Rank of the current process. Defaults to 0.
-        tensor_model_parallel_size (int, optional): Size of tensor model parallel group. Defaults to 1.
-        pipeline_model_parallel_size (int, optional): Size of pipeline model parallel group. Defaults to 1.
-        context_parallel_size (int, optional): Size of context parallel group for sequence parallelism. Defaults to 1.
-        expert_model_parallel_size (int, optional): Size of expert model parallel group for MoE models. Defaults to 1.
-        lnc_size (int, optional): Logical neuron core size. Defaults to 1.
+        world_size: Total number of processes in the distributed setup. Defaults to 1.
+        rank: Rank of the current process. Defaults to 0.
+        tensor_model_parallel_size: Size of tensor model parallel group. Defaults to 1.
+        pipeline_model_parallel_size: Size of pipeline model parallel group. Defaults to 1.
+        context_parallel_size: Size of context parallel group for sequence parallelism. Defaults to 1.
+        expert_model_parallel_size: Size of expert model parallel group for MoE models. Defaults to 1.
+        lnc_size: Logical NeuronCore size. Defaults to platform-specific value (2 for LNC_2, 1 otherwise).
     
     Usage:
         ```python
@@ -46,7 +47,7 @@ class NxDParallelState:
         pipeline_model_parallel_size=1,
         context_parallel_size=1,
         expert_model_parallel_size=1,
-        lnc_size=1
+        lnc_size=None
     ):
         self.world_size = world_size
         self.rank = rank
@@ -54,7 +55,7 @@ class NxDParallelState:
         self.pipeline_model_parallel_size = pipeline_model_parallel_size
         self.context_parallel_size = context_parallel_size
         self.expert_model_parallel_size = expert_model_parallel_size
-        self.lnc_size = lnc_size
+        self.lnc_size = lnc_size if lnc_size is not None else (2 if get_platform_lnc() == LogicalNCConfig.LNC_2 else 1)
         self.mock_dist = None
 
     def __enter__(self):

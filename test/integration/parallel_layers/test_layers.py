@@ -18,6 +18,10 @@ from neuronx_distributed.parallel_layers import layers, parallel_state
 from neuronx_distributed.parallel_layers.pad import pad_model
 from neuronx_distributed.parallel_layers.random import model_parallel_xla_manual_seed
 from neuronx_distributed.parallel_layers.utils import requires_init_pg_override
+from neuronx_distributed.parallel_layers.mappings import (
+    gather_from_tensor_model_parallel_region,
+    reduce_from_tensor_model_parallel_region,
+)
 from neuronx_distributed.utils import cpu_mode, mark_step
 
 datetime_str = str(datetime.now())
@@ -156,6 +160,58 @@ def test_parallel_embedding_shard_over_embedding_dim(tp_size, device):
     error = embedding_parallel.weight.grad.sub(weight_grad_orig).abs().max()
     print("   error in grad (parallel) on global rank {}: {}".format(torch.distributed.get_rank(), error))
     # assert error < 1.0e-5, 'error: {}'.format(error) #Error is 2.09
+
+
+def test_parallel_embedding_embedding_shard_no_collective(tp_size, device):
+    parallel_state.initialize_model_parallel(tp_size)
+    assert tp_size == parallel_state.get_tensor_model_parallel_size()
+
+    batch_size = 1
+    seq_length = 2048
+    vocab_size = 30432
+    hidden_size = 1024
+    seed = 1234
+
+    set_random_seed(seed)
+    embedding_original = torch.nn.Embedding(vocab_size, hidden_size).to(device)
+    set_random_seed(seed)
+    embedding_parallel = layers.ParallelEmbedding(
+        vocab_size, hidden_size, init_method=init.normal_, shard_across_embedding=True, collect_output=False,
+    ).to(device)
+    input_data = torch.LongTensor(size=(batch_size, seq_length)).random_(0, vocab_size).to(device)
+
+    actual = embedding_parallel(input_data)
+    # Manually perform collectives to confirm we can get the same behavior
+    actual = gather_from_tensor_model_parallel_region(actual, parallel_state.get_tensor_model_parallel_group())
+    
+    expected = embedding_original(input_data)
+    torch.testing.assert_close(actual, expected)
+
+
+def test_parallel_embedding_vocab_shard_no_collective(tp_size, device):
+    parallel_state.initialize_model_parallel(tp_size)
+    assert tp_size == parallel_state.get_tensor_model_parallel_size()
+
+    batch_size = 1
+    seq_length = 2048
+    vocab_size = 30432
+    hidden_size = 1024
+    seed = 1234
+
+    set_random_seed(seed)
+    embedding_original = torch.nn.Embedding(vocab_size, hidden_size).to(device)
+    set_random_seed(seed)
+    embedding_parallel = layers.ParallelEmbedding(
+        vocab_size, hidden_size, init_method=init.normal_, shard_across_embedding=False, collect_output=False,
+    ).to(device)
+    input_data = torch.LongTensor(size=(batch_size, seq_length)).random_(0, vocab_size).to(device)
+
+    actual = embedding_parallel(input_data)
+    # Manually perform collectives to confirm we can get the same behavior
+    actual = reduce_from_tensor_model_parallel_region(actual, parallel_state.get_tensor_model_parallel_group())
+    
+    expected = embedding_original(input_data)
+    torch.testing.assert_close(actual, expected)
 
 
 def test_initialize_parameter_cpu(tp_size):
@@ -678,6 +734,8 @@ if __name__ == "__main__":
     while tensor_model_parallel_size <= world_size:
         run_test(test_parallel_embedding, tensor_model_parallel_size, device)
         run_test(test_parallel_embedding_shard_over_embedding_dim, tensor_model_parallel_size, device)
+        run_test(test_parallel_embedding_embedding_shard_no_collective, tensor_model_parallel_size, device)
+        run_test(test_parallel_embedding_vocab_shard_no_collective, tensor_model_parallel_size, device)
         run_test(test_initialize_parameter_cpu, tensor_model_parallel_size)
         run_test(test_row_parallel_linear_seq_parallel, tensor_model_parallel_size, device)
         run_test(test_column_parallel_linear_seq_parallel, tensor_model_parallel_size, device)

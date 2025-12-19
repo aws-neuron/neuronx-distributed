@@ -5,11 +5,11 @@ import torch
 import torch.nn as nn
 
 from neuronx_distributed.utils.model_utils import init_on_device
-from neuronx_distributed import NxDParallelState, shard_checkpoint, ModelBuilder, NxDModel
+from neuronx_distributed import NxDParallelState, shard_checkpoint, NxDModel
 from neuronx_distributed.parallel_layers import ColumnParallelLinear, RowParallelLinear
 from neuronx_distributed.trace.model_builder_utils import ModelBuilderConstants
 from neuronx_distributed.trace.hlo_utils import mark_weights_for_wlo, apply_layout_transformation
-from neuronx_distributed.trace.model_builder import (
+from neuronx_distributed.trace.functions import (
     trace,
     compile,
     compile_wlo,
@@ -456,7 +456,46 @@ class TestE2EFundamentalUnitsFlowDistributed(unittest.TestCase):
             shutil.rmtree(os.path.join(ModelBuilderConstants.DEFAULT_COMPILER_WORKDIR, key))
 
         torch.classes.neuron.Runtime().unsafe_close()
+    
+    def test_e2e_simple_aliased_model(self):
+        class Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer('cache', torch.tensor([0], dtype=torch.float32), persistent=False)
 
+            def forward(self, x, update_value):
+                self.cache = torch.add(self.cache, update_value)
+                return x + self.cache
+
+        cpu_model = Model()
+        model = Model()
+
+        example_inputs1 = {'x': torch.zeros(1, dtype=torch.float32), 'update_value': torch.zeros(1, dtype=torch.float32)}        
+        trace_artifacts = {
+            "bucket1": trace(model, kwargs=example_inputs1),
+        }
+        compilation_artifacts_bucket1 = compile(
+            hlo_module=trace_artifacts["bucket1"].hlo,
+            metaneff=trace_artifacts["bucket1"].metaneff,
+            key="bucket1"
+        )
+
+
+        nxd_model = NxDModel(world_size=1)
+        nxd_model.add(key="bucket1", trace_artifacts=trace_artifacts["bucket1"], compilation_artifacts=compilation_artifacts_bucket1)
+        nxd_model.to_neuron()
+
+        input1 = (torch.tensor([1], dtype=torch.float32), torch.tensor([5], dtype=torch.float32))
+        input2 =  (torch.tensor([2], dtype=torch.float32), torch.tensor([10], dtype=torch.float32))
+
+        model_iteration = 0
+        for input in [input1, input2]:
+            cpu_out = cpu_model(input[0], input[1])
+            neuron_out = nxd_model(x=input[0], update_value=input[1])
+
+            torch.testing.assert_close(cpu_out, neuron_out)
+            model_iteration += 1
+            print(f"Iteration {model_iteration} matches!")
 
 if __name__ == '__main__':
     unittest.main()

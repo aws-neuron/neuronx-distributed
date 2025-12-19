@@ -1,4 +1,6 @@
+import math
 import warnings
+import logging
 import torch
 import torch_xla.core.xla_model as xm
 import torch.nn.functional as F
@@ -9,6 +11,8 @@ from neuronx_distributed.modules.moe.model_utils import DEFAULT_PADDING_VALUE, D
 from neuronx_distributed.modules.moe.moe_configs import BlockwiseMatmulConfig
 from neuronx_distributed.modules.moe.nki_import import NKIImport, import_nki
 from neuronx_distributed.parallel_layers import mappings
+from neuronx_distributed.quantization.quantization_config import is_ocp_mx_quantized, QuantizationType
+from neuronx_distributed.quantization.dequantize import blockwise_scale_dequantize
 from neuronxcc.nki.compiler.backends.neuron.dimensions import VNC
 from neuronx_distributed.utils.model_utils import LogicalNCConfig
 from torch_neuronx.xla_impl.base import xla_call
@@ -25,14 +29,13 @@ try:
         blockwise_mm_baseline_shard_intermediate_hybrid,
         blockwise_mm_baseline_shard_intermediate,
     )
-    from neuronxcc.nki._pre_prod_kernels.blockwise_mm import (
-        ActivationFunction,
-    )
     USE_DYNAMIC_KERNEL=True
 
 except Exception as e:
     warnings.warn(f"Warning: Current compiler version does not have dynamic while kernel, here's the exception message: {e}")
     USE_DYNAMIC_KERNEL=False
+
+logger = logging.getLogger("Neuron")
 
 def initialize_nki_components() -> dict:
     """
@@ -46,12 +49,15 @@ def initialize_nki_components() -> dict:
         "blockwise_mm_baseline_shard_hidden": NKIImport("blockwise_mm_baseline_shard_hidden", module_name="blockwise_mm", nki_jit_type="use_nki_jit_decorator"),
         "blockwise_mm_baseline_block_parallel": NKIImport("blockwise_mm_baseline_block_parallel", module_name="blockwise_matmul", nki_jit_type="use_nki_jit_decorator"),
         "blockwise_mm_baseline_block_parallel_allocated": NKIImport("blockwise_mm_baseline_block_parallel_allocated", module_name="blockwise_matmul", nki_jit_type="use_jit_decorator"),
+        "bwmm_shard_on_block": NKIImport("bwmm_shard_on_block", module_name="blockwise_matmul", nki_jit_type="use_jit_decorator"),
         "blockwise_mm_bwd": NKIImport("blockwise_mm_bwd", module_name="blockwise_mm_bwd", nki_jit_type="use_nki_jit_decorator"),
+        "bwmm_fp4_shard_on_block": NKIImport("bwmm_fp4_shard_on_block", module_name="bwmm_mxfp4"),
         "blockwise_mm_bwd_baseline_shard_hidden": NKIImport("blockwise_mm_bwd_baseline_shard_hidden", module_name="blockwise_mm_bwd", nki_jit_type="use_nki_jit_decorator"),
         "blockwise_mm_baseline": NKIImport("blockwise_mm_baseline", module_name="blockwise_mm", nki_jit_type="use_nki_jit_decorator"),
         "check_compatibility": NKIImport("check_blockwise_mm_kernel_compatibility", module_name="blockwise_mm"),
         "block_shard_strategy": NKIImport("BlockShardStrategy", module_name="blockwise_mm"),
         "affinity_scale_mode": NKIImport("ExpertAffinityScaleMode"),
+        "act_fn_type": NKIImport("ActFnType"),
         "skip_mode": NKIImport("SkipMode", module_name="blockwise_mm"),
     }
 
@@ -81,12 +87,15 @@ _blockwise_mm_nki_call = nki_components["blockwise_mm"]
 _blockwise_mm_baseline_shard_hidden_nki_call = nki_components["blockwise_mm_baseline_shard_hidden"]
 _blockwise_mm_baseline_block_parallel_nki_call = nki_components["blockwise_mm_baseline_block_parallel"]
 _blockwise_mm_baseline_block_parallel_allocated_nki_call = nki_components["blockwise_mm_baseline_block_parallel_allocated"]
+_bwmm_shard_on_block_nki_call = nki_components["bwmm_shard_on_block"]
+_bwmm_fp4_shard_on_block_nki_call = nki_components["bwmm_fp4_shard_on_block"]
 _blockwise_mm_nki_bwd_call = nki_components["blockwise_mm_bwd"]
 _blockwise_mm_bwd_baseline_shard_hidden_nki_call = nki_components["blockwise_mm_bwd_baseline_shard_hidden"]
 _blockwise_mm_training_nki_call = nki_components["blockwise_mm_baseline"]
 check_blockwise_mm_kernel_compatibility = nki_components["check_compatibility"]
 BlockShardStrategy = nki_components["block_shard_strategy"]
 ExpertAffinityScaleMode = nki_components["affinity_scale_mode"]
+ActFnType = nki_components["act_fn_type"]
 SkipMode = nki_components["skip_mode"]
 
 if USE_DYNAMIC_KERNEL:
@@ -149,6 +158,10 @@ class BlockwiseMatmulArgs:
     expert_affinities_scaling_mode: Any = ExpertAffinityScaleMode.POST_SCALE
     block_sharding_strategy: Any = BlockShardStrategy.HI_LO
     dtype: torch.dtype = torch.bfloat16
+    gate_clamp_upper_limit: Optional[float] = None
+    gate_clamp_lower_limit: Optional[float] = None
+    up_clamp_upper_limit: Optional[float] = None
+    up_clamp_lower_limit: Optional[float] = None
 
     # Optional Input tensors
     conditions: Optional[torch.Tensor] = None
@@ -252,6 +265,51 @@ def _call_block_parallel_kernel(args: BlockwiseMatmulArgs):
     return args.output
 
 
+def _call_bwmm_shard_on_block_kernel(args: BlockwiseMatmulArgs):
+    """Call the shard on block kernel for blockwise matmul."""
+    E = args.gate_up_proj_weight.shape[0]
+    # pass args not in the original interface as kwargs to ensure compatibility with different compiler versions
+    optional_kwargs = {}
+    if args.gate_clamp_upper_limit is not None:
+        optional_kwargs["gate_clamp_upper_limit"] = args.gate_clamp_upper_limit
+    if args.gate_clamp_lower_limit is not None:
+        optional_kwargs["gate_clamp_lower_limit"] = args.gate_clamp_lower_limit
+    if args.up_clamp_upper_limit is not None:
+        optional_kwargs["up_clamp_upper_limit"] = args.up_clamp_upper_limit
+    if args.up_clamp_lower_limit is not None:
+        optional_kwargs["up_clamp_lower_limit"] = args.up_clamp_lower_limit
+
+    output = _bwmm_shard_on_block_nki_call[VNC(2)](
+        conditions=args.conditions,
+        hidden_states=args.hidden_states,
+        expert_affinities_masked=args.expert_affinities_masked,
+        gate_up_proj_weight=args.gate_up_proj_weight,
+        down_proj_weight=args.down_proj_weight,
+        gate_and_up_proj_bias=args.gate_up_proj_bias.view(E, 2, -1) if args.gate_up_proj_bias is not None else None,
+        down_proj_bias=args.down_proj_bias,
+        gate_up_proj_scale=args.gate_up_proj_scale,
+        # TODO: Do we need to do something about 'down_activations' parameter to kernel?
+        down_proj_scale=args.down_proj_scale,
+        block_size=args.block_size,
+        token_position_to_id=args.token_position_to_id.to(dtype=torch.int32),
+        block_to_expert=args.block_to_expert.to(dtype=torch.int32),
+        skip_dma=args.skip_dma,
+        is_tensor_update_accumulating=args.is_tensor_update_accumulating,
+        expert_affinities_scaling_mode=args.expert_affinities_scaling_mode,
+        block_sharding_strategy=args.block_sharding_strategy,
+        compute_dtype = torch_to_nki_dtype(args.dtype),
+        activation_function=args.kernel_act_fn,
+        **optional_kwargs,
+    )
+
+    if args.is_tensor_update_accumulating:
+        # The output from kernel is of shape (2, total_tokens+1, hidden_size), we need
+        # to return the first value at first index from that result.
+        return output[0, ...]
+    else:
+        return output
+
+
 def _call_shard_hidden_kernel(args: BlockwiseMatmulArgs):
     """Call the shard hidden kernel for blockwise matmul."""
     _blockwise_mm_baseline_shard_hidden_nki_call[VNC(2)](
@@ -313,6 +371,16 @@ def _call_shard_on_intermediate_kernel(args: BlockwiseMatmulArgs):
     assert conditions is not None, "conditions must be passed in for shard-on-intermediate dynamic kernel"
     padded_conditions = torch.cat([conditions, torch.zeros(1, device=conditions.device)])
     E = args.gate_up_proj_weight.shape[0]
+    # pass args not in the original interface as kwargs to ensure compatibility with different compiler versions
+    optional_kwargs = {}
+    if args.gate_clamp_upper_limit is not None:
+        optional_kwargs["gate_clamp_upper_limit"] = args.gate_clamp_upper_limit
+    if args.gate_clamp_lower_limit is not None:
+        optional_kwargs["gate_clamp_lower_limit"] = args.gate_clamp_lower_limit
+    if args.up_clamp_upper_limit is not None:
+        optional_kwargs["up_clamp_upper_limit"] = args.up_clamp_upper_limit
+    if args.up_clamp_lower_limit is not None:
+        optional_kwargs["up_clamp_lower_limit"] = args.up_clamp_lower_limit
     return _blockwise_mm_baseline_shard_intermediate_hybrid[VNC(2)](
         # Inputs
         conditions=padded_conditions,
@@ -321,7 +389,7 @@ def _call_shard_on_intermediate_kernel(args: BlockwiseMatmulArgs):
         # MLP weights
         gate_up_proj_weight=args.gate_up_proj_weight,
         down_proj_weight=args.down_proj_weight,
-        gate_and_up_proj_bias=args.gate_up_proj_bias.view(E, 2, -1) if args.gate_up_proj_bias is not None else args.gate_up_proj_bias,
+        gate_and_up_proj_bias=args.gate_up_proj_bias.view(E, 2, -1) if args.gate_up_proj_bias is not None else None,
         down_proj_bias=args.down_proj_bias,
         activation_function=args.kernel_act_fn,
         # Block related
@@ -330,9 +398,11 @@ def _call_shard_on_intermediate_kernel(args: BlockwiseMatmulArgs):
         token_position_to_id=args.token_position_to_id.to(dtype=torch.int32),
         block_to_expert=args.block_to_expert.to(dtype=torch.int32),
         expert_affinities_scaling_mode=args.expert_affinities_scaling_mode,
+        compute_dtype=torch_to_nki_dtype(args.dtype),
         # Output
         skip_dma=args.skip_dma,
         is_tensor_update_accumulating=args.is_tensor_update_accumulating,
+        **optional_kwargs,
         )
 
 def _call_shard_on_block_kernel(args: BlockwiseMatmulArgs):
@@ -754,9 +824,14 @@ def can_use_blockwise_matmul_nki(
         logical_nc_config: int,
         use_block_parallel: bool = False,
         use_shard_on_intermediate: bool = False,
+        use_shard_on_block_dynamic_while: bool = False,
         use_bias: bool = False,
         scaling_factor: float = 1.0,
         act_fn: Any = "silu",
+        gate_clamp_upper_limit: Optional[float] = None,
+        gate_clamp_lower_limit: Optional[float] = None,
+        up_clamp_upper_limit: Optional[float] = None,
+        up_clamp_lower_limit: Optional[float] = None,
 ) -> bool:
     """
     Determine if blockwise NKI kernel can be used based on configuration.
@@ -777,15 +852,17 @@ def can_use_blockwise_matmul_nki(
     """
     glu_type = GLUType.validate(glu_type)
     act_fn = ACTFunc.validate(act_fn)
+    glu_supported = bias_supported = clamp_supported = (use_shard_on_intermediate or use_shard_on_block_dynamic_while)
     pre_validation_conditions = [
         (device.type == "cpu", "Cannot run blockwise NKI kernel on CPU"),
         (not glu_mlp, "Blockwise NKI kernel incompatible with glu_mlp=False"),
         (glu_type is not None and glu_type not in GLUType, "Blockwise NKI kernel only support glu_type=GLU or glu_type=SWIGLU"),
         (use_torch_block_wise, "use_torch_block_wise set, using torch implementation"),
-        (glu_type == GLUType.SWIGLU and not use_shard_on_intermediate, "SWIGLU is only supported in shard-on-intermediate kernel"),
-        (use_bias and not use_shard_on_intermediate, "gate_up_proj and down_proj bias is only supported in shard-on-intermediate kernel"),
+        (glu_type == GLUType.SWIGLU and not glu_supported, "SWIGLU is not yet supported in the selected blockwise matmul NKI kernel"),
+        (use_bias and not bias_supported, "gate_up_proj and down_proj bias is not yet supported in the selected blockwise matmul NKI kernel"),
         (scaling_factor != DEFAULT_HIDDEN_ACT_SCALING_FACTOR and glu_type == GLUType.SWIGLU, "scaling factor should be 1.702 for NKI kernel with SWIGLU"),
-        (glu_type == GLUType.SWIGLU and act_fn != ACTFunc.SIGMOID, "SWIGLU is only supported with sigmoid activation function")
+        (glu_type == GLUType.SWIGLU and act_fn != ACTFunc.SIGMOID, "SWIGLU is only supported with sigmoid activation function"),
+        ((gate_clamp_upper_limit or gate_clamp_lower_limit or up_clamp_upper_limit or up_clamp_lower_limit) and not clamp_supported, "clamp limit is not yet supported in the selected blockwise matmul NKI kernel")
     ]
 
     for condition, warning in pre_validation_conditions:
@@ -809,8 +886,12 @@ def can_use_blockwise_matmul_nki(
             block_size=block_size,
             intermediate_size_tp=intermediate_size_tp,
         )
-    except AssertionError as e:
+    except Exception as e:
         warnings.warn(f"Blockwise kernel not compatible with model config. Reason: {str(e)}")
+        return False
+
+    if intermediate_size_tp % 16 != 0:
+        warnings.warn("Blockwise kernel not compatible with model config. Reason: intermediate size tp is not disivible by 16")
         return False
 
     return True
@@ -886,6 +967,10 @@ class BlockwiseMatmulNKIFunc(torch.autograd.Function):
         expert_affinities_scaling_mode=ExpertAffinityScaleMode.POST_SCALE,
         conditions: Optional[torch.Tensor] = None,
         num_static_blocks: Optional[int] = None,
+        gate_clamp_upper_limit: Optional[float] = None,
+        gate_clamp_lower_limit: Optional[float] = None,
+        up_clamp_upper_limit: Optional[float] = None,
+        up_clamp_lower_limit: Optional[float] = None,
         gate_up_proj_bias: Optional[torch.tensor] = None,
         down_proj_bias: Optional[torch.tensor] = None,
         kernel_act_fn_id: int = 1,
@@ -963,12 +1048,25 @@ class BlockwiseMatmulNKIFunc(torch.autograd.Function):
             output, hidden_states, token_position_to_id, expert_affinities_masked = (
                 augment_inputs_for_padded_blockwise_matmul(output, hidden_states, token_position_to_id,
                                                                      expert_affinities_masked))
+        #TODO: Currently blockwise scales are not supported in blockwise kernel. Deprecate this when supported.
+        if gate_up_proj_scale is not None and len(gate_up_proj_scale.shape) > 2:
+            assert len(gate_up_proj_scale.shape) == len(down_proj_scale.shape) == 3
+            warnings.warn(
+                f"""gate_up_proj_scale: {gate_up_proj_scale.shape} down_proj_scale: {down_proj_scale.shape} both are blockwise scales.
+                Blockwise scaling is not supported in blockwise kernel for now and will be dequantized before the kernel"""
+            )
+            # mx swizzle currently only applies to gate_up and down proj weights
+            mx_swizzle = is_ocp_mx_quantized(QuantizationType.BLOCKWISE_SYMMETRIC, gate_up_proj_weight.dtype, gate_up_proj_scale.dtype)
+            gate_up_proj_weight = blockwise_scale_dequantize(gate_up_proj_weight, gate_up_proj_scale, upcast_dtype=hidden_states.dtype, mx_swizzle=mx_swizzle)
+            mx_swizzle = is_ocp_mx_quantized(QuantizationType.BLOCKWISE_SYMMETRIC, down_proj_weight.dtype, down_proj_scale.dtype)
+            down_proj_weight = blockwise_scale_dequantize(down_proj_weight, down_proj_scale, upcast_dtype=hidden_states.dtype, mx_swizzle=mx_swizzle)
+            gate_up_proj_scale, down_proj_scale = None, None
+
         # Reshape gate_up_proj_weight to (E, H, 2, I) as expected by the kernel
         gate_up_proj_weight = gate_up_proj_weight.view(ctx.num_experts, hidden_size, 2, -1)
         # Flatten expert_affinities_masked: ((T+1)*E, 1)
         # TODO: cannot refactor to (T+1, E) as we currently don't support dynamic slice on both axis.
         expert_affinities_masked = expert_affinities_masked.view(-1, 1)
-
         args = BlockwiseMatmulArgs(
             hidden_states=hidden_states,
             expert_affinities_masked=expert_affinities_masked,
@@ -989,7 +1087,10 @@ class BlockwiseMatmulNKIFunc(torch.autograd.Function):
             dtype=hidden_states.dtype,
             conditions=conditions,
             num_static_blocks=num_static_blocks,
-            # Only Shard-on-Intermediate kernel suport computation with bias and swiglu
+            gate_clamp_upper_limit=gate_clamp_upper_limit,
+            gate_clamp_lower_limit=gate_clamp_lower_limit,
+            up_clamp_upper_limit=up_clamp_upper_limit,
+            up_clamp_lower_limit=up_clamp_lower_limit,
             gate_up_proj_bias=gate_up_proj_bias,
             down_proj_bias=down_proj_bias,
             kernel_act_fn=ActivationFunction(kernel_act_fn_id) if USE_DYNAMIC_KERNEL else None,
@@ -1007,7 +1108,10 @@ class BlockwiseMatmulNKIFunc(torch.autograd.Function):
             elif use_shard_on_intermediate_dynamic_while:
                 output = _call_shard_on_intermediate_kernel(args)
             elif use_shard_on_block_dynamic_while:
-                output = _call_shard_on_block_kernel(args)
+                if args.gate_up_proj_bias is not None and _bwmm_shard_on_block_nki_call is not None:
+                    output = _call_bwmm_shard_on_block_kernel(args)
+                else:
+                    output = _call_shard_on_block_kernel(args)
             elif use_block_parallel:
                 output = _call_block_parallel_kernel(args)
             else:
@@ -1118,4 +1222,124 @@ class BlockwiseMatmulNKIFunc(torch.autograd.Function):
             None,
             None,
             None,
+            None,
+            None,
+            None,
+            None,
         )
+
+def _call_bwmm_fp4_shard_on_block(args: BlockwiseMatmulArgs):
+    output = _bwmm_fp4_shard_on_block_nki_call[VNC(2)](
+        hidden_states=args.hidden_states,
+        expert_affinities_masked=args.expert_affinities_masked,
+        gate_up_proj_weight=args.gate_up_proj_weight,
+        down_proj_weight=args.down_proj_weight,
+        block_size=args.block_size,
+        token_position_to_id=args.token_position_to_id,
+        block_to_expert=args.block_to_expert,
+        gate_and_up_proj_bias=args.gate_up_proj_bias,
+        down_proj_bias=args.down_proj_bias,
+        gate_up_proj_scale=args.gate_up_proj_scale,
+        down_proj_scale=args.down_proj_scale,
+        gate_up_activations_T=None,
+        down_activations=None,
+        # Meta parameters
+        activation_function=args.kernel_act_fn,
+        skip_dma=args.skip_dma,
+        is_tensor_update_accumulating=args.is_tensor_update_accumulating,
+        expert_affinities_scaling_mode=args.expert_affinities_scaling_mode,
+        gate_clamp_upper_limit=args.gate_clamp_upper_limit,
+        gate_clamp_lower_limit=args.gate_clamp_lower_limit,
+        up_clamp_lower_limit=args.up_clamp_lower_limit,
+        up_clamp_upper_limit=args.up_clamp_upper_limit,
+    )
+
+    if args.is_tensor_update_accumulating:
+        # The output from kernel is of shape (2, total_tokens+1, hidden_size), we need
+        # to return the first value at first index from that result.
+        return output[0, ...]
+    else:
+        return output
+
+
+class BlockwiseMatmulMXNKIFunc(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        hidden_states,
+        expert_affinities_masked,
+        gate_up_proj_weight,
+        down_proj_weight,
+        token_position_to_id,
+        block_to_expert,
+        gate_up_proj_scale,
+        down_proj_scale,
+        is_training,
+        blockwise_matmul_config: BlockwiseMatmulConfig,
+        multi_expert_per_token=True,
+        expert_affinities_scaling_mode=ExpertAffinityScaleMode.POST_SCALE,
+        conditions: Optional[torch.Tensor] = None,
+        num_static_blocks: Optional[int] = None,
+        gate_clamp_upper_limit: Optional[float] = None,
+        gate_clamp_lower_limit: Optional[float] = None,
+        up_clamp_upper_limit: Optional[float] = None,
+        up_clamp_lower_limit: Optional[float] = None,
+        gate_up_proj_bias: Optional[torch.tensor] = None,
+        down_proj_bias: Optional[torch.tensor] = None,
+        kernel_act_fn_id: int = 1,
+    ):
+        assert not is_training, "Blockwise MX matmul is not supported for training yet"
+        total_tokens, hidden_size = hidden_states.shape
+        assert hidden_size % 512 == 0, "Hidden size must be divisible by 512"
+        num_experts = expert_affinities_masked.shape[1]
+
+        output = torch.zeros(total_tokens, hidden_size, device=hidden_states.device, dtype=hidden_states.dtype)
+
+        # Pad T dim to T+1 when token DMA skipping is disabled
+        skip_dma = getattr(blockwise_matmul_config, 'skip_dma')
+        if not skip_dma.skip_token:
+            output, hidden_states, token_position_to_id, expert_affinities_masked = (
+                augment_inputs_for_padded_blockwise_matmul(output, hidden_states, token_position_to_id,
+                                                                        expert_affinities_masked))
+
+        I_TP = gate_up_proj_weight.shape[-1]
+        num_I_TP_blocks = math.ceil(I_TP / 512)
+        I_TP_block_size = I_TP // num_I_TP_blocks
+        if gate_up_proj_bias is not None:
+            gate_up_proj_bias = gate_up_proj_bias.reshape(num_experts, I_TP_block_size // 4, 2, num_I_TP_blocks, 4)
+
+        expert_affinities_masked = expert_affinities_masked.view(-1, 1)
+
+        args = BlockwiseMatmulArgs(
+            hidden_states=hidden_states,
+            expert_affinities_masked=expert_affinities_masked,
+            gate_up_proj_weight=gate_up_proj_weight,
+            down_proj_weight=down_proj_weight,
+            gate_up_proj_scale=gate_up_proj_scale,
+            down_proj_scale=down_proj_scale,
+            block_size=blockwise_matmul_config.block_size,
+            token_position_to_id=token_position_to_id.to(dtype=torch.int32),
+            block_to_expert=block_to_expert.to(dtype=torch.int32),
+            conditions=conditions,
+            num_static_blocks=num_static_blocks,
+            gate_clamp_upper_limit=gate_clamp_upper_limit,
+            gate_clamp_lower_limit=gate_clamp_lower_limit,
+            up_clamp_upper_limit=up_clamp_upper_limit,
+            up_clamp_lower_limit=up_clamp_lower_limit,
+            gate_up_proj_bias=gate_up_proj_bias,
+            down_proj_bias=down_proj_bias,
+            kernel_act_fn=ActivationFunction(kernel_act_fn_id),
+            is_tensor_update_accumulating=multi_expert_per_token,
+            expert_affinities_scaling_mode=expert_affinities_scaling_mode,
+            output=output
+        )
+
+        output = _call_bwmm_fp4_shard_on_block(args)
+        output = output[:total_tokens, :]
+
+        return output
+
+    @staticmethod
+    def backward(ctx, *grad_outputs):
+        raise NotImplementedError("Backward for blockwise MX matmul is not implemented yet.")
+    

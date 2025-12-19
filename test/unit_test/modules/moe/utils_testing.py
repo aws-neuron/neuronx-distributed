@@ -170,6 +170,7 @@ class ExptCfg:
     expert_mlp_kernel_enabled: Optional[bool] = None
     shared_mlp_kernel_enabled: Optional[bool] = None
     stack_size: int = 1
+    use_index_calc_kernel: bool = True
 
 def get_random_activations(num, seed=None):
     if seed is not None:
@@ -670,6 +671,7 @@ def init_expert_mlps(cfg:ExptCfg):
             early_expert_affinity_modulation=cfg.early_expert_affinity_modulation,
             block_sharding_strategy=cfg.block_sharding_strategy,
             enable_spmd_rank=cfg.enable_spmd_rank,
+            use_index_calc_kernel=cfg.use_index_calc_kernel,
         )
 
         if cfg.implementation == "topk":
@@ -690,6 +692,7 @@ def init_expert_mlps(cfg:ExptCfg):
             top_k=cfg.top_k,
             hidden_act=cfg.hidden_act,
             enable_spmd_rank=cfg.enable_spmd_rank,
+            use_index_calc_kernel=cfg.use_index_calc_kernel,
         )
 
         blockwise_matmul_config = BlockwiseMatmulConfig.from_kwargs(

@@ -1,0 +1,7 @@
+rules: 
+  - pattern:
+      matching: "*"
+    approvers:
+    - type: TEAM
+      id: aws-neuron-release-admin
+      required: 1
