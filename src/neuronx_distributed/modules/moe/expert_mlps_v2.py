@@ -1,5 +1,5 @@
 import math
-from typing import Optional, Any, Dict
+from typing import Optional, Any, Dict, Tuple, List
 
 import torch
 import torch.nn.functional as F
@@ -39,7 +39,8 @@ from neuronx_distributed.modules.moe.moe_process_group import (
     get_moe_ep_group,
 )
 import neuronxcc.nki.language as nl
-from neuronx_distributed.kernels.find_index import find_index_shard_rows
+from neuronx_distributed.kernels.find_nonzero_indices import find_nonzero_indices
+from neuronx_distributed.kernels.indexed_flatten import indexed_flatten
 
 logger = get_logger()
 
@@ -146,6 +147,12 @@ class ExpertMLPsV2(torch.nn.Module):
         self.moe_expert_model_parallel_group = cte_expert_model_parallel_group if is_prefill else tkg_expert_model_parallel_group
 
     def initialize_mlp_op(self, tensor_model_parallel_group: ProcessGroup, expert_model_parallel_group: ProcessGroup, is_prefill: bool):
+        # increase clamping limit by hidden_act_bias because normally clamping is done before hidden act bias is added
+        if self.routed_experts_mlp_config.up_clamp_upper_limit:
+            self.routed_experts_mlp_config.up_clamp_upper_limit += self.routed_experts_mlp_config.hidden_act_bias
+        if self.routed_experts_mlp_config.up_clamp_lower_limit:
+            self.routed_experts_mlp_config.up_clamp_lower_limit += self.routed_experts_mlp_config.hidden_act_bias
+        expert_distribution = self.routed_experts_mlp_config.expert_distribution if is_prefill else None
         mlp_op = Experts(
             num_experts=self.routed_experts_mlp_config.num_experts,
             hidden_size=self.routed_experts_mlp_config.hidden_size,
@@ -157,12 +164,16 @@ class ExpertMLPsV2(torch.nn.Module):
             bias=self.routed_experts_mlp_config.bias,
             glu_type=self.routed_experts_mlp_config.glu_type,
             hidden_act_scaling_factor=self.routed_experts_mlp_config.hidden_act_scaling_factor,
-            hidden_act_bias=self.routed_experts_mlp_config.hidden_act_bias,
+            gate_clamp_upper_limit=self.routed_experts_mlp_config.gate_clamp_upper_limit,
+            gate_clamp_lower_limit=self.routed_experts_mlp_config.gate_clamp_lower_limit,
+            up_clamp_upper_limit=self.routed_experts_mlp_config.up_clamp_upper_limit,
+            up_clamp_lower_limit=self.routed_experts_mlp_config.up_clamp_lower_limit,
             input_layer_init_method=self.routed_experts_mlp_config.input_layer_init_method,
             output_layer_init_method=self.routed_experts_mlp_config.output_layer_init_method,
             tensor_model_parallel_group=tensor_model_parallel_group,
             expert_model_parallel_group=expert_model_parallel_group,
             is_prefill=is_prefill,
+            expert_distribution=expert_distribution,
         )
         return mlp_op
 
@@ -192,8 +203,32 @@ class ExpertMLPsV2(torch.nn.Module):
             world_size=parallel_state.get_world_group().size(),
             n_routed_experts=self.routed_experts_mlp_config.num_experts,
             expert_model_parallel_group=self.moe_expert_model_parallel_group,
-            spmd_rank_name="spmd_rank"
+            spmd_rank_name="spmd_rank",
+            expert_distribution=self.routed_experts_mlp_config.expert_distribution
         )
+
+        if self.routed_experts_mlp_config.bias:
+            # currently kernel only supports hidden_act_bias=0, so we preprocess the checkpoint to
+            # make sure that flat compiler and kernel code paths are the same by adding hidden_act_bias
+            # to the up_proj portion (second half) of the concatenated bias
+            gate_up_proj_biases = model_state_dict[f"{prefix}mlp_op.gate_up_proj.bias"].clone()  # clone to avoid modifying in place for tensors that have grad
+            intermediate_size = gate_up_proj_biases.shape[-1] // 2
+            if self.dtype == torch.float32: 
+                # Fix for preshard hook added +1 to bias in BF16 which had 
+                # precision issues compared to +1 in code which in CPU tests is FP32
+                gate_up_proj_biases = gate_up_proj_biases.to(torch.float32)
+
+            # Skip up_bias += hidden_act_bias when I dim is shuffled, as this preprocessing has already happened upstream pre-shuffle.
+            if not self.routed_experts_mlp_config.is_intermediate_dim_shuffled:
+                if self.routed_experts_mlp_config.intermediate_size_actual:
+                    gate_up_proj_biases[:, intermediate_size:intermediate_size + self.routed_experts_mlp_config.intermediate_size_actual] += self.routed_experts_mlp_config.hidden_act_bias
+                else:
+                    gate_up_proj_biases[:, intermediate_size:] += self.routed_experts_mlp_config.hidden_act_bias
+
+            model_state_dict[f"{prefix}mlp_op.gate_up_proj.bias"] = gate_up_proj_biases
+            # RPL bias needs to be divided by tp_degree because we do all-reduce at the end of MoE, we
+            # divide bias by TP here to avoid needing to separately add down_proj bias after all-reduce
+            model_state_dict[f"{prefix}mlp_op.down_proj.bias"] = model_state_dict[f"{prefix}mlp_op.down_proj.bias"] / self.moe_tensor_model_parallel_group.size()
 
         # In hybrid sharding new keys will be created for gate_up_proj and down_proj for different sharding strategy
         if self.enabled_hybrid_sharding:
@@ -201,14 +236,8 @@ class ExpertMLPsV2(torch.nn.Module):
             new_prefix_down_proj_weight = f"{prefix}mlp_op_tkg.down_proj.weight"
             old_prefix_gate_up_proj_weight = f"{prefix}mlp_op.gate_up_proj.weight"
             new_prefix_gate_up_proj_weight = f"{prefix}mlp_op_tkg.gate_up_proj.weight"
-            old_prefix_down_proj_bias = f"{prefix}mlp_op.down_proj.bias"
-            new_prefix_down_proj_bias = f"{prefix}mlp_op_tkg.down_proj.bias"
-            old_prefix_gate_up_proj_bias = f"{prefix}mlp_op.gate_up_proj.bias"
-            new_prefix_gate_up_proj_bias = f"{prefix}mlp_op_tkg.gate_up_proj.bias"
             duplicate_and_replace_prefixes(old_prefix_down_proj_weight, new_prefix_down_proj_weight, model_state_dict)
             duplicate_and_replace_prefixes(old_prefix_gate_up_proj_weight, new_prefix_gate_up_proj_weight, model_state_dict)
-            duplicate_and_replace_prefixes(old_prefix_down_proj_bias, new_prefix_down_proj_bias, model_state_dict)
-            duplicate_and_replace_prefixes(old_prefix_gate_up_proj_bias, new_prefix_gate_up_proj_bias, model_state_dict)
 
             # create another spmd_rank for decode
             create_spmd_ranks(
@@ -220,13 +249,14 @@ class ExpertMLPsV2(torch.nn.Module):
                 spmd_rank_name="spmd_rank_tkg",
             )
             if self.routed_experts_mlp_config.bias:
+                old_prefix_down_proj_bias = f"{prefix}mlp_op.down_proj.bias"
+                new_prefix_down_proj_bias = f"{prefix}mlp_op_tkg.down_proj.bias"
+                old_prefix_gate_up_proj_bias = f"{prefix}mlp_op.gate_up_proj.bias"
+                new_prefix_gate_up_proj_bias = f"{prefix}mlp_op_tkg.gate_up_proj.bias"
+                duplicate_and_replace_prefixes(old_prefix_down_proj_bias, new_prefix_down_proj_bias, model_state_dict)
+                duplicate_and_replace_prefixes(old_prefix_gate_up_proj_bias, new_prefix_gate_up_proj_bias, model_state_dict)
+                # divide down_proj bias by tp_degree for decode as well
                 model_state_dict[f"{prefix}mlp_op_tkg.down_proj.bias"] = model_state_dict[f"{prefix}mlp_op_tkg.down_proj.bias"] / get_moe_tp_ep_group(prefill=False).size()
-
-        if self.routed_experts_mlp_config.bias:
-                model_state_dict[f"{prefix}mlp_op.down_proj.bias"] = model_state_dict[f"{prefix}mlp_op.down_proj.bias"] / get_moe_tp_ep_group(prefill=True).size()
-
-        if self.routed_experts_mlp_config.bias:
-            model_state_dict[f"{prefix}mlp_op.down_proj.bias"] = model_state_dict[f"{prefix}mlp_op.down_proj.bias"] / self.moe_tensor_model_parallel_group.size()
 
     @staticmethod
     def validate_routed_experts_configs(routed_experts_mlp_config: RoutedExpertsMLPOpsConfig):
@@ -311,6 +341,28 @@ class ExpertMLPsV2(torch.nn.Module):
                 ]
             expert_mask = (expert_affinities_masked > 0).to(torch.float64)
             return expert_affinities_masked, expert_mask, expert_index
+
+    def mask_padding_tokens(self, expert_mask: torch.tensor, expert_affinities_masked: torch.tensor, padding_mask: torch.tensor) -> tuple[Optional[torch.tensor], torch.tensor]:
+        """Masks padding tokens in expert assignments and affinities based on padding_mask.
+
+        Args:
+            expert_mask: Tensor of shape (B*S, E) with expert assignments, or None.
+            expert_affinities_masked: Tensor of shape (B*S, E) with masked expert affinities.
+            padding_mask: Tensor of shape (B, S) with mask for padded tokens, or None to skip masking.
+        
+        Returns:
+            Tuple of (expert_mask, expert_affinities_masked) with padding tokens masked out.
+        """
+        if padding_mask is None:
+            return expert_mask, expert_affinities_masked
+
+        padding_mask = padding_mask.view(-1).unsqueeze(1)
+
+        expert_affinities_masked = expert_affinities_masked * padding_mask
+        if expert_mask is not None:
+            expert_mask = expert_mask * padding_mask
+
+        return expert_mask, expert_affinities_masked
 
     def forward_all_experts(self, hidden_states, expert_affinities, expert_index, chosen_expert_indices=None):
         """Forward pass where all tokens are computed by all experts.
@@ -571,9 +623,73 @@ class ExpertMLPsV2(torch.nn.Module):
         # output: (T, H)
         output = torch.stack(output_list, dim=0)
 
-        return output
+        return output    
 
-    def forward_blockwise(self, hidden_states, expert_affinities, expert_index):
+    def use_index_calc_kernel(self, total_tokens):
+        if self.training:
+            # TODO: enable index calc kernel for training
+            return False
+        if not self.is_prefill:
+            # No index calculation needed for TKG
+            return False
+        if not self.routed_experts_mlp_config.use_index_calc_kernel:
+            # The use_index_calc_kernel config can be used to turn the kernel off.
+            return False
+        if not self.routed_experts_mlp_config.enable_spmd_rank:
+            return False
+
+        mlp_op = self.get_mlp_op()
+        assert mlp_op.gate_up_proj._n_local_experts == mlp_op.down_proj._n_local_experts
+        local_experts = mlp_op.gate_up_proj._n_local_experts
+
+        use_index_calc_kernel = can_use_find_index_kernel(
+            T=total_tokens,
+            block_size=self.blockwise_matmul_config.block_size,
+            E_local=local_experts,
+            logical_nc_config=self.blockwise_matmul_config.logical_nc_config,
+            tp_size=self.moe_tensor_model_parallel_group.size(),
+            ep_size=self.moe_expert_model_parallel_group.size(),
+        )
+
+        return use_index_calc_kernel
+
+    def get_full_expert_affinities_masked(self, expert_affinities, expert_index):
+        # expert_mask: (T/SP, E). Happens in SP on ALL the experts.
+        expert_mask = self.get_expert_mask(expert_index, self.routed_experts_mlp_config.num_experts)
+        # expert_affinities_masked: (T, E)
+        expert_affinities_masked = self.get_expert_affinities_masked(
+            expert_affinities,
+            expert_mask,
+            self.routed_experts_mlp_config.normalize_top_k_affinities,
+        )
+
+        # Gather expert affinities from SP
+        expert_affinities_masked = mappings.gather_from_sequence_parallel_region(
+            expert_affinities_masked,
+            sequence_dimension=0,
+            to_model_parallel=False,
+            process_group=self.tensor_parallel_group,
+        )
+
+        return expert_affinities_masked
+
+    def maybe_get_expert_affinities_masked(self, expert_index, expert_affinities, expert_affinities_masked_full=None, padding_mask=None):
+        if expert_affinities_masked_full is not None:
+            # This means router is in SP.
+            return expert_affinities_masked_full
+        
+        # Router is not in SP.
+        # expert_mask: (T, E). Happens on all the experts, not just the local experts
+        expert_mask = self.get_expert_mask(expert_index, self.routed_experts_mlp_config.num_experts)
+        # expert_affinities_masked: (T, E)
+        expert_affinities_masked = self.get_expert_affinities_masked(
+            expert_affinities,
+            expert_mask,
+            self.routed_experts_mlp_config.normalize_top_k_affinities,
+        )
+        return expert_affinities_masked
+
+    def forward_blockwise(self, hidden_states, expert_affinities, expert_index, expert_affinities_masked_full=None, padding_mask=None):
         """
         Forward pass which implements the blockwise matmul approach for expert computations without
         dropping tokens.
@@ -594,7 +710,7 @@ class ExpertMLPsV2(torch.nn.Module):
         # N is the number of blocks needed in the worst case distribution of tokens to experts. Intuition below.
         # With top_k = 1, let E-1 experts be assigned 1 token each. They require 1 block each, and (E-1) total. The remaining
         # tokens are all assigned the same experts, and require CEIL((T-(E-1))/B) blocks. The formula holds for top_k > 1 also.
-        if self.moe_expert_model_parallel_group.size() > 1 and not self.training:
+        if self.moe_expert_model_parallel_group.size() > 1:
             assert mlp_op.gate_up_proj._n_local_experts == mlp_op.down_proj._n_local_experts
             local_experts = mlp_op.gate_up_proj._n_local_experts
         else:
@@ -603,66 +719,98 @@ class ExpertMLPsV2(torch.nn.Module):
         num_blocks = math.ceil((total_tokens * self.routed_experts_mlp_config.top_k - (local_experts - 1)) / self.blockwise_matmul_config.block_size) + local_experts - 1
         # Handle case where T*top_k is smaller than E. We will need atmost T*top_k blocks.
         num_blocks = min(num_blocks, total_tokens * self.routed_experts_mlp_config.top_k)
-        
+
         # Get num_static_block from blockwise_matmul_config, if not set, the default num_static_blocks will be computed as
-        # NUM_STATIC_BLOCK = T * TopK / (EP_degree * B) 
+        # NUM_STATIC_BLOCK = T * TopK / (EP_degree * B)
         # this estimation represent a perfect balance workload between workers.
         if self.blockwise_matmul_config.num_static_blocks is not None:
             num_static_blocks = self.blockwise_matmul_config.num_static_blocks
         else:
-            num_static_blocks = int(math.ceil((total_tokens * self.routed_experts_mlp_config.top_k) / self.moe_expert_model_parallel_group.size() ) / self.blockwise_matmul_config.block_size)
+            num_static_blocks = math.ceil(math.ceil((total_tokens * self.routed_experts_mlp_config.top_k) / self.moe_expert_model_parallel_group.size() ) / self.blockwise_matmul_config.block_size)
 
-        # expert_mask: (T, E). Still happens on all the experts, not just the local experts
-        expert_mask = self.get_expert_mask(expert_index, self.routed_experts_mlp_config.num_experts)
-        # expert_affinities_masked: (T, E)
-        expert_affinities_masked = self.get_expert_affinities_masked(
-            expert_affinities,
-            expert_mask,
-            self.routed_experts_mlp_config.normalize_top_k_affinities,
-        )
+        use_index_calc_kernel = self.use_index_calc_kernel(total_tokens)
+        if use_index_calc_kernel:
+            expert_affinities_masked = self.maybe_get_expert_affinities_masked(
+                expert_index, expert_affinities, expert_affinities_masked_full, padding_mask
+            )
+            _, expert_affinities_masked = self.mask_padding_tokens(None, expert_affinities_masked, padding_mask)
+            if self.moe_expert_model_parallel_group.size() > 1:
+                # Slice to get EP-local expert affinities
+                local_expert_indices = spmd_rank.get_local_expert_indices()
+                broadcasted_local_expert_indices = torch.broadcast_to(local_expert_indices, (total_tokens, local_experts))
+                local_expert_affinities_masked = torch.gather(expert_affinities_masked, 1, broadcasted_local_expert_indices)
+            else:
+                local_expert_affinities_masked = expert_affinities_masked
 
-        if self.sequence_parallel_enabled and not self.training:
-            expert_affinities_masked, expert_mask, expert_index = self.get_sp_expert_masks_index(expert_affinities_masked, expert_index)
-
-        if self.moe_expert_model_parallel_group.size() > 1 and not self.training:
-            # [T, E/ep_size]
-            local_expert_indices = spmd_rank.get_local_expert_indices()
-            broadcasted_local_expert_indices = torch.broadcast_to(local_expert_indices, (total_tokens, local_experts))
-
-            local_expert_mask = torch.gather(expert_mask, 1, broadcasted_local_expert_indices)
-            local_expert_affinities_masked = torch.gather(expert_affinities_masked, 1, broadcasted_local_expert_indices)
-            # TODO: make EP work with optimized_block_to_token_mapping in the future, currently not supported.
-            ues_optimized_block_to_token_mapping = False
-            logger.info("Expert Parallel Enabled for forward_blockwise\n" +
-                        f"broadcasted_local_expert_indices: {broadcasted_local_expert_indices.shape}\n" +
-                        f"expert_mask: {expert_mask.shape}\n" +
-                        f"expert_affinities_masked: {expert_affinities_masked.shape}\n" +
-                        f"local_expert_mask: {broadcasted_local_expert_indices.shape}\n" +
-                        f"local_expert_affinities_masked: {local_expert_affinities_masked.shape}\n")
-        else:
-            # [T, E]
-            local_expert_mask = expert_mask
-            local_expert_affinities_masked = expert_affinities_masked
-            ues_optimized_block_to_token_mapping = self.blockwise_matmul_config.optimized_block_to_token_mapping,
-
-        use_index_calc_kernel = self.can_use_index_calc_kernel(
-            T=total_tokens,
-            block_size=self.blockwise_matmul_config.block_size,
-            E_local=local_experts,
-            logical_nc_config=self.blockwise_matmul_config.logical_nc_config,
-            tp_size=self.moe_tensor_model_parallel_group.size())
-        if self.moe_expert_model_parallel_group.size() > 1 and use_index_calc_kernel and not self.training:
             # Enable kernel flow only for EP + inference (cte) cases.
+            # Note that when the kernel is used, we don't need to materialize `expert_mask`, `local_expert_mask`, or 'expert_index'.
+            # Pass expert_affinities_masked directly
             block_to_expert, token_position_to_id = self.get_blockwise_expert_and_token_mapping_kernel(
                 num_blocks=num_blocks,
-                expert_mask=local_expert_mask,
+                expert_affinities_masked=expert_affinities_masked,
                 block_size=self.blockwise_matmul_config.block_size,
                 device=hidden_states.device,
                 spmd_rank = spmd_rank,
                 tensor_parallel_group=self.moe_tensor_model_parallel_group,
+                expert_parallel_group=self.moe_expert_model_parallel_group,
                 logical_nc_config=self.blockwise_matmul_config.logical_nc_config,
             )
         else:
+            # expert_mask: (T, E). Still happens on all the experts, not just the local experts
+            expert_mask = self.get_expert_mask(expert_index, self.routed_experts_mlp_config.num_experts)
+            # expert_affinities_masked: (T, E)
+            expert_affinities_masked = self.get_expert_affinities_masked(
+                expert_affinities,
+                expert_mask,
+                self.routed_experts_mlp_config.normalize_top_k_affinities,
+            )
+
+            if self.sequence_parallel_enabled and not self.training:
+                expert_affinities_masked, expert_mask, expert_index = self.get_sp_expert_masks_index(expert_affinities_masked, expert_index)
+
+            expert_mask, expert_affinities_masked = self.mask_padding_tokens(expert_mask, expert_affinities_masked, padding_mask)
+
+            if self.moe_expert_model_parallel_group.size() > 1:
+                # [T, E/ep_size]
+                local_expert_indices = spmd_rank.get_local_expert_indices()
+                broadcasted_local_expert_indices = torch.broadcast_to(local_expert_indices, (total_tokens, local_experts))
+
+                local_expert_mask = torch.gather(expert_mask, 1, broadcasted_local_expert_indices)
+                local_expert_affinities_masked = torch.gather(expert_affinities_masked, 1, broadcasted_local_expert_indices)
+                if self.routed_experts_mlp_config.expert_distribution:
+                    expert_parallel_rank = spmd_rank.get_rank() // self.moe_tensor_model_parallel_group.size()
+                    expert_start_idx, expert_end_idx = self.allocate_token_blocks(
+                        torch.tensor(
+                            self.routed_experts_mlp_config.local_redudancy_degree,
+                            dtype=torch.int32, device=local_expert_mask.device
+                        ), local_expert_mask.shape[0])
+                    local_expert_mask = self.generate_local_expert_mask_with_redundancy(
+                        local_expert_mask,
+                        local_expert_indices,
+                        expert_start_idx,
+                        expert_end_idx,
+                        self.routed_experts_mlp_config.num_experts,
+                        expert_parallel_rank,
+                    )
+                    local_expert_affinities_masked = self.get_expert_affinities_masked(
+                        local_expert_affinities_masked, # (T, E')
+                        local_expert_mask, # (T, E')
+                        False,
+                    )
+                # TODO: make EP work with optimized_block_to_token_mapping in the future, currently not supported.
+                ues_optimized_block_to_token_mapping = False
+                logger.info("Expert Parallel Enabled for forward_blockwise\n" +
+                            f"broadcasted_local_expert_indices: {broadcasted_local_expert_indices.shape}\n" +
+                            f"expert_mask: {expert_mask.shape}\n" +
+                            f"expert_affinities_masked: {expert_affinities_masked.shape}\n" +
+                            f"local_expert_mask: {local_expert_mask.shape}\n" +
+                            f"local_expert_affinities_masked: {local_expert_affinities_masked.shape}\n")
+            else:
+                # [T, E]
+                local_expert_mask = expert_mask
+                local_expert_affinities_masked = expert_affinities_masked
+                ues_optimized_block_to_token_mapping = self.blockwise_matmul_config.optimized_block_to_token_mapping,
+
             block_to_expert, token_position_to_id = self.get_blockwise_expert_and_token_mapping(
                 total_tokens=total_tokens,
                 num_blocks=num_blocks,
@@ -697,10 +845,16 @@ class ExpertMLPsV2(torch.nn.Module):
             logical_nc_config=self.blockwise_matmul_config.logical_nc_config,
             use_block_parallel=self.blockwise_matmul_config.use_block_parallel,
             use_shard_on_intermediate=self.blockwise_matmul_config.use_shard_on_intermediate_dynamic_while,
+            use_shard_on_block_dynamic_while=self.blockwise_matmul_config.use_shard_on_block_dynamic_while,
             use_torch_block_wise=self.blockwise_matmul_config.use_torch_block_wise,
             use_bias=self.routed_experts_mlp_config.bias,
             scaling_factor=self.routed_experts_mlp_config.hidden_act_scaling_factor,
+            gate_clamp_upper_limit=self.routed_experts_mlp_config.gate_clamp_upper_limit,
+            gate_clamp_lower_limit=self.routed_experts_mlp_config.gate_clamp_lower_limit,
+            up_clamp_upper_limit=self.routed_experts_mlp_config.up_clamp_upper_limit,
+            up_clamp_lower_limit=self.routed_experts_mlp_config.up_clamp_lower_limit,
         )
+        #TODO: Have the blockwise matmul kernel support I_TP sizes that are not divisible by 16
         if use_blockwise_matmul_nki:
             expert_affinities_scaling_mode = ExpertAffinityScaleMode.POST_SCALE
             if self.routed_experts_mlp_config.early_expert_affinity_modulation:
@@ -734,6 +888,10 @@ class ExpertMLPsV2(torch.nn.Module):
                 expert_affinities_scaling_mode,
                 conditions,
                 num_static_blocks,
+                self.routed_experts_mlp_config.gate_clamp_upper_limit,
+                self.routed_experts_mlp_config.gate_clamp_lower_limit,
+                self.routed_experts_mlp_config.up_clamp_upper_limit,
+                self.routed_experts_mlp_config.up_clamp_lower_limit,
                 mlp_op.gate_up_proj.bias if self.routed_experts_mlp_config.bias else None,
                 mlp_op.down_proj.bias if self.routed_experts_mlp_config.bias else None,
                 kernel_act_fn_id,
@@ -752,24 +910,152 @@ class ExpertMLPsV2(torch.nn.Module):
             )
 
     @staticmethod
-    def can_use_index_calc_kernel(
-        T: int,
-        block_size: int,
-        E_local: int,
-        logical_nc_config: int,
-        tp_size: int,
-    ) -> bool:
-        # The kernel outputs (E/EP, T) and we massage the data to (N*B,) for BWMM kernel input.
-        # If T is not divisible by the block_size, the kernel path is not supported.
-        if T % block_size != 0:
-            logger.warning(f"T {T} not divisible by block_size {block_size}, cannot use index calc kernel.")
-            return False
-        # The kernel currently runs on LNC2, sharidng along the expert dimension.
-        # This means each rank needs to have at least 2 experts --> min 128 experts needed on a node.
-        if not (E_local % (logical_nc_config * tp_size) == 0):
-            logger.warning(f"E_local {E_local} not divisible by {logical_nc_config * tp_size}, cannot use index calc kernel, will use non-kernel index calc path")
-            return False
-        return True
+    def allocate_token_blocks(local_redudancy_degree, tokens_per_expert):
+        """
+        Helper function that calculates the start position id and the end position id
+        corresponding to each expert based on the expert distribution across all EP groups.
+
+        Args:
+        local_redudancy_degree : The redundancy degree of experts within each EP group.
+        tokens_per_expert: Total number of input tokens.
+
+        Returns:
+        start_indices: Tensor of shape [num_ep_group, experts] denoting start position ids for each expert.
+        end_indices: Tensor of shape [num_ep_group, experts] denoting end position ids for each expert.
+        """
+        # Get global counts for each expert
+        global_expert_counts = local_redudancy_degree.sum(dim=0, dtype=torch.int32)  # Shape: [num_experts]
+
+        # Get cumulative counts up to (but not including) each EP group
+        cumsum = torch.cumsum(local_redudancy_degree, dim=0, dtype=torch.int32)
+        prev_counts = torch.zeros_like(local_redudancy_degree, dtype=torch.int32)
+        prev_counts[1:] = cumsum[:-1]  # Shape: [ep_group, num_experts]
+
+        # Calculate base block size for each expert
+        block_size = tokens_per_expert // global_expert_counts
+        remainder = tokens_per_expert % global_expert_counts
+        block_size = block_size.to(dtype=torch.int32)
+        remainder = remainder.to(dtype=torch.int32)
+
+        # Calculate start and end indices
+        start_indices = (prev_counts * block_size.unsqueeze(0)).to(dtype=torch.int32)
+        end_indices = ((prev_counts + local_redudancy_degree) * block_size.unsqueeze(0)).to(dtype=torch.int32) - 1
+
+        # Add remainder to the last block for each expert
+        is_last = (cumsum == global_expert_counts.unsqueeze(0))
+        end_indices = end_indices + (is_last * remainder.unsqueeze(0)).to(dtype=torch.int32)
+        return start_indices, end_indices
+
+    @staticmethod
+    def generate_local_expert_boolean_mask(local_expert_indices, num_experts):
+        """
+        Helper function which converts the local_expert_indices into a mask of logical experts to local physical experts.
+        Example:
+        local_expert_indices : [5, 5, 0, 1, 0], num_experts = 8
+        result [[F F T F T], [F F F T F], [F F F F F ], [F, F, F, F, F], [F, F, F, F, F], [T T F F F]], [F, F, F, F, F], [F, F, F, F, F]
+        """
+        indices = torch.arange(num_experts, dtype=torch.int32, device=local_expert_indices.device).unsqueeze(1)
+        result = (indices == local_expert_indices)
+        return result
+
+    @staticmethod
+    def generate_mask_with_no_local_redundancy(mask):
+        """
+        Helper function which masks out the duplicate expert Ids within the same ep group.
+        Example:
+        mask [[F F T F T], [F F F T F], [F F F F F ], [F, F, F, F, F], [F, F, F, F, F], [T T F F F]], [F, F, F, F, F], [F, F, F, F, F]
+        result [[F F T F F], [F F F T F], [F F F F F ], [F, F, F, F, F], [F F F F F ], [T F F F F]], [F F F F F ], [F F F F F ],
+        """
+        t_mask = torch.transpose(mask, 0, 1).to(dtype=torch.int32)
+        mask_cumsum = cumsum(t_mask)
+        mask_first_occurance = mask_cumsum == 1
+        mask_first_occurance = torch.transpose(mask_first_occurance, 0, 1)
+        return torch.logical_and(mask_first_occurance, mask)
+
+    @staticmethod
+    def generate_local_expert_id_no_local_redundancy(mask, device):
+        """
+        Helper function that takes in a ogical experts to local physical experts mask and converts to
+        local_expert_indices with -1s for locally duplicated experts.
+        """
+        temp = torch.arange(mask.shape[0], device=device, dtype=torch.int32).unsqueeze(1).expand_as(mask)
+        temp_pad = torch.full(mask.shape, fill_value=-1, device=device, dtype=torch.int32)
+        expert_indices = torch.where(mask, temp, temp_pad)
+        expert_per_slot = torch.max(expert_indices, dim=0).values
+        return expert_per_slot
+
+    def generate_local_expert_mask_with_redundancy(self, local_expert_mask, local_expert_indices, expert_start_ids, expert_end_ids, num_experts, rank):
+        """
+        Generates local expert mask where tokens are divided among redundant experts in equal chunks based on degree of redundancy to
+        avoid duplicate computation for tokens routed to redundant experts.
+
+        Eg:
+
+        For EP degree is 2, and expert distribution as [[0, 2, 4, 5], [1, 3, 5, 4]] with num_experts as 6
+        If the expert_mask is as shown below
+        [ E0 E1 E2 E3 E4 E5
+        [1, 0, 0, 0, 0, 1],  # Token0
+        [0, 0, 1, 0, 1, 0],  # Token1
+        [0, 0, 0, 1, 1, 0],  # Token2
+        [0, 1, 0, 0, 0, 1]   # Token3
+        ]
+        then the local expert mask for EP Group0 is
+        E0 E2 E4 E5
+        [[1, 0, 0, 1],  # Token0
+        [0, 1, 1, 0],  # Token1
+        [0, 0, 1, 0],  # Token2
+        [0, 0, 0, 1],  # Token3
+        ]
+
+        and the local expert mask for EP Group1 is
+        E1 E3 E5 E4
+        [[0, 0, 1, 0],  # Token0
+        [0, 0, 0, 1],  # Token1
+        [0, 1, 0, 1],  # Token2
+        [1, 0, 1, 0],  # Token3
+        ]
+
+        The output local expert mask for EP Group0 will be
+        E0 E2 E4 E5
+        [[1, 0, 0, 1],  # Token0
+        [0, 1, 1, 0],  # Token1
+        [0, 0, 0, 0],  # Token2
+        [0, 0, 0, 0],  # Token3
+        ]
+
+        The output local expert mask for EP Group0 will be
+        E1 E3 E5 E4
+        [[0, 0, 0, 0],  # Token0
+        [0, 0, 0, 0],  # Token1
+        [0, 1, 0, 1],  # Token2
+        [1, 0, 1, 0],  # Token3
+        ]
+
+        Args:
+        local_expert_mask: Local expert mask of shape [T, Local experts]
+        local_expert_indices: Local expert indices tensor of shape [1, Local experts]
+        expert_start_ids: The start indices of tokens for each experts as per the expert distribution
+        expert_end_ids: The end indices of tokens for each experts as per the expert distribution
+        num_experts: Total number of logical routed experts.
+        rank: A tensor of shape [1,] indicating the current expert parallel rank.
+
+        Returns:
+        A tensor of shape [T, Local experts] ensuring no duplicate processing across physical experts when redundancy is applicable.
+        """
+        local_expert_indices = local_expert_indices.squeeze(0)
+        total_tokens = local_expert_mask.shape[0]
+        local_start_ids = expert_start_ids[rank, local_expert_indices][None, :]
+        loacl_end_ids = expert_end_ids[rank, local_expert_indices][None, :]
+        token_range = torch.arange(total_tokens, device=local_expert_mask.device)[:, None]
+        from_start = token_range >= local_start_ids
+        before_end = token_range <= loacl_end_ids
+        mask = torch.logical_and(from_start, before_end)
+        final_mask = local_expert_mask.masked_fill(~mask, 0)
+        local_expert_boolean_masked =  self.generate_local_expert_boolean_mask(local_expert_indices, num_experts)
+        local_mask_with_no_redundancy = self.generate_mask_with_no_local_redundancy(local_expert_boolean_masked)
+        local_expert_indices_unique = self.generate_local_expert_id_no_local_redundancy(local_mask_with_no_redundancy, local_expert_mask.device) # -1 where it is duplicated
+        local_redundancy_mask = local_expert_indices_unique != -1
+        return final_mask.masked_fill(~local_redundancy_mask, 0)
 
     @staticmethod
     def get_block_conditions(
@@ -786,81 +1072,119 @@ class ExpertMLPsV2(torch.nn.Module):
     @staticmethod
     def get_blockwise_expert_and_token_mapping_kernel(
         num_blocks: int,
-        expert_mask: torch.tensor,
+        expert_affinities_masked: torch.tensor,
         block_size: int,
         device: torch.device,
         spmd_rank: SPMDRank,
         tensor_parallel_group: ProcessGroup,
+        expert_parallel_group: ProcessGroup,
         logical_nc_config: int,
     ):
         '''
         Equivalent function of get_blockwise_expert_and_token_mapping, but nstead of torch code,
         this function uses a kernel to perform the index mapping.
 
-        The assumption is that the input is already EP sharded if we're in EP.
+        Note, `expert_affinities_masked` is the full (T,E) shaped expert affinities masked w/o sharding.
 
         Args:
             num_blocks: int, total number of blocks on this rank.
-            expert_mask: Tensor of shape (T,E), containing top_k-hot encoded experts for each token
+            expert_affinities_masked: Tensor of shape (T,E), containing masked expert affinities
+                - Note for performance reasons, this input should be full (unsharded).
+                - The kernel will read the corresponding mask chunk it processes.
             block_size: int, block size of the blockwise matmul kernel.
             device: device
             spmd_rank: SPMDRank object for the local rank.
-            tensor_parallel_group: TP process group
+            tensor_parallel_group: MoE's TP replica group.
+            expert_parallel_group: MoE's EP replica group.
+            logical_nc_config: LNC config
         Returns:
             block_to_expert: Tensor of shape (num_blocks,), indicating which expert each block belongs to.
             token_position_to_id: Tensor of shape (num_blocks*block_size,), mapping positions of tokens in
                 the flattened blocks to their indices in T.
         '''
-        T, E_local = expert_mask.shape
+        T, E = expert_affinities_masked.shape
 
-        # Run kernel in EP around the world.
-        tp_rank = torch.remainder(spmd_rank.get_rank(), tensor_parallel_group.size())
-        expert_mask = mappings.scatter_to_process_group_spmd(
-            expert_mask,
-            partition_dim=1,
-            rank=tp_rank,
-            process_group=tensor_parallel_group,
-        )
+        global_rank = spmd_rank.get_rank().to(device)
+        tp_size = tensor_parallel_group.size()
+        tp_rank = torch.remainder(global_rank, tp_size)
+        ep_size = expert_parallel_group.size()
+        ep_rank = global_rank // tp_size
 
-        # Index calculation kernel --- ids_per_expert: (E_local/TP,T); tokens_per_expert: (E_local/TP,)
-        ids_per_expert, tokens_per_expert = find_index_shard_rows[nl.nc(logical_nc_config)](expert_mask.T.to(torch.int32), T, T)
+        # Every EP rank needs the information about its local expert (`E_local` of those).
+        E_local = E // ep_size
+        if E_local % tp_size != 0:
+            # Replicate index calc kernel on TP ranks in the EP group.
+            logger.warning(f"Replicating index calc kernel on TP ranks, because {E_local=} is not divisible by {tp_size=}.")
+            E_kernel = E_local
+            # Process E_local by setting:
+            #  - `row_start_id` to the start of the expert on this EP rank.
+            #  - `n_rows` to the number of experts on this EP rank.
+            indices, nonzero_counts = find_nonzero_indices[nl.nc(logical_nc_config)](
+                input_tensor=expert_affinities_masked.to(torch.float32),
+                row_start_id=ep_rank*E_kernel,
+                n_rows=E_kernel,
+                chunk_size = T,
+                index_dtype=nl.int32,
+            )
+        else:
+            # Shard index calc kernel further along expert dimension in the TP group.
+            # i.e. the index calc is sharded globally in EP.
+            E_kernel = E_local // tp_size
+            # TP ranks shards the processing of E_local by starting at different `row_start_id`,
+            # and calculating fewer experts `E_kernel`.
+            indices, nonzero_counts = find_nonzero_indices[nl.nc(logical_nc_config)](
+                input_tensor=expert_affinities_masked.to(torch.float32),
+                row_start_id=global_rank*E_kernel,
+                n_rows=E_kernel,
+                chunk_size = T,
+                index_dtype=nl.int32,
+            )
+            # Gather nonzero_counts: [E_kernel,] --> [E/EP,]
+            nonzero_counts = mappings.gather_from_tensor_model_parallel_region(
+                nonzero_counts, process_group=tensor_parallel_group,
+            )
 
-        # Gather kernel output --- ids_per_expert: (E_local,T); tokens_per_expert: (E_local,)
-        ids_per_expert, tokens_per_expert = xm.all_gather_bucketized(
-            [ids_per_expert, tokens_per_expert],
-            0,
-            comm._get_group_mesh(tensor_parallel_group)
-        )
+        # Get number of blocks and cumulative number of blocks per expert.
+        blocks_per_expert = ((nonzero_counts + block_size - 1) // block_size).to(dtype=torch.long)  # (E_EP,)
+        blocks_per_expert_expanded = blocks_per_expert.unsqueeze(1)  # (E_EP, 1)
+        cum_blocks_per_expert = cumsum(blocks_per_expert_expanded)  # (E_EP, 1)
+        cum_blocks_per_expert[1:] = cum_blocks_per_expert[:-1]
+        cum_blocks_per_expert[0] = 0
 
-        # From this point onward, each rank within a TP group is doing duplicate work.
-        # TODO: make the code below more optimal.
-
-        # Turn kernel output into blocks.
-        T_B = T // block_size
-        ids_per_expert = ids_per_expert.reshape(E_local, T_B, block_size)
-
-        # Get mask of valid blocks
-        block_indices = torch.arange(T_B, device=device).unsqueeze(0)  # [1, T_B]
-        blocks_per_expert = ((tokens_per_expert + block_size - 1) // block_size).to(dtype=torch.long)  # (E_local,)
-        blocks_per_expert_expanded = blocks_per_expert.unsqueeze(1)  # (E_local, 1)
-        mask = block_indices < blocks_per_expert_expanded  # (E_local, T_B)
-
-        # Get index of valid blocks in the full num_blocks N.
-        position_in_N = torch.cumsum(mask, dim=1).to(dtype=torch.long)  # (E_local, T_B)
-        cumulative_blocks_per_expert = cumsum(blocks_per_expert_expanded)  # (E_local, 1)
-        position_in_N[1:] += cumulative_blocks_per_expert[:-1]  # (E_local, T_B)
-        position_in_N = position_in_N.masked_fill(torch.eq(mask, 0), 0).to(dtype=torch.long)  # (E_local, T_B)
-
-        # Shuffle blocks to turn (E_local, T_B, block_size) into (num_blocks * block_size) representation.
-        token_position_to_id = -1 * torch.ones((num_blocks+1, block_size), device=device, dtype=torch.long)
-        token_position_to_id[position_in_N] = ids_per_expert.to(torch.long)
-        token_position_to_id = token_position_to_id[1:].reshape(-1)  # (N*B,)
+        # Convert [E_kernel, T] indices into [N*B+T] token_position_to_id_padded
+        # Each partition writes `f_len` elements on the free dimension.
+        f_len = min(128, T // 16)
+        row_offsets = cum_blocks_per_expert * (block_size // f_len)
+        if E_local % tp_size != 0:
+            # [E/EP, T] --> [num_blocks * block_size,]
+            token_position_to_id_padded = indexed_flatten[nl.nc(logical_nc_config)](
+                input_tensor = indices,
+                f_len = f_len,
+                output_len=num_blocks*block_size + T,
+                row_offsets= row_offsets.reshape(-1).to(torch.int32),
+                row_offsets_start = 0,
+            )
+            token_position_to_id = token_position_to_id_padded[:num_blocks * block_size]
+        else:
+            # [E/(EP*TP), T] --> [num_blocks * block_size,]
+            token_position_to_id_padded = indexed_flatten[nl.nc(logical_nc_config)](
+                input_tensor = indices,
+                f_len = f_len,
+                output_len=num_blocks*block_size + T,
+                row_offsets= row_offsets.reshape(-1).to(torch.int32),
+                row_offsets_start = tp_rank*E_kernel,
+            )
+            # Aggregate information across TP ranks.
+            token_position_to_id = mappings._reduce(
+                token_position_to_id_padded[:num_blocks * block_size], computation=xm.REDUCE_MAX, process_group=tensor_parallel_group,
+            )
 
         # Get the block to expert mapping.
         block_ids = torch.arange(num_blocks, device=device, dtype=torch.long)  # (N, )
-        block_to_expert = torch.sum(block_ids.unsqueeze(1) >= cumulative_blocks_per_expert[:-1].squeeze(1), dim=1).to(torch.long)
+        block_to_expert = torch.sum(block_ids.unsqueeze(0) >= cum_blocks_per_expert[1:], dim=0).to(torch.long)  # (N, )
 
         return block_to_expert, token_position_to_id
+
 
     @staticmethod
     def get_blockwise_expert_and_token_mapping(
@@ -1054,7 +1378,7 @@ class ExpertMLPsV2(torch.nn.Module):
 
         return output
 
-    def forward(self, hidden_states, expert_affinities, expert_index, seq_len):
+    def forward(self, hidden_states, expert_affinities, expert_index, seq_len, padding_mask=None, expert_affinities_masked_full=None):
         """Forward pass of the ExpertMLPs.
 
         For training:
@@ -1088,6 +1412,7 @@ class ExpertMLPsV2(torch.nn.Module):
             expert_affinities: Tensor of shape (T, E), containing the normalized affinities of each token for each expert.
             expert_index: Tensor of shape (T, top_k), containing the 'chosen' experts for each token.
             seq_len: Sequence length S. Used to infer context encoding vs token generation in inference.
+            padding_mask: Padding mask to mask out padded tokens
 
             If sequence_parallel_enabled:
                 hidden_states: Tensor of shape (T, H).
@@ -1143,7 +1468,7 @@ class ExpertMLPsV2(torch.nn.Module):
                         return self.forward_all_experts(hidden_states, expert_affinities, expert_index)
                     else:
                         # Use blockwise for dropless context encoding
-                        return self.forward_blockwise(hidden_states, expert_affinities, expert_index)
+                        return self.forward_blockwise(hidden_states, expert_affinities, expert_index, expert_affinities_masked_full, padding_mask=padding_mask)
                 else:
                     return self.forward_capacity_factor(hidden_states, expert_affinities, expert_index)
 
@@ -1154,6 +1479,7 @@ def create_spmd_ranks(
     n_routed_experts: int,
     expert_model_parallel_group: ProcessGroup,
     spmd_rank_name: str,
+    expert_distribution=None,
 ):
     # add weight for spmd rank
     model_state_dict[f"{prefix}{spmd_rank_name}.rank"] = torch.arange(
@@ -1161,7 +1487,6 @@ def create_spmd_ranks(
     )
     if expert_model_parallel_group.size() > 1:
         expert_indices = []
-        expert_ranks = []
         for rank in range(world_size):
             curr_expert_rank = parallel_state.get_expert_parallel_rank_from_global_rank(
                 rank=rank, expert_parallel_group=expert_model_parallel_group
@@ -1170,15 +1495,12 @@ def create_spmd_ranks(
                 curr_expert_rank,
                 total_number_of_experts=n_routed_experts,
                 expert_model_parallel_size=expert_model_parallel_group.size(),
+                expert_distribution=expert_distribution,
             )
             expert_indices.append(curr_expert_indices)
-            expert_ranks.append(curr_expert_rank)
 
         model_state_dict[f"{prefix}{spmd_rank_name}.local_expert_indices"] = torch.tensor(
             expert_indices, dtype=torch.int32
-        )
-        model_state_dict[f"{prefix}{spmd_rank_name}.ep_rank"] = torch.tensor(
-            expert_ranks, dtype=torch.int32
         )
 
 def duplicate_and_replace_prefixes(old_prefix: str, new_prefix: str, model_state_dict: Dict[str, Any]):
@@ -1196,3 +1518,43 @@ def duplicate_and_replace_prefixes(old_prefix: str, new_prefix: str, model_state
 
     for key_index in range(len(old_keys)):
         model_state_dict[new_keys[key_index]] = model_state_dict[old_keys[key_index]]
+
+
+def can_use_find_index_kernel(
+    T: int,
+    block_size: int,
+    E_local: int,
+    logical_nc_config: int,
+    tp_size: int,
+    ep_size: int,
+) -> bool:
+    """
+    Checks whether the index calculation kernel can be used with the given configuration.
+
+    Args:
+        T: total number of tokens
+        block_size: block size of the blockwise matmul
+        E_local: number of experts on each EP rank
+        logical_nc_config: LNC setting.
+        tp_size: TP size
+        ep_size: EP size
+    """
+    # The kernel outputs (E/EP, T) and we massage the data to (N*B,) for BWMM kernel input.
+    # If T is not divisible by the block_size, the kernel path is not supported.
+    if T % block_size != 0:
+        logger.warning(f"{T=} not divisible by {block_size=}, cannot use index calc kernel.")
+        return False
+    # The kernel currently runs on LNC2, sharding along the expert dimension.
+    # This means each rank needs to have at least 2 experts
+    if logical_nc_config != 2:
+        logger.warning(f"{logical_nc_config=} must be 2 to use the index calc kernel.")
+        return False
+    if not (E_local % logical_nc_config == 0):
+        logger.warning(f"{E_local=} not divisible by {logical_nc_config=}, cannot use index calc kernel.")
+        return False
+    if tp_size == 8 and ep_size == 8:
+        logger.warning("TP=8 and EP=8 is not supported by the index calc kernel, because TP ranks are not contiguous")
+        return False
+
+    return True
+

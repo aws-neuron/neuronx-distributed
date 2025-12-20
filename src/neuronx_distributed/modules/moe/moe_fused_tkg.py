@@ -36,6 +36,7 @@ def initialize_nki_components() -> dict:
         "mlp": NKIImport("mlp_isa_kernel", module_name="mlp", nki_jit_type="use_nki_jit_decorator"),
         "quant_mlp": NKIImport("quant_mlp_isa_kernel", module_name="mlp", nki_jit_type="use_nki_jit_decorator"),
         "expert_mlps": NKIImport("expert_mlps_isa_inline_kernel", module_name="expert_mlps"),
+        "moe_token_gen_selective_load_kernel": NKIImport("moe_token_gen_selective_load_kernel", module_name="moe_token_gen"),
         "moe_token_gen_selective_loading": NKIImport("moe_token_gen_kernel", module_name="moe_token_gen"),
         "moe_token_gen_forward_all_experts": NKIImport("moe_token_gen_all_experts_kernel", module_name="moe_token_gen"),
         "affinity_scale_mode": NKIImport("ExpertAffinityScaleMode"),
@@ -59,6 +60,8 @@ nki_components = initialize_nki_components()
 _router_topk_nki_call = nki_components["router_topk"]
 _mlp_nki_call = nki_components["mlp"]
 _quant_mlp_nki_call = nki_components["quant_mlp"]
+# a new selective loading kernel that's compatible with GPTOSS (clamp, bias, non-shared experts, SWIGLU)
+_moe_token_gen_selective_load_kernel_nki_call = nki_components["moe_token_gen_selective_load_kernel"]
 _moe_tkg_selective_loading_nki_call = nki_components["moe_token_gen_selective_loading"]
 _moe_tkg_forward_all_experts_nki_call = nki_components["moe_token_gen_forward_all_experts"]
 ExpertAffinityScaleMode = nki_components["affinity_scale_mode"]
@@ -106,6 +109,9 @@ def _post_create_quantized_module_hook(layer):
     delattr(layer.scale, "get_tensor_from_state_dict")
     delattr(layer.weight, "get_tensor_from_state_dict")
     delattr(layer.weight, "set_tensor_to_state_dict")
+    if layer.bias is not None:
+        delattr(layer.bias, "get_tensor_from_state_dict")
+        delattr(layer.bias, "set_tensor_to_state_dict")
 
 class MoEFusedTKG(torch.nn.Module):
     """
@@ -169,8 +175,16 @@ class MoEFusedTKG(torch.nn.Module):
         Check if a specific NKI kernel can be used based on configuration and conditions.
         """
         assert kernel_type in ["moe_fused", "router_topk", "expert_mlp", "shared_mlp"]
+
         # Check explicit user setting
         enabled = getattr(self.config, f"{kernel_type}_kernel_enabled", None)
+        # Individual kernels are not currently supported due to compiler regression. We fall back to flat
+        # compiler flow even if user explicitly specifies to enable individual kernels.
+        # TODO: re-enable individual kernels when compiler regression is resolved
+        if kernel_type in ["router_topk", "expert_mlp", "shared_mlp"]:
+            if enabled:
+                logger.warning("Individual kernels are currently not supported, falling back to flat compiler flow")
+            return False
         if enabled is not None:
             return enabled
 
@@ -178,50 +192,36 @@ class MoEFusedTKG(torch.nn.Module):
             logger.info(f"Conditions not met for running {kernel_type} NKI kernel: cannot run on cpu")
             return False
 
-        if kernel_type in ["moe_fused", "expert_mlp"]:
-            if not self.expert_mlps.routed_experts_mlp_config.glu_mlp:
-                logger.info(f"Conditions not met for {kernel_type} NKI kernel: disabling GLU not supported")
-                return False
-            if self.expert_mlps.routed_experts_mlp_config.normalize_top_k_affinities:
-                logger.info(f"Conditions not met for {kernel_type} NKI kernel: normalize top k affinities not supported")
-                return False
+        if not self.expert_mlps.routed_experts_mlp_config.glu_mlp:
+            logger.info(f"Conditions not met for {kernel_type} NKI kernel: disabling GLU not supported")
+            return False
+        if self.expert_mlps.routed_experts_mlp_config.normalize_top_k_affinities and kernel_type not in ["moe_fused"]:
+            logger.info(f"Conditions not met for {kernel_type} NKI kernel: normalizing top k affinities is only supported for moe_fused kernel")
+            return False
 
-        if kernel_type in ["shared_mlp"]:
-            if self.shared_experts is None:
-                logger.info(f"Conditions not met for {kernel_type} NKI kernel: module does not contain shared experts")
+        batch_dimension = 1 - self.sequence_dimension  # hidden states are [B, S, H] or [S, B, H]
+        if hidden_states.shape[batch_dimension] > 64:
+            logger.info(f"Conditions not met for {kernel_type} NKI kernel: bs > 64 not yet supported")
+            return False
+        batch_size = hidden_states.shape[batch_dimension]
+        seq_len = hidden_states.shape[self.sequence_dimension]
+        total_tokens = batch_size * seq_len
+        perc_experts_loaded = total_tokens * self.num_experts_per_tok / self.num_local_experts
+        if perc_experts_loaded >= DEFAULT_SELECTIVE_LOADING_THRESHOLD:
+            logger.info(f"perc_experts_loaded={perc_experts_loaded} >= DEFAULT_SELECTIVE_LOADING_THRESHOLD={DEFAULT_SELECTIVE_LOADING_THRESHOLD}")
+            glu_type = GLUType.validate(self.expert_mlps.routed_experts_mlp_config.glu_type)
+            if glu_type == GLUType.SWIGLU and self.expert_mlps.routed_experts_mlp_config.hidden_act_scaling_factor != DEFAULT_HIDDEN_ACT_SCALING_FACTOR:
+                logger.info(f"Conditions not met for {kernel_type} NKI kernel: NKI kernel only supports scaling factor = 1.702 for SWIGLU")
                 return False
-
-        if kernel_type == "moe_fused":
-            batch_dimension = 1 - self.sequence_dimension  # hidden states are [B, S, H] or [S, B, H]
-            if hidden_states.shape[batch_dimension] > 32:
-                logger.info(f"Conditions not met for {kernel_type} NKI kernel: bs > 32 not yet supported")
+            kernel_call = _moe_tkg_forward_all_experts_nki_call
+        else:
+            logger.info(f"perc_experts_loaded={perc_experts_loaded} < DEFAULT_SELECTIVE_LOADING_THRESHOLD={DEFAULT_SELECTIVE_LOADING_THRESHOLD}")
+            if self.ep_enabled:
+                logger.info(f"Conditions not met for {kernel_type} NKI kernel: EP not supported")
                 return False
-            batch_size = hidden_states.shape[batch_dimension]
-            seq_len = hidden_states.shape[self.sequence_dimension]
-            total_tokens = batch_size * seq_len
-            perc_experts_loaded = total_tokens * self.num_experts_per_tok / self.num_local_experts
-            if perc_experts_loaded >= DEFAULT_SELECTIVE_LOADING_THRESHOLD:
-                logger.info(f"perc_experts_loaded={perc_experts_loaded} >= DEFAULT_SELECTIVE_LOADING_THRESHOLD={DEFAULT_HIDDEN_ACT_SCALING_FACTOR}")
-                glu_type = GLUType.validate(self.expert_mlps.routed_experts_mlp_config.glu_type)
-                if glu_type == GLUType.SWIGLU and self.expert_mlps.routed_experts_mlp_config.hidden_act_scaling_factor != DEFAULT_HIDDEN_ACT_SCALING_FACTOR:
-                    logger.info(f"Conditions not met for {kernel_type} NKI kernel: NKI kernel only supports scaling factor = 1.702 for SWIGLU")
-                    return False
-                kernel_call = _moe_tkg_forward_all_experts_nki_call
-            else:
-                logger.info(f"perc_experts_loaded={perc_experts_loaded} < DEFAULT_SELECTIVE_LOADING_THRESHOLD={DEFAULT_HIDDEN_ACT_SCALING_FACTOR}")
-                # selective loading kernel does not support optional shared experts at the moment
-                if self.shared_experts is None:
-                    logger.info(f"Conditions not met for {kernel_type} NKI kernel: module does not contain shared experts")
-                    return False
-                if self.ep_enabled:
-                    logger.info(f"Conditions not met for {kernel_type} NKI kernel: EP not supported")
-                    return False
-                kernel_call = _moe_tkg_selective_loading_nki_call
-            if kernel_call is None:
-                logger.info("Failed to load MoE Fused NKI kernel")
-                return False
-        elif kernel_type == "expert_mlp" and nki_components["expert_mlps"] is None:
-            logger.info("Failed to load ExpertMLP NKI kernel")
+            kernel_call = _moe_tkg_selective_loading_nki_call
+        if kernel_call is None:
+            logger.info("Failed to load MoE Fused NKI kernel")
             return False
 
         return True
@@ -417,7 +417,9 @@ class MoEFusedTKG(torch.nn.Module):
             expert_affinities_scaling_mode = ExpertAffinityScaleMode.PRE_SCALE
         else:
             expert_affinities_scaling_mode = ExpertAffinityScaleMode.POST_SCALE
-
+        local_rank = self.expert_mlps.spmd_rank.get_rank()
+        # TODO: make this compatible with hybrid sharding, current issue is moe_tensor_model_parallel_group will be the tensor_model_parallel_group used in CTE
+        local_ep_rank = local_rank // self.expert_mlps.moe_tensor_model_parallel_group.size()
         grid = (nc(self.logical_nc_config),)
         shared_experts_gate_proj_weight, shared_experts_up_proj_weight, shared_experts_down_proj_weight = self._slice_shared_experts_weights()
         common_args = dict(
@@ -446,32 +448,59 @@ class MoEFusedTKG(torch.nn.Module):
             router_mm_dtype=nl.float32,
         )
 
+        # this is a temporary check that can be removed once release compiler supports
+        # `hidden_actual` kwarg in the moe tkg kernel calls
+        if self.expert_mlps.routed_experts_mlp_config.hidden_size_actual is not None:
+            common_args["hidden_actual"] = self.expert_mlps.routed_experts_mlp_config.hidden_size_actual
+
         total_tokens = hidden_states_shape[0] * hidden_states_shape[1]
         perc_experts_loaded = total_tokens * self.num_experts_per_tok / self.num_local_experts
-        if perc_experts_loaded >= DEFAULT_SELECTIVE_LOADING_THRESHOLD:
+
+        kernel_call = None
+        if (perc_experts_loaded >= DEFAULT_SELECTIVE_LOADING_THRESHOLD):
             logger.info("Percentage of experts loaded >= selective loading threshod, run forward all experts kernel")
+            kernel_call = _moe_tkg_forward_all_experts_nki_call
+        elif (perc_experts_loaded < DEFAULT_SELECTIVE_LOADING_THRESHOLD and self.shared_experts is None):
+            logger.info("Run seletive loading kernel: _moe_token_gen_selective_load_kernel_nki_call")
+            kernel_call = _moe_token_gen_selective_load_kernel_nki_call
+
+        if kernel_call:
+            # run kernels that's compatible with clamp, bias, non-shared experts, SWIGLU
             routed_experts_mlp_config = self.expert_mlps.routed_experts_mlp_config
             kernel_activation_func_id = get_kernel_activation_func_id(
                 ACTFunc.validate(routed_experts_mlp_config.hidden_act),
                 routed_experts_mlp_config.glu_type
             )
-            logger.info(self.expert_mlps.spmd_rank.get_rank().item())
-            out, router_logits = _moe_tkg_forward_all_experts_nki_call[grid](
+            # pass args not in the original interface as kwargs to ensure compatibility with different compiler versions
+            optional_kwargs = {}
+            if routed_experts_mlp_config.gate_clamp_upper_limit is not None:
+                optional_kwargs["gate_clamp_upper_limit"] = routed_experts_mlp_config.gate_clamp_upper_limit
+            if routed_experts_mlp_config.gate_clamp_lower_limit is not None:
+                optional_kwargs["gate_clamp_lower_limit"] = routed_experts_mlp_config.gate_clamp_lower_limit
+            if routed_experts_mlp_config.up_clamp_upper_limit is not None:
+                optional_kwargs["up_clamp_upper_limit"] = routed_experts_mlp_config.up_clamp_upper_limit
+            if routed_experts_mlp_config.up_clamp_lower_limit is not None:
+                optional_kwargs["up_clamp_lower_limit"] = routed_experts_mlp_config.up_clamp_lower_limit
+            
+            if kernel_call == _moe_tkg_forward_all_experts_nki_call:
+                optional_kwargs["rank_id"] = local_ep_rank.reshape(1, 1)
+            out, router_logits = kernel_call[grid](
                 **common_args,
                 router_bias=self.router.linear_router.bias if self.router.bias else None,
-                expert_gate_up_bias=self.expert_mlps.mlp_op.gate_up_proj.bias if routed_experts_mlp_config.bias else None,
+                expert_gate_up_bias=self.expert_mlps.mlp_op.gate_up_proj.bias.view(self.num_local_experts, 2, -1) if routed_experts_mlp_config.bias else None,
                 expert_down_bias=self.expert_mlps.mlp_op.down_proj.bias if routed_experts_mlp_config.bias else None,
                 shared_expert_gate_bias=None,  # kernel only supports None
                 shared_expert_up_bias=None,  # kernel only supports None
                 shared_expert_down_bias=None,  # kernel only supports None
-                router_pre_norm=True,
-                hidden_act_fn=kernel_activation_func_id,
+                router_pre_norm=not self.router.apply_act_fn_over_topk,
+                hidden_act_fn=ActFnType(kernel_activation_func_id),
                 hidden_act_scale_factor=None,  # kernel only supports None
                 hidden_act_bias=None,  # kernel only supports None
-                rank_id=self.expert_mlps.spmd_rank.get_rank().item(),
+                norm_topk_prob=self.config.norm_topk_prob,
+                **optional_kwargs,
             )
         else:
-            logger.info("Percentage of experts loaded < selective loading threshod, run seletive loading kernel")
+            logger.info("Run seletive loading kernel: moe_token_gen_selective_loading")
             out, router_logits = _moe_tkg_selective_loading_nki_call[grid](
                 **common_args
             )
@@ -498,7 +527,8 @@ class MoEFusedTKG(torch.nn.Module):
             output, router_logits = self._moe_fused_tkg_kernel(hidden_states)
 
             if self.return_expert_index:
-                expert_index = None  # can't return expert_index from fused kernel
+                # return_expert_index not supported in kernel, return emtpy tensor to match with cte tracing when return_expert_index is set to True
+                expert_index = torch.empty((self.expert_mlps.routed_experts_mlp_config.num_experts, self.num_experts_per_tok), device=hidden_states.device, dtype=torch.long)
         else:
             if self.post_attention_layernorm is not None:
                 # we don't have individual kernel support for RMSNorm

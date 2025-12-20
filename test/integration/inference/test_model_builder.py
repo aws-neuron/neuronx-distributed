@@ -49,14 +49,15 @@ class CPLRPLModel(torch.nn.Module):
     def __init__(self,
                  hidden_dim,
                  is_distributed,
-                 rank_ordering=None):
+                 rank_ordering=None,
+                 bias=False):
         super().__init__()
         if is_distributed:
-            self.lay1 = ColumnParallelLinear(input_size=hidden_dim, output_size=hidden_dim, bias=False, gather_output=False, rank_ordering=rank_ordering, dtype=torch.float32)
-            self.lay2 = RowParallelLinear(input_size=hidden_dim, output_size=hidden_dim, bias=False, input_is_parallel=True, rank_ordering=rank_ordering, dtype=torch.float32)
+            self.lay1 = ColumnParallelLinear(input_size=hidden_dim, output_size=hidden_dim, bias=bias, gather_output=False, rank_ordering=rank_ordering, dtype=torch.float32)
+            self.lay2 = RowParallelLinear(input_size=hidden_dim, output_size=hidden_dim, bias=bias, input_is_parallel=True, rank_ordering=rank_ordering, dtype=torch.float32)
         else:
-            self.lay1 = torch.nn.Linear(hidden_dim, hidden_dim, bias=False, dtype=torch.float32)
-            self.lay2 = torch.nn.Linear(hidden_dim, hidden_dim, bias=False, dtype=torch.float32)
+            self.lay1 = torch.nn.Linear(hidden_dim, hidden_dim, bias=bias, dtype=torch.float32)
+            self.lay2 = torch.nn.Linear(hidden_dim, hidden_dim, bias=bias, dtype=torch.float32)
 
     def forward(self, x):
         rx = self.lay1(x)
@@ -664,6 +665,45 @@ def test_rank_ordering_cpl_rpl():
     torch.testing.assert_close(traced_model.nxd_model.weights[0]["lay1.weight"].to("cpu"), reordered_traced_model.nxd_model.weights[1]["lay1.weight"].to("cpu"))
     torch.testing.assert_close(traced_model.nxd_model.weights[0]["lay2.weight"].to("cpu"), reordered_traced_model.nxd_model.weights[1]["lay2.weight"].to("cpu"))
 
+def test_rank_ordering_cpl_rpl_with_bias():
+    hidden_dim = 4
+    batch_size = 2
+    tp_degree = 2
+
+    model = CPLRPLModel(hidden_dim=hidden_dim, is_distributed=False, bias=True)
+    torch.save(model.state_dict(), ckpt_path)
+
+    x = torch.randn((batch_size, hidden_dim))
+
+    builder = ModelBuilder(router=None,
+                           tp_degree=tp_degree,
+                           checkpoint_loader=partial(torch.load, ckpt_path),
+                           compiler_workdir="new_compiler_workdir/")
+    builder.add(key = "main",
+                model_instance = BaseModelInstance(partial(CPLRPLModel, hidden_dim=hidden_dim, is_distributed=True, bias=True), input_output_aliases={}),
+                example_inputs=[(x,)],
+                compiler_args="--auto-cast=none")
+
+    traced_model = builder.trace(initialize_model_weights=True)
+
+    rank_ordering = [1, 0] # rank 0 gets rank 1 weights, rank 1 gets rank 0 weights
+
+    builder = ModelBuilder(router=None,
+                           tp_degree=tp_degree,
+                           checkpoint_loader=partial(torch.load, ckpt_path),
+                           compiler_workdir="new_compiler_workdir/")
+    builder.add(key = "main",
+                model_instance = BaseModelInstance(partial(CPLRPLModel, hidden_dim=hidden_dim, is_distributed=True, rank_ordering=rank_ordering, bias=True), input_output_aliases={}),
+                example_inputs=[(x,)],
+                compiler_args="--auto-cast=none")
+
+    reordered_traced_model = builder.trace(initialize_model_weights=True)
+
+    torch.testing.assert_close(traced_model.nxd_model.weights[0]["lay1.weight"].to("cpu"), reordered_traced_model.nxd_model.weights[1]["lay1.weight"].to("cpu"))
+    torch.testing.assert_close(traced_model.nxd_model.weights[0]["lay2.weight"].to("cpu"), reordered_traced_model.nxd_model.weights[1]["lay2.weight"].to("cpu"))
+    torch.testing.assert_close(traced_model.nxd_model.weights[0]["lay1.bias"].to("cpu"), reordered_traced_model.nxd_model.weights[1]["lay1.bias"].to("cpu"))
+    torch.testing.assert_close(traced_model.nxd_model.weights[0]["lay2.bias"].to("cpu"), reordered_traced_model.nxd_model.weights[1]["lay2.bias"].to("cpu"))
+
 
 def test_rank_ordering_quantized_cpl_rpl():
     hidden_dim = 4
@@ -809,6 +849,7 @@ if __name__ == "__main__":
         test_batch_bucketed_model,
         test_loading_checkpoint,
         test_rank_ordering_cpl_rpl,
+        test_rank_ordering_cpl_rpl_with_bias,
         test_rank_ordering_quantized_cpl_rpl,
         test_rank_ordering_quantized_expert_fused_cpl_rpl,
         test_rank_ordering_embedding,

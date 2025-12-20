@@ -11,6 +11,11 @@ from neuronx_distributed.parallel_layers.layers import SPMDRank
 
 from integration.kernels.test_find_index import routing_setup_random_topk
 
+import torch_xla.runtime as xr  # noqa: E402
+def print_rank0(s):
+    if xr.global_ordinal() == 0:
+        print(s)
+
 def get_test_configs():
     return [
         {
@@ -22,13 +27,13 @@ def get_test_configs():
             "block_size": 128,
         },
         {
-            "T": 8192,
+            "T": 10240,
             "E": 128,
-            "tp_degree": 1,
-            "ep_degree": 64,
+            "tp_degree": 2,
+            "ep_degree": 32,
             "top_k": 8,
             "block_size": 128,
-        }
+        },
     ]
 
 
@@ -59,24 +64,28 @@ def main():
         spmd_rank.rank.data[:] = torch.tensor([rank], dtype=torch.int32)
 
         # EP mask setup
-        expert_mask, _ = routing_setup_random_topk(cfg.T, cfg.top_k, cfg.E)
+        expert_mask_full, _ = routing_setup_random_topk(cfg.T, cfg.top_k, cfg.E)
+        expert_mask_full = expert_mask_full.astype(np.float32)
         E_local = cfg.E // cfg.ep_degree
-        expert_mask = expert_mask[:, E_local*ep_rank:E_local*(ep_rank+1)]
+        expert_mask = np.copy(expert_mask_full[:, E_local*ep_rank:E_local*(ep_rank+1)])
         expert_mask = torch.tensor(expert_mask, dtype=torch.float64).to(device)
+        expert_mask_full[expert_mask_full > 0] = 0.1 # Simulate kernel consumes float instead of mask
+        expert_mask_full = torch.tensor(expert_mask_full, dtype=torch.float64).to(device)
 
         num_blocks = math.ceil((cfg.T * cfg.top_k - (E_local - 1)) / cfg.block_size) + E_local - 1
 
         block_to_expert_kernel, token_position_to_id_kernel = ExpertMLPsV2.get_blockwise_expert_and_token_mapping_kernel(
             num_blocks=num_blocks,
-            expert_mask=expert_mask,
+            expert_affinities_masked=expert_mask_full,
             block_size=cfg.block_size,
             device=device,
             spmd_rank = spmd_rank,
             tensor_parallel_group=parallel_state.get_tensor_model_parallel_group(),
+            expert_parallel_group=parallel_state.get_expert_model_parallel_group(),
             logical_nc_config=2,
         )
-        block_to_expert_kernel_np = block_to_expert_kernel.cpu().detach().numpy()
-        token_position_to_id_kernel_np = token_position_to_id_kernel.cpu().detach().numpy()
+        block_to_expert_kernel_np = block_to_expert_kernel.to(torch.int32).cpu().detach().numpy()
+        token_position_to_id_kernel_np = token_position_to_id_kernel.to(torch.int32).cpu().detach().numpy()
 
         block_to_expert_fw, token_position_to_id_fw = ExpertMLPsV2.get_blockwise_expert_and_token_mapping(
             total_tokens=cfg.T,
@@ -91,13 +100,13 @@ def main():
             optimized_block_to_token_mapping=False,
             parallelize_token_to_block_mapping=True,
         )
-        block_to_expert_fw_np = block_to_expert_fw.cpu().detach().numpy()
-        token_position_to_id_fw_np = token_position_to_id_fw.cpu().detach().numpy()
+        block_to_expert_fw_np = block_to_expert_fw.to(torch.int32).cpu().detach().numpy()
+        token_position_to_id_fw_np = token_position_to_id_fw.to(torch.int32).cpu().detach().numpy()
 
-        assert np.allclose(block_to_expert_kernel_np, block_to_expert_fw_np), "block_to_expert mismatch!"
-        assert np.allclose(token_position_to_id_kernel_np, token_position_to_id_fw_np), "block_to_expert mismatch!"
+        assert np.allclose(block_to_expert_kernel_np, block_to_expert_fw_np), f"Config {cfg}, block_to_expert mismatch!"
+        assert np.allclose(token_position_to_id_kernel_np, token_position_to_id_fw_np), f"Config {cfg}, token_position_to_id mismatch!"
+        print_rank0(f"{cfg} passed!")
 
 
 if __name__ == "__main__":
     main()
-

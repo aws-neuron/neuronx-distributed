@@ -6,11 +6,10 @@ from torch.distributed import ProcessGroup
 from neuronx_distributed.modules.moe import expert_mlps, routing, token_shuffling
 from neuronx_distributed.modules.moe.shared_experts import SharedExperts
 from neuronx_distributed.modules.moe.moe_fused_tkg import MoEFusedTKG
+from neuronx_distributed.modules.moe.moe_fused_tkg_mx import MoEFusedTKGMX
 from neuronx_distributed.modules.moe.moe_configs import MoEFusedTKGConfig
 from neuronx_distributed.parallel_layers import mappings, parallel_state
 from neuronx_distributed.parallel_layers.utils import indices_split_along_dim
-
-MAX_MEMORY_BOUND_SEQLEN = 1  # decides when to use the TKG kernel
 
 class MoE(torch.nn.Module):
     """Module which implements a Mixture-of-Experts layer.
@@ -138,7 +137,8 @@ class MoE(torch.nn.Module):
         self.moe_fused_tkg: Optional[MoEFusedTKG] = None
         if init_tkg_module:
             assert tkg_config is not None, "tkg_config must be passed if init_tkg_module is True"
-            self.moe_fused_tkg = MoEFusedTKG(
+            cls = MoEFusedTKGMX if tkg_config.is_mxfp4_compute else MoEFusedTKG
+            self.moe_fused_tkg = cls(
                 post_attention_layernorm=self.rmsnorm,
                 router=self.router,
                 expert_mlps=self.expert_mlps,
@@ -151,7 +151,7 @@ class MoE(torch.nn.Module):
             )
             self.moe_fused_tkg.eval()
 
-    def _forward_compute_bound(self, hidden_states):
+    def _forward_compute_bound(self, hidden_states, padding_mask=None):
         """Forward pass of the MoE layer.
 
         Common nomenclature:
@@ -169,6 +169,8 @@ class MoE(torch.nn.Module):
 
         Arguments:
             hidden_states: Input tensor (of shape as described above)
+            padding_mask: (Optional) Padding mask for the input tokens. If passed in will mask out 
+                            expert affinities mask and expert mask for the padded tokens.
 
         Returns:
             output: Output tensor of the same shape as hidden_states, containing the output of the MoE layer.
@@ -189,6 +191,18 @@ class MoE(torch.nn.Module):
             if self.token_shuffle_seed is not None:
                 # store for debugging purpose, which is when user specifies a seed
                 self.shuffle_permutation = shuffle_permutation
+        
+        s0, s1, _ = hidden_states.shape
+        total_tokens = s0*s1*self.tensor_parallel_group.size() if self.sequence_parallel_enabled else s0*s1
+        use_index_calc_kernel = self.expert_mlps.use_index_calc_kernel(total_tokens)
+        expert_affinities_masked_full = None
+        # If router is in SP, gather expert_affinities_masked_full early, so index calculation can be overlapped
+        # with the hidden states all-gather.
+        early_affinities_ag = use_index_calc_kernel and self.sequence_parallel_enabled and self.router.sequence_parallel_enabled
+        if early_affinities_ag:
+            # Pull router + router collectives to before the hidden all-gather of seq parallel
+            router_logits, expert_affinities, expert_index = self.router(hidden_states)
+            expert_affinities_masked_full = self.expert_mlps.get_full_expert_affinities_masked(expert_affinities, expert_index)
 
         if self.sequence_parallel_enabled:
             # All-Gather the hidden_states to exit sequence parallel
@@ -209,10 +223,11 @@ class MoE(torch.nn.Module):
 
         # Get the router_logits, expert_affinities and expert_index from the router
         # router_logits: (T, E), expert_affinities: (T, E), expert_index: (T, top_k)
-        if self.router.sequence_parallel_enabled:
-            router_logits, expert_affinities, expert_index = self.router(hidden_states)
-        else:
-            router_logits, expert_affinities, expert_index = self.router(full_hidden_states)
+        if not early_affinities_ag:
+            if self.router.sequence_parallel_enabled:
+                router_logits, expert_affinities, expert_index = self.router(hidden_states)
+            else:
+                router_logits, expert_affinities, expert_index = self.router(full_hidden_states)
 
         if not self.ep_enabled:
             # All-Reduce expert_affinities gradients in backward pass, to account for delayed output All-Reduce
@@ -225,6 +240,8 @@ class MoE(torch.nn.Module):
             expert_affinities=expert_affinities,
             expert_index=expert_index,
             seq_len=seq_len,
+            padding_mask=padding_mask,
+            expert_affinities_masked_full=expert_affinities_masked_full,
         )
         output = self._apply_shared_experts(output, full_hidden_states, hidden_states, hidden_states_shape, seq_len)
         # output: (T, H) -> (S, B, H) or (B, S, H)
@@ -266,11 +283,11 @@ class MoE(torch.nn.Module):
             return_op += (expert_index,)
         return return_op
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states, padding_mask=None, is_speculative_decoding=False):
         seq_len = hidden_states.shape[self.sequence_dimension]
-        if seq_len <= MAX_MEMORY_BOUND_SEQLEN and self.moe_fused_tkg is not None:  # memory bound
+        if (seq_len == 1 or is_speculative_decoding) and self.moe_fused_tkg is not None:  # spec decode and normal tkg will use the fused kernel
             return self.moe_fused_tkg(hidden_states)
-        return self._forward_compute_bound(hidden_states)
+        return self._forward_compute_bound(hidden_states, padding_mask)
 
     def _apply_shared_experts(self, output, full_hidden_states, hidden_states, hidden_states_shape, seq_len):
         """

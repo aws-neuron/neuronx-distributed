@@ -988,14 +988,16 @@ def get_expert_parallel_rank_from_global_rank(rank: int, expert_parallel_group: 
     raise ValueError(f"rank: {rank} not found in the mesh: {mesh}")
 
 
-def get_experts_for_expert_parallel_rank(expert_parallel_rank: int, total_number_of_experts: int, expert_model_parallel_size: int) -> List[int]:
+def get_experts_for_expert_parallel_rank(expert_parallel_rank: int, total_number_of_experts: int, expert_model_parallel_size: int, expert_distribution: Optional[List[List[int]]] = None) -> List[int]:
     """
     Get list of expert indices that belong to a specific ep_rank.
     
     Args:
-        ep_rank: The parallel rank to get experts for
-        n_expert: Total number of experts
-        EP_DEGREE: Number of parallel ranks (EP)
+        expert_parallel_rank: The parallel rank to get experts for
+        total_number_of_experts: Total number of experts
+        expert_model_parallel_size: Number of parallel ranks (EP)
+        expert_distribution: expert distribution configuration for each rank.
+
     
     Returns:
         list[int]: List of expert indices belonging to this ep_rank
@@ -1005,7 +1007,13 @@ def get_experts_for_expert_parallel_rank(expert_parallel_rank: int, total_number
     assert expert_parallel_rank < expert_model_parallel_size, \
         f"expert_parallel_rank: {expert_parallel_rank} is not less than expert_model_parallel_size: {expert_model_parallel_size}"
     experts_per_rank = total_number_of_experts // expert_model_parallel_size
-
+    if expert_distribution:
+        assert len(expert_distribution) == expert_model_parallel_size, \
+            f"len of expert_distribution: {expert_distribution} is not matching the expert_model_parallel_size: {expert_model_parallel_size}"
+        flattened_expert_distribution = [item for sublist in expert_distribution for item in sublist]
+        assert set(range(total_number_of_experts)) == set(flattened_expert_distribution), \
+            f"Expert indexing not covering all expert id in the range [0,{total_number_of_experts})"
+        return expert_distribution[expert_parallel_rank]
     start_expert = expert_parallel_rank * experts_per_rank
     end_expert = start_expert + experts_per_rank
     

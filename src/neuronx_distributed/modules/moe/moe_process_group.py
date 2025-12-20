@@ -61,3 +61,14 @@ def get_moe_ep_group(prefill: bool = True):
     else:
         assert _MOE_TKG_EXPERT_MODEL_PARALLEL_GROUP is not None, "_MOE_TKG_EXPERT_MODEL_PARALLEL_GROUP is not initialized"
         return _MOE_TKG_EXPERT_MODEL_PARALLEL_GROUP
+
+def destroy_moe_model_parallel()-> None:
+    """Set the moe groups to none."""
+    global _MOE_TKG_TENSOR_MODEL_PARALLEL_GROUP
+    _MOE_TKG_TENSOR_MODEL_PARALLEL_GROUP = None
+    global _MOE_TKG_EXPERT_MODEL_PARALLEL_GROUP
+    _MOE_TKG_EXPERT_MODEL_PARALLEL_GROUP = None
+    global _MOE_CTE_TENSOR_MODEL_PARALLEL_GROUP
+    _MOE_CTE_TENSOR_MODEL_PARALLEL_GROUP= None
+    global _MOE_CTE_EXPERT_MODEL_PARALLEL_GROUP
+    _MOE_CTE_EXPERT_MODEL_PARALLEL_GROUP = None

@@ -379,4 +379,8 @@ def get_platform_lnc():
     if env_lnc != -1:
         return LogicalNCConfig(env_lnc)
     else:
-        return LogicalNCConfig.LNC_2 if get_platform_target() == "trn2" else LogicalNCConfig.LNC_1
+        target = get_platform_target()
+        if target == "trn2" or target == "trn3":
+            return LogicalNCConfig.LNC_2
+        else:
+            return LogicalNCConfig.LNC_1

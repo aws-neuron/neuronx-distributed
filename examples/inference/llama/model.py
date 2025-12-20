@@ -328,7 +328,7 @@ def load_llama_checkpoint(cfg: Config, model_path: str, tp_degree=1):
     state_dict = replace(state_dict, "mlp.w3", "mlp.up_proj")
     state_dict = replace(state_dict, "mlp.w2", "mlp.down_proj")
 
-    # The embedding and modeling head outputs are tied. We just close because
+    # The embedding and modeling head outputs are tied. We just clone because
     # model builder's sharding logic does not take care of tied weights yet.
     state_dict["output.weight"] = state_dict["embedding.weight"].clone().detach()
 

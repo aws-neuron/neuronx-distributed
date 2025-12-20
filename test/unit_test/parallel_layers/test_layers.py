@@ -1,6 +1,7 @@
 import unittest
 from unittest.mock import MagicMock, patch
 import torch
+import math
 
 from neuronx_distributed.parallel_layers.layers_utils import (
     _linear_autograd_base_setup_fwd,
@@ -494,6 +495,46 @@ class TestCustomFunction(unittest.TestCase):
             # Validate the output is kept padded
             final_output = model(torch.ones(2, 16))
             assert(final_output.shape == (2, 1536))
+
+    def test_RPL_preshard_hook_with_bias_and_padding(self):
+        input_size = 6401
+        output_size = 1499
+        world_size = 64
+        padded_input_size_per_rank = int(math.ceil(input_size/world_size))
+        padded_input_size = world_size * padded_input_size_per_rank
+        pad_size = padded_input_size - input_size
+
+        with (
+            patch("neuronx_distributed.parallel_layers.layers.RowParallelLinear.initialize_weight_and_bias") as mock_init,
+        ):
+            mock_init.return_value = None
+            model= RowParallelLinear(
+                input_size=input_size,
+                output_size=output_size,
+                pad=True,
+                bias=True,
+                tensor_model_parallel_group=torch.distributed.ProcessGroup(0,world_size)
+            )
+            model.weight = torch.rand(input_size, output_size)
+            model.bias = torch.zeros((output_size,))
+            model.eval()
+ 
+            # Validate sharding and padding
+            model_state_dict = {
+                'layer.weight': torch.ones(output_size, input_size),
+                'layer.bias': torch.ones(output_size,)
+            }
+            orig_weight = model_state_dict['layer.weight'].clone()
+            orig_bias = model_state_dict['layer.bias'].clone()
+            model.preshard_hook(model_state_dict, 'layer.weight')
+            model.preshard_hook(model_state_dict, 'layer.bias')
+            new_weight = model_state_dict['layer.weight']
+            new_bias = model_state_dict['layer.bias']
+            assert(new_weight.shape == (output_size, padded_input_size))
+            assert(torch.equal(new_weight, torch.nn.functional.pad(orig_weight, (0, pad_size))))
+            assert(new_bias.shape == (output_size,))
+            # Check original bias and new bias are of the same shape
+            assert(torch.equal(new_bias, orig_bias))
 
 if __name__ == "__main__":
     unittest.main()

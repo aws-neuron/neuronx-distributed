@@ -33,7 +33,8 @@ def import_nki(import_config: NKIImport) -> Tuple[Optional[Any], Optional[str]]:
     else:
         import_paths = [
             f"neuronxcc.nki._pre_prod_kernels.{import_config.module_name}",
-            f"neuronxcc.nki._private_kernels.{import_config.module_name}"
+            f"neuronxcc.nki._private_kernels.{import_config.module_name}",
+            f"neuronxcc.nki._private.{import_config.module_name}"
         ]
     last_error = None
     for path in import_paths:

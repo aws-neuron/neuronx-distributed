@@ -1,5 +1,5 @@
 import math
-from typing import Optional, Tuple, Callable, Any, Sequence
+from typing import Optional, Tuple, Callable, Any, Sequence, List
 
 import torch
 import torch.nn as nn
@@ -137,7 +137,7 @@ class ExpertFusedLinearWithAsyncCommunication(torch.autograd.Function):
 
 
 class ExpertFusedLinear(nn.Module):
-    def _mark_expert_parallel_weights(self, iterable=None, expert_parallel_group_size=None, is_prefill=True):
+    def _mark_expert_parallel_weights(self, iterable=None, expert_parallel_group_size=None, is_prefill=True, expert_distribution=None):
         """Register expert parallel parameters"""
         if expert_parallel_group_size is None:
             expert_parallel_group_size = get_expert_model_parallel_size()
@@ -150,6 +150,7 @@ class ExpertFusedLinear(nn.Module):
                 p.expert_model_parallel = True
                 if is_prefill:
                     p.is_prefill = True
+                p.expert_distribution = expert_distribution
 
     def _apply(self, fn, *args, **kwargs):
         """Moving parameters from cpu to device creates new parameters. to() method
@@ -161,6 +162,9 @@ class ExpertFusedLinear(nn.Module):
         return out
 
     def _save_to_state_dict(self, destination, *args, **kwargs):
+        if not self.training:
+            super()._save_to_state_dict(destination, *args, **kwargs)
+
         initial_states = {id(v) for v in destination.values()}
         out = super()._save_to_state_dict(destination, *args, **kwargs)
         new_states = [v for v in destination.values() if id(v) not in initial_states]
@@ -194,13 +198,19 @@ class ExpertFusedColumnParallelLinear(layers.ColumnParallelLinear, ExpertFusedLi
         tensor_model_parallel_group: Optional[ProcessGroup] = None,
         expert_model_parallel_group: Optional[ProcessGroup] = None,
         is_prefill: bool = True,
+        is_fused_gate_up: bool = False,
+        expert_distribution: Optional[List[List[int]]] = None,
     ) -> None:
         self.num_experts = num_experts
         if expert_model_parallel_group is None:
             expert_model_parallel_group = get_expert_model_parallel_group()
-        self._n_local_experts = utils.divide(num_experts, expert_model_parallel_group.size())
+        if expert_distribution is None:
+            self._n_local_experts = utils.divide(num_experts, expert_model_parallel_group.size())
+        else:
+            self._n_local_experts = len(expert_distribution[0])
         self.expert_model_parallel_group = expert_model_parallel_group
         self.is_prefill = is_prefill
+        self.is_fused_gate_up = is_fused_gate_up
         super().__init__(
             input_size=input_size,
             output_size=output_size,
@@ -215,7 +225,7 @@ class ExpertFusedColumnParallelLinear(layers.ColumnParallelLinear, ExpertFusedLi
             skip_bias_add=False,
             tensor_model_parallel_group=tensor_model_parallel_group,
         )
-        self._mark_expert_parallel_weights(expert_parallel_group_size=expert_model_parallel_group.size(), is_prefill=is_prefill)
+        self._mark_expert_parallel_weights(expert_parallel_group_size=expert_model_parallel_group.size(), is_prefill=is_prefill, expert_distribution=expert_distribution)
 
     def set_weight_and_bias_config(self):
         # Define 3D weight tensor, one linear layer per expert
@@ -319,13 +329,19 @@ class ExpertFusedRowParallelLinear(layers.RowParallelLinear, ExpertFusedLinear):
         tensor_model_parallel_group: Optional[ProcessGroup] = None,
         expert_model_parallel_group: Optional[ProcessGroup] = None,
         is_prefill: bool = True,
+        is_fused_gate_up: bool = False,
+        expert_distribution: Optional[List[List[int]]] = None,
     ) -> None:
         self.num_experts = num_experts
         if expert_model_parallel_group is None:
             expert_model_parallel_group = get_expert_model_parallel_group()
-        self._n_local_experts = utils.divide(num_experts, expert_model_parallel_group.size())
+        if expert_distribution is None:
+            self._n_local_experts = utils.divide(num_experts, expert_model_parallel_group.size())
+        else:
+            self._n_local_experts = len(expert_distribution[0])
         self.expert_model_parallel_group = expert_model_parallel_group
         self.is_prefill = is_prefill
+        self.is_fused_gate_up = is_fused_gate_up
         super().__init__(
             input_size=input_size,
             output_size=output_size,
@@ -342,7 +358,7 @@ class ExpertFusedRowParallelLinear(layers.RowParallelLinear, ExpertFusedLinear):
             tensor_model_parallel_group=tensor_model_parallel_group,
         )
 
-        self._mark_expert_parallel_weights(expert_parallel_group_size=expert_model_parallel_group.size(), is_prefill=is_prefill)
+        self._mark_expert_parallel_weights(expert_parallel_group_size=expert_model_parallel_group.size(), is_prefill=is_prefill, expert_distribution=expert_distribution)
 
     def set_weight_and_bias_config(self):
         # Define 3D weight tensor, one linear layer per expert

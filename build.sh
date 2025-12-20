@@ -3,9 +3,9 @@ set -e
 
 : ${DIST_DIR:=build}
 
-python -m pip install ruff
+python3 -m pip install ruff
 # removing cache fails in ToD
-python -m ruff check --no-cache --line-length=120 --ignore=F401,E203
+python3 -m ruff check --no-cache --line-length=120 --ignore=F401,E203
 # exit when asked to run `ruff` only
 if [[ "$1" == "ruff" ]]
 then
@@ -13,13 +13,13 @@ then
 fi
 
 # Run static code analysis
-python -m pip install mypy
+python3 -m pip install mypy
 # Install type bindings
-python -m pip install types-requests boto3-stubs[s3] types-PyYAML
+python3 -m pip install types-requests boto3-stubs[s3] types-PyYAML
 # Dependencies for s3 checkpoint storage
-python -m pip install tenacity
+python3 -m pip install tenacity
 # removing cache fails in ToD
-python -m mypy --no-incremental --cache-dir=/dev/null
+python3 -m mypy --no-incremental --cache-dir=/dev/null
 # exit when asked to run `mypy` only
 if [[ "$1" == "mypy" ]]
 then
@@ -29,4 +29,4 @@ fi
 
 
 # Build wheel
-python setup.py bdist_wheel --dist-dir ${DIST_DIR}
+python3 setup.py bdist_wheel --dist-dir ${DIST_DIR}

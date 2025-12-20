@@ -289,7 +289,23 @@ class TestTensorRegistryHelperMethods(unittest.TestCase):
         manual_tensors = self.registry.get_manual_tensors()
         
         self.assertEqual(len(manual_tensors), 3)
-        
+
+    def test_get_manual_tensor_output_list(self):
+        """Test getting manual tensor output list"""
+        self.registry.configure(enabled=True, modules=[], max_tensors=4)
+
+        # Register manual tensors
+        for i in range(2):
+            tensor = torch.tensor([float(i)])
+            self.registry.register_tensor(f"{i}", tensor)
+        expert_stats_0 = torch.tensor([float(0)])
+        self.registry.register_tensor("moe_auto_expert_index_0", expert_stats_0)
+        expert_stats_1 = torch.tensor([float(1)])
+        self.registry.register_tensor("moe_auto_expert_index_1", expert_stats_1)
+        manual_tensors = self.registry.get_manual_tensors()
+        self.assertEqual(len(manual_tensors), 3)
+        self.assertEqual(manual_tensors["auto_moe_stats.expert_index"].shape, (2, 1))
+
     def test_get_tensor_counts(self):
         """Test getting tensor counts"""
         modules = ["linear"]

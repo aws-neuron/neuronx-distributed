@@ -1,4 +1,4 @@
-from typing import Callable, Optional
+from typing import Callable, Optional, List
 
 import torch
 from torch import Tensor
@@ -59,11 +59,16 @@ class Experts(Module):
         glu_type: Optional[GLUType] = GLUType.GLU,
         hidden_act_scaling_factor: float = 1.,
         hidden_act_bias: float = 0.,
+        gate_clamp_upper_limit: Optional[float] = None,
+        gate_clamp_lower_limit: Optional[float] = None,
+        up_clamp_upper_limit: Optional[float] = None,
+        up_clamp_lower_limit: Optional[float] = None,
         input_layer_init_method=None,
         output_layer_init_method=None,
         is_prefill = True,
         tensor_model_parallel_group: Optional[ProcessGroup] = None,
         expert_model_parallel_group: Optional[ProcessGroup] = None,
+        expert_distribution: Optional[List[List[int]]] = None,
     ) -> None:
         super().__init__()
 
@@ -75,6 +80,10 @@ class Experts(Module):
         self.num_experts = num_experts
         self.hidden_act_scaling_factor = hidden_act_scaling_factor
         self.hidden_act_bias = hidden_act_bias
+        self.gate_clamp_upper_limit = gate_clamp_upper_limit
+        self.gate_clamp_lower_limit = gate_clamp_lower_limit
+        self.up_clamp_upper_limit = up_clamp_upper_limit
+        self.up_clamp_lower_limit = up_clamp_lower_limit
         # todo: we can also generalize expert-parallel group
         self.tensor_parallel_group = tensor_model_parallel_group if \
             tensor_model_parallel_group is not None else get_tensor_model_parallel_group()
@@ -98,6 +107,8 @@ class Experts(Module):
                 tensor_model_parallel_group=self.tensor_parallel_group,
                 expert_model_parallel_group=self.expert_model_parallel_group,
                 is_prefill=is_prefill,
+                is_fused_gate_up=True,
+                expert_distribution=expert_distribution,
             )
         else:
             self.up_proj = ExpertFusedColumnParallelLinear(
@@ -113,6 +124,7 @@ class Experts(Module):
                 tensor_model_parallel_group=self.tensor_parallel_group,
                 expert_model_parallel_group=self.expert_model_parallel_group,
                 is_prefill=is_prefill,
+                expert_distribution=expert_distribution,
             )
 
         self.down_proj = ExpertFusedRowParallelLinear(
@@ -129,6 +141,7 @@ class Experts(Module):
             tensor_model_parallel_group=self.tensor_parallel_group,
             expert_model_parallel_group=self.expert_model_parallel_group,
             is_prefill=is_prefill,
+            expert_distribution=expert_distribution,
         )
 
     def forward(self, hidden_states: Tensor, expert_indices: Optional[Tensor] = None) -> Tensor:
@@ -205,11 +218,14 @@ class Experts(Module):
 
     def _activation(self, x: Tensor) -> Tensor:
         if self._glu:
+            gate, up = torch.chunk(x, chunks=2, dim=-1)
+            if self.gate_clamp_lower_limit or self.gate_clamp_upper_limit:
+                gate = gate.clamp(min=self.gate_clamp_lower_limit, max=self.gate_clamp_upper_limit)
+            if self.up_clamp_lower_limit or self.up_clamp_upper_limit:
+                up = up.clamp(min=self.up_clamp_lower_limit, max=self.up_clamp_upper_limit)
             if self._glu_type == GLUType.GLU:
-                gate, up = torch.chunk(x, chunks=2, dim=-1)
                 return self._activation_fn(self.hidden_act_scaling_factor * gate) * (up + self.hidden_act_bias)
             elif self._glu_type == GLUType.SWIGLU:
-                gate, up = torch.chunk(x, chunks=2, dim=-1)
                 gate = gate * self._activation_fn(self.hidden_act_scaling_factor * gate)
                 out = gate * (up + self.hidden_act_bias)
                 return out
