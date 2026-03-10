@@ -362,6 +362,6 @@ def allreduce_context_parallel_gradients(optimizer):
                             grads.append(p.main_grad.data)
     for grad in grads:
         # Scale down by the context parallel size and allreduce the grads from the context parallel regions
-        grad = grad / get_context_model_parallel_size()
+        grad /= get_context_model_parallel_size()
         reduce_from_context_model_parallel_region(grad, get_context_model_parallel_group())
     

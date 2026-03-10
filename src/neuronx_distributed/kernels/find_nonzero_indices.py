@@ -101,9 +101,9 @@ def find_nonzero_indices(input_tensor: nt.tensor,
     n_partitions = nl.tile_size.pmax
     quadrant=32
     n_quadrant = 4
-    n_q7 = 8
-    n_q7_per_quadrant = 2
-    n_partition_per_q7 = 16
+    n_gpsimd_cores = 8
+    n_gpsimd_cores_per_quadrant = 2
+    n_partition_per_gpsimd_core = 16
 
     # Initialize (E,T) output on HBM to all -1s.
     indices = nl.ndarray((E, T), dtype=index_dtype, buffer=nl.shared_hbm)
@@ -116,44 +116,44 @@ def find_nonzero_indices(input_tensor: nt.tensor,
     nonzero_counts = nl.ndarray((E, ), dtype=nl.int32, buffer=nl.shared_hbm)
     nonzero_counts_local = nl.zeros((1, E_per_shard), dtype=nl.int32, buffer=nl.sbuf)
 
-    # 2. Handle experts in groups of 8: 8 Q7 cores run in parallel.
+    # 2. Handle experts in groups of 8: 8 GPSIMD cores run in parallel.
     # Number of rounds to find index in groups of 8.
-    n_rounds = (E_per_shard + n_q7 - 1) // n_q7
+    n_rounds = (E_per_shard + n_gpsimd_cores - 1) // n_gpsimd_cores
     # Number of chunks to chunk along the T dim.
     n_T_chunks = T // chunk_size
     for r in nl.static_range(n_rounds):
         # Get number of experts to process this round.
-        n_e = n_q7
+        n_e = n_gpsimd_cores
         if r == n_rounds - 1:
-            n_e = E_per_shard - n_q7 * r
+            n_e = E_per_shard - n_gpsimd_cores * r
 
         # Counts of nonzeros so far. This is the offset at which the next chunk write should begin.
         # Keep offsets in int32.
-        offsets = nl.zeros((1, n_q7), dtype=nl.int32, buffer=nl.sbuf)
+        offsets = nl.zeros((1, n_gpsimd_cores), dtype=nl.int32, buffer=nl.sbuf)
 
         # Handle sequences in chunks with chunk_size
         for c in nl.static_range(n_T_chunks):
             # Load input: (T,E) layout on HBM
-            # Q7 kernel needs: (128, chunk_size) with partition 0, 16, 32, ... each filled with a different expert.
-            input_local_q7_aligned = nl.ndarray((n_partitions, 1, chunk_size), dtype=input_tensor.dtype, buffer=nl.sbuf)
+            # GPSIMD kernel needs: (128, chunk_size) with partition 0, 16, 32, ... each filled with a different expert.
+            input_local_gpsimd_core_aligned = nl.ndarray((n_partitions, 1, chunk_size), dtype=input_tensor.dtype, buffer=nl.sbuf)
             n_tiles = chunk_size // n_partitions
             for i in nl.affine_range(n_tiles):
                 # Read (128, n_e) chunk
                 i_packed_t = nl.arange(n_partitions)[:, None]
                 i_packed_e = nl.arange(n_e)[None, :]
-                offset = r * n_q7 + row_start_id + E_offset
+                offset = r * n_gpsimd_cores + row_start_id + E_offset
                 input_local_te = nl.load(input_tensor[i_packed_t + c * chunk_size + i * n_partitions, i_packed_e + offset])
 
                 # Copy to (128, 128) chunk, putting the n_e columns at column 0, 16, 32, ..., 112
                 input_local_aligned_te = nl.ndarray((n_partitions, n_partitions), dtype=input_tensor.dtype, buffer=nl.sbuf)
                 for q in nl.affine_range(n_e):
-                    input_local_aligned_te[:, nl.ds(q * n_partition_per_q7, 1)] = input_local_te[:, nl.ds(q, 1)]
+                    input_local_aligned_te[:, nl.ds(q * n_partition_per_gpsimd_core, 1)] = input_local_te[:, nl.ds(q, 1)]
 
                 # Transpose so we have expert data at row 0, 16, 32, ..., 112
-                input_local_q7_aligned[:, 0, nl.ds(i*n_partitions, n_partitions)] = nisa.nc_transpose(input_local_aligned_te)
+                input_local_gpsimd_core_aligned[:, 0, nl.ds(i*n_partitions, n_partitions)] = nisa.nc_transpose(input_local_aligned_te)
 
-            # Run Q7 kernel for ISA NonzeroWithCount.
-            output_local = nki_asm_nonzero_with_count(input_local_q7_aligned, c*chunk_size)
+            # Run GPSIMD kernel for ISA NonzeroWithCount.
+            output_local = nki_asm_nonzero_with_count(input_local_gpsimd_core_aligned, c*chunk_size)
 
             # Write out rows 0, 32, 64, 96
             i_0 = nl.arange(1)[:, None]
@@ -161,35 +161,35 @@ def find_nonzero_indices(input_tensor: nt.tensor,
             i_indices = nl.arange(chunk_size)[None, :]
             for q in nl.affine_range(n_quadrant):
                 nl.store(
-                    indices[i_0 + E_offset + r * n_q7 + q * n_q7_per_quadrant, i_indices + offsets[i_0, i_1 + q * n_q7_per_quadrant]],
+                    indices[i_0 + E_offset + r * n_gpsimd_cores + q * n_gpsimd_cores_per_quadrant, i_indices + offsets[i_0, i_1 + q * n_gpsimd_cores_per_quadrant]],
                     value=output_local[nl.ds(q*quadrant, 1), 0, nl.ds(0, chunk_size)],
-                    mask=i_0 + q * n_q7_per_quadrant < n_e
+                    mask=i_0 + q * n_gpsimd_cores_per_quadrant < n_e
                 )
-                offsets[i_0, i_1 + q * n_q7_per_quadrant] = nl.add(
-                    offsets[i_0, i_1 + q * n_q7_per_quadrant],
+                offsets[i_0, i_1 + q * n_gpsimd_cores_per_quadrant] = nl.add(
+                    offsets[i_0, i_1 + q * n_gpsimd_cores_per_quadrant],
                     output_local[nl.ds(q*quadrant, 1), 0, nl.ds(chunk_size, 1)],
-                    mask=i_0 + q * n_q7_per_quadrant < n_e
+                    mask=i_0 + q * n_gpsimd_cores_per_quadrant < n_e
                 )
 
             # Stream shuffle to move rows 16, 48, 80, 112 to rows 0, 32, 64, 96, and then write them out
             quad_mask = [255] * quadrant
-            quad_mask[0] = n_partition_per_q7
+            quad_mask[0] = n_partition_per_gpsimd_core
             nisa.nc_stream_shuffle(src=output_local, dst=output_local, shuffle_mask = quad_mask)
             for q in nl.affine_range(n_quadrant):
                 nl.store(
-                    indices[i_0 + E_offset + r * n_q7 + q * n_q7_per_quadrant + 1, i_indices + offsets[i_0, i_1 + q * n_q7_per_quadrant + 1]],
+                    indices[i_0 + E_offset + r * n_gpsimd_cores + q * n_gpsimd_cores_per_quadrant + 1, i_indices + offsets[i_0, i_1 + q * n_gpsimd_cores_per_quadrant + 1]],
                     value=output_local[nl.ds(q*quadrant, 1), 0, nl.ds(0, chunk_size)],
-                    mask=i_0 + q * n_q7_per_quadrant + 1 < n_e
+                    mask=i_0 + q * n_gpsimd_cores_per_quadrant + 1 < n_e
                 )
-                offsets[i_0, i_1 + q * n_q7_per_quadrant + 1] = nl.add(
-                    offsets[i_0, i_1 + q * n_q7_per_quadrant + 1],
+                offsets[i_0, i_1 + q * n_gpsimd_cores_per_quadrant + 1] = nl.add(
+                    offsets[i_0, i_1 + q * n_gpsimd_cores_per_quadrant + 1],
                     output_local[nl.ds(q*quadrant, 1), 0, nl.ds(chunk_size, 1)],
-                    mask=i_0 + q * n_q7_per_quadrant + 1 < n_e
+                    mask=i_0 + q * n_gpsimd_cores_per_quadrant + 1 < n_e
                 )
 
         # Final offsets are the nonzero counts per expert.
         i_n_e = nl.arange(n_e)[None, :]
-        nonzero_counts_local[i_0, i_n_e + r * n_q7] = offsets[i_0, i_n_e]
+        nonzero_counts_local[i_0, i_n_e + r * n_gpsimd_cores] = offsets[i_0, i_n_e]
 
     nonzero_counts_reshape = nonzero_counts.reshape((1, E))
     nl.store(nonzero_counts_reshape[:, nl.ds(E_offset, E_per_shard)], nonzero_counts_local)

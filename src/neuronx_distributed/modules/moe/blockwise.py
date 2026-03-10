@@ -162,7 +162,7 @@ class BlockwiseMatmulArgs:
     gate_clamp_lower_limit: Optional[float] = None
     up_clamp_upper_limit: Optional[float] = None
     up_clamp_lower_limit: Optional[float] = None
-
+    use_shard_on_block_dynamic_while: bool = False
     # Optional Input tensors
     conditions: Optional[torch.Tensor] = None
     num_static_blocks: Optional[int] = None
@@ -1229,8 +1229,21 @@ class BlockwiseMatmulNKIFunc(torch.autograd.Function):
         )
 
 def _call_bwmm_fp4_shard_on_block(args: BlockwiseMatmulArgs):
+    #directly inject the conditions vector here
+    # FIXME: move this code to expert_mlps_v2.py instead of injecting it directly here
+    
+    # Reshape the token positions into blocks
+    padded_conditions = None
+    if args.use_shard_on_block_dynamic_while:
+      num_blocks = args.block_to_expert.shape[0]
+      blocks = args.token_position_to_id.view(num_blocks, args.block_size)
+      # Check each block for non padded tokens (any position != -1)
+      conditions = torch.any(blocks != -1, dim=1).to(torch.int32)
+      padded_conditions = torch.cat([conditions, torch.zeros(2, device=conditions.device)])
+
     output = _bwmm_fp4_shard_on_block_nki_call[VNC(2)](
         hidden_states=args.hidden_states,
+        conditions=padded_conditions,
         expert_affinities_masked=args.expert_affinities_masked,
         gate_up_proj_weight=args.gate_up_proj_weight,
         down_proj_weight=args.down_proj_weight,
@@ -1326,12 +1339,14 @@ class BlockwiseMatmulMXNKIFunc(torch.autograd.Function):
             gate_clamp_lower_limit=gate_clamp_lower_limit,
             up_clamp_upper_limit=up_clamp_upper_limit,
             up_clamp_lower_limit=up_clamp_lower_limit,
+            use_shard_on_block_dynamic_while=blockwise_matmul_config.use_shard_on_block_dynamic_while,
             gate_up_proj_bias=gate_up_proj_bias,
             down_proj_bias=down_proj_bias,
             kernel_act_fn=ActivationFunction(kernel_act_fn_id),
             is_tensor_update_accumulating=multi_expert_per_token,
             expert_affinities_scaling_mode=expert_affinities_scaling_mode,
-            output=output
+            output=output,
+            skip_dma=skip_dma,
         )
 
         output = _call_bwmm_fp4_shard_on_block(args)

@@ -506,7 +506,7 @@ class NxDModel(torch.nn.Module, BaseNxDModel):
         """
         if not self.loaded_on_neuron:
             raise RuntimeError("Model not initialized. Call set_weights() followed by to_neuron()")
-        SUPPORTED_FORWARD_MODES = {'default', 'ranked', 'async'}
+        SUPPORTED_FORWARD_MODES = {'default', 'ranked', 'ranked_to_cpu', 'async'}
         assert forward_mode in SUPPORTED_FORWARD_MODES, f"{forward_mode=} is not supported. It must be one of {SUPPORTED_FORWARD_MODES}"
 
         kwargs, arg_names = self.convert_dict_to_ordered_list(  # type: ignore[assignment]
@@ -546,12 +546,14 @@ class NxDModel(torch.nn.Module, BaseNxDModel):
         if forward_mode == 'default':
             outputs: List[torch.Tensor] = self.spmd_models[model_name].forward(flattened_inputs)  # type: ignore[no-redef]
             return self.packer_map[model_name](outputs)
+        elif forward_mode == 'ranked_to_cpu':
+            outputs: List[torch.Tensor] = self.spmd_models[model_name].forward_ranked_to_cpu(flattened_inputs) # type: ignore[no-redef]
         elif forward_mode == 'ranked':
             outputs: List[List[torch.Tensor]] = self.spmd_models[model_name].forward_ranked(flattened_inputs)  # type: ignore[no-redef]
         else: # async
             outputs: List[List[torch.Tensor]] = self.spmd_models[model_name].forward_async(flattened_inputs)  # type: ignore[no-redef]
 
-        # only runs for 'ranked' and 'async' modes
+        # only runs for 'ranked' , 'ranked_to_cpu'  and 'async' modes
         # change output from [rank][output] to [output][rank]
         transposed_outputs: List[List[torch.Tensor]] = [[None for _ in range(len(outputs))] for _ in range(len(outputs[0]))]
         for rank,output in enumerate(outputs):

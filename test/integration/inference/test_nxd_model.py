@@ -32,6 +32,8 @@ class IdentityModule(torch.nn.Module):
         return x
     def forward_ranked(self, x):
         return x
+    def forward_ranked_to_cpu(self, x):
+        return x
     def forward_async(self, x):
         return x
 
@@ -785,7 +787,7 @@ def test_forward_pos_and_kwargs(mode):
         assert torch.equal(output[0][0], a)
         assert torch.equal(output[1][0], b)
 
-@pytest.mark.parametrize('mode',['default','ranked','async',])
+@pytest.mark.parametrize('mode',['default','ranked', 'ranked_to_cpu','async',])
 def test_forward_specific_model_name(mode):
     nxd_model = generate_nxdmodel_with_mock_spmdmodels(1,2)
 
@@ -809,6 +811,7 @@ def test_forward_specific_model_name(mode):
         return [tensor+1 for tensor in tensors]
     setattr(mock_model, 'forward', mock_model)
     setattr(mock_model, 'forward_ranked', mock_model)
+    setattr(mock_model, 'forward_ranked_to_cpu', mock_model)
     setattr(mock_model, 'forward_async', mock_model)
     nxd_model.spmd_models['key1'] = mock_model
 
@@ -855,7 +858,7 @@ def test_forward_pos_and_kwargs_distributed(mode):
         assert torch.equal(output[1][1], b)
         
 
-@pytest.mark.parametrize('mode',['default','ranked','async',])
+@pytest.mark.parametrize('mode',['default','ranked', 'ranked_to_cpu','async',])
 def test_forward_specific_model_name_distributed(mode):
     nxd_model = generate_nxdmodel_with_mock_spmdmodels(2,2)
 
@@ -879,6 +882,7 @@ def test_forward_specific_model_name_distributed(mode):
         return [tensor+1 for tensor in tensors]
     setattr(mock_model, 'forward', mock_model)
     setattr(mock_model, 'forward_ranked', mock_model)
+    setattr(mock_model, 'forward_ranked_to_cpu', mock_model)
     setattr(mock_model, 'forward_async', mock_model)
     nxd_model.spmd_models['key1'] = mock_model
 

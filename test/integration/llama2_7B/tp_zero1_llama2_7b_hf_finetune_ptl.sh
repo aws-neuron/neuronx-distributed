@@ -1,13 +1,6 @@
 #!/bin/bash
 
 #############################################
-# Override transformers and Optimum-Neuron packages, can be removed once ON released changes in https://github.com/huggingface/optimum-neuron/pull/370
-pip install git+https://github.com/huggingface/optimum-neuron.git
-pip install -U transformers==4.48.0 # reinstall transformers due to optimum neuron override
-sed -i 's/original_forward = copy\.deepcopy(self\.forward)/original_forward = self.forward/' /home/ubuntu/aws_neuron_venv/lib/python3.10/site-packages/optimum/neuron/generation/utils.py
-pip install --no-warn-conflicts nltk
-
-#############################################
 # User defined parameters and env vars
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )

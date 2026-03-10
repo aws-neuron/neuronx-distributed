@@ -1,6 +1,7 @@
 import torch
 from typing import List, Dict, Any, Set, Optional
 from collections import OrderedDict, defaultdict
+from neuronx_distributed.parallel_layers import mappings
 
 class CapturedModelInfo:
     """
@@ -86,7 +87,7 @@ class TensorRegistry:
         # Update the model info with new configuration
         self.model_info = CapturedModelInfo(list(modules or []), max_tensors, capture_inputs)
     
-    def register_tensor(self, name, tensor):
+    def register_tensor(self, name, tensor, neu_module=None):
         """
         Register a tensor in the registry for capture.
         
@@ -115,7 +116,15 @@ class TensorRegistry:
                         break
         
         if is_monitored:
-            self.model_info.module_tensors[name] = tensor.clone().detach()
+            t = tensor.clone().detach()
+            if 'lm_head' in name:
+                assert not neu_module.sequence_parallel_enabled, \
+                    "Sequence parallel must be disabled for lm_head tensor capture to gather logits from all ranks"
+                # lm_head gather should be done in the modeling code already
+                if not neu_module.keep_padded_output and neu_module.pad and neu_module.pad_size > 0:
+                    t = torch.narrow(t, -1, 0, neu_module.output_size - neu_module.pad_size)
+            
+            self.model_info.module_tensors[name] = t
         # For manual registration
         else:
             # Check if we've reached the limit

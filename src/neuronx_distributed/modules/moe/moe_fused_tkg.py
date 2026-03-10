@@ -102,6 +102,16 @@ def expert_isa_kernel_wrapper(
     )  # [T, H]
     return out
 
+def _convert_torch_dtype_to_nki_dtype(dtype: torch.dtype):
+    TORCH_NKI_DTYPE_MAP = {
+        torch.float16: nl.float16,
+        torch.bfloat16: nl.bfloat16,
+        torch.float32: nl.float32,
+    }
+
+    assert dtype in TORCH_NKI_DTYPE_MAP.keys(), f"expected dtype in {TORCH_NKI_DTYPE_MAP.keys()}, got {dtype=}"
+    return TORCH_NKI_DTYPE_MAP[dtype]
+
 def _post_create_quantized_module_hook(layer):
     # This is a workaround in order to avoid loading weights for MoEFusedTKG during tracing.
     # Quantized modules implement these functions so they will always attempt to load these
@@ -226,6 +236,12 @@ class MoEFusedTKG(torch.nn.Module):
 
         return True
 
+    def _can_use_fused_residual_add(self, hidden_states):
+        """
+        Currently, no fused kernels called by MoEFusedTKG support fused residual add.
+        """
+        return False
+
     def _slice_shared_experts_weights(self):
         """
         When sequence parallel is enabled for shared experts, their weights will be replicated on each core.
@@ -247,7 +263,6 @@ class MoEFusedTKG(torch.nn.Module):
             shared_experts_gate_proj_weight = shared_experts.gate_proj.weight
             shared_experts_down_proj_weight = shared_experts.down_proj.weight
         return shared_experts_gate_proj_weight, shared_experts_up_proj_weight, shared_experts_down_proj_weight
-
 
     def _router_topk(self, hidden_states):
         """
@@ -404,15 +419,18 @@ class MoEFusedTKG(torch.nn.Module):
 
         return shared_output
 
-    def _moe_fused_tkg_kernel(self, hidden_states):
+    def _moe_fused_tkg_kernel(self, hidden_states, residual=None):
         """
         Args:
             hidden_states: [B, S, H] or [S, B, H]
+            residual (optional): None TODO CR
 
         Returns:
             output: original shape
+            router_logits: [B*S, E]
         """
         hidden_states_shape = hidden_states.shape
+        router_mm_dtype = _convert_torch_dtype_to_nki_dtype(self.config.router_mm_dtype)
         if self.expert_mlps.routed_experts_mlp_config.early_expert_affinity_modulation:
             expert_affinities_scaling_mode = ExpertAffinityScaleMode.PRE_SCALE
         else:
@@ -445,7 +463,7 @@ class MoEFusedTKG(torch.nn.Module):
             top_k=self.num_experts_per_tok,
             router_act_fn=ROUTER_ACT_FN_MAPPING[self.router.act_fn],
             expert_affinities_scaling_mode=expert_affinities_scaling_mode,
-            router_mm_dtype=nl.float32,
+            router_mm_dtype=router_mm_dtype,
         )
 
         # this is a temporary check that can be removed once release compiler supports
@@ -507,24 +525,31 @@ class MoEFusedTKG(torch.nn.Module):
 
         return out.view(hidden_states_shape), router_logits.to(hidden_states.dtype)
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states, residual=None):
         """
         Forward through MoE TKG mega-kernel if conditions are satisfied. Otherwise forward through
         flat compiler / individual kernels.
 
-        Conditions for MoE TKG mega-kernel:
-        - batch_size <= 32
-        - must use RMSNorm, RouterTopK, ExpertMLPs, SharedExperts
-
         Args:
             hidden_states: [B, S, H] or [S, B, H]
+            residual (optional): [B, S, H] or [S, B, H]
 
         Returns:
             output: original shape
+            router_logits: [B*S, E]
+            residual (optional): residual tensor of same shape as output
         """
+
+        if not self._can_use_fused_residual_add(hidden_states) and residual is not None:
+            hidden_states = hidden_states + residual
+            residual = hidden_states.clone()
+
         if self._can_use_nki_kernel("moe_fused", hidden_states):
             logger.info("Running MoE Fused NKI kernel")
-            output, router_logits = self._moe_fused_tkg_kernel(hidden_states)
+            if not self._can_use_fused_residual_add(hidden_states) or residual is None:
+                output, router_logits = self._moe_fused_tkg_kernel(hidden_states)
+            else:
+                output, router_logits, residual = self._moe_fused_tkg_kernel(hidden_states, residual=residual)
 
             if self.return_expert_index:
                 # return_expert_index not supported in kernel, return emtpy tensor to match with cte tracing when return_expert_index is set to True
@@ -561,6 +586,8 @@ class MoEFusedTKG(torch.nn.Module):
             return_op += (router_logits,)
         if self.return_expert_index:
             return_op += (expert_index,)
+        if residual is not None:
+            return_op += (residual,)
 
         return return_op
 

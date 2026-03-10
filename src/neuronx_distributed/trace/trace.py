@@ -687,9 +687,13 @@ def create_local_weight(rank, world_size, full_weight, partition_dim, per_partit
 
 def create_local_weight_with_expert_parallel(rank, world_size, full_weight, partition_dim, per_partition_size, stride, local_expert_indices, tensor_dtype, out_weight=None):
     if local_expert_indices is not None:
+        local_weight = create_local_weight(rank, world_size, full_weight, partition_dim, per_partition_size, stride, out_weight=out_weight)
         if tensor_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
-            return create_local_weight(rank, world_size, full_weight, partition_dim, per_partition_size, stride,out_weight=out_weight).view(torch.int8)[local_expert_indices,...].view(tensor_dtype)
-        return create_local_weight(rank, world_size, full_weight, partition_dim, per_partition_size, stride,out_weight=out_weight)[local_expert_indices,...]
+            return local_weight.view(torch.int8)[local_expert_indices,...].view(tensor_dtype)
+        elif tensor_dtype == torch.uint16:
+            return local_weight.view(torch.int16)[local_expert_indices,...].view(tensor_dtype)
+        else:
+            return local_weight[local_expert_indices,...]
     else:
         return create_local_weight(rank, world_size, full_weight, partition_dim, per_partition_size, stride,out_weight=out_weight)
 

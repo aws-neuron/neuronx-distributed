@@ -121,6 +121,7 @@ def _convert_initialized_float_to_initialized_quantized(
             )
         if type(mod) in mapping and name not in modules_to_not_convert:
             if not any(key in ".".join(prefixes) for key in modules_to_not_convert):
+                logger.debug(f"Quantizing {'.'.join(prefixes)} to {q_config['quantized_dtype']}")
                 quantized_class = mapping[type(mod)]
                 reassign[name] = quantized_class.from_float(
                     mod=mod,

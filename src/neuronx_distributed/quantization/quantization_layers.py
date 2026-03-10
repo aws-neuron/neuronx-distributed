@@ -63,7 +63,7 @@ from neuronx_distributed.quantization.quantization_config import (
     is_ocp_mx_quantized,
     validate_block_axis_size
 )
-from neuronx_distributed.quantization.quantization_utils import extract_q_scale, quantize_fp8_per_channel
+from neuronx_distributed.quantization.quantization_utils import extract_q_scale, quantize_fp8_per_channel, quantize_static_quant_activations
 from neuronx_distributed.utils import cpu_mode
 from neuronx_distributed.utils.logger import get_logger
 
@@ -210,6 +210,7 @@ class BaseQuantizeParallelLinear(torch.nn.Module, metaclass=ABCMeta):
         per_channel_axis: Optional[int] = None,
         block_axis: Optional[List[int]] = None,
         block_size: Optional[List[int]] = None,
+        activation_quantization_type: Optional[ActivationQuantizationType] = None,
     ):
         """Setup required for scale
 
@@ -233,6 +234,13 @@ class BaseQuantizeParallelLinear(torch.nn.Module, metaclass=ABCMeta):
             set_tensor_model_parallel_attributes(
                 tensor=self.scale, is_parallel=False, dim=0, stride=1, num_partitions=1,
             )
+            if activation_quantization_type == ActivationQuantizationType.STATIC:
+                self.input_scale = Parameter(torch.tensor([self.scale_dtype.get_default_scale()], device=self.weight.device, dtype=self.scale_dtype.value), requires_grad=False)
+                set_tensor_model_parallel_attributes(
+                    tensor=self.input_scale, is_parallel=False, dim=0, stride=1, num_partitions=1,
+                )
+                setattr(self.input_scale, "get_tensor_from_state_dict", BaseQuantizeParallelLinear.get_input_scale_from_state_dict)
+
         elif quantization_type in [QuantizationType.PER_CHANNEL_SYMMETRIC, QuantizationType.EXPERT_WISE_PER_CHANNEL_SYMMETRIC]:
             assert (
                 per_channel_axis is not None
@@ -321,6 +329,11 @@ class BaseQuantizeParallelLinear(torch.nn.Module, metaclass=ABCMeta):
     @staticmethod
     def get_scale_from_state_dict(prefix: str, state_dict: Dict[str, Any]) -> torch.Tensor:
         return QuantizedParallelLinearLayerStateDictAdaptor.get_scale_from_state_dict(
+            prefix=prefix, state_dict=state_dict
+        )
+    @staticmethod
+    def get_input_scale_from_state_dict(prefix: str, state_dict: Dict[str, Any]) -> torch.Tensor:
+        return QuantizedParallelLinearLayerStateDictAdaptor.get_input_scale_from_state_dict(
             prefix=prefix, state_dict=state_dict
         )
 
@@ -429,6 +442,25 @@ class QuantizedParallelLinearLayerStateDictAdaptor(object):
         else:
             raise RuntimeError(f"Cannot find {(prefix + 'scale')} in state_dict")
 
+    @staticmethod
+    def get_input_scale_from_state_dict(prefix: str, state_dict: Dict[str, Any]) -> torch.Tensor:
+        """Get scale value from state dict
+
+        Args:
+            prefix (str): layer prefix
+            state_dict (dict): model state dict from the checkpoint
+
+        Raises:
+            RuntimeError: if input_scale is not found
+
+        Returns:
+            torch.Tensor: input_scale tensor
+        """
+        if (prefix + "input_scale") in state_dict:
+            input_scale: torch.Tensor = state_dict[prefix + "input_scale"]
+            return input_scale
+        else:
+            raise RuntimeError(f"Cannot find {(prefix + 'input_scale')} in state_dict")
 
 class QuantizedColumnParallel(BaseQuantizeParallelLinear):
     """Quantized Linear layer with column parallelism.
@@ -549,6 +581,7 @@ class QuantizedColumnParallel(BaseQuantizeParallelLinear):
             per_channel_axis=quantization_per_channel_axis,
             block_axis=block_axis,
             block_size=block_size,
+            activation_quantization_type=self.activation_quantization_type
         )
         ##### Parallelism setup #####
         self._setup_for_parallelism(world_size=world_size)
@@ -608,10 +641,17 @@ class QuantizedColumnParallel(BaseQuantizeParallelLinear):
             )
 
         ## TODO: add a flow for static quantization once zhankuil@ is done
-        if self.activation_quantization_type == ActivationQuantizationType.DYNAMIC:
+        if self.activation_quantization_type != ActivationQuantizationType.NONE:
             # Matrix multiply.
             original_dtype = input_parallel.dtype
-            quantized_input, input_scale = quantize_fp8_per_channel(input_parallel, dtype=torch.float8_e4m3fn, channel_axis=1, clamp_bound=self.clamp_bound)
+            if self.activation_quantization_type == ActivationQuantizationType.DYNAMIC:
+                quantized_input, input_scale = quantize_fp8_per_channel(input_parallel, dtype=torch.float8_e4m3fn, channel_axis=1, clamp_bound=self.clamp_bound)
+            else:
+                assert self.quantization_type == QuantizationType.PER_TENSOR_SYMMETRIC, "Static Activation is only supported for PER TENSOR quantization type."
+                original_dtype = self.dequantized_dtype
+                quantized_input = quantize_static_quant_activations(input_parallel, self.input_scale, self.quantized_dtype.value)
+                input_scale = self.input_scale
+
             output_parallel = self._forward_impl(
                 input=quantized_input,
                 weight=self.weight,
@@ -767,6 +807,7 @@ class QuantizedRowParallel(BaseQuantizeParallelLinear):
         self.clamp_bound = clamp_bound
         self.input_size = input_size
         self.output_size = output_size
+        self.dtype = dtype
         self.input_is_parallel = input_is_parallel
         world_size = self.tensor_parallel_group.size()
         self.pad = pad
@@ -823,6 +864,7 @@ class QuantizedRowParallel(BaseQuantizeParallelLinear):
             per_channel_axis=quantization_per_channel_axis,
             block_axis=block_axis,
             block_size=block_size,
+            activation_quantization_type=self.activation_quantization_type,
         )
 
         self._forward_impl = linear_with_async_allreduce
@@ -863,11 +905,16 @@ class QuantizedRowParallel(BaseQuantizeParallelLinear):
                 input_, process_group=self.tensor_parallel_group,
             )
         # Matrix multiply.
-        if self.activation_quantization_type == ActivationQuantizationType.DYNAMIC:
-            original_dtype = input_parallel.dtype
-            #TODO: combine with zhankuil's implementation of static quantization for input
-            quantized_input, input_scale = quantize_fp8_per_channel(input_parallel, dtype=torch.float8_e4m3fn, channel_axis=1)
-
+        if self.activation_quantization_type != ActivationQuantizationType.NONE:
+            if self.activation_quantization_type == ActivationQuantizationType.DYNAMIC:
+                original_dtype = input_parallel.dtype
+                #TODO: combine with zhankuil's implementation of static quantization for input
+                quantized_input, input_scale = quantize_fp8_per_channel(input_parallel, dtype=torch.float8_e4m3fn, channel_axis=1)
+            else:
+                assert self.quantization_type == QuantizationType.PER_TENSOR_SYMMETRIC, "Only per-tensor symmetric quantization is supported for static activation quantization"
+                original_dtype = self.dequantized_dtype
+                quantized_input = quantize_static_quant_activations(input_parallel, self.input_scale, self.quantized_dtype.value)
+                input_scale = self.input_scale
 
             output_ = self._forward_impl(
                 input=quantized_input,
@@ -903,8 +950,6 @@ class QuantizedRowParallel(BaseQuantizeParallelLinear):
                 output_ = scale_dequantize(
                     tensor=output_, scale=self.scale.T, upcast_dtype=output_.dtype,
                 )
-
-
 
         if self.reduce_output:
             # All-reduce across all the partitions.

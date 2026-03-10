@@ -45,7 +45,7 @@ def modify_model_for_tensor_capture(model: nn.Module,
     registry.configure(enabled=True, modules=modules_to_capture, max_tensors=max_tensors, capture_inputs=capture_inputs)
     model_info = registry.model_info
 
-    def make_hook(module_name: str) -> Callable:
+    def make_hook(module_name: str, module) -> Callable:
         def hook(module: nn.Module, args: tuple, kwargs: dict, output: Any) -> None:
             # Get registry
             registry = TensorRegistry.get_instance()
@@ -53,7 +53,7 @@ def modify_model_for_tensor_capture(model: nn.Module,
             def register_tensor_object(prefix: str, obj: Any) -> None:
                 """Helper function to register tensors from various object types"""
                 if isinstance(obj, torch.Tensor):
-                    registry.register_tensor(prefix, obj)
+                    registry.register_tensor(prefix, obj, module)
                 elif isinstance(obj, tuple):
                     for i, item in enumerate(obj):
                         register_tensor_object(f"{prefix}.{i}", item)
@@ -86,7 +86,7 @@ def modify_model_for_tensor_capture(model: nn.Module,
     # Register forward hooks for targeted modules
     for name, module in dict(model.named_modules()).items():
         if name in modules_to_capture:
-            hook_handle = module.register_forward_hook(make_hook(name), with_kwargs=True)
+            hook_handle = module.register_forward_hook(make_hook(name, module), with_kwargs=True)
             model_info.hooks.append(hook_handle)
             logger.info(f"Registered forward hook for module {name} : {module} for tensor capture")
 

@@ -56,6 +56,7 @@ class BlockwiseMatmulConfig:
                  use_shard_on_intermediate_dynamic_while: bool,
                  use_shard_on_block_dynamic_while: bool,
                  num_static_blocks: int,
+                 pad_num_blocks_to_even: bool = False,
                  ):
         self.block_size = block_size
         self.logical_nc_config = logical_nc_config
@@ -71,6 +72,7 @@ class BlockwiseMatmulConfig:
         self.use_shard_on_intermediate_dynamic_while = use_shard_on_intermediate_dynamic_while
         self.use_shard_on_block_dynamic_while = use_shard_on_block_dynamic_while
         self.num_static_blocks = num_static_blocks
+        self.pad_num_blocks_to_even = pad_num_blocks_to_even
 
     #TODO: refactor this function
     @staticmethod
@@ -107,6 +109,7 @@ class BlockwiseMatmulConfig:
                 block_sharding_strategy = BlockShardStrategy.PING_PONG
             else:
                 raise ValueError(f"Unsupported block_sharding_strategy: {block_sharding_strategy}")
+        pad_num_blocks_to_even = kwargs.pop("pad_num_blocks_to_even", False)
 
         return BlockwiseMatmulConfig(block_size=block_size,
                                     use_block_parallel=use_block_parallel,
@@ -122,6 +125,7 @@ class BlockwiseMatmulConfig:
                                     use_shard_on_intermediate_dynamic_while=use_shard_on_intermediate_dynamic_while,
                                     use_shard_on_block_dynamic_while=use_shard_on_block_dynamic_while,
                                     num_static_blocks=num_static_blocks,
+                                    pad_num_blocks_to_even=pad_num_blocks_to_even,
                                     )
 
     @staticmethod
@@ -254,16 +258,16 @@ class RouterConfig:
     def __init__(
             self,
             act_fn: str = "softmax",
-            dtype: torch.dtype = torch.float32):
+            dtype: Optional[Union[torch.dtype, str]] = torch.float32):
         self.act_fn = act_fn
+        if isinstance(dtype, str):
+            dtype = to_torch_dtype(dtype)
         self.dtype = dtype
 
     @staticmethod
     def from_kwargs(**kwargs):
         act_fn = kwargs.pop("router_act_fn", "softmax")
         dtype = kwargs.pop("router_dtype", torch.float32)
-        if isinstance(dtype, str):
-            dtype = to_torch_dtype(dtype)
         return RouterConfig(act_fn=act_fn, dtype=dtype)
 
 class MoEFusedTKGConfig:
@@ -275,7 +279,8 @@ class MoEFusedTKGConfig:
         expert_mlp_kernel_enabled: Optional[bool] = None,
         shared_mlp_kernel_enabled: Optional[bool] = None,
         norm_topk_prob: bool = False, # Boolean to normalize top k expert affinities, defaults to no normalization
-        is_mxfp4_compute: Optional[bool] = None
+        is_mxfp4_compute: Optional[bool] = None,
+        router_mm_dtype: torch.dtype = torch.float32,
     ):
         self.quantized = quantized
         self.moe_fused_kernel_enabled = moe_fused_kernel_enabled
@@ -284,3 +289,4 @@ class MoEFusedTKGConfig:
         self.shared_mlp_kernel_enabled = shared_mlp_kernel_enabled
         self.norm_topk_prob = norm_topk_prob
         self.is_mxfp4_compute = is_mxfp4_compute
+        self.router_mm_dtype = router_mm_dtype

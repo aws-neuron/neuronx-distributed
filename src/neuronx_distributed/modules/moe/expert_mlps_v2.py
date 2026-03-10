@@ -719,6 +719,11 @@ class ExpertMLPsV2(torch.nn.Module):
         num_blocks = math.ceil((total_tokens * self.routed_experts_mlp_config.top_k - (local_experts - 1)) / self.blockwise_matmul_config.block_size) + local_experts - 1
         # Handle case where T*top_k is smaller than E. We will need atmost T*top_k blocks.
         num_blocks = min(num_blocks, total_tokens * self.routed_experts_mlp_config.top_k)
+        # Padding num_blocks to even (TODO: currently only for MXFP4 BWMM kernel to support dynamic while)
+
+        pad_num_blocks_to_even = self.blockwise_matmul_config.pad_num_blocks_to_even
+        if pad_num_blocks_to_even:
+            num_blocks += num_blocks % 2
 
         # Get num_static_block from blockwise_matmul_config, if not set, the default num_static_blocks will be computed as
         # NUM_STATIC_BLOCK = T * TopK / (EP_degree * B)
@@ -754,6 +759,7 @@ class ExpertMLPsV2(torch.nn.Module):
                 tensor_parallel_group=self.moe_tensor_model_parallel_group,
                 expert_parallel_group=self.moe_expert_model_parallel_group,
                 logical_nc_config=self.blockwise_matmul_config.logical_nc_config,
+                pad_num_blocks_to_even=pad_num_blocks_to_even
             )
         else:
             # expert_mask: (T, E). Still happens on all the experts, not just the local experts
@@ -823,6 +829,7 @@ class ExpertMLPsV2(torch.nn.Module):
                 tensor_parallel_group=self.moe_tensor_model_parallel_group,
                 optimized_block_to_token_mapping=ues_optimized_block_to_token_mapping,
                 parallelize_token_to_block_mapping=self.blockwise_matmul_config.parallelize_token_to_block_mapping,
+                pad_num_blocks_to_even=pad_num_blocks_to_even,
             )
 
         if self.blockwise_matmul_config.use_shard_on_block_dynamic_while:
@@ -1079,6 +1086,7 @@ class ExpertMLPsV2(torch.nn.Module):
         tensor_parallel_group: ProcessGroup,
         expert_parallel_group: ProcessGroup,
         logical_nc_config: int,
+        pad_num_blocks_to_even: bool = False,
     ):
         '''
         Equivalent function of get_blockwise_expert_and_token_mapping, but nstead of torch code,
@@ -1109,6 +1117,7 @@ class ExpertMLPsV2(torch.nn.Module):
         tp_rank = torch.remainder(global_rank, tp_size)
         ep_size = expert_parallel_group.size()
         ep_rank = global_rank // tp_size
+        max_chunk_size = 16384
 
         # Every EP rank needs the information about its local expert (`E_local` of those).
         E_local = E // ep_size
@@ -1123,7 +1132,7 @@ class ExpertMLPsV2(torch.nn.Module):
                 input_tensor=expert_affinities_masked.to(torch.float32),
                 row_start_id=ep_rank*E_kernel,
                 n_rows=E_kernel,
-                chunk_size = T,
+                chunk_size=min(T, max_chunk_size),
                 index_dtype=nl.int32,
             )
         else:
@@ -1136,7 +1145,7 @@ class ExpertMLPsV2(torch.nn.Module):
                 input_tensor=expert_affinities_masked.to(torch.float32),
                 row_start_id=global_rank*E_kernel,
                 n_rows=E_kernel,
-                chunk_size = T,
+                chunk_size=min(T, max_chunk_size),
                 index_dtype=nl.int32,
             )
             # Gather nonzero_counts: [E_kernel,] --> [E/EP,]
@@ -1146,6 +1155,13 @@ class ExpertMLPsV2(torch.nn.Module):
 
         # Get number of blocks and cumulative number of blocks per expert.
         blocks_per_expert = ((nonzero_counts + block_size - 1) // block_size).to(dtype=torch.long)  # (E_EP,)
+
+        # Calculate padding blocks needed and add to last expert
+        if pad_num_blocks_to_even:
+            total_needed_blocks = torch.sum(blocks_per_expert)
+            padding_blocks = num_blocks - total_needed_blocks
+            blocks_per_expert[-1] += padding_blocks
+
         blocks_per_expert_expanded = blocks_per_expert.unsqueeze(1)  # (E_EP, 1)
         cum_blocks_per_expert = cumsum(blocks_per_expert_expanded)  # (E_EP, 1)
         cum_blocks_per_expert[1:] = cum_blocks_per_expert[:-1]
@@ -1199,7 +1215,8 @@ class ExpertMLPsV2(torch.nn.Module):
         tensor_parallel_group,
         optimized_block_to_token_mapping=True,
         parallelize_token_to_block_mapping=False,
-        ):
+        pad_num_blocks_to_even=False,
+    ):
         """
         Token position: position in blocks.
         E.g. given block_size=2, num_token=6. The following expert_mask
@@ -1242,6 +1259,13 @@ class ExpertMLPsV2(torch.nn.Module):
         tokens_per_expert = torch.sum(expert_mask, dim=0)
         # blocks_per_expert: (E, )
         blocks_per_expert = ((tokens_per_expert + block_size - 1) // block_size).to(dtype=torch.long)
+
+        # Calculate padding blocks needed and add to last expert
+        if pad_num_blocks_to_even:
+            total_needed_blocks = torch.sum(blocks_per_expert)
+            padding_blocks = num_blocks - total_needed_blocks
+            blocks_per_expert[-1] += padding_blocks
+
         # block_to_expert: (N, ). Block id to expert id mapping.
         # The simplest way to do this is to use repeat_interleave after padding blocks_per_expert with unassigned blocks.
         # But this op is not lowered to xla with vector 'repeats', so we use the equivalent implementation below.
