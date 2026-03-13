@@ -152,35 +152,9 @@ class MoE(torch.nn.Module):
             self.moe_fused_tkg.eval()
 
     def _forward_compute_bound(self, hidden_states, padding_mask=None):
-        """Forward pass of the MoE layer.
-
-        Common nomenclature:
-            S: Sequence length, B: Batch size, H: Hidden Size
-            S': Sequence length (when the input is in SP)
-            T: Tokens = S * B (token dimension obtained by flattening S and B)
-
-        Layout of input hidden_states:
-            - In the training flow,
-                With SP enabled  : (S', B, H)
-                With SP disabled : (B, S, H)
-            - In the inference flow,
-                With SP enabled  : (B, S', H)
-                With SP disabled : (B, S, H)
-
-        Arguments:
-            hidden_states: Input tensor (of shape as described above)
-            padding_mask: (Optional) Padding mask for the input tokens. If passed in will mask out 
-                            expert affinities mask and expert mask for the padded tokens.
-
-        Returns:
-            output: Output tensor of the same shape as hidden_states, containing the output of the MoE layer.
-            bias: (Optional) Returned if expert_mlps.return_bias is True. Currently bias is not supported for the MoE layer.
-            router_logits: (Optional) Tensor of shape (T, E) containing the router logits for each token.
-                                      Returned if self.return_router_logits is True.
-            expert_index: (Optional) Tensor of shape (T, E) containing the experts assigned to each token.
-                                     Returned if self.return_expert_index is True.
         """
-
+        MoE forward pass for compute-bound workloads. Compute-bound workloads are almost always context encoding workloads.
+        """
         if self.rmsnorm is not None:
             hidden_states = self.rmsnorm(hidden_states)
 
@@ -283,11 +257,50 @@ class MoE(torch.nn.Module):
             return_op += (expert_index,)
         return return_op
 
-    def forward(self, hidden_states, padding_mask=None, is_speculative_decoding=False):
+    def forward(self, hidden_states, padding_mask=None, is_speculative_decoding=False, residual=None):
+        """
+        Forward pass of the MoE layer.
+
+        Common nomenclature:
+            S: Sequence length, B: Batch size, H: Hidden Size
+            S': Sequence length (when the input is in SP)
+            T: Tokens = S * B (token dimension obtained by flattening S and B)
+
+        Layout of input hidden_states:
+            - In the training flow,
+                With SP enabled  : (S', B, H)
+                With SP disabled : (B, S, H)
+            - In the inference flow,
+                With SP enabled  : (B, S', H)
+                With SP disabled : (B, S, H)
+
+        Arguments:
+            hidden_states: Input tensor (of shape as described above).
+            padding_mask: (Optional) Padding mask for the input tokens. If passed in will mask out 
+                            expert affinities mask and expert mask for the padded tokens.
+            is_speculative_decoding: (Optional) Indicates whether the current forward pass is using speculative decoding.
+            residual: (Optional) Residual tensor same layout as hidden_states.
+
+        Returns:
+            output: Output tensor of the same shape as hidden_states, containing the output of the MoE layer.
+            bias: (Optional) Returned if expert_mlps.return_bias is True. Currently bias is not supported for the MoE layer.
+            router_logits: (Optional) Tensor of shape (T, E) containing the router logits for each token.
+                                      Returned if self.return_router_logits is True.
+            expert_index: (Optional) Tensor of shape (T, E) containing the experts assigned to each token.
+                                     Returned if self.return_expert_index is True.
+            residual: (Optional) Tensor of same shape as hidden_states, containing the residual connection from the beginning of the MoE layer. 
+        """
         seq_len = hidden_states.shape[self.sequence_dimension]
         if (seq_len == 1 or is_speculative_decoding) and self.moe_fused_tkg is not None:  # spec decode and normal tkg will use the fused kernel
-            return self.moe_fused_tkg(hidden_states)
-        return self._forward_compute_bound(hidden_states, padding_mask)
+            return self.moe_fused_tkg(hidden_states, residual=residual)
+        else:
+            # Fused residual add is not supported in _forward_compute_bound, so compute it in torch here.
+            if residual is not None:
+                hidden_states = hidden_states + residual
+                residual = hidden_states.clone()
+                return self._forward_compute_bound(hidden_states, padding_mask) + (residual,)
+            else:
+                return self._forward_compute_bound(hidden_states, padding_mask)
 
     def _apply_shared_experts(self, output, full_hidden_states, hidden_states, hidden_states_shape, seq_len):
         """

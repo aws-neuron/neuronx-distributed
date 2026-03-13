@@ -108,7 +108,7 @@ class TestBaseQuantizeParallelLinear(unittest.TestCase):
         with self.assertRaises(AssertionError) as context:
             BaseQuantizeParallelLinear(quantization_type="something")
         self.assertTrue(
-            "something quantization is not supported currently. Specify from [['per_tensor_symmetric', 'per_channel_symmetric', 'blockwise_symmetric', 'expert_wise_per_channel_symmetric']]"
+            "something quantization is not supported currently."
             in str(context.exception)
         )
 

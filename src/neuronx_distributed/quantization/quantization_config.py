@@ -24,6 +24,9 @@ class DtypeBound(Enum):
     if torch.__version__ >= '2.1':
         F8E4M3_MAX = 240.0
         F8E4M3_MIN = -240.0
+        
+        INT8_MAX = 127
+        INT8_MIN = -128
 
         F8E4M3FN_MAX = torch.finfo(torch.float8_e4m3fn).max
         F8E4M3FN_MIN = torch.finfo(torch.float8_e4m3fn).min
@@ -37,6 +40,12 @@ class DtypeBound(Enum):
         F8E8M0_MAX = 2.0 ** (255.0 - 127.0)
         F8E8M0_MIN = 2.0 ** (-127.0)
 
+        BFLOAT16_MAX = torch.finfo(torch.bfloat16).max
+        BFLOAT16_MIN = torch.finfo(torch.bfloat16).min
+        
+        FLOAT16_MAX = torch.finfo(torch.float16).max
+        FLOAT16_MIN = torch.finfo(torch.float16).min
+
     @staticmethod
     def from_torch_dtype(dtype):
         """Map PyTorch data type to the corresponding DtypeBound."""
@@ -44,19 +53,37 @@ class DtypeBound(Enum):
             return (DtypeBound.F8E4M3_MAX.value, DtypeBound.F8E4M3_MIN.value)
         elif dtype == torch.float8_e5m2:
             return (DtypeBound.F8E5M2_MAX.value, DtypeBound.F8E5M2_MIN.value)
+        elif dtype == torch.int8:
+            return (DtypeBound.INT8_MAX.value, DtypeBound.INT8_MIN.value)
+        elif dtype == torch.bfloat16:
+            return (DtypeBound.BFLOAT16_MAX.value, DtypeBound.BFLOAT16_MIN.value)
+        elif dtype == torch.float16:
+            return (DtypeBound.FLOAT16_MAX.value, DtypeBound.FLOAT16_MIN.value)
         else:
             raise ValueError(f"Unsupported dtype: {dtype}")
 
 class QuantizationType(Enum, metaclass=MyEnumMeta):
     PER_TENSOR_SYMMETRIC = "per_tensor_symmetric"
     PER_CHANNEL_SYMMETRIC = "per_channel_symmetric"
+    PER_KEY_SYMMETRIC = "per_key_symmetric"
     BLOCKWISE_SYMMETRIC = "blockwise_symmetric"
     EXPERT_WISE_PER_CHANNEL_SYMMETRIC = "expert_wise_per_channel_symmetric"
 
+class KVQuantizationConfig:
+    def __init__(self, **kwargs):
+        self.k_quant_method = kwargs.pop("k_quant_method", QuantizationType.PER_TENSOR_SYMMETRIC)
+        self.v_quant_method = kwargs.pop("v_quant_method", QuantizationType.PER_TENSOR_SYMMETRIC)
+        self.quant_dtype = kwargs.pop("quant_dtype", torch.float8_e4m3fn)
+        self.direct_cast = kwargs.pop("direct_cast", True)
+
+        if self.direct_cast:
+            assert self.k_quant_method == QuantizationType.PER_TENSOR_SYMMETRIC and self.v_quant_method == QuantizationType.PER_TENSOR_SYMMETRIC, "When using direct cast both K and V quantization strategies must be PER_TENSOR_SYMMETRIC" 
+
+
 class ActivationQuantizationType(Enum, metaclass=MyEnumMeta):
     DYNAMIC = "dynamic"
+    STATIC = "static"
     NONE = None
-
 
 def get_float4x4_torch_dtype():
     """
@@ -139,7 +166,6 @@ class PER_CHANNEL_QCONFIG_DICT_TYPE(BASE_QCONFIG_DICT_TYPE):
 class EXPERT_WISE_PER_CHANNEL_QCONFIG_DICT_TYPE(BASE_QCONFIG_DICT_TYPE):
     quantization_per_channel_axis: Optional[int]
 
-
 class BLOCKWISE_QCONFIG_DICT_TYPE(BASE_QCONFIG_DICT_TYPE):
     block_axis: Optional[List[int]]
     block_size: Optional[List[int]]
@@ -200,7 +226,6 @@ def get_default_per_channel_custom_qconfig_dict() -> PER_CHANNEL_QCONFIG_DICT_TY
 def get_default_blockwise_custom_qconfig_dict() -> BLOCKWISE_QCONFIG_DICT_TYPE:
     """Defines the default blockwise config dict"""
     return BLOCKWISE_QCONFIG_DICT_TYPE(**_DEFAULT_BLOCKWISE_QCONFIG_DICT)
-
 
 def get_default_expert_wise_per_channel_custom_qconfig_dict() -> EXPERT_WISE_PER_CHANNEL_QCONFIG_DICT_TYPE:
     """

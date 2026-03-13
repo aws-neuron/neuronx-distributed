@@ -1,4 +1,5 @@
 import torch
+import torch_xla.core.xla_model as xm
 from torch_neuronx.xla_impl.ops import TopK
 from torch_neuronx.utils import get_platform_target
 
@@ -22,17 +23,60 @@ def _is_nki_topk_available():
     hardware_type = hardware(get_platform_target())
     return hardware_type == hardware.TRN2 or hardware_type == hardware.TRN3
 
-def _nki_topk_wrapper(tensor, k, dim):
+def _get_topk_wrappers(topk_implementation, lnc):
     """
-    There are three per-shard topk implementations:
-    1. neuronxcc.nki._pre_prod_kernels.topk import topk (this method is a wrapper over this variant)
-    2. torch_neuronx.xla_impl.ops.TopK
-    3. neuronx_distributed.kernels.topk.topk_rotated
+    Returns two wrapper functions for topk implementation:
+    1. topk_without_sorted: calls topk with sorting disabled (if supported)
+    2. topk_with_sorted: calls topk with sorting enabled
+    
+    Args:
+        topk_implementation: The topk implementation to wrap
+        
+    Returns:
+        tuple: (topk_without_sorted_func, topk_with_sorted_func)
+    """
+    
+    # Detect implementation type once
+    func_name = getattr(topk_implementation, 'func_name', None)
+    is_topk_rotated = func_name == getattr(topk_rotated, 'func_name', None)
+    is_nki_topk = func_name == getattr(nki_topk, 'func_name', None)
+    
+    def create_wrapper(sorted_output):
+        """Factory to create topk wrapper with specified sorting behavior"""
+        def wrapper(tensor, k, dim):
+            if is_topk_rotated:
+                return topk_implementation[(lnc,)](tensor, k, dim=dim, sorted=sorted_output)
+            elif is_nki_topk:
+                # FIXME: sorted=False gives error, need to fix it in kernel
+                return topk_implementation[(lnc,)](tensor, k, sorted=True)
+            else:
+                return topk_implementation(tensor, k, dim=dim)
+        
+        return wrapper
+    
+    return create_wrapper(False), create_wrapper(True)
 
-    (2) and (3) take a dim parameter whereas (1) does not.
-    This wrapper function helps us to invoke all the above implementations with a common interface.
-    """
-    return nki_topk(tensor, k)
+
+def get_topk_implementation(use_topk_rotated_kernel=False, lnc=2, dim=-1, tensor=None, stages=1):
+    hardware_type = hardware(get_platform_target())
+    is_trn1 = hardware_type == hardware.TRN1
+    lnc = lnc if is_trn1 else nl.nc(lnc)
+    if use_topk_rotated_kernel:
+        topk_implementation = topk_rotated
+        assert stages == 1, "stages other than 1 is not supported when using topk_rotated kernel"
+    else:
+        # check if nki topk kernel is available, if so, always prefer 1 stage (k%8==0 will be removed after kernel update)
+        can_use_nki_topk = dim in (-1, len(tensor.shape) - 1) and _is_nki_topk_available()
+        if can_use_nki_topk:
+            stages = 1
+            topk_implementation = nki_topk
+        else:
+            topk_implementation = TopK.apply
+
+    topk_implementation, call_topk_kernel_with_sorted_parameter = _get_topk_wrappers(topk_implementation, lnc)
+
+    return topk_implementation, call_topk_kernel_with_sorted_parameter, stages
+
 
 def topk(tensor, k, dim, gather_dim, process_group=None, stages=1, rank_id=None, use_topk_rotated_kernel=False, lnc=2):
     """
@@ -78,35 +122,7 @@ def topk(tensor, k, dim, gather_dim, process_group=None, stages=1, rank_id=None,
     is_trn1 = hardware_type == hardware.TRN1
     is_trn2_or_trn3 = (hardware_type == hardware.TRN2 or hardware_type == hardware.TRN3)
 
-    if use_topk_rotated_kernel:
-        lnc = lnc if is_trn1 else nl.nc(lnc)
-        topk_implementation = topk_rotated[(lnc,)]
-        assert stages == 1, "stages other than 1 is not supported when using topk_rotated kernel"
-    else:
-        # check if nki topk kernel is available, if so, always prefer 1 stage (k%8==0 will be removed after kernel update)
-        can_use_nki_topk = dim in (-1, len(tensor.shape) - 1) and _is_nki_topk_available()
-        if can_use_nki_topk:
-            stages = 1
-            topk_implementation = _nki_topk_wrapper
-        else:
-            topk_implementation = TopK.apply
-
-    def call_topk_kernel_with_sorted_parameter(tensor, k, dim):
-        """
-        There are three possible choices for per-shard topk implementations:
-        1. neuronxcc.nki._pre_prod_kernels.topk import topk
-        2. torch_neuronx.xla_impl.ops.TopK
-        3. neuronx_distributed.kernels.topk.topk_rotated
-
-        The first two sort the output by default, while the third one offers a parameter to do it.
-        With the third one, we want to use sorted=True only for the last call.
-        This function is a special wrapper to make that last call uniformly within the higher function.
-        For all intermediate calls, the default behavior of the topk_implementation is fine.
-        """
-        if hasattr(topk_implementation, 'func_name') and topk_implementation.func_name == topk_rotated.func_name:
-            return topk_implementation(tensor, k, dim=dim, sorted=True)
-        else:
-            return topk_implementation(tensor, k, dim=dim)
+    topk_implementation, call_topk_kernel_with_sorted_parameter, stages = get_topk_implementation(use_topk_rotated_kernel, lnc, dim, tensor, stages)
 
     if stages > 1:
         if is_trn2_or_trn3:
@@ -144,7 +160,10 @@ def topk(tensor, k, dim, gather_dim, process_group=None, stages=1, rank_id=None,
     num_dims = len(tensor.shape)
 
     # find local rank max value and index
-    local_value, local_index = topk_implementation(tensor, k, dim=dim)
+    local_k = k
+    if gather_dim == dim:
+        local_k = min(k, sharded_size)
+    local_value, local_index = topk_implementation(tensor, local_k, dim=dim)
 
     if stages > 1:
         if gather_dim == dim:
@@ -172,7 +191,7 @@ def topk(tensor, k, dim, gather_dim, process_group=None, stages=1, rank_id=None,
     if gather_dim == dim:
         full_size = sharded_size * tp_degree
         offset = torch.arange(0, full_size, sharded_size)
-        offset = offset.repeat_interleave(k)
+        offset = offset.repeat_interleave(local_k)
         offset = offset.view([1 if i != dim else -1 for i in range(num_dims)])
         corrected_global_indices = global_indices + offset
     else:

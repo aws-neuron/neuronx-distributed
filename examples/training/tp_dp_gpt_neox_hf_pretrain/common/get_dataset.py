@@ -4,7 +4,7 @@ from itertools import chain
 from datasets import load_dataset
 from transformers import AutoTokenizer
 
-dataset_name = "wikicorpus"
+dataset_name = "gboleda/wikicorpus"
 dataset_config_name = "raw_en"
 save_path = "~/examples_datasets/wikicorpus_gpt_neox_tokenized_2k"
 

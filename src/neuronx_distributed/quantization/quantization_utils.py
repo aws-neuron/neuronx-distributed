@@ -74,6 +74,20 @@ def extract_q_scale(q_tensor: torch.Tensor) -> torch.Tensor:
     else:
         raise ValueError(f"qscheme: {q_tensor.qscheme()} is not supported")
 
+def quantize_static_quant_activations(input: torch.Tensor, input_scale: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """Quantize the input tensor with the given scale and dtype
+
+    Args:
+        input (torch.Tensor): Input tensor to quantize
+        input_scale (torch.Tensor): Input scale
+        dtype (torch.dtype): Target dtype
+
+    Returns:
+        torch.Tensor: Quantized tensor
+    """
+    q_max, q_min = DtypeBound.from_torch_dtype(dtype)
+    input = (input / input_scale).clamp(q_min, q_max)
+    return input.round().to(dtype) if dtype == torch.int8 else input.to(dtype)
 
 def convert_qint8_to_int8_state_dict(state_dict: Dict[str, Any]) -> None:
     """A utility function to convert a qint8 type state dict to int8 type state dict.

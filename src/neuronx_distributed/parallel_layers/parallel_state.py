@@ -201,15 +201,23 @@ def ascending_descending_ring_PG_group(lnc_size: int, cluster_ranks_nonexp: torc
     world_size: int = torch.distributed.get_world_size()
 
     nodes = world_size//total_ranks_per_node
-    
+    num_tp_groups_per_node = total_ranks_per_node//tp
     tp_groups=[]
     for node in range(nodes):
         node_skip_val = node * total_ranks_per_node # temp variable to jump all ranks in n nodes
-        tp_groups.append([i for i in range(ranks_start[0] + node_skip_val, ranks_end[0] + node_skip_val)]+
-                                               [i for i in range(ranks_start[3] + node_skip_val, ranks_end[3] + node_skip_val)]) # first row and last row are one group in Logic2
-        tp_groups.append([i for i in range(ranks_start[1] + node_skip_val, ranks_end[1] + node_skip_val)]+
-                                               [i for i in range(ranks_start[2] + node_skip_val, ranks_end[2] + node_skip_val)]) # second and third row are one group in Logic2
-    
+        first_and_last_rows_tp_group = ([i for i in range(ranks_start[0] + node_skip_val, ranks_end[0] + node_skip_val)]+
+                    [i for i in range(ranks_start[3] + node_skip_val, ranks_end[3] + node_skip_val)])
+
+        sec_and_third_rows_tp_group = ([i for i in range(ranks_start[1] + node_skip_val, ranks_end[1] + node_skip_val)]+
+                    [i for i in range(ranks_start[2] + node_skip_val, ranks_end[2] + node_skip_val)])
+
+        if num_tp_groups_per_node == 1: # need to combine all 4 rows into one TP group per node
+            first_and_last_rows_tp_group.extend(sec_and_third_rows_tp_group)
+            tp_groups.append(first_and_last_rows_tp_group)
+        else:
+            tp_groups.append(first_and_last_rows_tp_group) # first row and last row are one group in Logic2
+            tp_groups.append(sec_and_third_rows_tp_group) # second and third row are one group in Logic2
+
     assert len(tp_groups)==(world_size//tp)
     
     def merge_groups(chunk, prev_parallel_degree):
@@ -597,7 +605,7 @@ def initialize_model_parallel(
         if expert_model_parallel_size > 1:
             raise NotImplementedError("TP=4 case not yet implemented for expert parallelism")
 
-        local_world_size = int(os.environ["LOCAL_WORLD_SIZE"])
+        local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", world_size))
         num_local_ranks = local_world_size // tensor_model_parallel_size
         cluster_ranks = torch.arange(0, world_size).reshape(
             pipeline_model_parallel_size, data_parallel_size // num_local_ranks, context_parallel_size, tensor_model_parallel_size, num_local_ranks

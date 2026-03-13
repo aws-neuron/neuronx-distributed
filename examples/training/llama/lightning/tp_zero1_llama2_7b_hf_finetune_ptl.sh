@@ -92,9 +92,6 @@ elif [ -v OMPI_COMM_WORLD_RANK ]; then
     export CCOM_SOCKET_IFNAME=eth0
     export FI_EFA_FORK_SAFE=1
 
-    # Dataset is in shared location (Don't know where the s3 bucket for this artifact is to onboard to Kaizen)
-    #DATA_PATH="$SHARED_PATH_PREFIX/examples_datasets/databricks-dolly-15k"
-
     # Store metrics in shared location
     METRICS_FILE=$ARTIFACT_PATH/results.json
     mkdir -p $ARTIFACT_PATH

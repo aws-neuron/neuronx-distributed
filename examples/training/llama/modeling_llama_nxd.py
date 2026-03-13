@@ -822,9 +822,12 @@ class LlamaForCausalLM(LlamaForCausalLMHF):
             shift_labels = shift_labels.view(-1)
             # Enable model parallelism
             shift_labels = shift_labels.to(shift_logits.device)
-            loss = loss_fct(shift_logits, shift_labels)
+            per_token_loss = loss_fct(shift_logits, shift_labels)
+            valid_mask = (shift_labels != -100).float()
+            per_token_loss = per_token_loss * valid_mask
 
-            loss = torch.mean(loss)
+            denom = valid_mask.sum().clamp_min(1.0)
+            loss = per_token_loss.sum() / denom
 
         if not return_dict:
             output = (logits,) + outputs[1:]
