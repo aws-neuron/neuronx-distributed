@@ -1,5 +1,5 @@
 import pytest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
 import torch
 from neuronx_distributed.modules.moe.moe_fused_tkg_mx import MoEFusedTKGMX
@@ -75,56 +75,24 @@ def test_should_use_all_expert_at_threshold(mock_moe_mx_module):
     result = mock_moe_mx_module._should_use_all_expert(hidden_states)
     assert result
 
-@patch('neuronx_distributed.modules.moe.moe_fused_tkg_mx.import_module')
-def test_can_use_fused_residual_add_with_support(mock_import, mock_moe_mx_module):
-    mock_mod = Mock()
-    mock_mod.MOE_ALL_EXPERTS_FUSED_RESIDUAL_SUPPORT = True
-    mock_import.return_value = mock_mod
-    
+def test_can_use_fused_residual_add_above_threshold(mock_moe_mx_module):
     hidden_states = torch.randn(32, 32, 512)
-    result = mock_moe_mx_module._can_use_fused_residual_add(hidden_states)
-    assert result
+    assert mock_moe_mx_module._can_use_fused_residual_add(hidden_states)
 
-@patch('neuronx_distributed.modules.moe.moe_fused_tkg_mx.import_module')
-def test_can_use_fused_residual_add_without_support(mock_import, mock_moe_mx_module):
-    mock_mod = Mock()
-    mock_mod.MOE_ALL_EXPERTS_FUSED_RESIDUAL_SUPPORT = False
-    mock_import.return_value = mock_mod
-    
-    hidden_states = torch.randn(32, 32, 512)
-    result = mock_moe_mx_module._can_use_fused_residual_add(hidden_states)
-    assert not result
-
-@patch('neuronx_distributed.modules.moe.moe_fused_tkg_mx.import_module')
-def test_can_use_fused_residual_add_constant_missing(mock_import, mock_moe_mx_module):
-    mock_mod = Mock(spec=[])
-    mock_import.return_value = mock_mod
-    
-    hidden_states = torch.randn(32, 32, 512)
-    result = mock_moe_mx_module._can_use_fused_residual_add(hidden_states)
-    assert not result
-
-@patch('neuronx_distributed.modules.moe.moe_fused_tkg_mx.import_module')
-def test_can_use_fused_residual_add_below_threshold(mock_import, mock_moe_mx_module):
-    mock_mod = Mock()
-    mock_mod.MOE_ALL_EXPERTS_FUSED_RESIDUAL_SUPPORT = True
-    mock_import.return_value = mock_mod
-    
+def test_can_use_fused_residual_add_below_batch_threshold(mock_moe_mx_module):
+    # batch_x_seq = 1 < 256, fails batch threshold
     hidden_states = torch.randn(1, 1, 512)
-    result = mock_moe_mx_module._can_use_fused_residual_add(hidden_states)
-    assert not result
+    assert not mock_moe_mx_module._can_use_fused_residual_add(hidden_states)
 
-@patch('neuronx_distributed.modules.moe.moe_fused_tkg_mx.import_module')
-def test_can_use_fused_residual_add_requires_both_conditions(mock_import, mock_moe_mx_module):
-    mock_mod = Mock()
-    mock_mod.MOE_ALL_EXPERTS_FUSED_RESIDUAL_SUPPORT = True
-    mock_import.return_value = mock_mod
-    
-    hidden_states_above = torch.randn(32, 32, 512)
-    assert mock_moe_mx_module._can_use_fused_residual_add(hidden_states_above)
-    
-    hidden_states_below = torch.randn(1, 1, 512)
-    assert not mock_moe_mx_module._can_use_fused_residual_add(hidden_states_below)
+def test_can_use_fused_residual_add_at_batch_boundary(mock_moe_mx_module):
+    # batch_x_seq = 16 * 16 = 256, exactly at threshold
+    hidden_states = torch.randn(16, 16, 512)
+    assert mock_moe_mx_module._can_use_fused_residual_add(hidden_states)
+
+def test_can_use_fused_residual_add_just_below_batch_boundary(mock_moe_mx_module):
+    # batch_x_seq = 15 * 17 = 255, just below 256 threshold
+    hidden_states = torch.randn(15, 17, 512)
+    assert not mock_moe_mx_module._can_use_fused_residual_add(hidden_states)
 
 if __name__ == "__main__":
     pytest.main([__file__, '-v'])

@@ -2,7 +2,7 @@ import pytest
 from unittest.mock import Mock, patch
 
 import torch
-import neuronxcc.nki.language as nl
+import nki.language as nl
 
 from neuronx_distributed.modules.moe.moe_fused_tkg import MoEFusedTKG, _convert_torch_dtype_to_nki_dtype
 

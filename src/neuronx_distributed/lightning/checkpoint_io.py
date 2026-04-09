@@ -1,6 +1,8 @@
 import os
 from typing import Any, Dict, Optional
 
+import torch_xla.core.xla_model as xm
+
 from lightning.fabric.plugins.io import XLACheckpointIO 
 from lightning.fabric.utilities.cloud_io import get_filesystem 
 from lightning.fabric.utilities.types import _PATH 
@@ -27,6 +29,11 @@ class NeuronCheckpointIO(XLACheckpointIO):
             master_dp_only=master_dp_only,
             weights_only=self.weights_only,
         )
+    
+    def remove_checkpoint(self, path: _PATH) -> None:
+        if xm.get_ordinal() == 0:
+            super().remove_checkpoint(path)
+        xm.rendezvous('Deleting checkpoint')
 
     def save_checkpoint(
         self,

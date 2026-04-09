@@ -1,5 +1,5 @@
 import math
-from typing import Optional, Any, Dict, Tuple, List
+from typing import Optional, Any, Dict
 
 import torch
 import torch.nn.functional as F
@@ -17,13 +17,12 @@ from neuronx_distributed.modules.moe.model_utils import (
 from neuronx_distributed.modules.moe.blockwise import (
     BlockwiseMatmulNKIFunc,
     can_use_blockwise_matmul_nki,
-    TorchBlockwiseTraining,
     ExpertAffinityScaleMode,
     SkipMode
 )
 from neuronx_distributed.modules.moe.moe_configs import RoutedExpertsMLPOpsConfig, BlockwiseMatmulConfig
 from neuronx_distributed.parallel_layers import mappings
-from neuronx_distributed.parallel_layers import parallel_state, comm
+from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.parallel_layers.layers import SPMDRank
 from neuronx_distributed.utils.tensor_utils import cumsum
 from neuronx_distributed.parallel_layers.parallel_state import (
@@ -38,9 +37,9 @@ from neuronx_distributed.modules.moe.moe_process_group import (
     get_moe_tp_ep_group,
     get_moe_ep_group,
 )
-import neuronxcc.nki.language as nl
-from neuronx_distributed.kernels.find_nonzero_indices import find_nonzero_indices
-from neuronx_distributed.kernels.indexed_flatten import indexed_flatten
+import nki.language as nl
+from nkilib.core.subkernels.find_nonzero_indices import find_nonzero_indices
+from nkilib.core.subkernels.indexed_flatten import indexed_flatten
 
 logger = get_logger()
 
@@ -1126,12 +1125,13 @@ class ExpertMLPsV2(torch.nn.Module):
             logger.warning(f"Replicating index calc kernel on TP ranks, because {E_local=} is not divisible by {tp_size=}.")
             E_kernel = E_local
             # Process E_local by setting:
-            #  - `row_start_id` to the start of the expert on this EP rank.
-            #  - `n_rows` to the number of experts on this EP rank.
-            indices, nonzero_counts = find_nonzero_indices[nl.nc(logical_nc_config)](
+            #  - `col_start_id` to the start of the expert on this EP rank.
+            #  - `n_cols` to the number of experts on this EP rank.
+            col_start_id = (ep_rank * E_kernel).to(torch.int32).reshape(1)
+            indices, nonzero_counts = find_nonzero_indices[logical_nc_config](
                 input_tensor=expert_affinities_masked.to(torch.float32),
-                row_start_id=ep_rank*E_kernel,
-                n_rows=E_kernel,
+                col_start_id=col_start_id,
+                n_cols=E_kernel,
                 chunk_size=min(T, max_chunk_size),
                 index_dtype=nl.int32,
             )
@@ -1139,15 +1139,17 @@ class ExpertMLPsV2(torch.nn.Module):
             # Shard index calc kernel further along expert dimension in the TP group.
             # i.e. the index calc is sharded globally in EP.
             E_kernel = E_local // tp_size
-            # TP ranks shards the processing of E_local by starting at different `row_start_id`,
+            # TP ranks shards the processing of E_local by starting at different `col_start_id`,
             # and calculating fewer experts `E_kernel`.
-            indices, nonzero_counts = find_nonzero_indices[nl.nc(logical_nc_config)](
+            col_start_id = (global_rank * E_kernel).to(torch.int32).reshape(1)
+            indices, nonzero_counts = find_nonzero_indices[logical_nc_config](
                 input_tensor=expert_affinities_masked.to(torch.float32),
-                row_start_id=global_rank*E_kernel,
-                n_rows=E_kernel,
+                col_start_id=col_start_id,
+                n_cols=E_kernel,
                 chunk_size=min(T, max_chunk_size),
                 index_dtype=nl.int32,
             )
+ 
             # Gather nonzero_counts: [E_kernel,] --> [E/EP,]
             nonzero_counts = mappings.gather_from_tensor_model_parallel_region(
                 nonzero_counts, process_group=tensor_parallel_group,
@@ -1173,7 +1175,7 @@ class ExpertMLPsV2(torch.nn.Module):
         row_offsets = cum_blocks_per_expert * (block_size // f_len)
         if E_local % tp_size != 0:
             # [E/EP, T] --> [num_blocks * block_size,]
-            token_position_to_id_padded = indexed_flatten[nl.nc(logical_nc_config)](
+            token_position_to_id_padded = indexed_flatten[logical_nc_config](
                 input_tensor = indices,
                 f_len = f_len,
                 output_len=num_blocks*block_size + T,
@@ -1183,7 +1185,7 @@ class ExpertMLPsV2(torch.nn.Module):
             token_position_to_id = token_position_to_id_padded[:num_blocks * block_size]
         else:
             # [E/(EP*TP), T] --> [num_blocks * block_size,]
-            token_position_to_id_padded = indexed_flatten[nl.nc(logical_nc_config)](
+            token_position_to_id_padded = indexed_flatten[logical_nc_config](
                 input_tensor = indices,
                 f_len = f_len,
                 output_len=num_blocks*block_size + T,
@@ -1196,8 +1198,8 @@ class ExpertMLPsV2(torch.nn.Module):
             )
 
         # Get the block to expert mapping.
-        block_ids = torch.arange(num_blocks, device=device, dtype=torch.long)  # (N, )
-        block_to_expert = torch.sum(block_ids.unsqueeze(0) >= cum_blocks_per_expert[1:], dim=0).to(torch.long)  # (N, )
+        block_ids = torch.arange(num_blocks, device=device, dtype=torch.int32)  # (N, )
+        block_to_expert = torch.sum(block_ids.unsqueeze(0) >= cum_blocks_per_expert[1:], dim=0).to(torch.int32)  # (N, )
 
         return block_to_expert, token_position_to_id
 
@@ -1581,4 +1583,3 @@ def can_use_find_index_kernel(
         return False
 
     return True
-

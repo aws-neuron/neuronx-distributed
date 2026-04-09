@@ -21,7 +21,6 @@ from .mappings import (
     gather_from_tensor_model_parallel_region_with_dim,
     reduce_from_tensor_model_parallel_region,
     reduce_scatter_to_sequence_parallel_region,
-    reduce_scatter_to_sequence_parallel_region_tiled,
     scatter_input_channels_to_tensor_model_parallel_region,
     scatter_to_tensor_model_parallel_region,
 )
@@ -1034,14 +1033,9 @@ class RowParallelLinear(BaseParallelLinear):
             output_ = output_.to(self.reduce_dtype)
 
             if self.sequence_parallel_enabled:
-                if self.tile_cc:
-                    output_ = reduce_scatter_to_sequence_parallel_region_tiled(
-                        output_, self.sequence_dimension, process_group=self.tensor_parallel_group,
-                    )
-                else:
-                    output_ = reduce_scatter_to_sequence_parallel_region(
-                        output_, self.sequence_dimension, process_group=self.tensor_parallel_group, dtype=original_dtype,
-                    )
+                output_ = reduce_scatter_to_sequence_parallel_region(
+                    output_, self.sequence_dimension, process_group=self.tensor_parallel_group, dtype=original_dtype,
+                )
 
             else:
                 output_ = reduce_from_tensor_model_parallel_region(

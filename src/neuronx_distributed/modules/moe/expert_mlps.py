@@ -1,7 +1,7 @@
 from typing import Union, Optional, Callable, Any, List
 
 import torch
-from neuronxcc.nki._private_kernels.blockwise_mm import BlockShardStrategy
+from nkilib.core.moe.moe_cte.moe_cte_utils import BlockShardStrategy
 from torch.distributed import ProcessGroup
 
 from neuronx_distributed.modules.moe.experts import GLUType

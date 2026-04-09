@@ -2,7 +2,7 @@ import importlib
 import torch
 from typing import Union, Optional, List
 
-from neuronxcc.nki._private_kernels.blockwise_mm import BlockShardStrategy
+from nkilib.core.moe.moe_cte.moe_cte_utils import BlockShardStrategy
 
 from neuronx_distributed.modules.moe.model_utils import GLUType, ACTFunc
 from neuronx_distributed.modules.moe.model_utils import DEFAULT_BLOCK_SIZE, DEFAULT_SKIP_MODE, DEFAULT_LNC_SIZE

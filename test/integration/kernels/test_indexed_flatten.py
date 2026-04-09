@@ -6,7 +6,7 @@ from typing import List, Optional
 import neuronxcc.nki as nki
 import neuronxcc.nki.language as nl
 
-from neuronx_distributed.kernels.indexed_flatten import indexed_flatten
+from nkilib.core.subkernels.indexed_flatten import indexed_flatten
 from torch_neuronx.utils import get_platform_target
 
 
@@ -41,7 +41,7 @@ def test_indexed_flatten(
         expected_output[flattened_offsets[flattened_offsets_start + e]:flattened_offsets[flattened_offsets_start + e]+T] = flattened_offsets_start + e
 
     # Get kernel outputs
-    actual_output = indexed_flatten[nl.nc(2)](
+    actual_output = indexed_flatten[2](
         input_tensor=input,
         f_len=f_len,
         output_len=output_len,
@@ -50,7 +50,7 @@ def test_indexed_flatten(
     )
 
     # Run benchmark
-    bench_func = nki.benchmark(warmup=20, iters=100)(indexed_flatten[nl.nc(2)])
+    bench_func = nki.benchmark(warmup=20, iters=100)(indexed_flatten[2])
     bench_func(
         input_tensor=input,
         f_len=f_len,

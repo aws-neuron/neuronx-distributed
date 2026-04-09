@@ -13,7 +13,7 @@ class NKIImport:
     name: str
     module_name: Optional[str] = None
     nki_jit_type: Optional[str] = None
-
+    is_kernel: Optional[bool] = None
 def import_nki(import_config: NKIImport) -> Tuple[Optional[Any], Optional[str]]:
     """
     Import NKI module with default and fallback paths.
@@ -45,6 +45,45 @@ def import_nki(import_config: NKIImport) -> Tuple[Optional[Any], Optional[str]]:
                 return jit(platform_target = get_platform_target())(attr), None
             elif import_config.nki_jit_type == "use_nki_jit_decorator":
                 return nki_jit()(attr), None
+            return attr, None
+        except ImportError as e:
+            last_error = str(e)
+            continue
+        except AttributeError as e:
+            last_error = f"Attribute {import_config.name} not found in {path}: {str(e)}"
+            continue
+
+    return None, f"Failed to import {import_config.name}: {last_error}"
+
+def import_nki_beta2(import_config: NKIImport) -> Tuple[Optional[Any], Optional[str]]:
+    """
+    Import NKI module with default and fallback paths.
+    Args:
+        import_config: NKIImport configuration dataclass
+
+    Returns:
+        tuple: (imported_module, error_message)
+            - imported_module: The imported module or None if import failed
+            - error_message: Error description if import failed, None otherwise
+    """
+    if not import_config.module_name:
+        import_paths = [
+            "nkilib.core"
+        ]
+    else:
+        import_paths = [
+            f"nkilib.core.{import_config.module_name}"
+        ]
+    last_error = None
+    import nki
+    for path in import_paths:
+        try:
+            module = importlib.import_module(path)
+            attr = getattr(module, import_config.name)
+            if attr is None:
+                assert False, "kernel import failed"
+            if import_config.is_kernel:
+                return nki.jit(attr, mode='torchxla'), None
             return attr, None
         except ImportError as e:
             last_error = str(e)

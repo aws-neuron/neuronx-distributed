@@ -523,7 +523,7 @@ class ModelBuilder:
         )
         return self
 
-    def trace(self, initialize_model_weights=True, dry_run=False):
+    def trace(self, initialize_model_weights=True, dry_run=False, disable_fail_fast=False):
         """
         Trace and compile a NxD model into a NEFF that can be excuted on neuron
         devices.
@@ -708,7 +708,7 @@ class ModelBuilder:
         logger.info("Starting compilation for all HLOs")
         compile_start_time = time.time()
         executor = concurrent.futures.ThreadPoolExecutor()
-        jobs = []
+        jobs = {}
         for key, model_artifacts in self.model_collection.items():
             for bucket_rank, hlo_artifacts in enumerate(model_artifacts.hlo_artifact_collection):
                 if bucket_rank == model_artifacts.priority_model_idx:
@@ -732,8 +732,7 @@ class ModelBuilder:
 
                 logger.info(f"Neuron compiler flags: {compiler_args}")
 
-                jobs.append(
-                    executor.submit(
+                future = executor.submit(
                         submit_compilation_job_with_cache,
                         key,
                         bucket_rank,
@@ -742,22 +741,38 @@ class ModelBuilder:
                         cache_key=module_hash,
                         work_dir=Path(output_dir).absolute(),
                     )
-                )
+                jobs[future] = (key, bucket_rank)
 
+        failed_compilations = []
         for future in concurrent.futures.as_completed(jobs):
-            key, bucket_rank, neff_bytes = future.result()
-            output_dir = os.path.join(self.compiler_workdir, key, f"_tp0_bk{bucket_rank}")
-            neff_artifacts = self.write_neff_to_file(neff_bytes, os.path.join(output_dir, NEFF_FILE))
-            self.model_collection[key].neff_artifact_collection[bucket_rank] = neff_artifacts
+            fut_key, fut_bucket_rank = jobs[future]
+            try:
+                key, bucket_rank, neff_bytes = future.result()
+                output_dir = os.path.join(self.compiler_workdir, key, f"_tp0_bk{bucket_rank}")
+                neff_artifacts = self.write_neff_to_file(neff_bytes, os.path.join(output_dir, NEFF_FILE))
+                self.model_collection[key].neff_artifact_collection[bucket_rank] = neff_artifacts
+            except Exception as e:
+                if not disable_fail_fast:
+                    raise
+                logger.error(f"Compilation failed for {fut_key} bucket {fut_bucket_rank}: {e}")
+                failed_compilations.append((fut_key, fut_bucket_rank, e))
 
-        # Save metaneff
+        # Save metaneff for successfully compiled buckets
         for key, model_artifacts in self.model_collection.items():
             for bucket_rank, hlo_artifacts in enumerate(model_artifacts.hlo_artifact_collection):
+                if model_artifacts.neff_artifact_collection[bucket_rank] is None:
+                    continue
                 path = os.path.join(self.compiler_workdir, key, f"_tp0_bk{bucket_rank}", "metaneff.pb")
                 with open(path, "wb") as f:
                     f.write(hlo_artifacts.metaneff)
 
         logger.info(f"Finished Compilation for all HLOs in {time.time() - compile_start_time} seconds")
+
+        if failed_compilations:
+            failed_desc = ", ".join(f"{k} bucket {b}" for k, b, _ in failed_compilations)
+            raise RuntimeError(
+                f"Compilation failed for {len(failed_compilations)} bucket(s): {failed_desc}"
+            )
 
         nxd_model_executor = self.build_nxd_model()
 

@@ -4,7 +4,6 @@ import json
 import os
 import traceback
 from datetime import datetime
-import time
 
 # Third Party
 import torch
@@ -78,14 +77,12 @@ def test_send_and_recv():
             t = send(recv_a) #noqa
             mark_step()
             recv_a_cpu = recv_a.to(torch.device("cpu"))
-            time.sleep(5)
-            a = torch.load("tensor.pt", map_location=torch.device("cpu"))
-            assert torch.equal(a, recv_a_cpu)
         else:
             recv_a = recv_from(tensor_meta)
             mark_step()
             recv_a_cpu = recv_a.to(torch.device("cpu"))
-            time.sleep(5)
+        xm.rendezvous("sync_tensor_save")
+        if get_pipeline_model_parallel_rank() != 0:
             a = torch.load("tensor.pt", map_location=torch.device("cpu"))
             assert torch.equal(a, recv_a_cpu)
 
@@ -123,8 +120,6 @@ def test_1f_1b_comm():
             recv_backward = recv_from(backward_tensor_meta, recv_prev=False)
             mark_step()
             recv_backward_cpu = recv_backward.to(torch.device("cpu"))
-            backward = torch.load("backward.pt", map_location=torch.device("cpu"))
-            assert torch.equal(backward, recv_backward_cpu)
         elif get_pipeline_model_parallel_rank() < 7:
             recv_forward = recv_from(forward_tensor_meta)
             mark_step()
@@ -135,11 +130,7 @@ def test_1f_1b_comm():
             t = send(recv_backward, send_next=False) #noqa
             mark_step()
             recv_forward_cpu = recv_forward.to(torch.device("cpu"))
-            forward = torch.load("forward.pt", map_location=torch.device("cpu"))
-            assert torch.equal(forward, recv_forward_cpu)
             recv_backward_cpu = recv_backward.to(torch.device("cpu"))
-            backward = torch.load("backward.pt", map_location=torch.device("cpu"))
-            assert torch.equal(backward, recv_backward_cpu)
         else:
             recv_forward = recv_from(forward_tensor_meta)
             mark_step()
@@ -148,6 +139,16 @@ def test_1f_1b_comm():
             mark_step()
             torch.save(backward.cpu(), "backward.pt")
             recv_forward_cpu = recv_forward.to(torch.device("cpu"))
+        xm.rendezvous("sync_1f1b_save")
+        if get_pipeline_model_parallel_rank() == 0:
+            backward = torch.load("backward.pt", map_location=torch.device("cpu"))
+            assert torch.equal(backward, recv_backward_cpu)
+        elif get_pipeline_model_parallel_rank() < 7:
+            forward = torch.load("forward.pt", map_location=torch.device("cpu"))
+            assert torch.equal(forward, recv_forward_cpu)
+            backward = torch.load("backward.pt", map_location=torch.device("cpu"))
+            assert torch.equal(backward, recv_backward_cpu)
+        else:
             forward = torch.load("forward.pt", map_location=torch.device("cpu"))
             assert torch.equal(forward, recv_forward_cpu)
 

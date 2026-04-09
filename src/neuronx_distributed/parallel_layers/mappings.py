@@ -7,12 +7,6 @@ from torch.autograd import Function
 import torch.distributed
 from torch.distributed import ProcessGroup
 import torch_xla.core.xla_model as xm
-from torch_neuronx.xla_impl.ops import nki_jit
-
-import neuronxcc.nki.nccl as nccl
-import neuronxcc.nki.language as nl
-from neuronxcc.nki.compiler.backends.neuron.dimensions import CCPipeline  # noqa: N811
-import numpy as np
 
 from . import parallel_state
 
@@ -99,16 +93,6 @@ def _gather_along_dim(x: Tensor, partition_dim: int, process_group: Optional[Pro
     if tp_group.size() == 1:  # type: ignore
         return x
 
-    if tile_cc:
-        tp_size = tp_group.size()  # type: ignore
-        shape = list(x.shape)
-        shape[partition_dim] *= tp_size
-        output = torch.empty(shape, dtype=x.dtype, device=x.device)
-
-        _traced_tiled_ag[(CCPipeline(1),)](x, output, cc_dim=partition_dim, tp_rank=tp_size)
-
-        return output
-
     output = all_gather(
         x,
         dim=partition_dim,
@@ -130,100 +114,6 @@ def _gather_along_last_dim(x: Tensor, process_group: Optional[ProcessGroup] = No
 def _reduce_scatter_along_first_dim(x: Tensor, computation=xm.REDUCE_SUM,
                                     process_group: Optional[ProcessGroup] = None) -> Tensor:
     return _reduce_scatter_along_dim(x, partition_dim=0, computation=computation, process_group=process_group)
-
-# NKI cc tile related functions
-xm_compute_to_np = {
-    xm.REDUCE_MAX: np.max,
-    xm.REDUCE_SUM: np.add,
-}
-
-def _get_tensor_refs_tiled_nki_cc(multi_rank_tensor, single_rank_tensor, cc_dim, tp_rank, num_tiles, tile_id):
-    mr_shape = multi_rank_tensor.shape
-    assert len(mr_shape) == 3
-    assert (*mr_shape[:cc_dim], mr_shape[cc_dim] // tp_rank, *mr_shape[cc_dim + 1:]) == single_rank_tensor.shape
-
-    S = mr_shape[cc_dim]
-    assert S % (num_tiles * tp_rank) == 0, \
-        f'tiled CC expects S % (num_tiles * tp_rank) == 0; but got ({S}) % ({num_tiles} * {tp_rank}).  ' \
-        f'multi_rank_tensor.shape={multi_rank_tensor.shape}  single_rank_tensor.shape={single_rank_tensor.shape}'
-
-    mr_tile_size = S // num_tiles
-    sr_tile_size = S // tp_rank // num_tiles
-
-    if cc_dim == 0:
-        mr_ref = multi_rank_tensor[
-            nl.arange(mr_tile_size)[:, None, None] + tile_id * mr_tile_size,
-            nl.arange(mr_shape[1])[None, :, None],
-            nl.arange(mr_shape[2])[None, None, :]]
-        sr_ref = single_rank_tensor[
-            nl.arange(sr_tile_size)[:, None, None] + tile_id * sr_tile_size,
-            nl.arange(mr_shape[1])[None, :, None],
-            nl.arange(mr_shape[2])[None, None, :]]
-    elif cc_dim == 1:
-        mr_ref = multi_rank_tensor[
-            nl.arange(mr_shape[0])[:, None, None],
-            nl.arange(mr_tile_size)[None, :, None] + tile_id * mr_tile_size,
-            nl.arange(mr_shape[2])[None, None, :]]
-        sr_ref = single_rank_tensor[
-            nl.arange(mr_shape[0])[:, None, None],
-            nl.arange(sr_tile_size)[None, :, None] + tile_id * sr_tile_size,
-            nl.arange(mr_shape[2])[None, None, :]]
-    else:
-        raise NotImplementedError
-
-    return mr_ref, sr_ref
-
-
-def tiled_nki_rs(src_tensor, dst_tensor, cc_dim, tp_rank, op=xm.REDUCE_SUM):
-    """
-    NKI kernel doing reduce-scatter with a compiler attribute to request tiling on the src/dst
-    tensors' outermost dimension.
-    The kernel should be compiled with NKI's 'early-inline' experimental flag so that compiler's
-    collective tiling logic will transform the collective instruction accordingly and perform fusion
-    with the tiled upstream/downstream compute.
-    """
-    cc = nccl.reduce_scatter(
-        op=xm_compute_to_np[op], srcs=[src_tensor], dsts=[dst_tensor],
-        replica_groups=[list(range(tp_rank))], reduce_scatter_dim=cc_dim)
-    cc.set_attr('tile_outermost_dim', 1)
-    return
-
-
-def spmd_tiled_nki_rs(src_tensor, dst_tensor, cc_dim, tp_rank, op=xm.REDUCE_SUM):
-    """
-    NKI kernel doing reduce-scatter that supports explicit tiling specified via SPMD grid.
-    In comparison to tiled_nki_rs, this kernel does manual tiling as opposed to the compiler doing
-    the tiling.  So this kernel should not be attached with 'early-inline' attribute.
-    """
-    num_tiles = nl.num_programs(axes=0)
-    tile_id = nl.program_id(axis=0)
-    grid_ndim = nl.program_ndim()
-    assert grid_ndim == 1, f"tiled_nki_rs only supports specialization along one axis , got grid {grid_ndim}"
-
-    src_ref, dst_ref = _get_tensor_refs_tiled_nki_cc(src_tensor, dst_tensor, cc_dim, tp_rank, num_tiles, tile_id)
-    _ = nccl.reduce_scatter(
-        op=xm_compute_to_np[op], srcs=[src_ref], dsts=[dst_ref],
-        replica_groups=[list(range(tp_rank))], reduce_scatter_dim=cc_dim)
-
-
-def tiled_nki_ag(src_tensor, dst_tensor, cc_dim, tp_rank):
-    """
-    NKI kernel doing all-gather with a compiler attribute to request tiling on the src/dst
-    tensors' outermost dimension.
-    The kernel should be compiled with NKI's 'early-inline' experimental flag so that compiler's
-    collective tiling logic will transform the collective instruction accordingly and perform fusion
-    with the tiled upstream/downstream compute.
-    """
-    cc = nccl.all_gather(
-        op=np.max, srcs=[src_tensor], dsts=[dst_tensor],
-        replica_groups=[list(range(tp_rank))], all_gather_dim=cc_dim)
-    cc.set_attr('tile_outermost_dim', 1)
-    return
-
-
-_traced_tiled_rs = nki_jit(experimental_flags='early-inline')(tiled_nki_rs)
-_traced_tiled_ag = nki_jit(experimental_flags='early-inline')(tiled_nki_ag)
-_traced_spmd_tiled_rs = nki_jit()(spmd_tiled_nki_rs)
 
 
 def _reduce_scatter_along_last_dim(x: Tensor, computation=xm.REDUCE_SUM,
@@ -253,11 +143,6 @@ def _reduce_scatter_along_dim(
         )
     shape[partition_dim] //= tp_size
     output = torch.empty(shape, dtype=x.dtype, device=x.device)
-
-    if tile_cc:
-        _traced_tiled_rs[(CCPipeline(1),)](
-            x, output, cc_dim=partition_dim, tp_rank=tp_size, op=computation)
-        return output
 
     reduce_scatter(
         computation,
@@ -569,13 +454,6 @@ def reduce_scatter_to_sequence_parallel_region(
 ) -> Tensor:
     return _ReduceScatterToSequenceParallelRegion.apply(
         input_, sequence_dimension, process_group, False, dtype
-    )  # type: ignore
-
-def reduce_scatter_to_sequence_parallel_region_tiled(
-        input_: Tensor, sequence_dimension: int = 0, process_group: Optional[ProcessGroup] = None,
-) -> Tensor:
-    return _ReduceScatterToSequenceParallelRegion.apply(
-        input_, sequence_dimension, process_group, True
     )  # type: ignore
 
 def reduce_scatter_to_tensor_model_parallel_region_with_dim(

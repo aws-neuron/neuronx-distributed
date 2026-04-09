@@ -139,32 +139,33 @@ def _generate_test_configs():
 
 class BlockWiseNkiAvailabilityTest(unittest.TestCase):
     def test_can_use_blockwise_nki(self):
-        for test_config in _generate_test_configs():
-            hidden_size = test_config["hidden_size"]
-            intermediate_size_tp = test_config["intermediate_size_tp"]
-            block_size = test_config["block_size"]
-            glu_mlp = test_config["glu_mlp"]
-            glu_type = test_config["glu_type"]
-            use_torch_block_wise = test_config["use_torch_block_wise"]
-            device = torch.device(test_config["device"])
-            lnc = test_config.get("logical_nc_config", get_platform_lnc())
-            use_block_parallel = test_config.get("use_block_parallel", False)
-            use_shard_on_block_dynamic_while = test_config.get("use_shard_on_block_dynamic_while", False)
-            
-            res = can_use_blockwise_matmul_nki(
-                hidden_size, 
-                intermediate_size_tp, 
-                block_size, 
-                glu_mlp, 
-                glu_type, 
-                use_torch_block_wise, 
-                device, 
-                lnc, 
-                use_block_parallel,
-                use_shard_on_block_dynamic_while=use_shard_on_block_dynamic_while
-            )
-            print(test_config)
-            assert res == test_config["result"]
+        for i, test_config in enumerate(_generate_test_configs()):
+            with self.subTest(config_index=i+1, config=test_config):
+                hidden_size = test_config["hidden_size"]
+                intermediate_size_tp = test_config["intermediate_size_tp"]
+                block_size = test_config["block_size"]
+                glu_mlp = test_config["glu_mlp"]
+                glu_type = test_config["glu_type"]
+                use_torch_block_wise = test_config["use_torch_block_wise"]
+                device = torch.device(test_config["device"])
+                lnc = test_config.get("logical_nc_config", 2)
+                use_block_parallel = test_config.get("use_block_parallel", False)
+                use_shard_on_block_dynamic_while = test_config.get("use_shard_on_block_dynamic_while", False)
+
+                res = can_use_blockwise_matmul_nki(
+                    hidden_size,
+                    intermediate_size_tp,
+                    block_size,
+                    glu_mlp,
+                    glu_type,
+                    use_torch_block_wise,
+                    device,
+                    lnc,
+                    use_block_parallel,
+                    use_shard_on_block_dynamic_while=use_shard_on_block_dynamic_while
+                )
+                self.assertEqual(res, test_config["result"],
+                            f"Config {i+1}: expected {test_config['result']}, got {res}")
 
 if __name__ == "__main__":
     unittest.main(verbosity=3, failfast=False)

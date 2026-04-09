@@ -5,11 +5,10 @@ import torch
 import torch_xla.core.xla_model as xm
 import torch.nn.functional as F
 
-from neuronx_distributed.kernels.kernel_utils import torch_to_nki_dtype
 from neuronx_distributed.modules.moe.model_utils import GLUType, ACTFunc
 from neuronx_distributed.modules.moe.model_utils import DEFAULT_PADDING_VALUE, DEFAULT_BLOCK_SIZE, DEFAULT_HIDDEN_ACT_SCALING_FACTOR
 from neuronx_distributed.modules.moe.moe_configs import BlockwiseMatmulConfig
-from neuronx_distributed.modules.moe.nki_import import NKIImport, import_nki
+from neuronx_distributed.modules.moe.nki_import import NKIImport, import_nki_beta2, import_nki
 from neuronx_distributed.parallel_layers import mappings
 from neuronx_distributed.quantization.quantization_config import is_ocp_mx_quantized, QuantizationType
 from neuronx_distributed.quantization.dequantize import blockwise_scale_dequantize
@@ -19,23 +18,27 @@ from torch_neuronx.xla_impl.base import xla_call
 
 from dataclasses import dataclass
 from typing import Tuple, Any, Optional
-from enum import Enum
 
-try:
-    from neuronxcc.nki._pre_prod_kernels.blockwise_matmul import (
-        blockwise_mm_baseline_shard_n_k1_while_2loops,
-    )
-    from neuronxcc.nki._pre_prod_kernels.blockwise_mm_shard_on_I import (
-        blockwise_mm_baseline_shard_intermediate_hybrid,
-        blockwise_mm_baseline_shard_intermediate,
-    )
-    USE_DYNAMIC_KERNEL=True
-
-except Exception as e:
-    warnings.warn(f"Warning: Current compiler version does not have dynamic while kernel, here's the exception message: {e}")
-    USE_DYNAMIC_KERNEL=False
 
 logger = logging.getLogger("Neuron")
+
+_TORCH_TO_NKI_DTYPE = {
+    torch.bfloat16: "bfloat16",
+    torch.float16: "float16",
+    torch.float32: "float32",
+    torch.int32: "int32",
+}
+
+
+def torch_to_nki_dtype(dtype: torch.dtype):
+    """Convert a torch dtype to the corresponding nki.language dtype."""
+    import nki.language as nl
+
+    attr = _TORCH_TO_NKI_DTYPE.get(dtype)
+    if attr is None:
+        raise ValueError(f"Unsupported torch dtype for NKI conversion: {dtype}")
+    return getattr(nl, attr)
+
 
 def initialize_nki_components() -> dict:
     """
@@ -45,33 +48,21 @@ def initialize_nki_components() -> dict:
         dict: Mapping of component names to their imported values
     """
     imports = {
-        "blockwise_mm": NKIImport("blockwise_mm", module_name="blockwise_mm", nki_jit_type="use_nki_jit_decorator"),
-        "blockwise_mm_baseline_shard_hidden": NKIImport("blockwise_mm_baseline_shard_hidden", module_name="blockwise_mm", nki_jit_type="use_nki_jit_decorator"),
-        "blockwise_mm_baseline_block_parallel": NKIImport("blockwise_mm_baseline_block_parallel", module_name="blockwise_matmul", nki_jit_type="use_nki_jit_decorator"),
-        "blockwise_mm_baseline_block_parallel_allocated": NKIImport("blockwise_mm_baseline_block_parallel_allocated", module_name="blockwise_matmul", nki_jit_type="use_jit_decorator"),
-        "bwmm_shard_on_block": NKIImport("bwmm_shard_on_block", module_name="blockwise_matmul", nki_jit_type="use_jit_decorator"),
-        "blockwise_mm_bwd": NKIImport("blockwise_mm_bwd", module_name="blockwise_mm_bwd", nki_jit_type="use_nki_jit_decorator"),
-        "bwmm_fp4_shard_on_block": NKIImport("bwmm_fp4_shard_on_block", module_name="bwmm_mxfp4"),
-        "blockwise_mm_bwd_baseline_shard_hidden": NKIImport("blockwise_mm_bwd_baseline_shard_hidden", module_name="blockwise_mm_bwd", nki_jit_type="use_nki_jit_decorator"),
-        "blockwise_mm_baseline": NKIImport("blockwise_mm_baseline", module_name="blockwise_mm", nki_jit_type="use_nki_jit_decorator"),
-        "check_compatibility": NKIImport("check_blockwise_mm_kernel_compatibility", module_name="blockwise_mm"),
-        "block_shard_strategy": NKIImport("BlockShardStrategy", module_name="blockwise_mm"),
-        "affinity_scale_mode": NKIImport("ExpertAffinityScaleMode"),
-        "act_fn_type": NKIImport("ActFnType"),
-        "skip_mode": NKIImport("SkipMode", module_name="blockwise_mm"),
+        "bwmm_shard_on_block": NKIImport("bwmm_shard_on_block", module_name="moe.moe_cte.bwmm_shard_on_block", is_kernel=True),
+        "bwmm_shard_on_block_mx": NKIImport("bwmm_shard_on_block_mx", module_name="moe.moe_cte.bwmm_shard_on_block_mx", is_kernel=True),
+        "blockwise_mm_baseline_shard_intermediate": NKIImport("blockwise_mm_baseline_shard_intermediate", module_name="moe.moe_cte.bwmm_shard_on_I", is_kernel=True),
+        "blockwise_mm_baseline_shard_intermediate_hybrid": NKIImport("blockwise_mm_baseline_shard_intermediate_hybrid", module_name="moe.moe_cte.bwmm_shard_on_I", is_kernel=True),
+        "blockwise_mm_shard_intermediate_dropping": NKIImport("blockwise_mm_shard_intermediate_dropping", module_name="moe.moe_cte.bwmm_shard_on_I", is_kernel=True),
+        "moe_cte": NKIImport("moe_cte", module_name="moe.moe_cte.moe_cte", is_kernel=True),
+        "block_shard_strategy": NKIImport("BlockShardStrategy", module_name="moe.moe_cte.moe_cte_utils"),
+        "skip_mode": NKIImport("SkipMode", module_name="moe.moe_cte.moe_cte_utils"),
+        "affinity_scale_mode": NKIImport("ExpertAffinityScaleMode", module_name="utils.common_types"),
+        "act_fn_type": NKIImport("ActFnType", module_name="utils.common_types"),
     }
-
-    if USE_DYNAMIC_KERNEL:
-        imports.update({
-            "blockwise_mm_baseline_shard_n_k1_while_2loops": NKIImport("blockwise_mm_baseline_shard_n_k1_while_2loops", module_name="blockwise_matmul_while", nki_jit_type="use_jit_decorator"),
-            "blockwise_mm_baseline_shard_intermediate_hybrid": NKIImport("blockwise_mm_baseline_shard_intermediate_hybrid", module_name="blockwise_mm_shard_on_I", nki_jit_type="use_jit_decorator"),
-            "blockwise_mm_baseline_shard_intermediate": NKIImport("blockwise_mm_baseline_shard_intermediate", module_name="blockwise_mm_shard_on_I", nki_jit_type="use_jit_decorator"),
-            "act_fn_type": NKIImport("ActFnType"),
-        })
 
     components = {}
     for name, config in imports.items():
-        component, error = import_nki(config)
+        component, error = import_nki_beta2(config)
         if error:
             warnings.warn(f"Warning: {error}")
         components[name] = component
@@ -82,27 +73,41 @@ def initialize_nki_components() -> dict:
 # Initialize all components
 nki_components = initialize_nki_components()
 
-# Assign to module-level variables
-_blockwise_mm_nki_call = nki_components["blockwise_mm"]
-_blockwise_mm_baseline_shard_hidden_nki_call = nki_components["blockwise_mm_baseline_shard_hidden"]
-_blockwise_mm_baseline_block_parallel_nki_call = nki_components["blockwise_mm_baseline_block_parallel"]
-_blockwise_mm_baseline_block_parallel_allocated_nki_call = nki_components["blockwise_mm_baseline_block_parallel_allocated"]
+# Assign to module-level variables (nkilib beta2 kernels)
 _bwmm_shard_on_block_nki_call = nki_components["bwmm_shard_on_block"]
-_bwmm_fp4_shard_on_block_nki_call = nki_components["bwmm_fp4_shard_on_block"]
-_blockwise_mm_nki_bwd_call = nki_components["blockwise_mm_bwd"]
-_blockwise_mm_bwd_baseline_shard_hidden_nki_call = nki_components["blockwise_mm_bwd_baseline_shard_hidden"]
-_blockwise_mm_training_nki_call = nki_components["blockwise_mm_baseline"]
-check_blockwise_mm_kernel_compatibility = nki_components["check_compatibility"]
+_bwmm_shard_on_block_mx_nki_call = nki_components["bwmm_shard_on_block_mx"]
+_blockwise_mm_baseline_shard_intermediate_nki_call = nki_components["blockwise_mm_baseline_shard_intermediate"]
+_blockwise_mm_baseline_shard_intermediate_hybrid = nki_components["blockwise_mm_baseline_shard_intermediate_hybrid"]
+_blockwise_mm_shard_intermediate_dropping_nki_call = nki_components["blockwise_mm_shard_intermediate_dropping"]
+_moe_cte_nki_call = nki_components["moe_cte"]
 BlockShardStrategy = nki_components["block_shard_strategy"]
+SkipMode = nki_components["skip_mode"]
 ExpertAffinityScaleMode = nki_components["affinity_scale_mode"]
 ActFnType = nki_components["act_fn_type"]
-SkipMode = nki_components["skip_mode"]
+ActivationFunction = nki_components["act_fn_type"]
 
-if USE_DYNAMIC_KERNEL:
-    _blockwise_mm_baseline_shard_n_k1_while_2loops = nki_components["blockwise_mm_baseline_shard_n_k1_while_2loops"]
-    _blockwise_mm_baseline_shard_intermediate_hybrid = nki_components["blockwise_mm_baseline_shard_intermediate_hybrid"]
-    _blockwise_mm_baseline_shard_intermediate = nki_components["blockwise_mm_baseline_shard_intermediate"]
-    ActivationFunction=nki_components["act_fn_type"]
+# Training kernels from neuronxcc (not yet in nkilib)
+def initialize_training_kernels() -> dict:
+    """Initialize training-related NKI kernels from neuronxcc."""
+    imports = {
+        "blockwise_mm_training": NKIImport("blockwise_mm_baseline", module_name="blockwise_mm", nki_jit_type="use_nki_jit_decorator"),
+        "blockwise_mm_baseline_shard_hidden": NKIImport("blockwise_mm_baseline_shard_hidden", module_name="blockwise_mm", nki_jit_type="use_nki_jit_decorator"),
+        "blockwise_mm_bwd": NKIImport("blockwise_mm_bwd", module_name="blockwise_mm_bwd", nki_jit_type="use_nki_jit_decorator"),
+        "blockwise_mm_bwd_baseline_shard_hidden": NKIImport("blockwise_mm_bwd_baseline_shard_hidden", module_name="blockwise_mm_bwd", nki_jit_type="use_nki_jit_decorator"),
+    }
+    components = {}
+    for name, config in imports.items():
+        component, error = import_nki(config)
+        if error:
+            warnings.warn(f"Warning: {error}")
+        components[name] = component
+    return components
+
+_training_components = initialize_training_kernels()
+_blockwise_mm_training_nki_call = _training_components["blockwise_mm_training"]
+_blockwise_mm_baseline_shard_hidden_nki_call = _training_components["blockwise_mm_baseline_shard_hidden"]
+_blockwise_mm_nki_bwd_call = _training_components["blockwise_mm_bwd"]
+_blockwise_mm_bwd_baseline_shard_hidden_nki_call = _training_components["blockwise_mm_bwd_baseline_shard_hidden"]
 
 def dynamic_slice_3D(tensor, start0, start1, start2, size0, size1, size2):
     @xla_call
@@ -215,58 +220,9 @@ def _call_training_shard_hidden_kernel(args: BlockwiseMatmulArgs):
     return args.output, args.gate_up_activations_T, args.down_activations
 
 
-def _call_block_parallel_allocated_kernel(args: BlockwiseMatmulArgs):
-    """Call the block parallel allocated kernel for blockwise matmul with quantization."""
-
-    down_proj_scale = args.down_proj_scale
-    if down_proj_scale is not None:
-        assert args.block_size in [128, 256], "Block size must be 128 or 256 for blockwise matmul Kernel with quantized checkpoints"
-        e, h = down_proj_scale.shape[0], down_proj_scale.shape[-1]
-        down_proj_scale = down_proj_scale.view(e,1,-1,128)
-        down_proj_scale = down_proj_scale.transpose(2,3)
-        down_proj_scale = down_proj_scale.view(e,1,h)
-
-    return _blockwise_mm_baseline_block_parallel_allocated_nki_call[VNC(2)](
-        hidden_states=args.hidden_states,
-        expert_affinities_masked=args.expert_affinities_masked,
-        gate_up_proj_weight=args.gate_up_proj_weight,
-        down_proj_weight=args.down_proj_weight,
-        gate_up_proj_scale=args.gate_up_proj_scale,
-        down_proj_scale=down_proj_scale,
-        block_size=args.block_size,
-        token_position_to_id=args.token_position_to_id.to(dtype=torch.int32),
-        block_to_expert=args.block_to_expert.to(dtype=torch.int32),
-        skip_dma=args.skip_dma,
-        is_tensor_update_accumulating=args.is_tensor_update_accumulating,
-        expert_affinities_scaling_mode=args.expert_affinities_scaling_mode,
-        block_sharding_strategy=args.block_sharding_strategy,
-        compute_dtype = torch_to_nki_dtype(args.dtype),
-    )
-
-
-def _call_block_parallel_kernel(args: BlockwiseMatmulArgs):
-    """Call the block parallel kernel for blockwise matmul."""
-    _blockwise_mm_baseline_block_parallel_nki_call[VNC(2)](
-        hidden_states=args.hidden_states,
-        expert_affinities_masked=args.expert_affinities_masked,
-        gate_up_proj_weight=args.gate_up_proj_weight,
-        down_proj_weight=args.down_proj_weight,
-        block_size=args.block_size,
-        token_position_to_id=args.token_position_to_id.to(dtype=torch.int32),
-        block_to_expert=args.block_to_expert.to(dtype=torch.int32),
-        output=args.output,
-        skip_dma=args.skip_dma,
-        is_tensor_update_accumulating=args.is_tensor_update_accumulating,
-        expert_affinities_scaling_mode=args.expert_affinities_scaling_mode,
-        block_sharding_strategy=args.block_sharding_strategy,
-        compute_dtype = torch_to_nki_dtype(args.dtype),
-    )
-
-    return args.output
-
-
 def _call_bwmm_shard_on_block_kernel(args: BlockwiseMatmulArgs):
     """Call the shard on block kernel for blockwise matmul."""
+    nki_grid = LogicalNCConfig.LNC_2
     E = args.gate_up_proj_weight.shape[0]
     # pass args not in the original interface as kwargs to ensure compatibility with different compiler versions
     optional_kwargs = {}
@@ -279,94 +235,49 @@ def _call_bwmm_shard_on_block_kernel(args: BlockwiseMatmulArgs):
     if args.up_clamp_lower_limit is not None:
         optional_kwargs["up_clamp_lower_limit"] = args.up_clamp_lower_limit
 
-    output = _bwmm_shard_on_block_nki_call[VNC(2)](
-        conditions=args.conditions,
-        hidden_states=args.hidden_states,
-        expert_affinities_masked=args.expert_affinities_masked,
-        gate_up_proj_weight=args.gate_up_proj_weight,
-        down_proj_weight=args.down_proj_weight,
-        gate_and_up_proj_bias=args.gate_up_proj_bias.view(E, 2, -1) if args.gate_up_proj_bias is not None else None,
-        down_proj_bias=args.down_proj_bias,
-        gate_up_proj_scale=args.gate_up_proj_scale,
-        # TODO: Do we need to do something about 'down_activations' parameter to kernel?
-        down_proj_scale=args.down_proj_scale,
+    output = _bwmm_shard_on_block_nki_call[nki_grid](
+        hidden_states=get_data(args.hidden_states),
+        expert_affinities_masked=get_data(args.expert_affinities_masked),
+        gate_up_proj_weight=get_data(args.gate_up_proj_weight),
+        down_proj_weight=get_data(args.down_proj_weight),
         block_size=args.block_size,
-        token_position_to_id=args.token_position_to_id.to(dtype=torch.int32),
-        block_to_expert=args.block_to_expert.to(dtype=torch.int32),
+        token_position_to_id=get_data(args.token_position_to_id, lambda x: x.to(dtype=torch.int32)),
+        block_to_expert=get_data(args.block_to_expert, lambda x: x.to(dtype=torch.int32)),
+        gate_and_up_proj_bias=get_data(args.gate_up_proj_bias, lambda x: x.view(E, 2, -1)),
+        down_proj_bias=get_data(args.down_proj_bias),
+        gate_up_proj_scale=get_data(args.gate_up_proj_scale),
+        down_proj_scale=get_data(args.down_proj_scale),
         skip_dma=args.skip_dma,
         is_tensor_update_accumulating=args.is_tensor_update_accumulating,
         expert_affinities_scaling_mode=args.expert_affinities_scaling_mode,
         block_sharding_strategy=args.block_sharding_strategy,
-        compute_dtype = torch_to_nki_dtype(args.dtype),
+        compute_dtype=torch_to_nki_dtype(args.dtype),
         activation_function=args.kernel_act_fn,
         **optional_kwargs,
     )
 
     if args.is_tensor_update_accumulating:
-        # The output from kernel is of shape (2, total_tokens+1, hidden_size), we need
-        # to return the first value at first index from that result.
-        return output[0, ...]
+        # The output from nkilib kernel is of shape (total_tokens + 1, 2, hidden_size), we need
+        # to return the first value at second index from that result.
+        return output[:, 0, ...]
     else:
         return output
 
 
 def _call_shard_hidden_kernel(args: BlockwiseMatmulArgs):
     """Call the shard hidden kernel for blockwise matmul."""
-    _blockwise_mm_baseline_shard_hidden_nki_call[VNC(2)](
-        hidden_states=args.hidden_states,
-        expert_affinities_masked=args.expert_affinities_masked,
-        gate_up_proj_weight=args.gate_up_proj_weight,
-        down_proj_weight=args.down_proj_weight,
-        block_size=args.block_size,
-        token_position_to_id=args.token_position_to_id.to(dtype=torch.int32),
-        block_to_expert=args.block_to_expert.to(dtype=torch.int32),
-        output=args.output,
-        gate_up_activations_T=args.gate_up_activations_T,
-        down_activations=args.down_activations,
-        skip_dma=args.skip_dma,
-        is_tensor_update_accumulating=args.is_tensor_update_accumulating,
-        expert_affinities_scaling_mode=args.expert_affinities_scaling_mode,
-        compute_dtype=torch_to_nki_dtype(args.dtype),
-    )
+    raise NotImplementedError("_call_shard_hidden_kernel is not available - kernel not imported from nkilib")
 
-    return args.output, args.gate_up_activations_T, args.down_activations
-
-
-def _call_default_kernel(args: BlockwiseMatmulArgs):
-    """Call the default kernel for blockwise matmul."""
-
-    gate_up_proj_scale, down_proj_scale = args.gate_up_proj_scale, args.down_proj_scale
-
-    if gate_up_proj_scale is not None:
-        # (1, 1, 2I) -> (2, I)
-        assert gate_up_proj_scale.shape[0] == 1 and gate_up_proj_scale.shape[1] == 1
-        gate_up_proj_scale = gate_up_proj_scale.view(2, -1)
-
-    if down_proj_scale is not None:
-        # (1, 1, H) -> (H)
-        assert down_proj_scale.shape[0] == 1 and down_proj_scale.shape[1] == 1
-        down_proj_scale = down_proj_scale.view(-1)
-
-    _blockwise_mm_nki_call(
-        hidden_states=args.hidden_states,
-        expert_affinities_masked=args.expert_affinities_masked,
-        gate_up_proj_weight=args.gate_up_proj_weight,
-        down_proj_weight=args.down_proj_weight,
-        block_size=args.block_size,
-        token_position_to_id=args.token_position_to_id.to(dtype=torch.int32),
-        block_to_expert=args.block_to_expert.to(dtype=torch.int32),
-        output=args.output,
-        skip_dma=args.skip_dma,
-        gate_up_proj_scale=gate_up_proj_scale,
-        down_proj_scale=down_proj_scale,
-        is_tensor_update_accumulating=args.is_tensor_update_accumulating,
-        compute_type=torch_to_nki_dtype(args.dtype),
-    )
-
-    return args.output
+def get_data(tensor, transform=None):
+    """Safely get .data from a tensor that might be None."""
+    if tensor is None:
+        return None
+    data = tensor.data
+    return transform(data) if transform else data
 
 def _call_shard_on_intermediate_kernel(args: BlockwiseMatmulArgs):
     """Call the shard-on-intermediate kernel for blockwise matmul."""
+    nki_grid = LogicalNCConfig.LNC_2
     conditions = args.conditions
     assert conditions is not None, "conditions must be passed in for shard-on-intermediate dynamic kernel"
     padded_conditions = torch.cat([conditions, torch.zeros(1, device=conditions.device)])
@@ -381,52 +292,35 @@ def _call_shard_on_intermediate_kernel(args: BlockwiseMatmulArgs):
         optional_kwargs["up_clamp_upper_limit"] = args.up_clamp_upper_limit
     if args.up_clamp_lower_limit is not None:
         optional_kwargs["up_clamp_lower_limit"] = args.up_clamp_lower_limit
-    return _blockwise_mm_baseline_shard_intermediate_hybrid[VNC(2)](
+    return _blockwise_mm_baseline_shard_intermediate_hybrid[nki_grid](
         # Inputs
-        conditions=padded_conditions,
-        hidden_states=args.hidden_states,
-        expert_affinities_masked=args.expert_affinities_masked,
+        conditions=get_data(padded_conditions),
+        hidden_states=get_data(args.hidden_states),
+        expert_affinities_masked=get_data(args.expert_affinities_masked),
         # MLP weights
-        gate_up_proj_weight=args.gate_up_proj_weight,
-        down_proj_weight=args.down_proj_weight,
-        gate_and_up_proj_bias=args.gate_up_proj_bias.view(E, 2, -1) if args.gate_up_proj_bias is not None else None,
-        down_proj_bias=args.down_proj_bias,
+        gate_up_proj_weight=get_data(args.gate_up_proj_weight),
+        down_proj_weight=get_data(args.down_proj_weight),
+        gate_and_up_proj_bias=get_data(args.gate_up_proj_bias, lambda x: x.view(E, 2, -1)),
+        down_proj_bias=get_data(args.down_proj_bias),
+        gate_up_proj_scale=get_data(args.gate_up_proj_scale),
+        down_proj_scale=get_data(args.down_proj_scale),
         activation_function=args.kernel_act_fn,
         # Block related
         block_size=args.block_size,
         num_static_block=args.num_static_blocks,
-        token_position_to_id=args.token_position_to_id.to(dtype=torch.int32),
-        block_to_expert=args.block_to_expert.to(dtype=torch.int32),
+        token_position_to_id=get_data(args.token_position_to_id, lambda x: x.to(dtype=torch.int32)),
+        block_to_expert=get_data(args.block_to_expert, lambda x: x.to(dtype=torch.int32)),
         expert_affinities_scaling_mode=args.expert_affinities_scaling_mode,
         compute_dtype=torch_to_nki_dtype(args.dtype),
         # Output
         skip_dma=args.skip_dma,
         is_tensor_update_accumulating=args.is_tensor_update_accumulating,
         **optional_kwargs,
-        )
+    )
 
 def _call_shard_on_block_kernel(args: BlockwiseMatmulArgs):
     """Call the shard-on-block kernel for blockwise matmul."""
-    conditions = args.conditions
-    assert conditions is not None, "conditions must be passed in for shard-on-block dynamic kernel"
-    padded_conditions = torch.cat([conditions, torch.zeros(1, device=conditions.device)])
-    return _blockwise_mm_baseline_shard_n_k1_while_2loops[VNC(2)](
-        # Inputs
-        conditions = padded_conditions,
-        hidden_states=args.hidden_states,
-        expert_affinities_masked=args.expert_affinities_masked,
-        # MLP weights
-        gate_up_proj_weight=args.gate_up_proj_weight,
-        down_proj_weight=args.down_proj_weight,
-        # Block related
-        block_size=args.block_size,
-        token_position_to_id=args.token_position_to_id.to(dtype=torch.int32),
-        block_to_expert=args.block_to_expert.to(dtype=torch.int32),
-        expert_affinities_scaling_mode=args.expert_affinities_scaling_mode,
-        # Output
-        skip_dma=args.skip_dma,
-        is_tensor_update_accumulating=args.is_tensor_update_accumulating,
-        )
+    raise NotImplementedError("_call_shard_on_block_kernel is not available - kernel not imported from nkilib")
 
 
 class TorchBlockwiseTraining(torch.autograd.Function):
@@ -799,19 +693,28 @@ def check_kernel_availability(config: KernelConfig) -> None:
     Raises:
         KernelAvailabilityError: If the required kernel is not available
     """
+    # TODO: Update kernel availability checks when more kernels are imported from nkilib
     if config.logical_nc_config == LogicalNCConfig.LNC_2:
         if config.use_block_parallel:
-            if _blockwise_mm_baseline_block_parallel_nki_call is None:
-                raise KernelAvailabilityError("Block parallel NKI kernel not available")
-        elif _blockwise_mm_baseline_shard_hidden_nki_call is None:
-            raise KernelAvailabilityError("Shard hidden NKI kernel not available")
+            raise KernelAvailabilityError("Block parallel NKI kernel not available in nkilib")
     elif config.logical_nc_config == LogicalNCConfig.LNC_1:
         if config.use_block_parallel:
             raise KernelAvailabilityError("Block parallel mode not supported with logical_nc_config=1")
-        elif _blockwise_mm_nki_call is None:
-            raise KernelAvailabilityError("Base NKI kernel not available")
+        raise KernelAvailabilityError("LNC_1 kernels not available in nkilib")
     else:
         raise ValueError(f"Invalid logical_nc_config: {config.logical_nc_config}")
+
+def check_blockwise_mm_kernel_compatibility(
+    hidden_size,
+    block_size,
+    intermediate_size_tp,
+    ):
+    PSUM_SIZE = 512
+    available_block_sizes = [128, 256, 512, 1024]
+    assert block_size in available_block_sizes, f"Only support block_size in {available_block_sizes}, found {block_size}"
+    
+    assert 512 <= hidden_size <= 8192, f"Hidden dim must be between 512 and 8192, found {hidden_size}"
+    assert hidden_size % PSUM_SIZE == 0, f"Hidden dim size must be multiples of {PSUM_SIZE}, found {hidden_size} "
 
 def can_use_blockwise_matmul_nki(
         hidden_size: int,
@@ -880,6 +783,7 @@ def can_use_blockwise_matmul_nki(
         warnings.warn(f"Failed to load Blockwise NKI kernel. Error: {str(e)}")
         return False
 
+    # TODO: Re-import from nkilib when check_blockwise_mm_kernel_compatibility is available in nkilib
     try:
         check_blockwise_mm_kernel_compatibility(
             hidden_size=hidden_size,
@@ -1093,7 +997,7 @@ class BlockwiseMatmulNKIFunc(torch.autograd.Function):
             up_clamp_lower_limit=up_clamp_lower_limit,
             gate_up_proj_bias=gate_up_proj_bias,
             down_proj_bias=down_proj_bias,
-            kernel_act_fn=ActivationFunction(kernel_act_fn_id) if USE_DYNAMIC_KERNEL else None,
+            kernel_act_fn=ActivationFunction(kernel_act_fn_id),
         )
 
         # Select and call the appropriate kernel function
@@ -1103,21 +1007,15 @@ class BlockwiseMatmulNKIFunc(torch.autograd.Function):
             else:
                 output, gate_up_activations, down_activations = _call_training_kernel(args)
         elif logical_nc_config == 2:
-            if down_proj_scale is not None:
-                output = _call_block_parallel_allocated_kernel(args)
-            elif use_shard_on_intermediate_dynamic_while:
+            if use_shard_on_intermediate_dynamic_while:
                 output = _call_shard_on_intermediate_kernel(args)
             elif use_shard_on_block_dynamic_while:
-                if args.gate_up_proj_bias is not None and _bwmm_shard_on_block_nki_call is not None:
-                    output = _call_bwmm_shard_on_block_kernel(args)
-                else:
-                    output = _call_shard_on_block_kernel(args)
-            elif use_block_parallel:
-                output = _call_block_parallel_kernel(args)
+                output = _call_bwmm_shard_on_block_kernel(args)
             else:
                 output, gate_up_activations, down_activations = _call_shard_hidden_kernel(args)
         else:
-            output = _call_default_kernel(args)
+            raise NotImplementedError("LNC_1 kernels not available in nkilib")
+
         output = output[:total_tokens, :]
         ctx.save_for_backward(
             hidden_states,
@@ -1231,7 +1129,7 @@ class BlockwiseMatmulNKIFunc(torch.autograd.Function):
 def _call_bwmm_fp4_shard_on_block(args: BlockwiseMatmulArgs):
     #directly inject the conditions vector here
     # FIXME: move this code to expert_mlps_v2.py instead of injecting it directly here
-    
+    nki_grid = LogicalNCConfig.LNC_2
     # Reshape the token positions into blocks
     padded_conditions = None
     if args.use_shard_on_block_dynamic_while:
@@ -1241,19 +1139,19 @@ def _call_bwmm_fp4_shard_on_block(args: BlockwiseMatmulArgs):
       conditions = torch.any(blocks != -1, dim=1).to(torch.int32)
       padded_conditions = torch.cat([conditions, torch.zeros(2, device=conditions.device)])
 
-    output = _bwmm_fp4_shard_on_block_nki_call[VNC(2)](
-        hidden_states=args.hidden_states,
-        conditions=padded_conditions,
-        expert_affinities_masked=args.expert_affinities_masked,
-        gate_up_proj_weight=args.gate_up_proj_weight,
-        down_proj_weight=args.down_proj_weight,
+    output = _bwmm_shard_on_block_mx_nki_call[nki_grid](
+        hidden_states=get_data(args.hidden_states),
+        expert_affinities_masked=get_data(args.expert_affinities_masked),
+        gate_up_proj_weight=get_data(args.gate_up_proj_weight),
+        down_proj_weight=get_data(args.down_proj_weight),
+        token_position_to_id=get_data(args.token_position_to_id, lambda x: x.to(dtype=torch.int32)),
+        block_to_expert=get_data(args.block_to_expert, lambda x: x.to(dtype=torch.int32)),
+        conditions=get_data(padded_conditions),
+        gate_and_up_proj_bias=get_data(args.gate_up_proj_bias),
+        down_proj_bias=get_data(args.down_proj_bias),
+        gate_up_proj_scale=get_data(args.gate_up_proj_scale),
+        down_proj_scale=get_data(args.down_proj_scale),
         block_size=args.block_size,
-        token_position_to_id=args.token_position_to_id,
-        block_to_expert=args.block_to_expert,
-        gate_and_up_proj_bias=args.gate_up_proj_bias,
-        down_proj_bias=args.down_proj_bias,
-        gate_up_proj_scale=args.gate_up_proj_scale,
-        down_proj_scale=args.down_proj_scale,
         gate_up_activations_T=None,
         down_activations=None,
         # Meta parameters

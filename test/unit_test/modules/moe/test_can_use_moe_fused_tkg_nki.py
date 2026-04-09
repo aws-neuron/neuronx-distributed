@@ -64,6 +64,7 @@ def _generate_test_configs():
                 normalize_top_k_affinities=False,
                 result=False,
             ),
+            # shared experts not supported by moe_block_tkg kernel
             TestCfg(
                 **cfg,
                 batch_size=1,
@@ -71,7 +72,7 @@ def _generate_test_configs():
                 device="xla",
                 glu_mlp=True,
                 normalize_top_k_affinities=False,
-                result=True,
+                result=False,
             ),
             TestCfg(
                 **cfg,
@@ -91,6 +92,7 @@ def _generate_test_configs():
                 normalize_top_k_affinities=False,
                 result=False,
             ),
+            # shared experts not supported by moe_block_tkg kernel
             TestCfg(
                 **cfg,
                 batch_size=1,
@@ -99,7 +101,7 @@ def _generate_test_configs():
                 glu_mlp=True,
                 top_k=2,
                 normalize_top_k_affinities=True,
-                result=True,
+                result=False,
             ),
             TestCfg(
                 **cfg,
@@ -122,125 +124,6 @@ def _generate_test_configs():
         ]
     )
 
-    cfg["test_kernel"] = "router_topk"
-    cfg["glu_mlp"] = True
-    cfg["batch_size"] = 64
-    test_configs.extend(
-        [
-            TestCfg(
-                **cfg,
-                device="xla",
-                result=False,
-            ),
-            TestCfg(
-                **cfg,
-                device="cpu",
-                result=False,
-            ),
-            TestCfg(
-                **cfg,
-                device="xla",
-                router_topk_kernel_enabled=True,
-                result=False,
-            ),
-            TestCfg(
-                **cfg,
-                device="xla",
-                router_topk_kernel_enabled=False,
-                result=False,
-            )
-        ]
-    )
-
-    cfg["test_kernel"] = "shared_mlp"
-    test_configs.extend(
-        [
-            TestCfg(
-                **cfg,
-                num_shared_experts=1,
-                device="xla",
-                result=False,
-            ),
-            TestCfg(
-                **cfg,
-                num_shared_experts=1,
-                device="cpu",
-                result=False,
-            ),
-            TestCfg(
-                **cfg,
-                num_shared_experts=1,
-                device="xla",
-                shared_mlp_kernel_enabled=True,
-                result=False,
-            ),
-            TestCfg(
-                **cfg,
-                num_shared_experts=1,
-                device="xla",
-                shared_mlp_kernel_enabled=False,
-                result=False,
-            ),
-            TestCfg(
-                **cfg,
-                num_shared_experts=0,
-                device="xla",
-                result=False,
-            ),
-        ]
-    )
-
-    cfg["test_kernel"] = "expert_mlp"
-    del cfg["glu_mlp"]
-    test_configs.extend(
-        [
-            TestCfg(
-                **cfg,
-                expert_mlp_kernel_enabled=True,
-                device="xla",
-                glu_mlp=False,
-                normalize_top_k_affinities=False,
-                result=False,
-            ),
-            TestCfg(
-                **cfg,
-                expert_mlp_kernel_enabled=False,
-                device="xla",
-                glu_mlp=True,
-                normalize_top_k_affinities=False,
-                result=False,
-            ),
-            TestCfg(
-                **cfg,
-                device="xla",
-                glu_mlp=True,
-                normalize_top_k_affinities=False,
-                result=False,
-            ),
-            TestCfg(
-                **cfg,
-                device="cpu",
-                glu_mlp=True,
-                normalize_top_k_affinities=False,
-                result=False,
-            ),
-            TestCfg(
-                **cfg,
-                device="xla",
-                glu_mlp=False,
-                normalize_top_k_affinities=False,
-                result=False,
-            ),
-            TestCfg(
-                **cfg,
-                device="xla",
-                glu_mlp=True,
-                top_k=2,
-                normalize_top_k_affinities=True,
-                result=False,
-            ),
-        ]
-    )
     return test_configs
 
 

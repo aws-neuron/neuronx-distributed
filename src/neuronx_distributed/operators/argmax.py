@@ -12,12 +12,7 @@ from neuronx_distributed.parallel_layers.mappings import _gather_along_dim
 from neuronx_distributed.utils.utils import hardware
 
 import neuronxcc.nki.language as nl
-
-# Try to import NKI max kernel, fall back to None if unavailable
-try:
-    from neuronxcc.nki._pre_prod_kernels.max.cascaded_max import cascaded_max as nki_max
-except (ImportError, ModuleNotFoundError):
-    nki_max = None
+from nkilib.core.max.cascaded_max import cascaded_max as nki_max
 
 
 def _can_use_nki_max(
@@ -34,10 +29,6 @@ def _can_use_nki_max(
 
     TODO: Remove these guardrails as kernel support expands.
     """
-    # Check if NKI max kernel is available
-    if nki_max is None:
-        return False
-
     # Check if kernel is manually disabled
     if disable_argmax_kernel:
         return False
@@ -135,7 +126,7 @@ def _compute_local_max(
         is_3d = len(tensor.shape) == 3
         input_tensor = tensor.squeeze(0) if is_3d else tensor
 
-        value, index = nki_max[(nl.nc(2),)](input_tensor)
+        value, index = nki_max[2](input_tensor)
 
         # Restore dimension if squeezed
         if is_3d:

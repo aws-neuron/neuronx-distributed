@@ -2,11 +2,17 @@ import pytest
 import numpy as np
 import math
 
-import neuronxcc.nki as nki
-import neuronxcc.nki.language as nl
+import torch
+import nki
+import nki.language as nl
 
-from neuronx_distributed.kernels.find_nonzero_indices import find_nonzero_indices
+from nkilib.core.subkernels.find_nonzero_indices import find_nonzero_indices
 from torch_neuronx.utils import get_platform_target
+
+NP_TO_TORCH_DTYPE = {
+    np.int32: torch.int32,
+    np.float32: torch.float32,
+}
 
 def golden_find_nonzero_indices(arr):
     indices = []
@@ -20,13 +26,14 @@ def golden_find_nonzero_indices(arr):
     
     return np.array(indices)
 
-@pytest.mark.parametrize("T,E,top_k,E_offset,E_local,chunk_size,in_dtype,expected_p99_lat_us", [
-    (4096, 128, 8, 0, 4, 4096, np.int32, 70),
-    (4096, 128, 8, 0, 4, 4096, np.float32, 70),
-    (10240, 128, 4, 16, 16, 10240, np.int32, 150),
-    (10240, 128, 4, 16, 16, 10240, np.float32, 150),
-    (65536, 128, 4, 32, 16, 16384, np.int32, 750),
-    (65536, 128, 4, 32, 16, 16384, np.float32, 750),
+@pytest.mark.parametrize("T,E,top_k,E_offset,E_local,chunk_size,in_dtype", [
+    (4096, 128, 8, 0, 4, 4096, np.int32),
+    (4096, 128, 8, 0, 4, 4096, np.float32),
+    (10240, 128, 4, 16, 16, 10240, np.int32),
+    (10240, 128, 4, 16, 16, 10240, np.float32),
+    (65536, 128, 4, 32, 16, 16384, np.int32),
+    (65536, 128, 4, 32, 16, 16384, np.float32),
+    (10240, 128, 4, 120, 8, 10240, np.float32),  # rank 15: E_offset=120
 ])
 def test_count_nonzeros_shard_rows(
     T: int,
@@ -36,7 +43,6 @@ def test_count_nonzeros_shard_rows(
     E_local: int,
     chunk_size: int,
     in_dtype: np.dtype,
-    expected_p99_lat_us: int,
 ):
     assert get_platform_target() != "trn1", "Kernel is not supported on TRN1"
     np.random.seed(42)
@@ -57,36 +63,29 @@ def test_count_nonzeros_shard_rows(
     if in_dtype == np.float32:
         input[input > 0] = 0.1
 
-    # Get kernel outputs
-    actual_indices, actual_nonzero_counts = find_nonzero_indices[nl.nc(2)](
-        input_tensor=input.T,
-        row_start_id=np.array([E_offset]).astype(np.int32),
-        n_rows=E_local,
-        chunk_size = chunk_size,
-        index_dtype=nl.int32,
-    )
+    # Convert inputs to torch tensors on XLA device for NKI backend
+    import torch_xla.core.xla_model as xm
+    device = xm.xla_device()
+    torch_dtype = NP_TO_TORCH_DTYPE[in_dtype]
+    input_tensor = torch.from_numpy(input.T.copy()).to(torch_dtype).to(device)
+    col_start_id = torch.tensor([E_offset], dtype=torch.int32).to(device)
 
-    # Run benchmark
-    bench_func = nki.benchmark(warmup=20, iters=100)(find_nonzero_indices[nl.nc(2)])
-    bench_func(
-        input_tensor=input.T,
-        row_start_id=np.array([E_offset]).astype(np.int32),
-        n_rows=E_local,
-        chunk_size = chunk_size,
+    # Get kernel outputs (use nki.language dtype, not numpy)
+    actual_indices_t, actual_nonzero_counts_t = find_nonzero_indices[2](
+        input_tensor=input_tensor,
+        col_start_id=col_start_id,
+        n_cols=E_local,
+        chunk_size=chunk_size,
         index_dtype=nl.int32,
     )
-    p99_lat = bench_func.benchmark_result.nc_latency.get_latency_percentile(99)
+    actual_indices = actual_indices_t.cpu().numpy() if torch.is_tensor(actual_indices_t) else np.asarray(actual_indices_t)
+    actual_nonzero_counts = actual_nonzero_counts_t.cpu().numpy() if torch.is_tensor(actual_nonzero_counts_t) else np.asarray(actual_nonzero_counts_t)
 
     assert np.allclose(actual_indices, expected_indices), \
         f"Failed indices match for config {T=}, {E=}, {top_k=}, {E_offset=}, {E_local=}, {chunk_size=}, {in_dtype=}"
     assert np.allclose(actual_nonzero_counts, expected_nonzero_counts), \
         f"Failed counts match for config {T=}, {E=}, {top_k=}, {E_offset=}, {E_local=}, {chunk_size=}, {in_dtype=}"
-    lat_regression_threshold = 1.05
-    assert p99_lat < lat_regression_threshold * expected_p99_lat_us, \
-        f"Failed latency assertion for config {T=}, {E=}, {top_k=}, {E_offset=}, {E_local=}, {chunk_size=}, {in_dtype=}"\
-        f"expected latency: {expected_p99_lat_us}, actual latency: {p99_lat}"
 
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
-

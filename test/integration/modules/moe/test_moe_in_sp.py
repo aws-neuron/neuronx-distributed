@@ -227,67 +227,18 @@ def get_moe_config(seq_len, config, sp_enable=False):
     return InferenceConfig(neuron_config=neuron_config, **inference_config)
 
 def get_test_configs():
-    return [
-        {
-            "model_type": "llama4 16E", 
-            "early_expert_affinity_modulation": True,
-            "disable_normalize_top_k_affinities": True, 
-            "hidden_size": 5120, 
-            "hidden_act":"silu",
-            "intermediate_size": 8192, 
-            "num_local_experts": 16, 
-            "num_experts_per_tok":1,
-            "n_shared_experts":0,
-            "mac_thres": 10,
-            "blockwise_matmul_config":{
-                "block_size": 256, 
-                "use_block_parallel": True,
-                "skip_dma_token": True, 
-                "skip_dma_weight": True,
-            },
-            "latency_threshold": 12.14, 
-            "sp_latency_threshold": 10.13,
-        },
-        {
-            "model_type": "llama4 128E", 
-            "early_expert_affinity_modulation": True,
-            "disable_normalize_top_k_affinities": True, 
-            "hidden_size": 5120, 
-            "hidden_act":"silu",
-            "intermediate_size": 8192, 
-            "num_local_experts": 128, 
-            "num_experts_per_tok":1,
-            "n_shared_experts":0, 
-            "mac_thres": 1e15,
-            "blockwise_matmul_config":{
-                "block_size": 256, 
-                "use_block_parallel": True,
-                "skip_dma_token": True, 
-                "skip_dma_weight": True,
-            },
-            "latency_threshold": 18.05,     
-            "sp_latency_threshold": 16.03,
-        },
-        {
-            "model_type": "DeepSeek", 
-            "early_expert_affinity_modulation": False,
-            "disable_normalize_top_k_affinities": False, 
-            "hidden_size": 7168, 
-            "hidden_act":"silu",
-            "intermediate_size": 2048, 
-            "num_local_experts": 256, 
-            "num_experts_per_tok":8,
-            "n_shared_experts":0, 
-            "mac_thres": 10,
-            "blockwise_matmul_config":{
-                "block_size": 256, 
-                "skip_dma_token": True, 
-                "skip_dma_weight": True,
-            },
-            "latency_threshold": 107.20,
-            "sp_latency_threshold": 96.43,
-        },
-    ]
+    """
+    Get test configs for MoE in SP tests.
+    
+    Note: All previous configs have been removed as they used beta1 blockwise kernels:
+    - llama4 16E/128E configs used use_block_parallel=True (blockwise_mm_baseline_block_parallel)
+    - DeepSeek config used default path (blockwise_mm_baseline_shard_hidden)
+    
+    To add new configs, use beta2 kernels by setting:
+    - use_shard_on_intermediate_dynamic_while=True, or
+    - use_shard_on_block_dynamic_while=True
+    """
+    return []
 
 
 def test_accuracy():

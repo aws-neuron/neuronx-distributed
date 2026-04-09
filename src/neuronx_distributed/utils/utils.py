@@ -1,4 +1,4 @@
-from enum import Enum
+from enum import auto, Enum
 import os
 import json
 from typing import Union, Dict, Any
@@ -7,7 +7,7 @@ class hardware(Enum):
     TRN1 = "trn1"
     TRN2 = "trn2"
     TRN3 = "trn3"
-    CUSTOM = os.environ.get("NEURON_PLATFORM_TARGET_OVERRIDE") 
+    CUSTOM = auto()
 
     @classmethod
     def _missing_(cls, value):
@@ -20,7 +20,7 @@ class hardware(Enum):
         }
         if value in _value_map:
             return _value_map[value]
-        elif value == cls.CUSTOM.value:
+        elif value == os.environ.get("NEURON_PLATFORM_TARGET_OVERRIDE"):
             return cls.CUSTOM
 
         return None

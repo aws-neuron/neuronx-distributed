@@ -220,44 +220,26 @@ class TestRoutedExpertsFP8(unittest.TestCase):
             }
         ]
 
-        blockwise_configs = []
-        block_sizes = [128, 256]
-        block_strategies = [ "PING_PONG", "HI_LO"]
-        skip_dma_configs = [[False, False], [True, True]]
-        
-        # Generate all possible combinations for blockwise_matmul_config
-        blockwise_configs = []
-        for base_config in test_configs:
-            param_combinations = itertools.product(
-                block_sizes,
-                block_strategies,
-                skip_dma_configs
-            )
-            
-            # for block_size, strategy, skip_token, skip_weight in param_combinations:
-            for block_size, strategy, skip_dma in param_combinations:
-                config = base_config.copy()
-                config["blockwise_matmul_config"] = {
-                    "block_size": block_size,
-                    "use_block_parallel": True,
-                    "block_sharding_strategy": strategy,
-                    "skip_dma_token": skip_dma[0],
-                    "skip_dma_weight": skip_dma[1]
-                }
-                blockwise_configs.append(config)
+        # NOTE: blockwise_configs generation removed - beta1 blockwise kernels deprecated
+        # blockwise_configs = []
+        # block_sizes = [128, 256]
+        # block_strategies = [ "PING_PONG", "HI_LO"]
+        # skip_dma_configs = [[False, False], [True, True]]
+        # ... (blockwise config generation code removed)
 
         seq_mapping = {
             1: "selective loading",
             128: "all experts",
-            1024: "blockwise"
+            # NOTE: blockwise (seq_len=1024) removed - uses beta1 blockwise kernels (use_block_parallel=True)
         }
 
         results = []
         for seq_len in seq_mapping.keys():
             print(f"\nRunning Test for {seq_mapping[seq_len]} with config:", end="")
 
-            if seq_mapping[seq_len] == "blockwise":
-                test_configs = blockwise_configs
+            # NOTE: blockwise branch removed - beta1 kernels deprecated
+            # if seq_mapping[seq_len] == "blockwise":
+            #     test_configs = blockwise_configs
 
             for config in test_configs:
                 config_str = str(config)

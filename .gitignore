@@ -149,3 +149,4 @@ __pycache__
 /tmp*
 tmp.*
 pyproject.toml
+pip/
