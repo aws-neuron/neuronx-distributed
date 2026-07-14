@@ -314,8 +314,8 @@ class LoraEmbedding(LoraLayer):
         )
 
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
-        previous_dtype = x.dtype
         result = self.base_layer(x, *args, **kwargs)
+        previous_dtype = result.dtype
         if not self.merged:
             assert self.lora_embedding_A is not None and self.lora_embedding_B is not None
             embedding_A = self.lora_embedding_A.T

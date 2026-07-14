@@ -71,6 +71,19 @@ class TestLoraLayers(unittest.TestCase):
                 layer_str = str(lora_layer)
                 assert "lora" in layer_str
 
+    def test_torch_embedding_forward_preserves_output_dtype(self):
+        layer = torch.nn.Embedding(8, 3, dtype=torch.float32)
+        with torch.no_grad():
+            layer.weight[0] = torch.tensor([0.25, 0.5, 0.75])
+        lora_layer = LoraEmbedding(layer, get_lora_config())
+        input_ids = torch.tensor([0], dtype=torch.long)
+
+        expected = layer(input_ids)
+        actual = lora_layer(input_ids)
+
+        self.assertEqual(actual.dtype, expected.dtype)
+        torch.testing.assert_close(actual, expected)
+
     @patch("neuronx_distributed.parallel_layers.layers.get_tensor_model_parallel_size", MagicMock(return_value=8))
     @patch("neuronx_distributed.parallel_layers.layers.get_tensor_model_parallel_rank", MagicMock(return_value=1))
     @patch("neuronx_distributed.parallel_layers.parallel_state.initialize_model_parallel", MagicMock(return_value=True))
