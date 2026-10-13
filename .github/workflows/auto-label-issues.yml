@@ -6,13 +6,15 @@ on:
     types: [opened]
   # TEST ONLY. Do not merge. Run this workflow on a test pull request.
   pull_request:
-    types: [opened, edited]
+    types: [opened, edited, synchronize]
 
 jobs:
   auto-label-issues:
     runs-on: ubuntu-latest
     permissions:
       issues: write
+      # TEST ONLY. A label on a pull request needs this permission.
+      pull-requests: write
     steps:
       - name: Analyze issue content and apply labels
         id: analyze_content
