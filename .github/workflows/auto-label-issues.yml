@@ -11,7 +11,7 @@ jobs:
     permissions:
       issues: write
     steps:
-      - name: Analyze issue content
+      - name: Analyze issue content and apply labels
         id: analyze_content
         uses: actions/github-script@v7
         env:
@@ -211,15 +211,35 @@ jobs:
               labels.push('Training');
             }
 
-            core.setOutput('labels', labels.join(','));
-            core.setOutput('has_labels', labels.length > 0);
+            // =============================================================================
+            // APPLY LABELS
+            // Call the API from this script. Do not pass values to a shell step.
+            // Apply only the labels that exist in the repository. The name match ignores case.
+            // =============================================================================
+            if (labels.length > 0) {
+              const repoLabels = await github.paginate(github.rest.issues.listLabelsForRepo, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                per_page: 100
+              });
+              const existingLabels = new Map(repoLabels.map(l => [l.name.toLowerCase(), l.name]));
 
-      - name: Apply labels to issue
-        if: steps.analyze_content.outputs.has_labels == 'true'
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          IFS=',' read -ra LABELS <<< "${{ steps.analyze_content.outputs.labels }}"
-          for label in "${LABELS[@]}"; do
-            gh issue edit ${{ github.event.issue.number }} --add-label "$label" -R ${{ github.repository }}
-          done
+              const labelsToApply = [];
+              for (const label of labels) {
+                const name = existingLabels.get(label.toLowerCase());
+                if (name) {
+                  labelsToApply.push(name);
+                } else {
+                  core.warning(`Label "${label}" does not exist in the repository. Create the label to apply it.`);
+                }
+              }
+
+              if (labelsToApply.length > 0) {
+                await github.rest.issues.addLabels({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.issue.number,
+                  labels: labelsToApply
+                });
+              }
+            }
